@@ -2,12 +2,13 @@
 //! old probes; each task retains only a weak runtime reference between ticks.
 use crate::{
     config::{HttpRuntime, Snapshot},
+    discovery::{Discovery, Protocol, ResolvedTarget},
     http_outbound::Pools,
     pool_member::{Backend, DesiredState},
     proxy::{Body, BodyError},
 };
 use anyhow::{Context, Result, ensure};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Uri};
@@ -22,14 +23,24 @@ pub fn spawn_monitor(
     pools: Arc<Pools>,
     shutdown: CancellationToken,
 ) {
+    spawn_monitor_with_discovery(active, pools, Arc::new(ArcSwapOption::empty()), shutdown);
+}
+
+pub fn spawn_monitor_with_discovery(
+    active: Arc<ArcSwap<Snapshot>>,
+    pools: Arc<Pools>,
+    discovery: Arc<ArcSwapOption<Discovery>>,
+    shutdown: CancellationToken,
+) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(run_monitor(active, pools, shutdown));
+        handle.spawn(run_monitor(active, pools, discovery, shutdown));
     }
 }
 
 async fn run_monitor(
     active: Arc<ArcSwap<Snapshot>>,
     pools: Arc<Pools>,
+    discovery: Arc<ArcSwapOption<Discovery>>,
     shutdown: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -77,6 +88,7 @@ async fn run_monitor(
                     backend.address().to_owned(),
                     prepared.clone(),
                     pools.clone(),
+                    discovery.clone(),
                     shutdown.clone(),
                 ));
             }
@@ -92,6 +104,7 @@ async fn run_backend(
     backend: String,
     prepared: Option<Arc<rustls::ClientConfig>>,
     pools: Arc<Pools>,
+    discovery: Arc<ArcSwapOption<Discovery>>,
     cancel: CancellationToken,
 ) {
     let Some(initial) = runtime.upgrade() else {
@@ -118,18 +131,50 @@ async fn run_backend(
             .active_health
             .as_ref()
             .expect("route policy is immutable");
-        let probe = probe_once(&current, &backend, prepared.as_ref(), &pools);
+        let resolved = discovery.load_full();
+        let Some(target) = resolve_probe_target(&backend, resolved.as_deref()) else {
+            // Missing Docker references have no endpoint to qualify. The
+            // proxy independently excludes them from selection until a new
+            // discovery epoch appears.
+            continue;
+        };
+        if !current.balancer.observe_epoch(index, target.epoch) {
+            continue;
+        }
+        let probe = probe_once(
+            &current,
+            &backend,
+            &target,
+            resolved,
+            prepared.as_ref(),
+            &pools,
+        );
         let outcome = tokio::select! {
             _ = cancel.cancelled() => break,
             result = tokio::time::timeout(Duration::from_millis(policy.timeout_ms), probe) => result,
         };
+        // A removed container or a replacement at the same IP:port cannot
+        // borrow the earlier probe's healthy result. Discovery epochs include
+        // restart and removal/reappearance transitions.
+        let latest = discovery.load_full();
+        if resolve_probe_target(&backend, latest.as_deref()).as_ref() != Some(&target) {
+            continue;
+        }
         match outcome {
-            Ok(Ok(status)) => current.balancer.record_active_status(index, status),
+            Ok(Ok(status)) => {
+                current
+                    .balancer
+                    .record_active_status_for(index, target.epoch, status)
+            }
             Ok(Err(error)) => {
                 tracing::debug!(route = %current.route.id, backend = %backend, error = %error, "active upstream probe failed");
-                current.balancer.record_active_transport_failure(index);
+                current
+                    .balancer
+                    .record_active_transport_failure_for(index, target.epoch);
             }
-            Err(_) => current.balancer.record_active_timeout(index),
+            Err(_) => current
+                .balancer
+                .record_active_timeout_for(index, target.epoch),
         }
         drop(current);
     }
@@ -137,7 +182,9 @@ async fn run_backend(
 
 async fn probe_once(
     runtime: &Arc<HttpRuntime>,
-    backend: &str,
+    configured: &str,
+    target: &ResolvedTarget,
+    discovery: Option<Arc<Discovery>>,
     prepared: Option<&Arc<rustls::ClientConfig>>,
     pools: &Pools,
 ) -> Result<u16> {
@@ -147,7 +194,10 @@ async fn probe_once(
         .active_health
         .as_ref()
         .expect("probe route");
-    let upstream: Uri = backend.parse().context("parse active probe backend")?;
+    let upstream: Uri = target
+        .endpoint
+        .parse()
+        .context("parse active probe backend")?;
     ensure!(
         matches!(upstream.scheme_str(), Some("http" | "https")),
         "active probe backend must be HTTP or HTTPS"
@@ -178,12 +228,23 @@ async fn probe_once(
         .uri(uri)
         .body(body)
         .context("build active probe request")?;
-    let client = pools.client(runtime, backend, prepared)?;
+    let client = pools.client_for_epoch(runtime, configured, target, discovery, prepared)?;
     let response = client
         .request(request)
         .await
         .context("active probe HTTP request")?;
     Ok(response.status().as_u16())
+}
+
+fn resolve_probe_target(backend: &str, discovery: Option<&Discovery>) -> Option<ResolvedTarget> {
+    if backend.starts_with("docker://") {
+        discovery?.resolve_with_epoch(backend, Protocol::Http)
+    } else {
+        Some(ResolvedTarget {
+            endpoint: backend.to_owned(),
+            epoch: 0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -340,7 +401,12 @@ mod tests {
         let active = Arc::new(ArcSwap::from(snapshot));
         let pools = Arc::new(Pools::new(crate::tls::client_config(None).unwrap(), 1));
         let shutdown = CancellationToken::new();
-        let monitor = tokio::spawn(run_monitor(active, pools, shutdown.clone()));
+        let monitor = tokio::spawn(run_monitor(
+            active,
+            pools,
+            Arc::new(ArcSwapOption::empty()),
+            shutdown.clone(),
+        ));
         let (mut connection, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
             .await
             .unwrap()

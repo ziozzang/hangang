@@ -2,7 +2,7 @@
 use crate::pool_member::DesiredState;
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -164,6 +164,10 @@ fn validate_statuses(healthy: &[u16], unhealthy: &[u16]) -> anyhow::Result<()> {
 #[derive(Default)]
 struct Node {
     active: crate::member_admission::MemberAdmission,
+    endpoint_epoch: AtomicU64,
+    // Serializes endpoint resets with probe and dynamic-response feedback.
+    // Selection still reads the published atomics without taking this lock.
+    endpoint_lock: Mutex<()>,
     failures: AtomicUsize,
     unavailable_until: AtomicU64,
     active_unhealthy: std::sync::atomic::AtomicBool,
@@ -216,6 +220,7 @@ pub struct BackendState {
 pub struct BackendLease(Arc<LeaseInner>);
 struct LeaseInner {
     node: Arc<Node>,
+    endpoint_epoch: u64,
     health: Option<HealthPolicy>,
     passive: Option<PassiveHealthPolicy>,
 }
@@ -225,62 +230,78 @@ impl Drop for LeaseInner {
     }
 }
 impl BackendLease {
+    fn with_current_epoch(&self, update: impl FnOnce(&Node)) {
+        let node = &self.0.node;
+        // Epoch zero is the immutable native-address path. Validated backend
+        // mapping cannot turn that node into a Docker reference, so ordinary
+        // request feedback needs only the atomic equality check.
+        if self.0.endpoint_epoch == 0 {
+            if node.endpoint_epoch.load(Ordering::Acquire) == 0 {
+                update(node);
+            }
+            return;
+        }
+        let _guard = node
+            .endpoint_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if node.endpoint_epoch.load(Ordering::Acquire) == self.0.endpoint_epoch {
+            update(node);
+        }
+    }
+
     pub fn record(&self, success: bool) {
         let Some(health) = self.0.health else { return };
-        if success {
-            self.0.node.failures.store(0, Ordering::Relaxed);
-            self.0.node.unavailable_until.store(0, Ordering::Relaxed);
-        } else if self.0.node.failures.fetch_add(1, Ordering::Relaxed) + 1
-            >= health.failure_threshold as usize
-        {
-            self.0
-                .node
-                .unavailable_until
-                .store(now_ms() + health.cooldown_ms, Ordering::Relaxed);
-        }
+        self.with_current_epoch(|node| {
+            if success {
+                node.failures.store(0, Ordering::Relaxed);
+                node.unavailable_until.store(0, Ordering::Relaxed);
+            } else if node.failures.fetch_add(1, Ordering::Relaxed) + 1
+                >= health.failure_threshold as usize
+            {
+                node.unavailable_until
+                    .store(now_ms() + health.cooldown_ms, Ordering::Relaxed);
+            }
+        });
     }
     pub fn record_http_status(&self, status: u16) {
         if let Some(passive) = &self.0.passive {
             // Kong's configured passive healthy.successes=0 makes healthy
             // status reports no-ops; they do not reset a failure streak.
-            if passive.unhealthy_statuses.contains(&status)
-                && self
-                    .0
-                    .node
-                    .passive_http_failures
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1
-                    >= passive.unhealthy_http_failures as usize
-            {
-                self.0.node.passive_unhealthy.store(true, Ordering::Release);
-            }
+            self.with_current_epoch(|node| {
+                if passive.unhealthy_statuses.contains(&status)
+                    && node.passive_http_failures.fetch_add(1, Ordering::Relaxed) + 1
+                        >= passive.unhealthy_http_failures as usize
+                {
+                    node.passive_unhealthy.store(true, Ordering::Release);
+                }
+            });
         } else {
             self.record(status < 500);
         }
     }
     pub fn record_transport_failure(&self) {
         if let Some(passive) = &self.0.passive {
-            if self
-                .0
-                .node
-                .passive_tcp_failures
-                .fetch_add(1, Ordering::Relaxed)
-                + 1
-                >= passive.unhealthy_tcp_failures as usize
-            {
-                self.0.node.passive_unhealthy.store(true, Ordering::Release);
-            }
+            self.with_current_epoch(|node| {
+                if node.passive_tcp_failures.fetch_add(1, Ordering::Relaxed) + 1
+                    >= passive.unhealthy_tcp_failures as usize
+                {
+                    node.passive_unhealthy.store(true, Ordering::Release);
+                }
+            });
         } else {
             self.record(false);
         }
     }
     pub fn record_timeout(&self) {
         if let Some(passive) = &self.0.passive {
-            if self.0.node.passive_timeouts.fetch_add(1, Ordering::Relaxed) + 1
-                >= passive.unhealthy_timeouts as usize
-            {
-                self.0.node.passive_unhealthy.store(true, Ordering::Release);
-            }
+            self.with_current_epoch(|node| {
+                if node.passive_timeouts.fetch_add(1, Ordering::Relaxed) + 1
+                    >= passive.unhealthy_timeouts as usize
+                {
+                    node.passive_unhealthy.store(true, Ordering::Release);
+                }
+            });
         } else {
             self.record(false);
         }
@@ -408,6 +429,68 @@ impl Balancer {
             && (self.config.health.is_none()
                 || self.nodes[index].unavailable_until.load(Ordering::Relaxed) <= now_ms())
     }
+    /// Health and admission must both apply to the exact endpoint generation.
+    /// The second epoch read fences a concurrent Docker replacement during
+    /// the otherwise lock-free selector check.
+    pub fn available_for(&self, index: usize, epoch: u64) -> bool {
+        self.nodes.get(index).is_some_and(|node| {
+            node.endpoint_epoch.load(Ordering::Acquire) == epoch
+                && self.available(index)
+                && node.endpoint_epoch.load(Ordering::Acquire) == epoch
+        })
+    }
+
+    /// Observe a newly resolved endpoint before selection. A stale result
+    /// cannot move the generation backwards. Reset all prior endpoint health
+    /// before making the newer epoch visible to readers.
+    pub fn observe_epoch(&self, index: usize, epoch: u64) -> bool {
+        let Some(node) = self.nodes.get(index) else {
+            return false;
+        };
+        let current = node.endpoint_epoch.load(Ordering::Acquire);
+        if current == epoch {
+            return true;
+        }
+        if current > epoch {
+            return false;
+        }
+        let _guard = node
+            .endpoint_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_epoch_locked(node, epoch)
+    }
+
+    fn ensure_epoch_locked(&self, node: &Node, epoch: u64) -> bool {
+        let current = node.endpoint_epoch.load(Ordering::Acquire);
+        if current > epoch {
+            return false;
+        }
+        if current == epoch {
+            return true;
+        }
+        let checking = self
+            .config
+            .active_health
+            .as_ref()
+            .is_some_and(|policy| policy.initial_state == InitialHealthState::Checking);
+        node.failures.store(0, Ordering::Relaxed);
+        node.unavailable_until.store(0, Ordering::Relaxed);
+        node.active_unhealthy.store(checking, Ordering::Release);
+        node.initial_check_pending
+            .store(checking, Ordering::Release);
+        node.active_probe_seen.store(false, Ordering::Release);
+        node.passive_unhealthy.store(false, Ordering::Release);
+        node.active_successes.store(0, Ordering::Relaxed);
+        node.active_http_failures.store(0, Ordering::Relaxed);
+        node.active_tcp_failures.store(0, Ordering::Relaxed);
+        node.active_timeouts.store(0, Ordering::Relaxed);
+        node.passive_http_failures.store(0, Ordering::Relaxed);
+        node.passive_tcp_failures.store(0, Ordering::Relaxed);
+        node.passive_timeouts.store(0, Ordering::Relaxed);
+        node.endpoint_epoch.store(epoch, Ordering::Release);
+        true
+    }
     pub fn admission_open(&self, index: usize) -> bool {
         self.nodes
             .get(index)
@@ -446,6 +529,12 @@ impl Balancer {
         self.config.weights.get(index).copied().unwrap_or(1) as usize
     }
     pub fn select(&self) -> Option<usize> {
+        self.select_where(|_| true)
+    }
+
+    /// The predicate runs before health availability, allowing callers to
+    /// resolve and observe a new endpoint epoch even when old health is down.
+    pub fn select_where(&self, predicate: impl Fn(usize) -> bool) -> Option<usize> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -455,7 +544,7 @@ impl Balancer {
             let mut best = None;
             for offset in 0..self.nodes.len() {
                 let index = (start + offset) % self.nodes.len();
-                if !self.available(index) {
+                if !predicate(index) || !self.available(index) {
                     continue;
                 }
                 if best.is_none_or(|previous: usize| {
@@ -482,28 +571,48 @@ impl Balancer {
         }
         (0..self.nodes.len())
             .map(|offset| (selected + offset) % self.nodes.len())
-            .find(|index| self.available(*index))
+            .find(|index| predicate(*index) && self.available(*index))
     }
     pub fn acquire(&self, index: usize) -> Option<BackendLease> {
-        if !self.available(index) {
+        self.acquire_for(index, 0)
+    }
+
+    pub fn acquire_for(&self, index: usize, epoch: u64) -> Option<BackendLease> {
+        if !self.available_for(index, epoch) {
             return None;
         }
-        if !self.nodes[index].active.acquire() {
+        let node = self.nodes.get(index)?;
+        if !node.active.acquire() {
+            return None;
+        }
+        if !self.available_for(index, epoch) {
+            node.active.release();
             return None;
         }
         Some(BackendLease(Arc::new(LeaseInner {
-            node: self.nodes[index].clone(),
+            node: node.clone(),
+            endpoint_epoch: epoch,
             health: self.config.health,
             passive: self.config.passive_health.clone(),
         })))
     }
     pub fn record_active_status(&self, index: usize, status: u16) {
+        self.record_active_status_for(index, 0, status);
+    }
+    pub fn record_active_status_for(&self, index: usize, epoch: u64, status: u16) {
         let Some(policy) = &self.config.active_health else {
             return;
         };
         let Some(node) = self.nodes.get(index) else {
             return;
         };
+        let _guard = node
+            .endpoint_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.ensure_epoch_locked(node, epoch) {
+            return;
+        }
         node.active_probe_seen.store(true, Ordering::Release);
         if policy.healthy_statuses.contains(&status) {
             node.active_http_failures.store(0, Ordering::Relaxed);
@@ -536,12 +645,22 @@ impl Balancer {
         }
     }
     pub fn record_active_transport_failure(&self, index: usize) {
+        self.record_active_transport_failure_for(index, 0);
+    }
+    pub fn record_active_transport_failure_for(&self, index: usize, epoch: u64) {
         let Some(policy) = &self.config.active_health else {
             return;
         };
         let Some(node) = self.nodes.get(index) else {
             return;
         };
+        let _guard = node
+            .endpoint_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.ensure_epoch_locked(node, epoch) {
+            return;
+        }
         node.active_probe_seen.store(true, Ordering::Release);
         node.active_successes.store(0, Ordering::Relaxed);
         if node.active_tcp_failures.fetch_add(1, Ordering::Relaxed) + 1
@@ -551,12 +670,22 @@ impl Balancer {
         }
     }
     pub fn record_active_timeout(&self, index: usize) {
+        self.record_active_timeout_for(index, 0);
+    }
+    pub fn record_active_timeout_for(&self, index: usize, epoch: u64) {
         let Some(policy) = &self.config.active_health else {
             return;
         };
         let Some(node) = self.nodes.get(index) else {
             return;
         };
+        let _guard = node
+            .endpoint_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.ensure_epoch_locked(node, epoch) {
+            return;
+        }
         node.active_probe_seen.store(true, Ordering::Release);
         node.active_successes.store(0, Ordering::Relaxed);
         if node.active_timeouts.fetch_add(1, Ordering::Relaxed) + 1
@@ -621,6 +750,7 @@ mod tests {
         // satisfy the active startup gate, even if its status is healthy.
         let in_flight = BackendLease(Arc::new(LeaseInner {
             node: balancer.nodes[0].clone(),
+            endpoint_epoch: 0,
             health: None,
             passive: Some(passive_policy()),
         }));
@@ -1039,6 +1169,103 @@ mod tests {
         }
         drop(lease);
         assert!(b.select().is_some());
+    }
+
+    #[test]
+    fn endpoint_epoch_requires_fresh_checking_probes_and_ignores_stale_results() {
+        let mut policy = active_policy();
+        policy.initial_state = InitialHealthState::Checking;
+        policy.healthy_successes = 2;
+        let balancer = Balancer::new(
+            BalanceConfig {
+                active_health: Some(policy),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(balancer.observe_epoch(0, 7));
+        balancer.record_active_status_for(0, 7, 200);
+        assert!(!balancer.available_for(0, 7));
+        assert!(balancer.observe_epoch(0, 8));
+        assert!(!balancer.observe_epoch(0, 7));
+        balancer.record_active_status_for(0, 7, 200);
+        balancer.record_active_timeout_for(0, 7);
+        assert_eq!(
+            balancer.backend_state(0).unwrap().probe_observed,
+            Some(false)
+        );
+        balancer.record_active_status_for(0, 8, 200);
+        assert!(!balancer.available_for(0, 8));
+        balancer.record_active_status_for(0, 8, 200);
+        assert!(balancer.available_for(0, 8));
+        assert!(!balancer.available_for(0, 7));
+        assert!(balancer.acquire_for(0, 7).is_none());
+        assert!(balancer.acquire_for(0, 8).is_some());
+        assert!(balancer.nodes[0].active.is_open());
+    }
+
+    #[test]
+    fn old_endpoint_lease_feedback_cannot_quarantine_replacement() {
+        let mut passive = passive_policy();
+        passive.unhealthy_http_failures = 1;
+        passive.unhealthy_tcp_failures = 1;
+        passive.unhealthy_timeouts = 1;
+        let balancer = Balancer::new(
+            BalanceConfig {
+                active_health: Some(active_policy()),
+                passive_health: Some(passive),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(balancer.observe_epoch(0, 11));
+        let old = balancer.acquire_for(0, 11).unwrap();
+        assert!(balancer.observe_epoch(0, 12));
+        old.record_http_status(503);
+        old.record_transport_failure();
+        old.record_timeout();
+        assert!(balancer.available_for(0, 12));
+        let current = balancer.acquire_for(0, 12).unwrap();
+        current.record_transport_failure();
+        assert!(!balancer.available_for(0, 12));
+        drop(old);
+        drop(current);
+        assert_eq!(balancer.backend_state(0).unwrap().active_requests, Some(0));
+    }
+
+    #[test]
+    fn selector_observes_new_epoch_before_testing_old_unhealthy_state() {
+        let mut policy = active_policy();
+        policy.unhealthy_http_failures = 1;
+        let balancer = Balancer::new(
+            BalanceConfig {
+                active_health: Some(policy),
+                ..Default::default()
+            },
+            1,
+        );
+        balancer.record_active_status_for(0, 5, 503);
+        assert!(!balancer.available_for(0, 5));
+        assert_eq!(
+            balancer.select_where(|index| {
+                balancer.observe_epoch(index, 6) && balancer.available_for(index, 6)
+            }),
+            Some(0)
+        );
+
+        let closed = Balancer::with_member_states(
+            BalanceConfig {
+                active_health: Some(active_policy()),
+                ..Default::default()
+            },
+            None,
+            &[],
+            &[DesiredState::Maintenance],
+        );
+        assert!(closed.observe_epoch(0, 6));
+        closed.record_active_status_for(0, 6, 200);
+        assert!(!closed.available_for(0, 6));
+        assert!(closed.acquire_for(0, 6).is_none());
     }
     #[tokio::test]
     async fn failures_quarantine_and_recover_without_replay() {
