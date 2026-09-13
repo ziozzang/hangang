@@ -3764,28 +3764,51 @@ function resetConfigReceipt() {
   state.configReceipt.data = null;
   state.configReceipt.error = null;
   state.configReceipt.loading = false;
+  $('#config-receipt-mode').value = 'v1';
   $('#config-receipt-authority').value = '';
   $('#config-receipt-operation').value = '';
+  $('#config-receipt-sequence').value = '';
+  syncConfigReceiptMode();
   $('#config-receipt-fields').replaceChildren();
   message($('#config-receipt-state'));
   $('#config-receipt-search').disabled = true;
 }
 
-function validConfigReceipt(data, authorityId, operationId) {
+function syncConfigReceiptMode() {
+  const v2 = $('#config-receipt-mode').value === 'v2';
+  for (const id of ['config-receipt-operation', 'config-receipt-sequence']) {
+    const input = $(`#${id}`);
+    const visible = id === (v2 ? 'config-receipt-sequence' : 'config-receipt-operation');
+    input.hidden = !visible;
+    input.disabled = !visible;
+    input.required = visible;
+    $(`label[for="${id}"]`).hidden = !visible;
+  }
+}
+
+function validConfigReceipt(data, mode, authorityId, identity) {
   const hex = (value, size) => typeof value === 'string' && new RegExp(`^[0-9a-f]{${size}}$`).test(value);
   const safe = (value) => Number.isSafeInteger(value) && value >= 0;
   if (!isObject(data) || data.scope !== 'configuration_authority' ||
     typeof data.supported !== 'boolean' || !safe(data.server_time_unix_ms)) return false;
   if (!data.supported) return data.receipt === null && data.stored_records === null &&
-    data.capacity === null && data.writes_available === null;
+    data.capacity === null && data.writes_available === null && (mode === 'v1' ||
+      (data.high_water === null && data.registered_authorities === null && data.authority_capacity === null));
   if (!safe(data.stored_records) || data.capacity !== 100000 ||
     data.stored_records > data.capacity || typeof data.writes_available !== 'boolean' ||
     (data.stored_records === data.capacity && data.writes_available)) return false;
+  if (mode === 'v2' && (!safe(data.high_water) || !safe(data.registered_authorities) ||
+    data.authority_capacity !== 4096 || data.registered_authorities > data.authority_capacity)) return false;
   if (data.receipt === null) return true;
   const receipt = data.receipt;
-  return isObject(receipt) && hex(receipt.epoch, 32) && safe(receipt.revision) &&
-    isObject(receipt.stamp) && receipt.stamp.authority_id === authorityId &&
-    receipt.stamp.operation_id === operationId && hex(receipt.stamp.candidate_sha256, 64);
+  if (!isObject(receipt) || !isObject(receipt.stamp)) return false;
+  const identityValid = mode === 'v1'
+    ? receipt.stamp?.operation_id === identity
+    : receipt.stamp?.acceptance_seq === Number(identity) &&
+      safe(receipt.stamp.acceptance_seq) && receipt.stamp.acceptance_seq > 0 &&
+      receipt.stamp.acceptance_seq <= data.high_water && hex(receipt.stamp.operation_id, 32);
+  return hex(receipt.epoch, 32) && safe(receipt.revision) && receipt.stamp.authority_id === authorityId &&
+    identityValid && hex(receipt.stamp.candidate_sha256, 64);
 }
 
 function renderConfigReceipt() {
@@ -3798,20 +3821,29 @@ function renderConfigReceipt() {
   const observed = auditDate(lookup.data.server_time_unix_ms);
   if (!lookup.data.supported) return message($('#config-receipt-state'),
     t('This store does not support historical SQL receipts. Observed: {time}.', { time: observed }), 'warning');
-  const capacity = t('Retained receipts: {stored}/{capacity} · Receipt quota admission: {writes} · Observed: {time}. This does not report overall write readiness.', {
+  const mode = $('#config-receipt-mode').value;
+  const capacity = t(mode === 'v2'
+    ? 'V2 receipts: {stored}/{capacity} · Registered authorities: {registered}/{authorityCapacity} · This authority admission: {writes} · Observed: {time}. This does not report overall write readiness.'
+    : 'Retained receipts: {stored}/{capacity} · Receipt quota admission: {writes} · Observed: {time}. This does not report overall write readiness.', {
     stored: formatNumber(lookup.data.stored_records), capacity: formatNumber(lookup.data.capacity),
+    registered: mode === 'v2' ? formatNumber(lookup.data.registered_authorities) : '',
+    authorityCapacity: mode === 'v2' ? formatNumber(lookup.data.authority_capacity) : '',
     writes: lookup.data.writes_available ? t('available') : t('blocked'), time: observed,
   });
+  const fence = mode === 'v2'
+    ? ` ${t('Committed sequence high-water: #{sequence}. This is a replay fence, not proof of complete history or local activation.', { sequence: lookup.data.high_water })}` : '';
   if (!lookup.data.receipt) return message($('#config-receipt-state'),
-    `${t('No retained receipt matches these IDs. The commit outcome is unknown; legacy writes, restore, or missing history can explain absence.')} ${capacity}`, 'warning');
+    `${t('No retained receipt matches this identity. The commit outcome is unknown; legacy writes, restore, or missing history can explain absence.')} ${capacity}${fence}`, 'warning');
   message($('#config-receipt-state'),
-    `${t('Historical SQL commit recorded. This does not prove current configuration, local activation, or fleet acknowledgement.')} ${capacity}`, 'success');
+    `${t('Historical SQL commit recorded. This does not prove current configuration, local activation, or fleet acknowledgement.')} ${capacity}${fence}`, 'success');
   const receipt = lookup.data.receipt;
-  for (const [label, value] of [
+  const details = [
     ['Store epoch', receipt.epoch], ['Store revision', receipt.revision],
     ['Proof authority ID', receipt.stamp.authority_id], ['Proof operation ID', receipt.stamp.operation_id],
     ['Proof candidate SHA-256', receipt.stamp.candidate_sha256],
-  ]) {
+  ];
+  if (mode === 'v2') details.splice(3, 0, ['Committed acceptance sequence', receipt.stamp.acceptance_seq]);
+  for (const [label, value] of details) {
     const dt = document.createElement('dt'); dt.textContent = t(label);
     const dd = document.createElement('dd'); dd.textContent = String(value);
     fields.append(dt, dd);
@@ -3821,15 +3853,19 @@ function renderConfigReceipt() {
 async function searchConfigReceipt(event) {
   event.preventDefault();
   if (!isAdmin() || !state.token || state.view !== 'config-operations') return;
+  const mode = $('#config-receipt-mode').value;
   const authorityId = $('#config-receipt-authority').value;
-  const operationId = $('#config-receipt-operation').value;
+  const identity = $(mode === 'v2' ? '#config-receipt-sequence' : '#config-receipt-operation').value;
   const lookup = state.configReceipt;
   const sequence = ++lookup.sequence;
   lookup.data = null;
   lookup.error = null;
-  if (!/^[0-9a-f]{32}$/.test(authorityId) || !/^[0-9a-f]{32}$/.test(operationId)) {
+  const validIdentity = mode === 'v1' ? /^[0-9a-f]{32}$/.test(identity) :
+    /^[1-9][0-9]*$/.test(identity) && Number.isSafeInteger(Number(identity));
+  if (!/^[0-9a-f]{32}$/.test(authorityId) || !validIdentity) {
     lookup.loading = false;
-    lookup.error = 'Enter two exact 32-character lowercase hexadecimal IDs.';
+    lookup.error = mode === 'v1' ? 'Enter two exact 32-character lowercase hexadecimal IDs.' :
+      'Enter a 32-character lowercase authority ID and a positive canonical safe acceptance sequence.';
     renderConfigReceipt();
     return;
   }
@@ -3837,14 +3873,18 @@ async function searchConfigReceipt(event) {
   const token = state.token;
   const stillCurrent = () => sequence === lookup.sequence && generation === state.authGeneration &&
     token === state.token && state.view === 'config-operations' && isAdmin() &&
-    $('#config-receipt-authority').value === authorityId && $('#config-receipt-operation').value === operationId;
+    $('#config-receipt-mode').value === mode && $('#config-receipt-authority').value === authorityId &&
+    $(mode === 'v2' ? '#config-receipt-sequence' : '#config-receipt-operation').value === identity;
   lookup.loading = true;
   renderConfigReceipt();
   try {
-    const query = new URLSearchParams({ authority_id: authorityId, operation_id: operationId });
-    const { data } = await api(`/v1/config/commit-receipt?${query}`);
+    const query = new URLSearchParams(mode === 'v2'
+      ? { authority_id: authorityId, acceptance_seq: identity }
+      : { authority_id: authorityId, operation_id: identity });
+    const endpoint = mode === 'v2' ? '/v1/config/commit-receipt-v2' : '/v1/config/commit-receipt';
+    const { data } = await api(`${endpoint}?${query}`);
     if (!stillCurrent()) return;
-    if (!validConfigReceipt(data, authorityId, operationId)) throw new Error(t('Historical SQL receipt response is invalid.'));
+    if (!validConfigReceipt(data, mode, authorityId, identity)) throw new Error(t('Historical SQL receipt response is invalid.'));
     lookup.data = data;
   } catch (error) {
     if (!stillCurrent() || error instanceof StaleSessionError) return;
@@ -3862,6 +3902,13 @@ function configReceiptQueryChanged() {
   lookup.error = null;
   lookup.loading = false;
   renderConfigReceipt();
+}
+
+function configReceiptModeChanged() {
+  $('#config-receipt-operation').value = '';
+  $('#config-receipt-sequence').value = '';
+  syncConfigReceiptMode();
+  configReceiptQueryChanged();
 }
 
 function resetConfigOperations() {
@@ -3906,6 +3953,7 @@ function validConfigOperationsPage(data, after) {
   return data.records.every((record, index) => isObject(record) && safe(record.id) &&
     record.id > (index ? data.records[index - 1].id : after) && record.id <= data.latest_id &&
     idValue(record.operation_id) && record.authority_id === data.authority_id &&
+    (record.receipt_version === undefined || record.receipt_version === 1 || record.receipt_version === 2) &&
     ['system', 'account'].includes(record.actor_kind) &&
     (record.actor_kind === 'system' ? record.actor_user_id == null : safe(record.actor_user_id) && record.actor_user_id > 0) &&
     safe(record.accepted_at_unix_ms) &&
@@ -3924,6 +3972,12 @@ function configOperationState(record) {
     failed: t('Failed'),
     indeterminate: t('Indeterminate; outcome unknown'),
   }[record.state];
+}
+
+function configOperationReceiptVersion(record) {
+  if (record.receipt_version === 2) return t('Sequenced V2 receipt · acceptance #{sequence}', { sequence: record.id });
+  if (record.receipt_version === 1) return t('Legacy V1 receipt');
+  return t('Legacy V1 receipt · version omitted by older server');
 }
 
 function renderConfigOperations() {
@@ -3960,10 +4014,10 @@ function renderConfigOperations() {
       const details = document.createElement('details');
       const summary = document.createElement('summary'); summary.textContent = t('Identifiers');
       const detailText = document.createElement('p');
-      detailText.textContent = t('Operation: {operation} · Candidate SHA-256: {digest} · Store: {store} · Authority epoch: {epoch}', {
+      detailText.textContent = `${configOperationReceiptVersion(record)} · ${t('Operation: {operation} · Candidate SHA-256: {digest} · Store: {store} · Authority epoch: {epoch}', {
         operation: record.operation_id, digest: record.candidate_sha256,
         store: record.store_kind, epoch: record.authority_epoch ?? '—',
-      });
+      })}`;
       details.append(summary, detailText); detailCell.append(details); tr.append(detailCell);
       rows.append(tr);
     }
@@ -4016,7 +4070,8 @@ async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
 function exportConfigOperationsPage() {
   const page = state.configOperations.page;
   if (!isAdmin() || !page?.records?.length) return;
-  const documentValue = { ...page, exported_page_after: state.configOperations.after, export_scope: 'current_page_only' };
+  const documentValue = { ...page, exported_page_after: state.configOperations.after, export_scope: 'current_page_only',
+    receipt_version_compatibility: 'missing means legacy_v1' };
   const url = URL.createObjectURL(new Blob([JSON.stringify(documentValue, null, 2)], { type: 'application/json' }));
   try {
     const link = document.createElement('a');
@@ -4069,6 +4124,7 @@ async function exportAllConfigOperations() {
     if (!stillCurrent()) throw new StaleSessionError();
     const archive = {
       scope: 'instance', export_scope: 'all_retained_at_history_revision',
+      receipt_version_compatibility: 'missing means legacy_v1',
       authority_id: firstPage.authority_id, coverage: firstPage.coverage,
       started_at_unix_ms: firstPage.started_at_unix_ms, history_revision: firstPage.history_revision,
       oldest_id: firstPage.oldest_id, latest_id: firstPage.latest_id, pruned_through: firstPage.pruned_through,
@@ -4211,8 +4267,10 @@ $('#audit-prune').addEventListener('click', pruneAuditPage);
 $('#config-operations-refresh').addEventListener('click', () => loadConfigOperations(0, []));
 $('#config-proof-refresh').addEventListener('click', loadConfigProof);
 $('#config-receipt-form').addEventListener('submit', searchConfigReceipt);
+$('#config-receipt-mode').addEventListener('change', configReceiptModeChanged);
 $('#config-receipt-authority').addEventListener('input', configReceiptQueryChanged);
 $('#config-receipt-operation').addEventListener('input', configReceiptQueryChanged);
+$('#config-receipt-sequence').addEventListener('input', configReceiptQueryChanged);
 $('#config-operations-previous').addEventListener('click', () => {
   const previous = state.configOperations.previous.slice();
   if (!previous.length) return;

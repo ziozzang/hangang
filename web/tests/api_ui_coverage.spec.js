@@ -58,6 +58,7 @@ const coverage = new Map([
   ['GET /v1/config/operations', ['#view-config-operations', 'app', '/v1/config/operations?after=']],
   ['GET /v1/config/operation-proof', ['#config-proof-state', 'app', "api('/v1/config/operation-proof'"]],
   ['GET /v1/config/commit-receipt', ['#config-receipt-form', 'app', '/v1/config/commit-receipt?']],
+  ['GET /v1/config/commit-receipt-v2', ['#config-receipt-mode', 'app', '/v1/config/commit-receipt-v2']],
   ['POST /v1/config/operations/prune', ['#config-operations-prune', 'app', "api('/v1/config/operations/prune', { method: 'POST'"]],
   ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
 ]);
