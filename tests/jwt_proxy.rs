@@ -601,6 +601,45 @@ async fn held_upload_origin() -> (
     (address, observed, task)
 }
 
+async fn stalled_headers_origin() -> (
+    SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (seen, observed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut buffer = [0u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            assert!(request.len() < 8192);
+        }
+        seen.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    (address, observed, task)
+}
+
+async fn response_headers_before_deadline(stream: &mut TcpStream, label: &str) -> Vec<u8> {
+    let mut headers = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() < 8192);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label} did not return before the longer configured timeout"));
+    headers
+}
+
 async fn websocket_echo_origin() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -745,6 +784,69 @@ async fn authenticated_chunked_upload_stops_at_jwt_expiry_while_client_holds_bod
         "origin received more upload data after the first chunk"
     );
     assert!(now() >= expires_at, "upload ended before JWT expiry");
+    gateway.shutdown().await;
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn jwt_expiry_interrupts_upstream_response_header_wait_before_header_timeout() {
+    let (upstream, observed, upstream_task) = stalled_headers_origin().await;
+    let mut route = jwt_route(upstream);
+    route["upstream_timeout_ms"] = json!(10_000);
+    let gateway = lease_gateway(vec![route]).await;
+    let mut payload = claims();
+    let expires_at = now() + 3;
+    payload["exp"] = json!(expires_at);
+    let bearer = token(
+        json!({"typ":"at+jwt", "alg":"EdDSA", "kid":"fixture-key"}),
+        payload,
+    );
+    let mut client = TcpStream::connect(gateway.address).await.unwrap();
+    client.write_all(format!("GET /secure/wait HTTP/1.1\r\nHost: jwt.test\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), observed)
+        .await
+        .expect("request did not reach the stalled origin")
+        .unwrap();
+    let headers = response_headers_before_deadline(&mut client, "stalled origin headers").await;
+    assert!(headers.starts_with(b"HTTP/1.1 503"), "{headers:?}");
+    assert!(now() >= expires_at, "response preceded JWT expiry");
+    gateway.shutdown().await;
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn jwt_expiry_interrupts_buffered_request_transform_waiting_for_upload_end() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let (seen, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let upstream_task = tokio::spawn(async move {
+        while let Ok((_stream, _)) = upstream.accept().await {
+            seen.send(()).unwrap();
+        }
+    });
+    let mut route = jwt_route(upstream_address);
+    route["resource_policy"]["allow"][0]["methods"] = json!(["POST"]);
+    route["request_transform"] = json!({
+        "mode":"buffered", "operations":[], "timeout_ms":10_000,
+        "max_buffer_bytes":65_536, "max_output_bytes":65_536
+    });
+    let gateway = lease_gateway(vec![route]).await;
+    let mut payload = claims();
+    let expires_at = now() + 3;
+    payload["exp"] = json!(expires_at);
+    let bearer = token(
+        json!({"typ":"at+jwt", "alg":"EdDSA", "kid":"fixture-key"}),
+        payload,
+    );
+    let mut client = TcpStream::connect(gateway.address).await.unwrap();
+    client.write_all(format!("POST /secure/upload HTTP/1.1\r\nHost: jwt.test\r\nAuthorization: Bearer {bearer}\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n").as_bytes()).await.unwrap();
+    let headers = response_headers_before_deadline(&mut client, "buffered upload").await;
+    assert!(headers.starts_with(b"HTTP/1.1 503"), "{headers:?}");
+    assert!(now() >= expires_at, "response preceded JWT expiry");
+    assert!(
+        observed.try_recv().is_err(),
+        "incomplete upload reached origin"
+    );
     gateway.shutdown().await;
     upstream_task.abort();
 }
