@@ -46,6 +46,8 @@ use std::{
 pub(crate) const MAX_CONFIG_BYTES: usize = store::MAX_CONFIG_BYTES;
 /// Length of an authority epoch: 128 random bits as lowercase hex.
 pub const EPOCH_LEN: usize = 32;
+/// Retained SQL receipts are bounded; a full history refuses new operation CAS.
+pub const COMMIT_RECEIPT_CAPACITY: u64 = 100_000;
 /// ACME HTTP-01 token limits shared by every store.
 pub const MAX_CHALLENGE_TOKEN_LEN: usize = 128;
 pub const MAX_KEY_AUTHORIZATION_LEN: usize = 512;
@@ -74,6 +76,23 @@ pub struct OperationProof {
     pub epoch: String,
     pub revision: u64,
     pub stamp: OperationStamp,
+}
+
+/// Evidence that one operation committed at a revision. It does not imply
+/// that the candidate is still the current document or active on this node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitReceipt {
+    pub epoch: String,
+    pub revision: u64,
+    pub stamp: OperationStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitReceiptObservation {
+    pub receipt: Option<CommitReceipt>,
+    pub stored_records: u64,
+    pub capacity: u64,
+    pub writes_available: bool,
 }
 
 /// Why a store operation failed. Callers use the distinction for readiness
@@ -196,6 +215,18 @@ pub trait ConfigStore: Send + Sync {
     async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
         Err(StoreError::Invalid(anyhow!(
             "operation-specific proof is unsupported by this store"
+        )))
+    }
+    fn supports_commit_receipts(&self) -> bool {
+        false
+    }
+    async fn lookup_commit_receipt(
+        &self,
+        _authority_id: &str,
+        _operation_id: &str,
+    ) -> StoreResult<CommitReceiptObservation> {
+        Err(StoreError::Invalid(anyhow!(
+            "retained commit receipts are unsupported by this store"
         )))
     }
     /// ACME HTTP-01 sharing: every instance behind a load balancer can answer
@@ -322,6 +353,59 @@ fn validate_operation_stamp(stamp: &OperationStamp, encoded: &str) -> StoreResul
     Ok(())
 }
 
+fn validate_receipt_ids(authority_id: &str, operation_id: &str) -> StoreResult<()> {
+    if valid_hex(authority_id, 32) && valid_hex(operation_id, 32) {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid(anyhow!(
+            "invalid commit receipt identity"
+        )))
+    }
+}
+
+fn commit_receipt(
+    authority_id: String,
+    operation_id: String,
+    epoch: String,
+    revision: i64,
+    candidate_sha256: String,
+) -> StoreResult<CommitReceipt> {
+    validate_receipt_ids(&authority_id, &operation_id)?;
+    check_epoch(&epoch)?;
+    let revision = i64_to_revision(revision)?;
+    if revision == 0 || !valid_hex(&candidate_sha256, 64) {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid stored commit receipt"
+        )));
+    }
+    Ok(CommitReceipt {
+        epoch,
+        revision,
+        stamp: OperationStamp {
+            authority_id,
+            operation_id,
+            candidate_sha256,
+        },
+    })
+}
+
+fn receipt_observation(
+    receipt: Option<CommitReceipt>,
+    stored_records: i64,
+) -> StoreResult<CommitReceiptObservation> {
+    let stored_records = u64::try_from(stored_records)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid commit receipt count")))?;
+    if stored_records > COMMIT_RECEIPT_CAPACITY || (receipt.is_some() && stored_records == 0) {
+        return Err(StoreError::Invalid(anyhow!("invalid commit receipt count")));
+    }
+    Ok(CommitReceiptObservation {
+        receipt,
+        stored_records,
+        capacity: COMMIT_RECEIPT_CAPACITY,
+        writes_available: stored_records < COMMIT_RECEIPT_CAPACITY,
+    })
+}
+
 fn decode_operation_metadata(
     authority_id: Option<String>,
     operation_id: Option<String>,
@@ -428,6 +512,17 @@ fn resolve_operation_cas(
         )));
     }
     Ok(CasResult::Conflict { current: stored })
+}
+
+fn receipt_recovery_read<T>(read: StoreResult<T>, uncertain: bool) -> StoreResult<T> {
+    match read {
+        Err(error) if uncertain => Err(StoreError::Indeterminate(
+            error
+                .into_inner()
+                .context("operation CAS recovery current read failed"),
+        )),
+        result => result,
+    }
 }
 
 pub(crate) fn check_challenge_token(token: &str) -> StoreResult<()> {
@@ -926,6 +1021,28 @@ impl ConfigStore for SqliteConfigStore {
         true
     }
 
+    fn supports_commit_receipts(&self) -> bool {
+        true
+    }
+
+    async fn lookup_commit_receipt(
+        &self,
+        authority_id: &str,
+        operation_id: &str,
+    ) -> StoreResult<CommitReceiptObservation> {
+        validate_receipt_ids(authority_id, operation_id)?;
+        let authority_id = authority_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.with_connection(Access::Read, move |connection| {
+            let transaction = connection.transaction().map_err(sqlite_error)?;
+            let observation =
+                sqlite_receipt_observation(&transaction, &authority_id, &operation_id)?;
+            transaction.commit().map_err(sqlite_error)?;
+            Ok(observation)
+        })
+        .await
+    }
+
     async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
         self.with_connection(Access::Read, move |connection| {
             let transaction = connection
@@ -958,6 +1075,20 @@ impl ConfigStore for SqliteConfigStore {
         self.with_connection(Access::Mutation,move |connection|{
             let transaction=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sqlite_error)?;
             let current=sqlite_load_operation(&transaction)?.ok_or_else(||StoreError::Invalid(anyhow!("SQLite configuration store is not initialized")))?;
+            let history=sqlite_receipt_observation(&transaction,&stamp.authority_id,&stamp.operation_id)?;
+            if let Some(receipt)=history.receipt {
+                if receipt.epoch!=epoch || receipt.revision!=next.revision || receipt.stamp!=stamp {
+                    return Err(StoreError::Invalid(anyhow!("operation identifier reused with another candidate or precondition")));
+                }
+                let result=if current.0.epoch==epoch && current.0.config==next &&
+                    current_operation_proof(&current.0,&current.1,&current.2).is_some_and(|proof| proof.stamp==stamp) {
+                    CasResult::Applied(current.0)
+                } else {CasResult::Conflict{current:current.0}};
+                return Ok(result);
+            }
+            if !history.writes_available {
+                return Err(StoreError::Unavailable(anyhow!("retained commit receipt capacity exhausted")));
+            }
             if current.2.as_ref().is_some_and(|metadata|metadata.stamp.operation_id==stamp.operation_id) {
                 return resolve_operation_cas(Ok(Some(current)),&epoch,&next,&stamp,false);
             }
@@ -965,7 +1096,12 @@ impl ConfigStore for SqliteConfigStore {
                 "UPDATE hangang_config SET revision=?1,config_json=?2,operation_authority_id=?3,operation_id=?4,operation_revision=?1,operation_sha256=?5 WHERE singleton=1 AND revision=?6 AND epoch=?7 AND (operation_id IS NULL OR operation_id!=?4)",
                 rusqlite::params![next_revision,encoded,stamp.authority_id,stamp.operation_id,stamp.candidate_sha256,expected_revision,epoch]
             ).map_err(sqlite_error)?;
-            let result=if changed==1 {CasResult::Applied(Stored{epoch,config:next})}
+            let result=if changed==1 {
+                transaction.execute("INSERT INTO hangang_commit_receipts(authority_id,operation_id,epoch,revision,candidate_sha256) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![stamp.authority_id,stamp.operation_id,epoch,next_revision,stamp.candidate_sha256]).map_err(sqlite_error)?;
+                let counted=transaction.execute("UPDATE hangang_commit_receipt_meta SET stored_records=stored_records+1 WHERE singleton=1 AND stored_records<100000",[]).map_err(sqlite_error)?;
+                if counted!=1 {return Err(StoreError::Unavailable(anyhow!("retained commit receipt capacity exhausted")));}
+                CasResult::Applied(Stored{epoch,config:next})
+            }
                 else {resolve_operation_cas(Ok(Some(current)),&epoch,&next,&stamp,false)?};
             transaction.commit().map_err(sqlite_error)?;
             Ok(result)
@@ -1080,6 +1216,18 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
                 token TEXT PRIMARY KEY,
                 key_authorization TEXT NOT NULL,
                 expires_unix INTEGER NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS hangang_commit_receipts (
+                authority_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                epoch TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                candidate_sha256 TEXT NOT NULL,
+                PRIMARY KEY(authority_id, operation_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS hangang_commit_receipt_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                stored_records INTEGER NOT NULL CHECK(stored_records >= 0 AND stored_records <= 100000)
             ) STRICT;",
         )
         .map_err(sqlite_error)?;
@@ -1117,6 +1265,10 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             return Err(sqlite_error(error));
         }
     }
+    connection.execute(
+        "INSERT OR IGNORE INTO hangang_commit_receipt_meta(singleton, stored_records) VALUES(1, 0)",
+        [],
+    ).map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -1246,6 +1398,59 @@ fn sqlite_load_operation(
         )));
     }
     Ok(Some((stored, encoded, metadata)))
+}
+
+fn sqlite_receipt_observation(
+    connection: &rusqlite::Connection,
+    authority_id: &str,
+    operation_id: &str,
+) -> StoreResult<CommitReceiptObservation> {
+    type ReceiptRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
+    let count: i64 = connection
+        .query_row(
+            "SELECT stored_records FROM hangang_commit_receipt_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let row: Option<ReceiptRow> = connection
+        .query_row(
+            "SELECT CASE WHEN octet_length(authority_id)<=32 THEN authority_id END,
+                CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
+                CASE WHEN octet_length(epoch)<=32 THEN epoch END,
+                revision,
+                CASE WHEN octet_length(candidate_sha256)<=64 THEN candidate_sha256 END
+         FROM hangang_commit_receipts WHERE authority_id=?1 AND operation_id=?2",
+            rusqlite::params![authority_id, operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let receipt = row
+        .map(|(a, o, e, r, h)| {
+            let (Some(a), Some(o), Some(e), Some(h)) = (a, o, e, h) else {
+                return Err(StoreError::Invalid(anyhow!(
+                    "invalid stored commit receipt"
+                )));
+            };
+            commit_receipt(a, o, e, r, h)
+        })
+        .transpose()?;
+    receipt_observation(receipt, count)
 }
 
 #[derive(Clone)]
@@ -1389,6 +1594,45 @@ fn resolve_bootstrap_read(
 }
 
 impl PostgresConfigStore {
+    async fn receipt_observation(
+        &self,
+        authority_id: &str,
+        operation_id: &str,
+    ) -> StoreResult<CommitReceiptObservation> {
+        validate_receipt_ids(authority_id, operation_id)?;
+        let row = self
+            .query_opt(
+                Access::Read,
+                "SELECT m.stored_records,
+                CASE WHEN octet_length(r.authority_id)<=32 THEN r.authority_id END,
+                CASE WHEN octet_length(r.operation_id)<=32 THEN r.operation_id END,
+                CASE WHEN octet_length(r.epoch)<=32 THEN r.epoch END,
+                r.revision,
+                CASE WHEN octet_length(r.candidate_sha256)<=64 THEN r.candidate_sha256 END
+             FROM hangang_commit_receipt_meta m
+             LEFT JOIN hangang_commit_receipts r ON r.authority_id=$1 AND r.operation_id=$2
+             WHERE m.singleton=1",
+                &[&authority_id, &operation_id],
+            )
+            .await?
+            .ok_or_else(|| StoreError::Invalid(anyhow!("commit receipt metadata is missing")))?;
+        let count: i64 = postgres_column(&row, 0)?;
+        let authority: Option<String> = postgres_column(&row, 1)?;
+        let operation: Option<String> = postgres_column(&row, 2)?;
+        let epoch: Option<String> = postgres_column(&row, 3)?;
+        let revision: Option<i64> = postgres_column(&row, 4)?;
+        let digest: Option<String> = postgres_column(&row, 5)?;
+        let receipt = match (authority, operation, epoch, revision, digest) {
+            (None, None, None, None, None) => None,
+            (Some(a), Some(o), Some(e), Some(r), Some(h)) => Some(commit_receipt(a, o, e, r, h)?),
+            _ => {
+                return Err(StoreError::Invalid(anyhow!(
+                    "invalid stored commit receipt"
+                )));
+            }
+        };
+        receipt_observation(receipt, count)
+    }
     /// Connect without transport encryption. This intentionally rejects
     /// non-loopback TCP hosts and `sslmode=require`; production remote
     /// PostgreSQL integration must use a separately verified TLS constructor.
@@ -1512,7 +1756,21 @@ impl PostgresConfigStore {
                 token TEXT PRIMARY KEY,
                 key_authorization TEXT NOT NULL,
                 expires_unix BIGINT NOT NULL
-            )",
+            );
+            CREATE TABLE IF NOT EXISTS hangang_commit_receipts (
+                authority_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                epoch TEXT NOT NULL,
+                revision BIGINT NOT NULL CHECK(revision > 0),
+                candidate_sha256 TEXT NOT NULL,
+                PRIMARY KEY(authority_id, operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS hangang_commit_receipt_meta (
+                singleton SMALLINT PRIMARY KEY CHECK(singleton = 1),
+                stored_records BIGINT NOT NULL CHECK(stored_records >= 0 AND stored_records <= 100000)
+            );
+            INSERT INTO hangang_commit_receipt_meta(singleton,stored_records)
+            VALUES(1,0) ON CONFLICT(singleton) DO NOTHING",
         ))
         .await
         .map_err(|failure| {
@@ -1801,6 +2059,18 @@ impl ConfigStore for PostgresConfigStore {
         true
     }
 
+    fn supports_commit_receipts(&self) -> bool {
+        true
+    }
+
+    async fn lookup_commit_receipt(
+        &self,
+        authority_id: &str,
+        operation_id: &str,
+    ) -> StoreResult<CommitReceiptObservation> {
+        self.receipt_observation(authority_id, operation_id).await
+    }
+
     async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
         Ok(self
             .load_stored_with_proof()
@@ -1823,6 +2093,36 @@ impl ConfigStore for PostgresConfigStore {
         validate_operation_stamp(&stamp, &encoded)?;
         let next_revision = revision_to_i64(next.revision)?;
         let expected_revision = revision_to_i64(expected)?;
+        let prior = self
+            .receipt_observation(&stamp.authority_id, &stamp.operation_id)
+            .await?;
+        if let Some(receipt) = prior.receipt {
+            if receipt.epoch != epoch || receipt.revision != next.revision || receipt.stamp != stamp
+            {
+                return Err(StoreError::Invalid(anyhow!(
+                    "operation identifier reused with another candidate or precondition"
+                )));
+            }
+            let current = self.load_stored_with_proof().await?.ok_or_else(|| {
+                StoreError::Invalid(anyhow!("PostgreSQL configuration store is not initialized"))
+            })?;
+            return Ok(
+                if current.0.epoch == epoch
+                    && current.0.config == next
+                    && current_operation_proof(&current.0, &current.1, &current.2)
+                        .is_some_and(|proof| proof.stamp == stamp)
+                {
+                    CasResult::Applied(current.0)
+                } else {
+                    CasResult::Conflict { current: current.0 }
+                },
+            );
+        }
+        if !prior.writes_available {
+            return Err(StoreError::Unavailable(anyhow!(
+                "retained commit receipt capacity exhausted"
+            )));
+        }
         let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &next_revision,
             &encoded,
@@ -1834,7 +2134,22 @@ impl ConfigStore for PostgresConfigStore {
         ];
         let Attempted{value:row,uncertain}=self.run(Access::Mutation,|client|async move{
             client.query_opt(
-                "UPDATE hangang_config SET revision=$1,config_json=$2,operation_authority_id=$3,operation_id=$4,operation_revision=$1,operation_sha256=$5 WHERE singleton=1 AND revision=$6 AND epoch=$7 AND (operation_id IS NULL OR operation_id<>$4) RETURNING revision",
+                "WITH updated AS (
+                    UPDATE hangang_config
+                    SET revision=$1,config_json=$2,operation_authority_id=$3,operation_id=$4,operation_revision=$1,operation_sha256=$5
+                    WHERE singleton=1 AND revision=$6 AND epoch=$7
+                      AND (operation_id IS NULL OR operation_id<>$4)
+                      AND NOT EXISTS (SELECT 1 FROM hangang_commit_receipts WHERE authority_id=$3 AND operation_id=$4)
+                      AND EXISTS (SELECT 1 FROM hangang_commit_receipt_meta WHERE singleton=1 AND stored_records<100000)
+                    RETURNING revision
+                ), inserted AS (
+                    INSERT INTO hangang_commit_receipts(authority_id,operation_id,epoch,revision,candidate_sha256)
+                    SELECT $3,$4,$7,revision,$5 FROM updated RETURNING revision
+                ), counted AS (
+                    UPDATE hangang_commit_receipt_meta SET stored_records=stored_records+1
+                    WHERE singleton=1 AND EXISTS (SELECT 1 FROM inserted)
+                    RETURNING stored_records
+                ) SELECT inserted.revision FROM inserted JOIN counted ON true",
                 parameters).await
         }).await?;
         if row.is_some() {
@@ -1842,6 +2157,62 @@ impl ConfigStore for PostgresConfigStore {
                 epoch: epoch.to_owned(),
                 config: next,
             }));
+        }
+        let history = match self
+            .receipt_observation(&stamp.authority_id, &stamp.operation_id)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if uncertain => {
+                return Err(StoreError::Indeterminate(
+                    error
+                        .into_inner()
+                        .context("operation CAS recovery receipt read failed"),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(receipt) = history.receipt {
+            if receipt.epoch != epoch || receipt.revision != next.revision || receipt.stamp != stamp
+            {
+                if uncertain {
+                    return Err(StoreError::Indeterminate(anyhow!(
+                        "operation CAS outcome is not provable after an unanswered attempt"
+                    )));
+                }
+                return Err(StoreError::Invalid(anyhow!(
+                    "operation identifier reused with another candidate or precondition"
+                )));
+            }
+            let current = receipt_recovery_read(self.load_stored_with_proof().await, uncertain)?;
+            if let Some((stored, encoded, metadata)) = current {
+                if stored.epoch == epoch
+                    && stored.config == next
+                    && current_operation_proof(&stored, &encoded, &metadata)
+                        .is_some_and(|proof| proof.stamp == stamp)
+                {
+                    return Ok(CasResult::Applied(stored));
+                }
+                if uncertain {
+                    return Err(StoreError::Indeterminate(anyhow!(
+                        "operation CAS committed historically but current document changed"
+                    )));
+                }
+                return Ok(CasResult::Conflict { current: stored });
+            }
+            return Err(StoreError::Indeterminate(anyhow!(
+                "operation CAS receipt exists but current configuration is absent"
+            )));
+        }
+        if !history.writes_available && !uncertain {
+            let current = self.load_stored_with_proof().await?;
+            if current.as_ref().is_some_and(|(stored, _, _)| {
+                stored.epoch == epoch && stored.config.revision == expected
+            }) {
+                return Err(StoreError::Unavailable(anyhow!(
+                    "retained commit receipt capacity exhausted"
+                )));
+            }
         }
         resolve_operation_cas(
             self.load_stored_with_proof().await,
@@ -2233,6 +2604,20 @@ mod tests {
         assert!(matches!(
             validate_operation_stamp(&first, &encode(&different).unwrap()),
             Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn retained_receipt_recovery_read_keeps_unanswered_write_indeterminate() {
+        let failure: StoreResult<()> = Err(StoreError::Unavailable(anyhow!("read failed")));
+        assert!(matches!(
+            receipt_recovery_read(failure, true),
+            Err(StoreError::Indeterminate(_))
+        ));
+        let failure: StoreResult<()> = Err(StoreError::Unavailable(anyhow!("read failed")));
+        assert!(matches!(
+            receipt_recovery_read(failure, false),
+            Err(StoreError::Unavailable(_))
         ));
     }
 
