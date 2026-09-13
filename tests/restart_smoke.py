@@ -90,6 +90,24 @@ class Restart(unittest.TestCase):
                 try:
                     initial=await_status(lambda value:True)
                     self.assertTrue(initial["state"]["supervised"])
+                    # Audit baseline, credentials and identities survive actual
+                    # serving-generation replacement in the same local store.
+                    credentials={"username":"audit-root","password":"owned audit fixture password"}
+                    code,_,_=smoke.Smoke.request(admin,"POST","/v1/auth/bootstrap",json.dumps(credentials),{"Content-Type":"application/json"},auth=True)
+                    self.assertEqual(code,201)
+                    code,_,body=smoke.Smoke.request(admin,"POST","/v1/auth/login",json.dumps(credentials),{"Content-Type":"application/json"})
+                    self.assertEqual(code,200)
+                    account_headers={"Authorization":"Bearer "+json.loads(body)["token"],"Content-Type":"application/json"}
+                    def account_audit():
+                        code,_,body=smoke.Smoke.request(admin,"GET","/v1/audit/users",headers=account_headers)
+                        self.assertEqual(code,200)
+                        return json.loads(body)
+                    code,_,body=smoke.Smoke.request(admin,"POST","/v1/users",json.dumps({"username":"audit-viewer","password":"owned viewer fixture password","role":"viewer"}),account_headers)
+                    self.assertEqual(code,201)
+                    audit_target=json.loads(body)["user"]["id"]
+                    audit_before=account_audit()
+                    self.assertEqual([row["action"] for row in audit_before["records"]],["baseline","bootstrap","create"])
+
                     workload_request()
                     self.assertEqual(initial["workload_materials"], [{"kind":"http","id":"private","ready":True}])
                     # File-only edits must change live admission without changing
@@ -116,6 +134,15 @@ class Restart(unittest.TestCase):
                     held_request()
                     child.send_signal(signal.SIGHUP)
                     next_generation=await_status(lambda value:value["process_id"]!=initial["process_id"])
+                    audit_after=account_audit()
+                    self.assertEqual(audit_after["records"],audit_before["records"])
+                    self.assertEqual(audit_after["started_at_unix_ms"],audit_before["started_at_unix_ms"])
+                    code,_,_=smoke.Smoke.request(admin,"PUT",f"/v1/users/{audit_target}",json.dumps({"enabled":False}),account_headers)
+                    self.assertEqual(code,200)
+                    audit_changed=account_audit()
+                    self.assertEqual(audit_changed["records"][-1]["action"],"update")
+                    self.assertEqual(audit_changed["records"][-1]["id"],audit_before["latest_id"]+1)
+
                     self.assertIsNone(child.poll())
                     workload_request()
                     held_request()
@@ -147,6 +174,7 @@ class Restart(unittest.TestCase):
                     code,_,_=smoke.Smoke.request(admin,"POST","/v1/lifecycle/restart",auth=True)
                     self.assertEqual(code,202)
                     final_generation=await_status(lambda value:value["process_id"]!=next_generation["process_id"])
+                    self.assertEqual(account_audit()["records"],audit_changed["records"])
                     workload_request()
                     # An unexpected serving-process death must be visible to the
                     # service manager as failure, rather than a clean shutdown.

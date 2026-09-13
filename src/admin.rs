@@ -926,6 +926,7 @@ impl Admin {
                 || path == "/v1/config/validate"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
+                || path.starts_with("/v1/audit/")
                 || path.starts_with("/v1/routes/");
             let mut r = if is_new {
                 problem(401, "Unauthorized", "a valid bearer token is required")
@@ -961,6 +962,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/audit/users" || path == "/v1/audit/users/prune" {
+            return Ok(self.handle_user_audit(req, &path, &actor).await);
         }
         if path == "/v1/users" || path.starts_with("/v1/users/") {
             return Ok(self.handle_users(req, &path, &actor).await);
@@ -2041,7 +2045,51 @@ fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {
     Some((offset, limit))
 }
 
+fn user_audit_query(query: Option<&str>) -> Option<(i64, usize)> {
+    let mut after = None;
+    let mut limit = None;
+    let mut parsed = reqwest::Url::parse("http://audit.invalid/").ok()?;
+    parsed.set_query(query);
+    for (key, value) in parsed.query_pairs() {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        match key.as_ref() {
+            "after" if after.is_none() => {
+                let value = value.parse::<i64>().ok()?;
+                if value > 9_007_199_254_740_991 {
+                    return None;
+                }
+                after = Some(value);
+            }
+            "limit" if limit.is_none() => {
+                let value = value.parse::<usize>().ok()?;
+                if !(1..=100).contains(&value) {
+                    return None;
+                }
+                limit = Some(value);
+            }
+            _ => return None,
+        }
+    }
+    Some((after.unwrap_or(0), limit.unwrap_or(100)))
+}
+
 fn account_problem(error: anyhow::Error) -> Response<Body> {
+    if error.is::<crate::admin_users::AuditCapacity>() {
+        return problem(
+            503,
+            "Audit Capacity Exhausted",
+            "account audit capacity exhausted; export and prune audit records before changing accounts",
+        );
+    }
+    if error.is::<crate::admin_users::AuditConflict>() {
+        return problem(
+            409,
+            "Audit Conflict",
+            "audit history changed or prune boundary is invalid; refresh before retrying",
+        );
+    }
     if error.is::<crate::admin_users::AuthorizationRevoked>() {
         return problem(403, "Forbidden", "administrator role required");
     }
@@ -2153,6 +2201,75 @@ impl Admin {
                 &serde_json::json!({"token":login.token,"expires_in_seconds":login.expires_in_seconds,"user":login.user}),
             ),
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
+            Err(error) => account_problem(error),
+        }
+    }
+
+    async fn handle_user_audit(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if path == "/v1/audit/users" {
+            if req.method() != hyper::Method::GET {
+                return problem(405, "Method Not Allowed", "GET required");
+            }
+            let Some((after, limit)) = user_audit_query(req.uri().query()) else {
+                return problem(
+                    400,
+                    "Invalid Audit Query",
+                    "after must be a nonnegative safe integer and limit must be 1..100; duplicate or unknown parameters are not accepted",
+                );
+            };
+            return match self
+                .users
+                .audit_page(actor.mutation_authority(), after, limit)
+                .await
+            {
+                Ok(page) => auth_json(200, &page),
+                Err(error) => account_problem(error),
+            };
+        }
+        if req.method() != hyper::Method::POST {
+            return problem(405, "Method Not Allowed", "POST required");
+        }
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Audit Query",
+                "prune does not accept query parameters",
+            );
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Prune {
+            through_id: i64,
+            expected_latest_id: i64,
+        }
+        let body: Prune = match read_json(req, 4096).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        if !(1..=9_007_199_254_740_991).contains(&body.through_id)
+            || !(1..=9_007_199_254_740_991).contains(&body.expected_latest_id)
+        {
+            return problem(
+                400,
+                "Invalid Audit Boundary",
+                "audit boundaries must be positive safe integers",
+            );
+        }
+        match self
+            .users
+            .prune_audit(
+                actor.mutation_authority(),
+                body.through_id,
+                body.expected_latest_id,
+            )
+            .await
+        {
+            Ok(result) => auth_json(200, &result),
             Err(error) => account_problem(error),
         }
     }
