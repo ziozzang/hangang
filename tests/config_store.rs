@@ -1110,6 +1110,51 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
         direct.load_current_operation_proof().await?.unwrap().stamp,
         first
     );
+
+    // A later operation commits without an acknowledgement. Before its
+    // recovery read, an older SQL writer advances the document but leaves the
+    // operation columns untouched. The stale same-ID stamp cannot prove the
+    // current document, and cannot prove that the unanswered write did not
+    // commit. This must remain Indeterminate rather than Invalid or Applied.
+    drop(proxy);
+    let candidate = config(0, "lost-before-old-writer");
+    let third = operation_stamp(1, &"3".repeat(32), &candidate);
+    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    proxy.hold(LOAD_MARKER);
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    let pending = tokio::spawn({
+        let epoch = epoch.clone();
+        async move {
+            writer
+                .compare_and_swap_operation(&epoch, 1, candidate, third)
+                .await
+        }
+    });
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert_eq!(direct.load_latest().await?.unwrap().config.revision, 2);
+    proxy.gate.send_replace(true);
+    assert_eq!(next_fault(&mut proxy.held).await?, Some(LOAD_MARKER));
+    let old_writer_document = config(3, "old-writer-overwrite");
+    let changed = client
+        .execute(
+            "UPDATE hangang_config SET revision=$1,config_json=$2 WHERE singleton=1 AND epoch=$3",
+            &[
+                &3_i64,
+                &serde_json::to_string(&old_writer_document)?,
+                &epoch,
+            ],
+        )
+        .await?;
+    assert_eq!(changed, 1);
+    assert_eq!(direct.load_current_operation_proof().await?, None);
+    proxy.release.send_replace(true);
+    let error = join_fault(pending).await?.unwrap_err();
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    assert_eq!(
+        direct.load_latest().await?.unwrap().config,
+        old_writer_document
+    );
     Ok(())
 }
 
