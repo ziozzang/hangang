@@ -36,6 +36,7 @@ struct Material {
     server_cert: PathBuf,
     server_key: PathBuf,
     ca_file: PathBuf,
+    ca_pem: String,
     ca_der: rustls::pki_types::CertificateDer<'static>,
     good_cert: String,
     good_key: String,
@@ -81,7 +82,8 @@ fn material() -> Material {
     let ca_file = directory.path().join("clients-ca.pem");
     std::fs::write(&server_cert, server.pem()).unwrap();
     write_private(&server_key, &server_keypair.serialize_pem());
-    std::fs::write(&ca_file, trusted_ca.pem()).unwrap();
+    let ca_pem = trusted_ca.pem();
+    std::fs::write(&ca_file, &ca_pem).unwrap();
     let (good_cert, good_key) = client_certificate(&trusted_ca, GOOD_ID);
     let (other_cert, other_key) = client_certificate(&trusted_ca, OTHER_ID);
     let (wrong_cert, wrong_key) = client_certificate(&untrusted_ca, GOOD_ID);
@@ -90,6 +92,7 @@ fn material() -> Material {
         server_cert,
         server_key,
         ca_file,
+        ca_pem,
         ca_der: trusted_ca.der().clone(),
         good_cert,
         good_key,
@@ -185,6 +188,22 @@ fn active_mtls_listener_requires_a_separate_retirement_revision_before_plaintext
     direct.validate_transition_from(&removed).unwrap();
 }
 
+#[test]
+fn damaged_material_does_not_prevent_disabling_an_existing_mtls_route() {
+    let material = material();
+    let listen = "127.0.0.1:19003".parse().unwrap();
+    let backend = "127.0.0.1:19004".parse().unwrap();
+    let old = config(listen, backend, &material, &[GOOD_ID]);
+    let active = Snapshot::new(old.clone()).unwrap();
+    std::fs::remove_file(&material.ca_file).unwrap();
+
+    let mut disabled = old.clone();
+    disabled.tcp[0].enabled = false;
+    let retired = Snapshot::replace(disabled.clone(), &active).unwrap();
+    assert!(retired.tcp_inbound_tls.is_empty());
+    assert!(Snapshot::replace(old, &retired).is_err());
+}
+
 #[tokio::test]
 async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reloads() {
     let material = material();
@@ -236,11 +255,13 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         .write_all(b"plaintext is not a TLS record")
         .await
         .unwrap();
-    let mut byte = [0];
+    let mut alert = [0; 1024];
+    // rustls may send a fatal TLS alert before closing a plaintext client.
+    // Its exact alert bytes are not an application response or backend dial.
     assert!(
-        tokio::time::timeout(Duration::from_secs(2), plain.read(&mut byte))
+        tokio::time::timeout(Duration::from_secs(2), plain.read(&mut alert))
             .await
-            .is_ok_and(|result| matches!(result, Ok(0) | Err(_)))
+            .is_ok()
     );
     assert_eq!(accepted.load(Ordering::SeqCst), 0);
 
@@ -260,6 +281,63 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     assert_eq!(&reply, b"ping");
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
 
+    // A no-op publication preserves the exact prepared verifier and a live
+    // authenticated stream. Replacing CA bytes at the same path must fence
+    // that stream even though the route JSON is unchanged.
+    let prepared_before = active.load_full().tcp_inbound_tls["workload"].clone();
+    let same = config(listen, backend_address, &material, &[GOOD_ID]);
+    let prepared = manager.prepare(&same).await.unwrap();
+    active.store(Arc::new(
+        Snapshot::replace(same.clone(), &active.load_full()).unwrap(),
+    ));
+    manager.commit(prepared).await;
+    assert!(Arc::ptr_eq(
+        &prepared_before,
+        &active.load_full().tcp_inbound_tls["workload"]
+    ));
+    held.write_all(b"ping").await.unwrap();
+    held.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"ping");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    std::fs::write(&material.ca_file, ca().pem()).unwrap();
+    let prepared = manager.prepare(&same).await.unwrap();
+    active.store(Arc::new(
+        Snapshot::replace(same.clone(), &active.load_full()).unwrap(),
+    ));
+    manager.commit(prepared).await;
+    assert!(!Arc::ptr_eq(
+        &prepared_before,
+        &active.load_full().tcp_inbound_tls["workload"]
+    ));
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0) | Err(_))),
+        "old CA stream stayed active: {closed:?}"
+    );
+    assert!(!exchange(&good, listen).await);
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    std::fs::write(&material.ca_file, &material.ca_pem).unwrap();
+    let prepared = manager.prepare(&same).await.unwrap();
+    active.store(Arc::new(
+        Snapshot::replace(same, &active.load_full()).unwrap(),
+    ));
+    manager.commit(prepared).await;
+    assert!(exchange(&good, listen).await);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let mut held = good
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    held.write_all(b"ping").await.unwrap();
+    held.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"ping");
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+
     let next = config(listen, backend_address, &material, &[OTHER_ID]);
     let prepared = manager.prepare(&next).await.unwrap();
     active.store(Arc::new(
@@ -272,9 +350,9 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         "old identity stream remained active: {closed:?}"
     );
     assert!(!exchange(&good, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
     assert!(exchange(&wrong_uri, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    assert_eq!(accepted.load(Ordering::SeqCst), 5);
 
     let socket = TcpStream::connect(listen).await.unwrap();
     let mut remaining = wrong_uri
@@ -284,7 +362,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     remaining.write_all(b"ping").await.unwrap();
     remaining.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"ping");
-    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 6);
 
     let empty = Config::default();
     let prepared = manager.prepare(&empty).await.unwrap();
@@ -298,7 +376,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         "removed route kept authenticated stream active: {closed:?}"
     );
     assert!(!exchange(&wrong_uri, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 6);
     manager.shutdown(Duration::from_secs(1)).await;
     backend_task.abort();
 }
