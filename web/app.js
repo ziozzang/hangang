@@ -1668,6 +1668,62 @@ function resourcePolicySection(route) {
     ] });
 }
 
+const LANGUAGE_RANGE = /^(?:\*|[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*)$/;
+function validateLanguagePolicy(policy) {
+  if (!isObject(policy) || !['any', 'preferred'].includes(policy.mode)
+    || !['allow', 'deny'].includes(policy.on_missing)
+    || (policy.enforce !== undefined && typeof policy.enforce !== 'boolean')
+    || Object.keys(policy).some((key) => !['mode', 'allow', 'deny', 'on_missing', 'enforce'].includes(key))) {
+    throw new Error(t('Language policy needs a valid mode, missing-header action and enforcement flag'));
+  }
+  const lists = ['allow', 'deny'].map((name) => {
+    const ranges = policy[name] ?? [];
+    if (!Array.isArray(ranges) || ranges.some((value) => typeof value !== 'string')) {
+      throw new Error(t('Language allow and deny lists must contain basic language ranges'));
+    }
+    const seen = new Set();
+    for (const range of ranges) {
+      if (new TextEncoder().encode(range).length > 128 || !LANGUAGE_RANGE.test(range)) {
+        throw new Error(t('Language ranges must be basic tags of at most 128 bytes, or *'));
+      }
+      const folded = range.toLowerCase();
+      if (seen.has(folded)) throw new Error(t('Language ranges must be unique within each list, ignoring case'));
+      seen.add(folded);
+    }
+    return ranges;
+  });
+  if (lists[0].length + lists[1].length < 1 || lists[0].length + lists[1].length > 32) {
+    throw new Error(t('Language policy needs 1–32 total allow and deny ranges'));
+  }
+  return policy;
+}
+
+function updateLanguagePolicyControls(form) {
+  const action = form.elements['language_policy_action'];
+  if (!action) return;
+  for (const control of action.closest('details')?.querySelectorAll('[data-group="language_policy"]') || []) {
+    control.disabled = action.value !== 'configured';
+  }
+}
+
+function languagePolicySection(route) {
+  const policy = isObject(route.language_policy) ? route.language_policy : null;
+  const action = field('Language policy action', 'language_policy_action', policy ? 'configured' : 'none', {
+    select: [['none', 'No language policy'], ['configured', 'Configure language policy'], ['remove', 'Remove language policy']],
+    help: 'Select Remove to delete a configured policy. Enforcement Off keeps valid rules without applying them.',
+  });
+  action.querySelector('select').addEventListener('change', () => updateLanguagePolicyControls($('#route-form')));
+  return section({ title: 'Accept-Language policy', configured: Boolean(policy),
+    note: 'This checks the selected route only; a denial does not try another route. Accept-Language is a client preference, not identity, country or location. Routes sharing one protected resource ID must use the same language policy.', fields: [
+      span2(action),
+      field('Preference mode', 'language_policy_mode', policy?.mode ?? 'any', { group: 'language_policy', select: [['any', 'Any acceptable preference'], ['preferred', 'Highest-quality preference']], help: 'Any checks every positive q preference; Preferred checks only ranges tied at the highest positive q. This is route admission, not language negotiation.' }),
+      field('Missing header', 'language_policy_on_missing', policy?.on_missing ?? 'deny', { group: 'language_policy', select: [['allow', 'Allow missing header'], ['deny', 'Deny missing header']], help: 'A missing header follows this setting. A present empty header or only q=0 preferences is denied while enforced.' }),
+      span2(field('Allow language ranges', 'language_policy_allow', Array.isArray(policy?.allow) ? policy.allow.join('\n') : '', { group: 'language_policy', textarea: true, help: 'One basic range per line, such as ko or ko-KR. Configured ko covers advertised ko-KR; * is explicit. Allow may be empty only when Deny has a range.' })),
+      span2(field('Deny language ranges', 'language_policy_deny', Array.isArray(policy?.deny) ? policy.deny.join('\n') : '', { group: 'language_policy', textarea: true, help: 'One basic range per line. Deny wins over Allow. A client * matches only a configured *, and q=0 is never acceptable.' })),
+      span2(field('Enforce language policy', 'language_policy_enforce', policy?.enforce !== false, { group: 'language_policy', checkbox: true, help: 'Off preserves the configured policy but skips admission enforcement. Rules must still be valid.' })),
+    ] });
+}
+
 function updateJwtControls(form) {
   const enabled = form.elements['jwt_auth_enabled']?.checked;
   const source = form.elements['jwt_key_source']?.value;
@@ -1888,6 +1944,7 @@ function httpSections(route) {
     jwtSection(route),
     workloadAuthSection(route),
     resourcePolicySection(route),
+    languagePolicySection(route),
     section({ title: 'Response headers', configured: Boolean(Object.keys(route.response_set_headers || {}).length || (route.response_remove_headers || []).length), note: 'Streaming-safe header edits applied to every upstream response head; framing and hop-by-hop names are rejected.', fields: [
       field('Set response headers', 'response_set_headers', pairsToLines(route.response_set_headers), { textarea: true, help: 'One name: value per line; replaces an existing header of the same name.' }),
       field('Remove response headers', 'response_remove_headers', (route.response_remove_headers || []).join('\n'), { textarea: true, help: 'One header name per line, for example server.' }),
@@ -2055,6 +2112,7 @@ function applyGroupToggles(form) {
     }
   }
   updateResourcePolicyControls(form);
+  updateLanguagePolicyControls(form);
   updateJwtControls(form);
 }
 
@@ -2234,6 +2292,9 @@ function routeFromForm() {
         && rule.methods.every((value) => typeof value === 'string' && value.length <= 32))) {
       throw new Error(t('Advanced resource policy JSON must contain an ID, principal and allow-rule arrays'));
     }
+  }
+  if (type === 'http' && route.language_policy !== undefined && route.language_policy !== null) {
+    validateLanguagePolicy(route.language_policy);
   }
   if (type === 'http' && route.jwt_auth !== undefined && route.jwt_auth !== null &&
       (!isObject(route.jwt_auth) || !isObject(route.jwt_auth.verification) || !isObject(route.jwt_auth.keys))) {
@@ -2503,6 +2564,26 @@ function routeFromForm() {
     } else throw new Error(t('Choose a valid resource policy action'));
     if (route.workload_auth && !route.resource_policy) throw new Error(t('Workload authentication requires resource authorization'));
 
+    const languageAction = raw('language_policy_action');
+    const originalLanguage = isObject(state.editing.value.language_policy);
+    if (originalLanguage && languageAction === 'none') throw new Error(t('Use Remove language policy to delete an existing policy'));
+    if (languageAction === 'none' || languageAction === 'remove') {
+      delete route.language_policy;
+    } else if (languageAction === 'configured') {
+      const previous = isObject(route.language_policy) ? route.language_policy : {};
+      const language = {
+        ...previous,
+        mode: raw('language_policy_mode'),
+        allow: raw('language_policy_allow').split('\n').map((range) => range.trim()).filter(Boolean),
+        deny: raw('language_policy_deny').split('\n').map((range) => range.trim()).filter(Boolean),
+        on_missing: raw('language_policy_on_missing'),
+      };
+      if (!checked('language_policy_enforce')) language.enforce = false;
+      else if (Object.hasOwn(previous, 'enforce')) language.enforce = true;
+      else delete language.enforce;
+      route.language_policy = validateLanguagePolicy(language);
+    } else throw new Error(t('Choose a valid language policy action'));
+
     route.response_set_headers = parseHeaderLines(raw('response_set_headers'), 'Response header');
     route.response_remove_headers = headerNames(lines('response_remove_headers'), 'Removed response header');
 
@@ -2673,6 +2754,15 @@ function syncRouteControlsFromJson() {
     form.elements['resource_policy_subject_header'].value = principal.subject_header ?? '';
     const allow = Array.isArray(policy?.allow) ? policy.allow : [];
     form.querySelector('.resource-rule-list').replaceChildren(...allow.slice(0, 33).map(resourceRuleRow));
+  }
+  if (form.elements['language_policy_action'] && (draft.language_policy === null || draft.language_policy === undefined || isObject(draft.language_policy))) {
+    const policy = isObject(draft.language_policy) ? draft.language_policy : null;
+    form.elements['language_policy_action'].value = policy ? 'configured' : 'none';
+    form.elements['language_policy_mode'].value = policy?.mode ?? 'any';
+    form.elements['language_policy_allow'].value = Array.isArray(policy?.allow) ? policy.allow.join('\n') : '';
+    form.elements['language_policy_deny'].value = Array.isArray(policy?.deny) ? policy.deny.join('\n') : '';
+    form.elements['language_policy_on_missing'].value = policy?.on_missing ?? 'deny';
+    form.elements['language_policy_enforce'].checked = policy?.enforce !== false;
   }
   if (form.elements['tcp_health_enabled'] && (draft.health === null || draft.health === undefined || isObject(draft.health))) {
     const health = isObject(draft.health) ? draft.health : null;
