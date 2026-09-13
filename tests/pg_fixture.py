@@ -15,8 +15,8 @@ def run(*args, **kwargs):
 
 def main():
     target=os.environ.get("HANGANG_PG_TEST_TARGET","config_store")
-    if target not in {"config_store","sequenced_store"}:
-        raise ValueError("HANGANG_PG_TEST_TARGET must be config_store or sequenced_store")
+    if target not in {"config_store","sequenced_store","sequenced_export"}:
+        raise ValueError("HANGANG_PG_TEST_TARGET must be config_store, sequenced_store or sequenced_export")
     name="hangang-configstore-"+secrets.token_hex(6)
     password=secrets.token_hex(24)
     with socket.socket() as listener:

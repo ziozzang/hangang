@@ -1067,6 +1067,7 @@ impl Admin {
                 || path == "/v1/config/operation-proof"
                 || path == "/v1/config/commit-receipt"
                 || path == "/v1/config/commit-receipt-v2"
+                || path == "/v1/config/commit-receipts-v2"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -1105,6 +1106,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/commit-receipts-v2" {
+            return Ok(self.handle_config_commit_receipts_v2(req, &actor).await);
         }
         if path == "/v1/config/commit-receipt-v2" {
             return Ok(self.handle_config_commit_receipt_v2(req, &actor).await);
@@ -2312,6 +2316,76 @@ fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {
     Some((offset, limit))
 }
 
+struct ReceiptPageQuery {
+    authority_id: String,
+    after_seq: u64,
+    limit: usize,
+    snapshot: Option<crate::config_store::SequencedReceiptSnapshot>,
+}
+
+fn commit_receipt_page_query(query: Option<&str>) -> Option<ReceiptPageQuery> {
+    fn integer(value: &str) -> Option<u64> {
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v <= 9_007_199_254_740_991)
+    }
+    let mut authority_id = None;
+    let mut after_seq = None;
+    let mut limit = None;
+    let mut high_water = None;
+    let mut generation = None;
+    let mut parsed = reqwest::Url::parse("http://receipt.invalid/").ok()?;
+    parsed.set_query(query);
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "authority_id" if authority_id.is_none() => {
+                if value.len() != 32
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return None;
+                }
+                authority_id = Some(value.into_owned());
+            }
+            "after_seq" if after_seq.is_none() => after_seq = Some(integer(&value)?),
+            "limit" if limit.is_none() => {
+                let v = integer(&value)?;
+                if !(1..=100).contains(&v) {
+                    return None;
+                }
+                limit = Some(v as usize);
+            }
+            "snapshot_high_water" if high_water.is_none() => high_water = Some(integer(&value)?),
+            "retention_generation" if generation.is_none() => generation = Some(integer(&value)?),
+            _ => return None,
+        }
+    }
+    let snapshot = match (high_water, generation) {
+        (None, None) if after_seq.unwrap_or(0) == 0 => None,
+        (Some(high_water), Some(retention_generation)) if after_seq.unwrap_or(0) <= high_water => {
+            Some(crate::config_store::SequencedReceiptSnapshot {
+                high_water,
+                retention_generation,
+            })
+        }
+        _ => return None,
+    };
+    Some(ReceiptPageQuery {
+        authority_id: authority_id?,
+        after_seq: after_seq.unwrap_or(0),
+        limit: limit.unwrap_or(100),
+        snapshot,
+    })
+}
+
 fn commit_receipt_v2_query(query: Option<&str>) -> Option<(String, u64)> {
     let mut authority_id = None;
     let mut acceptance_seq = None;
@@ -2535,6 +2609,120 @@ impl Admin {
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
             Err(error) => account_problem(error),
         }
+    }
+
+    async fn handle_config_commit_receipts_v2(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        use crate::config_store::{SequencedReceiptPageResult, canonical_operation_id};
+        if req.method() != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET required");
+        }
+        let Some(query) = commit_receipt_page_query(req.uri().query()) else {
+            return problem(
+                400,
+                "Invalid Receipt Page Query",
+                "authority_id is required; use canonical safe integers, limit 1..100, and both snapshot fields for continuations",
+            );
+        };
+        let result = match self.manager.config_store.as_ref() {
+            Some(store) if store.supports_sequenced_operation_cas() => Some(
+                store
+                    .list_commit_receipts_v2(
+                        &query.authority_id,
+                        query.after_seq,
+                        query.snapshot,
+                        query.limit,
+                    )
+                    .await,
+            ),
+            _ => None,
+        };
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        let page = match result {
+            Some(Ok(SequencedReceiptPageResult::Page(page))) => Some(page),
+            Some(Ok(SequencedReceiptPageResult::SnapshotChanged)) => {
+                return problem(
+                    409,
+                    "Receipt Snapshot Changed",
+                    "retained receipt snapshot changed; restart the export",
+                );
+            }
+            Some(Err(_)) => {
+                return problem(
+                    503,
+                    "Receipt Page Unavailable",
+                    "configuration store receipt page could not be read",
+                );
+            }
+            None => None,
+        };
+        if let Some(page) = page.as_ref() {
+            let mut previous = query.after_seq;
+            let mut invalid = page.snapshot.high_water > 9_007_199_254_740_991
+                || page.snapshot.retention_generation > 9_007_199_254_740_991
+                || query.snapshot.as_ref().is_some_and(|s| s != &page.snapshot)
+                || page.receipts.len() > query.limit
+                || (page.has_more && page.receipts.len() != query.limit);
+            for receipt in &page.receipts {
+                let stamp = &receipt.stamp;
+                invalid |= stamp.authority_id != query.authority_id
+                    || stamp.acceptance_seq <= previous
+                    || stamp.acceptance_seq > page.snapshot.high_water
+                    || receipt.revision == 0
+                    || receipt.revision > 9_007_199_254_740_991
+                    || receipt.epoch.len() != 32
+                    || !receipt
+                        .epoch
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || stamp.candidate_sha256.len() != 64
+                    || !stamp
+                        .candidate_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || canonical_operation_id(&query.authority_id, stamp.acceptance_seq)
+                        .ok()
+                        .as_ref()
+                        != Some(&stamp.operation_id);
+                previous = stamp.acceptance_seq;
+            }
+            invalid |= page.next_after != previous
+                || page.next_after > page.snapshot.high_water
+                || (page.has_more && page.next_after >= page.snapshot.high_water);
+            if invalid {
+                return problem(
+                    503,
+                    "Receipt Page Unavailable",
+                    "configuration store returned an invalid receipt page",
+                );
+            }
+        }
+        let Some(observed_ms) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|v| u64::try_from(v.as_millis()).ok())
+            .filter(|v| *v <= 9_007_199_254_740_991)
+        else {
+            return problem(
+                503,
+                "Receipt Page Unavailable",
+                "observation clock unavailable",
+            );
+        };
+        auth_json(
+            200,
+            &serde_json::json!({
+                "scope":"configuration_authority","supported":page.is_some(),"authority_id":query.authority_id,
+                "receipts":page.as_ref().map(|p|p.receipts.as_slice()).unwrap_or(&[]),
+                "snapshot":page.as_ref().map(|p|&p.snapshot),"next_after":page.as_ref().map(|p|p.next_after),
+                "has_more":page.as_ref().map(|p|p.has_more),"server_time_unix_ms":observed_ms,
+            }),
+        )
     }
 
     async fn handle_config_commit_receipt_v2(

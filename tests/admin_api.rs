@@ -1235,6 +1235,10 @@ async fn first_run_bootstrap_login_role_limits_and_logout() {
             "GET",
             "/v1/config/commit-receipt?authority_id=11111111111111111111111111111111&operation_id=22222222222222222222222222222222",
         ),
+        (
+            "GET",
+            "/v1/config/commit-receipts-v2?authority_id=11111111111111111111111111111111",
+        ),
         ("GET", "/v1/routes/http"),
         ("GET", "/v1/users"),
         ("POST", "/v1/cache/purge"),
@@ -4954,6 +4958,34 @@ struct HeldProofStore {
 
 #[async_trait::async_trait]
 impl hangang::config_store::ConfigStore for HeldProofStore {
+    async fn list_commit_receipts_v2(
+        &self,
+        _authority_id: &str,
+        after_seq: u64,
+        snapshot: Option<hangang::config_store::SequencedReceiptSnapshot>,
+        _limit: usize,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::SequencedReceiptPageResult> {
+        use hangang::config_store::*;
+        if after_seq == MAX_ACCEPTANCE_SEQUENCE {
+            return Err(StoreError::Unavailable(anyhow::anyhow!(
+                "private-page-database-detail"
+            )));
+        }
+        if snapshot.is_some_and(|s| s.retention_generation == 1) {
+            return Ok(SequencedReceiptPageResult::SnapshotChanged);
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(SequencedReceiptPageResult::Page(SequencedReceiptPage {
+            receipts: vec![],
+            snapshot: SequencedReceiptSnapshot {
+                high_water: 0,
+                retention_generation: 0,
+            },
+            next_after: 0,
+            has_more: false,
+        }))
+    }
     fn supports_sequenced_operation_cas(&self) -> bool {
         true
     }
@@ -5516,4 +5548,200 @@ async fn sequenced_commit_receipt_rechecks_after_wait_and_redacts_read_failures(
             .unwrap()
             .contains("private-v2-receipt-database-detail")
     );
+}
+
+#[tokio::test]
+async fn sequenced_receipt_pages_validate_queries_and_report_unsupported() {
+    let (address, _, _directory) = server().await;
+    let base = "/v1/config/commit-receipts-v2?authority_id=11111111111111111111111111111111";
+    let (status, headers, body) = request(address, "GET", base, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let value = json(&body);
+    assert_eq!(value["supported"], false);
+    assert_eq!(value["receipts"], serde_json::json!([]));
+    assert!(value["snapshot"].is_null());
+    assert!(value["next_after"].is_null());
+    assert!(value["has_more"].is_null());
+    assert_eq!(
+        request_with_token(address, "GET", base, None, None, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(request(address, "POST", base, None, None).await.0, 405);
+    for suffix in [
+        "&after_seq=1",
+        "&after_seq=00",
+        "&limit=0",
+        "&limit=101",
+        "&limit=01",
+        "&limit=1&limit=2",
+        "&extra=1",
+        "&snapshot_high_water=0",
+        "&retention_generation=0",
+        "&snapshot_high_water=0&retention_generation=0&after_seq=1",
+        "&snapshot_high_water=9007199254740992&retention_generation=0",
+        "&after_seq=%2b0",
+        "&authority_id=11111111111111111111111111111111",
+    ] {
+        assert_eq!(
+            request(address, "GET", &format!("{base}{suffix}"), None, None)
+                .await
+                .0,
+            400,
+            "{suffix}"
+        );
+    }
+    assert_eq!(
+        request(address, "GET", "/v1/config/commit-receipts-v2", None, None)
+            .await
+            .0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn sequenced_receipt_pages_recheck_live_authority_and_redact_errors() {
+    use hangang::config_store::ConfigStore;
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("held-pages.json");
+    let initial = Config::default();
+    let inner = FileConfigStore::new(state_path.clone());
+    inner.bootstrap(initial.clone()).await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(HeldProofStore {
+        inner,
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let (address, _) = server_on(state_path, initial, Some(store), false, 64, 16).await;
+    let token = account_admin_token(address).await;
+    let base = "/v1/config/commit-receipts-v2?authority_id=11111111111111111111111111111111";
+    let read = tokio::spawn({
+        let token = token.clone();
+        async move { request_with_token(address, "GET", base, None, None, Some(&token)).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    revoke_account_session(address, &token).await;
+    release.notify_one();
+    let (status, _, body) = read.await.unwrap();
+    assert_eq!(status, 403);
+    assert!(json(&body).get("receipts").is_none());
+    let (status,headers,body)=request(address,"GET",&format!("{base}&after_seq=9007199254740991&snapshot_high_water=9007199254740991&retention_generation=0"),None,None).await;
+    assert_eq!(status, 503);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("private-page-database-detail")
+    );
+    assert_eq!(
+        request(
+            address,
+            "GET",
+            &format!("{base}&snapshot_high_water=0&retention_generation=1"),
+            None,
+            None
+        )
+        .await
+        .0,
+        409
+    );
+}
+
+#[tokio::test]
+async fn sequenced_receipt_pages_export_pinned_prefix_across_new_http_writes() {
+    use hangang::config_store::{ConfigStore, SqliteConfigStore};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SqliteConfigStore::open(directory.path().join("pages.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let initial = Config::default();
+    store.bootstrap(initial.clone()).await.unwrap();
+    let (address, manager) = server_on(
+        directory.path().join("seed.json"),
+        initial,
+        Some(store),
+        false,
+        64,
+        16,
+    )
+    .await;
+    manager.reload_file().await.unwrap();
+    for revision in 0..2 {
+        let route = format!(
+            r#"{{"id":"route{revision}","path_prefix":"/{revision}","backends":["http://127.0.0.1:9"]}}"#
+        );
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/v1/routes/http",
+                Some(&route),
+                Some(revision)
+            )
+            .await
+            .0,
+            201
+        );
+    }
+    let records = config_operation_records(address).await;
+    let authority = records[0]["authority_id"].as_str().unwrap();
+    let base = format!("/v1/config/commit-receipts-v2?authority_id={authority}&limit=1");
+    let (status, headers, body) = request(address, "GET", &base, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let first = json(&body);
+    assert_eq!(
+        first["snapshot"],
+        serde_json::json!({"high_water":2,"retention_generation":0})
+    );
+    assert_eq!(first["next_after"], 1);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["receipts"][0]["stamp"]["acceptance_seq"], 1);
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/routes/http",
+            Some(r#"{"id":"later","path_prefix":"/later","backends":["http://127.0.0.1:9"]}"#),
+            Some(2)
+        )
+        .await
+        .0,
+        201
+    );
+    let suffix = "&snapshot_high_water=2&retention_generation=0";
+    let (status, _, body) = request(
+        address,
+        "GET",
+        &format!("{base}{suffix}&after_seq=1"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let last = json(&body);
+    assert_eq!(last["snapshot"], first["snapshot"]);
+    assert_eq!(last["has_more"], false);
+    assert_eq!(last["next_after"], 2);
+    assert_eq!(last["receipts"].as_array().unwrap().len(), 1);
+    assert_eq!(last["receipts"][0]["stamp"]["acceptance_seq"], 2);
+    let (status, _, body) = request(
+        address,
+        "GET",
+        &format!("{base}{suffix}&after_seq=2"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["receipts"], serde_json::json!([]));
+    assert_eq!(manager.active.load().config.revision, 3);
 }
