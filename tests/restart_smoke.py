@@ -90,6 +90,21 @@ class Restart(unittest.TestCase):
                     initial=await_status(lambda value:True)
                     self.assertTrue(initial["state"]["supervised"])
                     workload_request()
+                    self.assertEqual(initial["workload_materials"], [{"kind":"http","id":"private","ready":True}])
+                    # File-only edits must change live admission without changing
+                    # the shared configuration revision or requiring a restart.
+                    original_ca=ca.read_bytes();ca.write_bytes(b"invalid client CA")
+                    unavailable=await_status(lambda value: value["workload_materials"] == [{"kind":"http","id":"private","ready":False}])
+                    self.assertEqual(unavailable["revision"],initial["revision"])
+                    code,_,body=smoke.Smoke.request(admin,"GET","/metrics",auth=True)
+                    self.assertEqual(code,200)
+                    self.assertIn(b'hangang_workload_material_unavailable{kind="http"} 1',body)
+                    with self.assertRaises((OSError,http.client.HTTPException)):
+                        workload_request()
+                    ca.write_bytes(original_ca)
+                    restored=await_status(lambda value: value["workload_materials"] == [{"kind":"http","id":"private","ready":True}])
+                    self.assertEqual(restored["revision"],initial["revision"])
+                    workload_request()
                     stream=socket.create_connection(("127.0.0.1",tcp),timeout=2)
                     stream.sendall(b"before");self.assertEqual(recv_exact(stream,6),b"before")
                     child.send_signal(signal.SIGHUP)

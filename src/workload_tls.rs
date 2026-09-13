@@ -5,7 +5,6 @@
 //! caller must not use it to authenticate an unverified certificate chain.
 use std::{
     collections::HashSet,
-    fs::File,
     io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::Arc,
@@ -281,10 +280,36 @@ impl Prepared {
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("cannot open mTLS material {}", path.display()))?
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).context("cannot open mTLS material")?;
+    let before = file.metadata()?;
+    ensure!(before.is_file(), "mTLS material must be a regular file");
+    ensure!(
+        before.len() <= MAX_MATERIAL_BYTES,
+        "mTLS material exceeds 1 MiB"
+    );
+    (&mut file)
         .take(MAX_MATERIAL_BYTES + 1)
         .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    ensure!(
+        before.len() == after.len() && before.modified()? == after.modified()?,
+        "mTLS material changed during read"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec(),
+            "mTLS material changed during read"
+        );
+    }
     ensure!(
         bytes.len() <= MAX_MATERIAL_BYTES as usize,
         "mTLS material exceeds 1 MiB"
@@ -700,6 +725,31 @@ mod tests {
         .unwrap();
         if let Ok(prepared) = Prepared::load(&policy) {
             assert!(duplex_handshake(&prepared, &connector).await.is_err());
+        }
+    }
+    #[test]
+    fn material_reader_rejects_nonregular_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_bounded(dir.path()).is_err());
+        let oversized = dir.path().join("large");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_MATERIAL_BYTES + 1)
+            .unwrap();
+        assert!(read_bounded(&oversized).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = dir.path().join("fifo");
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+            // No writer is ever opened: blocking File::open would hang here.
+            assert!(read_bounded(&path).is_err());
+            let regular = dir.path().join("regular");
+            let link = dir.path().join("projected-secret");
+            std::fs::write(&regular, b"owned material").unwrap();
+            std::os::unix::fs::symlink(&regular, &link).unwrap();
+            assert_eq!(read_bounded(&link).unwrap(), b"owned material");
         }
     }
 }

@@ -1016,8 +1016,33 @@ async fn run(args: Args) -> Result<()> {
         cancel.cancel();
         anyhow::bail!("{authority} did not become ready within 10 seconds");
     }
+    let mut tls_watchers = vec![tokio::spawn(hangang::workload_material::watch(
+        active.clone(),
+        cancel.clone(),
+    ))];
+    // New slots are quarantined until the watcher verifies their files after
+    // publication. Do not signal startup readiness or accept traffic earlier.
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = active.load_full();
+            if snapshot
+                .tcp_inbound_tls
+                .values()
+                .chain(snapshot.http_workload_tls.values())
+                .all(|slot| slot.load().is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        cancel.cancel();
+        anyhow::bail!("workload TLS material did not become ready within 10 seconds");
+    }
     tcp.open_gate();
-    let mut tls_watchers = Vec::new();
     if args.config_tls {
         tls_watchers.push(tokio::spawn(hangang::certificates::watch(
             active.clone(),

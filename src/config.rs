@@ -1321,7 +1321,7 @@ pub struct Snapshot {
     pub workload_routes:
         std::collections::HashMap<String, std::sync::Arc<crate::workload_auth::Runtime>>,
     pub http_workload_tls:
-        std::collections::HashMap<String, std::sync::Arc<crate::workload_tls::Prepared>>,
+        std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
     pub upstream_tls: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
     // Fingerprints of the exact custom CA certificates used by prepared TLS.
@@ -1329,7 +1329,7 @@ pub struct Snapshot {
     #[doc(hidden)]
     pub upstream_trust: std::collections::HashMap<String, [u8; 32]>,
     pub tcp_inbound_tls:
-        std::collections::HashMap<String, std::sync::Arc<crate::workload_tls::Prepared>>,
+        std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
     pub certificates: Option<std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
     pub cache: Option<std::sync::Arc<crate::cache::CacheRuntime>>,
     pub config: Config,
@@ -1800,8 +1800,24 @@ impl Snapshot {
             let Some(policy) = &route.inbound_tls else {
                 continue;
             };
-            // Read on configuration preparation, never on a connection. A
-            // rejected replacement leaves the published generation intact.
+            // Reuse the live slot for an unchanged binding. File generations
+            // are owned by the watcher, never rolled back by a prepared config.
+            if let Some(old) = previous
+                .filter(|old| {
+                    old.config.tcp.iter().any(|prior| {
+                        prior.id == route.id
+                            && prior.enabled
+                            && prior.listen == route.listen
+                            && prior.inbound_tls == route.inbound_tls
+                    })
+                })
+                .and_then(|old| old.tcp_inbound_tls.get(&route.id))
+            {
+                tcp_inbound_tls.insert(route.id.clone(), old.clone());
+                continue;
+            }
+            // Validate candidates now, but new slots stay closed until the
+            // watcher verifies material after their active publication.
             let policy_key = serde_json::to_vec(policy)?;
             let prepared = match inbound_material.entry(policy_key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
@@ -1811,20 +1827,14 @@ impl Snapshot {
                     )?))
                     .clone(),
             };
-            let old = previous
-                .filter(|old| {
-                    old.config.tcp.iter().any(|prior| {
-                        prior.id == route.id && prior.enabled && prior.listen == route.listen
-                    })
-                })
-                .and_then(|old| old.tcp_inbound_tls.get(&route.id));
-            let prepared = match old {
-                Some(old) if old.fingerprint() == prepared.fingerprint() => old.clone(),
-                _ => prepared,
-            };
-            if route.enabled {
-                tcp_inbound_tls.insert(route.id.clone(), prepared);
-            }
+            tcp_inbound_tls.insert(
+                route.id.clone(),
+                std::sync::Arc::new(crate::workload_material::Slot::new(
+                    policy.clone(),
+                    prepared,
+                    false,
+                )),
+            );
         }
         let mut http_workload_tls = std::collections::HashMap::new();
         for listener in config
@@ -1832,23 +1842,30 @@ impl Snapshot {
             .iter()
             .filter(|listener| listener.enabled)
         {
-            let mut prepared = crate::workload_tls::Prepared::load(&listener.tls)?;
-            std::sync::Arc::make_mut(&mut prepared.server_config).alpn_protocols =
-                vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            let old = previous
+            if let Some(old) = previous
                 .filter(|old| {
                     old.config.workload_http.iter().any(|prior| {
-                        prior.enabled && prior.id == listener.id && prior.listen == listener.listen
+                        prior.enabled
+                            && prior.id == listener.id
+                            && prior.listen == listener.listen
+                            && prior.tls == listener.tls
                     })
                 })
                 .and_then(|old| old.http_workload_tls.get(&listener.id))
-                .filter(|old| old.fingerprint() == prepared.fingerprint());
+            {
+                http_workload_tls.insert(listener.id.clone(), old.clone());
+                continue;
+            }
+            let mut prepared = crate::workload_tls::Prepared::load(&listener.tls)?;
+            std::sync::Arc::make_mut(&mut prepared.server_config).alpn_protocols =
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             http_workload_tls.insert(
                 listener.id.clone(),
-                match old {
-                    Some(old) => old.clone(),
-                    None => std::sync::Arc::new(prepared),
-                },
+                std::sync::Arc::new(crate::workload_material::Slot::new(
+                    listener.tls.clone(),
+                    std::sync::Arc::new(prepared),
+                    true,
+                )),
             );
         }
         let certificates = if config.certificates.is_empty() {

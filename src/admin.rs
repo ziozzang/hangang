@@ -754,6 +754,11 @@ impl Admin {
             "revision": snapshot.config.revision,
             "http_routes": snapshot.config.http.len(),
             "tcp_routes": snapshot.config.tcp.len(),
+            "workload_materials": snapshot.tcp_inbound_tls.iter().map(|(id, slot)|
+                serde_json::json!({"kind":"tcp", "id":id, "ready":slot.load().is_some()}))
+                .chain(snapshot.http_workload_tls.iter().map(|(id, slot)|
+                    serde_json::json!({"kind":"http", "id":id, "ready":slot.load().is_some()})))
+                .collect::<Vec<_>>(),
             "metrics": {
                 "requests_total": metrics.requests.load(Ordering::Relaxed),
                 "cache_hits_total": metrics.cache_hits.load(Ordering::Relaxed),
@@ -1781,7 +1786,26 @@ impl Admin {
             return Ok(response(200, "ok\n"));
         }
         if path == "/metrics" && req.method() == hyper::Method::GET {
-            let mut r = response(200, &self.manager.metrics.render());
+            let mut output = self.manager.metrics.render();
+            let snapshot = self.manager.active.load();
+            output.push_str("# TYPE hangang_workload_material_ready gauge\n# TYPE hangang_workload_material_unavailable gauge\n");
+            for (kind, slots) in [
+                ("tcp", &snapshot.tcp_inbound_tls),
+                ("http", &snapshot.http_workload_tls),
+            ] {
+                use std::fmt::Write;
+                let ready = slots.values().filter(|slot| slot.load().is_some()).count();
+                let _ = writeln!(
+                    output,
+                    "hangang_workload_material_ready{{kind=\"{kind}\"}} {ready}"
+                );
+                let _ = writeln!(
+                    output,
+                    "hangang_workload_material_unavailable{{kind=\"{kind}\"}} {}",
+                    slots.len() - ready
+                );
+            }
+            let mut r = response(200, &output);
             r.headers_mut().insert(
                 "content-type",
                 "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
