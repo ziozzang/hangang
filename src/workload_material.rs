@@ -292,6 +292,7 @@ mod tests {
         let (_dir, active, slot) = fixture();
         Slot::refresh(&active, &slot).await;
         let first = slot.load().unwrap();
+        Slot::refresh(&active, &slot).await;
         // A verified metadata sample inside the five-second window avoids
         // reopening PEMs on every 500 ms poll. The full pass will detect a
         // same-metadata rewrite after that window.
@@ -320,5 +321,43 @@ mod tests {
         active.store(Arc::new(disabled));
         Slot::refresh(&active, &slot).await;
         assert!(slot.load().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_candidate_cannot_open_after_material_is_revoked_before_publication() {
+        let (_dir, active, old) = fixture();
+        Slot::refresh(&active, &old).await;
+        let mut config = active.load().config.clone();
+        config.tcp[0]
+            .inbound_tls
+            .as_mut()
+            .unwrap()
+            .handshake_timeout_ms += 1;
+        let candidate = Snapshot::replace(config, &active.load_full()).unwrap();
+        let pending = candidate.tcp_inbound_tls["mtls"].clone();
+        assert!(!Arc::ptr_eq(&old, &pending));
+        assert!(pending.load().is_none());
+        fs::write(&pending.policy.client_ca_file, b"invalid CA").unwrap();
+        active.store(Arc::new(candidate));
+        Slot::refresh(&active, &pending).await;
+        assert!(pending.load().is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_snapshot_reuses_revoked_slot_and_recovery_gets_new_generation() {
+        let (_dir, active, slot) = fixture();
+        Slot::refresh(&active, &slot).await;
+        let first = slot.load().unwrap();
+        let original = fs::read(&slot.policy.client_ca_file).unwrap();
+        fs::write(&slot.policy.client_ca_file, b"invalid CA").unwrap();
+        Slot::refresh(&active, &slot).await;
+        assert!(slot.load().is_none());
+        let same = Snapshot::replace(active.load().config.clone(), &active.load_full()).unwrap();
+        assert!(Arc::ptr_eq(&same.tcp_inbound_tls["mtls"], &slot));
+        active.store(Arc::new(same));
+        fs::write(&slot.policy.client_ca_file, original).unwrap();
+        Slot::refresh(&active, &slot).await;
+        let recovered = slot.load().unwrap();
+        assert!(!Arc::ptr_eq(&first, &recovered));
     }
 }
