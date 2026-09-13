@@ -20,7 +20,10 @@ use std::{
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    time::Instant,
+};
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -226,13 +229,13 @@ struct FillPermitGuard {
 impl FillPermitGuard {
     fn spawn(
         permit: OwnedSemaphorePermit,
-        timeout: Duration,
+        deadline: Instant,
         state: Arc<Mutex<CaptureState>>,
     ) -> Self {
         let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     // Abandon before releasing capacity so the freed permit can
                     // never be observed while stale capture state still exists.
                     CaptureState::abandon(&state);
@@ -355,6 +358,10 @@ fn prepare_capture(
         return Err(Box::new(Response::from_parts(parts, body)));
     }
     let timeout = Duration::from_millis(fill.cache.config.fill_timeout_ms);
+    // Anchor the deadline while constructing the capture. A detached guard
+    // might not be polled until after a busy executor has already spent the
+    // entire budget, so its first poll must never start a fresh interval.
+    let deadline = Instant::now() + timeout;
     // Move the permit into a deadline guard so a client that stops reading (and
     // therefore never polls this body) cannot pin a fill slot, the capture
     // buffer or the per-key registration for longer than fill_timeout.
@@ -364,8 +371,9 @@ fn prepare_capture(
         fill: Some(fill),
         entry: Some(entry),
         buffer: Vec::new(),
+        deadline,
     }));
-    let permit_guard = permit.map(|permit| FillPermitGuard::spawn(permit, timeout, state.clone()));
+    let permit_guard = permit.map(|permit| FillPermitGuard::spawn(permit, deadline, state.clone()));
     Ok((
         parts,
         Capture {
@@ -384,6 +392,7 @@ struct CaptureState {
     fill: Option<Fill>,
     entry: Option<CacheEntry>,
     buffer: Vec<u8>,
+    deadline: Instant,
 }
 impl CaptureState {
     fn lock(state: &Mutex<CaptureState>) -> std::sync::MutexGuard<'_, CaptureState> {
@@ -421,36 +430,38 @@ impl Capture {
             return;
         }
         self.capturing = false;
-        // Release the fill permit promptly on completion rather than waiting for
-        // the guard's deadline.
-        self.permit_guard = None;
-        let taken = {
+        let (expired, taken) = {
             let mut state = CaptureState::lock(&self.state);
-            (
+            let expired = Instant::now() >= state.deadline;
+            let taken = (
                 state.fill.take(),
                 state.entry.take(),
                 std::mem::take(&mut state.buffer),
-            )
+            );
+            (expired, taken)
         };
-        if let (Some(fill), Some(mut entry), buffer) = taken {
+        if let (false, (Some(fill), Some(mut entry), buffer)) = (expired, taken) {
             entry.body = Bytes::from(buffer);
             fill.publish(entry);
         }
+        // State was removed before cancelling the guard, so the permit cannot
+        // be reused while a stale per-key registration is still present.
+        self.permit_guard = None;
     }
     fn abandon(&mut self) {
         if !self.capturing {
             return;
         }
         self.capturing = false;
-        self.permit_guard = None;
         CaptureState::abandon(&self.state);
+        self.permit_guard = None;
     }
     fn push(&mut self, data: &[u8]) {
         if !self.capturing {
             return;
         }
         let mut state = CaptureState::lock(&self.state);
-        if state.fill.is_none() {
+        if Instant::now() >= state.deadline || state.fill.is_none() {
             // The deadline guard abandoned this capture while it was not polled.
             drop(state);
             self.abandon();
@@ -892,6 +903,101 @@ mod tests {
         );
         assert_eq!(cache.active_fills(), 0);
         assert!(cache.store.get("a").await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_deadline_survives_a_scheduler_stall_before_guard_starts() {
+        let cache = CacheRuntime::new(CacheConfig {
+            fill_timeout_ms: 1,
+            ..Default::default()
+        });
+        let Lookup::Fill(fill) = cache.lookup("stalled".into(), 0).await else {
+            panic!("fill")
+        };
+        let source = Full::new(Bytes::from_static(b"complete"))
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let response = capture(Response::new(source), fill, 60_000, 0, now_ms());
+        // No spawned task runs on this current-thread executor while blocked.
+        // The wall-clock deadline passes before the guard can first poll.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "complete",
+            "timeout must never truncate the downstream body"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.active_fills() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cache.store.get("stalled").await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_finish_rechecks_deadline_after_a_slow_body_poll() {
+        struct SlowEnd {
+            sent: bool,
+        }
+        impl hyper::body::Body for SlowEnd {
+            type Data = Bytes;
+            type Error = BodyError;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                if self.sent {
+                    Poll::Ready(None)
+                } else {
+                    self.sent = true;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"ready")))))
+                }
+            }
+
+            fn is_end_stream(&self) -> bool {
+                if self.sent {
+                    // Capture::push already saw an in-budget frame. A slow
+                    // synchronous end-of-stream check crosses the deadline
+                    // before Capture::finish can publish it.
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.sent
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(5)
+            }
+        }
+
+        let cache = CacheRuntime::new(CacheConfig {
+            fill_timeout_ms: 1,
+            ..Default::default()
+        });
+        let Lookup::Fill(fill) = cache.lookup("slow-end".into(), 0).await else {
+            panic!("fill")
+        };
+        let response = capture(
+            Response::new(SlowEnd { sent: false }.boxed_unsync()),
+            fill,
+            60_000,
+            0,
+            now_ms(),
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "ready"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.active_fills() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cache.store.get("slow-end").await.unwrap().is_none());
     }
 }
 
