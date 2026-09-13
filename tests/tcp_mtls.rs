@@ -27,6 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tokio_util::sync::CancellationToken;
 
 const GOOD_ID: &str = "spiffe://example.org/ns/test/sa/allowed";
 const OTHER_ID: &str = "spiffe://example.org/ns/test/sa/other";
@@ -179,6 +180,23 @@ async fn exchange(connector: &tokio_rustls::TlsConnector, listen: std::net::Sock
     .is_some()
 }
 
+async fn wait_material(
+    active: &Arc<ArcSwap<Snapshot>>,
+    ready: bool,
+) -> Option<Arc<hangang::workload_tls::Prepared>> {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let current = active.load().tcp_inbound_tls["workload"].load();
+            if current.is_some() == ready {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TCP workload material did not reach the requested state")
+}
+
 #[test]
 fn active_mtls_listener_requires_a_separate_retirement_revision_before_plaintext() {
     let material = material();
@@ -248,6 +266,11 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config::default()).unwrap(),
     ));
+    let watch_cancel = CancellationToken::new();
+    let watcher = tokio::spawn(hangang::workload_material::watch(
+        active.clone(),
+        watch_cancel.clone(),
+    ));
     let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 16);
     let first = config(listen, backend_address, &material, &[GOOD_ID]);
     let prepared = manager
@@ -258,6 +281,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         Snapshot::replace(first, &active.load_full()).unwrap(),
     ));
     manager.commit(prepared).await;
+    wait_material(&active, true).await;
 
     let good = connector(&material, Some((&material.good_cert, &material.good_key)));
     let no_certificate = connector(&material, None);
@@ -318,7 +342,8 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     // A no-op publication preserves the exact prepared verifier and a live
     // authenticated stream. Replacing CA bytes at the same path must fence
     // that stream even though the route JSON is unchanged.
-    let prepared_before = active.load_full().tcp_inbound_tls["workload"].clone();
+    let slot_before = active.load_full().tcp_inbound_tls["workload"].clone();
+    let prepared_before = slot_before.load().unwrap();
     let same = config(listen, backend_address, &material, &[GOOD_ID]);
     let prepared = manager.prepare(&same).await.unwrap();
     active.store(Arc::new(
@@ -326,7 +351,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     ));
     manager.commit(prepared).await;
     assert!(Arc::ptr_eq(
-        &prepared_before,
+        &slot_before,
         &active.load_full().tcp_inbound_tls["workload"]
     ));
     held.write_all(b"ping").await.unwrap();
@@ -334,14 +359,13 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     assert_eq!(&reply, b"ping");
     assert_eq!(accepted.load(Ordering::SeqCst), 3);
 
-    std::fs::write(&material.ca_file, ca().pem()).unwrap();
-    let prepared = manager.prepare(&same).await.unwrap();
-    active.store(Arc::new(
-        Snapshot::replace(same.clone(), &active.load_full()).unwrap(),
-    ));
-    manager.commit(prepared).await;
-    assert!(!Arc::ptr_eq(
-        &prepared_before,
+    // No config revision is published: the file watcher invalidates this
+    // same Slot when a CA file becomes malformed, closing existing streams
+    // and denying new handshakes rather than retaining stale trust.
+    std::fs::write(&material.ca_file, b"invalid CA material").unwrap();
+    wait_material(&active, false).await;
+    assert!(Arc::ptr_eq(
+        &slot_before,
         &active.load_full().tcp_inbound_tls["workload"]
     ));
     let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte)).await;
@@ -353,11 +377,8 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     assert_eq!(accepted.load(Ordering::SeqCst), 3);
 
     std::fs::write(&material.ca_file, &material.ca_pem).unwrap();
-    let prepared = manager.prepare(&same).await.unwrap();
-    active.store(Arc::new(
-        Snapshot::replace(same, &active.load_full()).unwrap(),
-    ));
-    manager.commit(prepared).await;
+    let restored = wait_material(&active, true).await.unwrap();
+    assert!(!Arc::ptr_eq(&prepared_before, &restored));
     assert!(exchange(&good, listen).await);
     assert_eq!(accepted.load(Ordering::SeqCst), 4);
 
@@ -377,6 +398,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         Snapshot::replace(next, &active.load_full()).unwrap(),
     ));
     manager.commit(prepared).await;
+    wait_material(&active, true).await;
     let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte)).await;
     assert!(
         matches!(closed, Ok(Ok(0) | Err(_))),
@@ -410,6 +432,8 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     );
     assert!(!exchange(&wrong_uri, listen).await);
     assert_eq!(accepted.load(Ordering::SeqCst), 7);
+    watch_cancel.cancel();
+    watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
     backend_task.abort();
 }
@@ -440,12 +464,18 @@ async fn tcp_mtls_owned_echo_throughput() {
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(document.clone()).unwrap(),
     ));
-    let manager = TcpManager::new(active, Arc::new(Metrics::default()), 32);
+    let watch_cancel = CancellationToken::new();
+    let watcher = tokio::spawn(hangang::workload_material::watch(
+        active.clone(),
+        watch_cancel.clone(),
+    ));
+    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 32);
     let prepared = manager
         .prepare_with_inherited(&document, vec![(listen, OwnedFd::from(held))])
         .await
         .unwrap();
     manager.commit(prepared).await;
+    wait_material(&active, true).await;
     let connector = connector(&material, Some((&material.good_cert, &material.good_key)));
     let concurrency = std::thread::available_parallelism()
         .map_or(1, |count| count.get())
@@ -484,6 +514,8 @@ async fn tcp_mtls_owned_echo_throughput() {
         concurrency * 8,
         (concurrency * 8) as f64 / elapsed
     );
+    watch_cancel.cancel();
+    watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
     backend_task.abort();
 }

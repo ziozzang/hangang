@@ -31,6 +31,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 const GOOD_ID: &str = "spiffe://example.org/ns/test/sa/allowed";
 const OTHER_ID: &str = "spiffe://example.org/ns/test/sa/other";
@@ -153,6 +154,35 @@ struct Running {
     policy: Arc<PolicyPool>,
     active: Arc<ArcSwap<Snapshot>>,
     metrics: Arc<Metrics>,
+    watch_cancel: CancellationToken,
+    watcher: JoinHandle<()>,
+}
+
+impl Running {
+    async fn shutdown(self) {
+        self.manager.shutdown(Duration::ZERO).await;
+        self.watch_cancel.cancel();
+        self.watcher.await.unwrap();
+        self.proxy.shutdown(Duration::ZERO).await;
+        self.policy.shutdown().await;
+    }
+}
+
+async fn wait_material(
+    active: &Arc<ArcSwap<Snapshot>>,
+    ready: bool,
+) -> Option<Arc<hangang::workload_tls::Prepared>> {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let current = active.load().http_workload_tls["private-edge"].load();
+            if current.is_some() == ready {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("HTTP workload material did not reach the requested state")
 }
 
 async fn start(config: Config, bound: TcpListener) -> Running {
@@ -173,6 +203,11 @@ async fn start_with_limit_and_idle(
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(config.clone()).unwrap(),
     ));
+    let watch_cancel = CancellationToken::new();
+    let watcher = tokio::spawn(hangang::workload_material::watch(
+        active.clone(),
+        watch_cancel.clone(),
+    ));
     let metrics = Arc::new(Metrics::default());
     let policy = Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1));
     let proxy = Arc::new(Proxy::new(active.clone(), policy.clone(), metrics.clone()));
@@ -191,12 +226,15 @@ async fn start_with_limit_and_idle(
         .unwrap();
     manager.commit(prepared).await;
     manager.open_gate();
+    wait_material(&active, true).await;
     Running {
         manager,
         proxy,
         policy,
         active,
         metrics,
+        watch_cancel,
+        watcher,
     }
 }
 
@@ -310,6 +348,7 @@ async fn publish(running: &Running, config: Config) {
         })
         .await
         .unwrap();
+    wait_material(&running.active, true).await;
 }
 
 async fn request_h1(
@@ -412,9 +451,7 @@ async fn http1_requires_verified_workload_and_ignores_spoofed_forwarding_identit
             .load(std::sync::atomic::Ordering::Relaxed)
             >= 2
     );
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
     backend_task.abort();
 }
 
@@ -465,9 +502,73 @@ async fn http2_uses_the_same_verified_workload_resource_policy() {
     assert_eq!(denied.status(), 403);
     assert_eq!(seen.lock().unwrap().len(), 1);
     connection_task.abort();
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
+    backend_task.abort();
+}
+
+#[tokio::test]
+async fn automatic_ca_damage_withdraws_http_identity_without_config_revision() {
+    let material = material();
+    let original_ca = std::fs::read(&material.ca_file).unwrap();
+    let (backend, seen, backend_task) = origin().await;
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let running = start(config(listen, backend, &material), bound).await;
+    let snapshot_before = running.active.load_full();
+    let prepared_before = wait_material(&running.active, true).await.unwrap();
+    let connector = connector(&material, Some(&material.good));
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let tls = connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri("https://private.test/private")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "ok"
+    );
+
+    std::fs::write(&material.ca_file, b"malformed CA PEM").unwrap();
+    wait_material(&running.active, false).await;
+    assert!(
+        Arc::ptr_eq(&snapshot_before, &running.active.load_full()),
+        "material change unexpectedly published config"
+    );
+    tokio::time::timeout(Duration::from_secs(3), connection_task)
+        .await
+        .expect("HTTP/2 mTLS connection survived invalid material")
+        .unwrap();
+    assert!(
+        request_h1(&connector, listen, "").await.is_none(),
+        "invalid material admitted a new HTTP request"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    std::fs::write(&material.ca_file, original_ca).unwrap();
+    let restored = wait_material(&running.active, true).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&prepared_before, &restored),
+        "restored CA reused a withdrawn verifier"
+    );
+    assert_eq!(request_h1(&connector, listen, "").await.unwrap().0, 200);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    running.shutdown().await;
     backend_task.abort();
 }
 
@@ -519,9 +620,7 @@ async fn held_sse_stream_closes_when_listener_identity_generation_is_withdrawn()
     })
     .await
     .expect("withdrawn mTLS SSE stream remained open");
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
     backend_task.abort();
 }
 
@@ -599,9 +698,7 @@ async fn upgraded_websocket_keeps_connection_admission_and_closes_on_route_polic
             .load(std::sync::atomic::Ordering::Relaxed)
             >= 1
     );
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
     backend_task.abort();
 }
 
@@ -680,9 +777,7 @@ async fn http2_stream_retirement_does_not_close_an_unrelated_workload_route() {
     );
     assert_eq!(seen.lock().unwrap().len(), 1);
     connection_task.abort();
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
     stream_task.abort();
     other_task.abort();
 }
@@ -761,8 +856,6 @@ async fn release_workload_http_mtls_throughput_diagnostic() {
         mebibytes / elapsed.as_secs_f64(),
         CLIENTS * REQUESTS_PER_CLIENT
     );
-    running.manager.shutdown(Duration::ZERO).await;
-    running.proxy.shutdown(Duration::ZERO).await;
-    running.policy.shutdown().await;
+    running.shutdown().await;
     backend_task.abort();
 }
