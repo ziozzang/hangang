@@ -71,7 +71,8 @@ const state = {
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
   configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false },
   configProof: { data: null, error: null, loading: false, sequence: 0 },
-  configReceipt: { data: null, error: null, loading: false, sequence: 0 },
+  configReceipt: { data: null, error: null, loading: false, sequence: 0,
+    exportSequence: 0, exporting: false, exportFetched: 0, exportError: null, exportNotice: null },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -108,7 +109,9 @@ function refreshAppCopy() {
   if (state.audit.page || state.audit.error) renderAudit();
   if (state.configOperations.page || state.configOperations.error) renderConfigOperations();
   if (state.configProof.data || state.configProof.error || state.configProof.loading) renderConfigProof();
-  if (state.configReceipt.data || state.configReceipt.error || state.configReceipt.loading) renderConfigReceipt();
+  if (state.configReceipt.data || state.configReceipt.error || state.configReceipt.loading ||
+    state.configReceipt.exporting || state.configReceipt.exportError || state.configReceipt.exportNotice)
+    renderConfigReceipt();
   if ($('#route-dialog').open && $('#route-form').dataset.invalidNative) {
     try { routeFromForm(); delete $('#route-form').dataset.invalidNative; message($('#route-message')); }
     catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); }
@@ -3761,9 +3764,14 @@ async function loadConfigProof() {
 
 function resetConfigReceipt() {
   state.configReceipt.sequence += 1;
+  state.configReceipt.exportSequence += 1;
   state.configReceipt.data = null;
   state.configReceipt.error = null;
   state.configReceipt.loading = false;
+  state.configReceipt.exporting = false;
+  state.configReceipt.exportFetched = 0;
+  state.configReceipt.exportError = null;
+  state.configReceipt.exportNotice = null;
   $('#config-receipt-mode').value = 'v1';
   $('#config-receipt-authority').value = '';
   $('#config-receipt-operation').value = '';
@@ -3772,6 +3780,7 @@ function resetConfigReceipt() {
   $('#config-receipt-fields').replaceChildren();
   message($('#config-receipt-state'));
   $('#config-receipt-search').disabled = true;
+  renderConfigReceiptExport();
 }
 
 function syncConfigReceiptMode() {
@@ -3784,6 +3793,31 @@ function syncConfigReceiptMode() {
     input.required = visible;
     $(`label[for="${id}"]`).hidden = !visible;
   }
+}
+
+function invalidateConfigReceiptExport() {
+  const lookup = state.configReceipt;
+  lookup.exportSequence += 1;
+  lookup.exporting = false;
+  lookup.exportFetched = 0;
+  lookup.exportError = null;
+  lookup.exportNotice = null;
+}
+
+function renderConfigReceiptExport() {
+  const lookup = state.configReceipt;
+  const button = $('#config-receipt-export-v2');
+  const v2 = $('#config-receipt-mode').value === 'v2';
+  button.hidden = !v2;
+  button.disabled = !v2 || !isAdmin() || !state.token || lookup.exporting ||
+    !/^[0-9a-f]{32}$/.test($('#config-receipt-authority').value);
+  button.textContent = t('Export retained V2 receipts JSON');
+  const target = $('#config-receipt-export-state');
+  if (!v2) return message(target);
+  if (lookup.exporting) return message(target, t('Exporting retained V2 receipts… {count} records checked.',
+    { count: formatNumber(lookup.exportFetched) }));
+  if (lookup.exportError) return message(target, t(lookup.exportError), 'error');
+  message(target, lookup.exportNotice ? t(lookup.exportNotice) : '');
 }
 
 function validConfigReceipt(data, mode, authorityId, identity) {
@@ -3814,6 +3848,7 @@ function validConfigReceipt(data, mode, authorityId, identity) {
 
 function renderConfigReceipt() {
   const lookup = state.configReceipt;
+  renderConfigReceiptExport();
   const fields = $('#config-receipt-fields'); fields.replaceChildren();
   $('#config-receipt-search').disabled = lookup.loading || !isAdmin() || !state.token;
   if (lookup.loading) return message($('#config-receipt-state'), t('Searching retained SQL receipts…'));
@@ -3858,6 +3893,7 @@ async function searchConfigReceipt(event) {
   const authorityId = $('#config-receipt-authority').value;
   const identity = $(mode === 'v2' ? '#config-receipt-sequence' : '#config-receipt-operation').value;
   const lookup = state.configReceipt;
+  invalidateConfigReceiptExport();
   const sequence = ++lookup.sequence;
   lookup.data = null;
   lookup.error = null;
@@ -3896,8 +3932,131 @@ async function searchConfigReceipt(event) {
   }
 }
 
+function validV2ReceiptPage(data, authorityId, after, snapshot = null) {
+  const safe = (value) => Number.isSafeInteger(value) && value >= 0;
+  const hex = (value, size) => typeof value === 'string' && new RegExp(`^[0-9a-f]{${size}}$`).test(value);
+  if (!isObject(data) || data.scope !== 'configuration_authority' ||
+    data.authority_id !== authorityId || typeof data.supported !== 'boolean' ||
+    !safe(data.server_time_unix_ms) || !Array.isArray(data.receipts) || data.receipts.length > 100) return false;
+  if (!data.supported) return !snapshot && !data.receipts.length && data.snapshot === null &&
+    data.next_after === null && data.has_more === null;
+  if (!isObject(data.snapshot) || !safe(data.snapshot.high_water) ||
+    !safe(data.snapshot.retention_generation) || !safe(data.next_after) ||
+    typeof data.has_more !== 'boolean' || data.next_after > data.snapshot.high_water ||
+    (snapshot && (data.snapshot.high_water !== snapshot.high_water ||
+      data.snapshot.retention_generation !== snapshot.retention_generation))) return false;
+  if (data.has_more && (data.receipts.length !== 100 || data.next_after >= data.snapshot.high_water)) return false;
+  if (data.next_after !== (data.receipts.at(-1)?.stamp?.acceptance_seq ?? after)) return false;
+  return data.receipts.every((receipt, index) => {
+    const stamp = receipt?.stamp;
+    return isObject(receipt) && isObject(stamp) && hex(receipt.epoch, 32) && safe(receipt.revision) &&
+      receipt.revision > 0 &&
+      stamp.authority_id === authorityId && safe(stamp.acceptance_seq) && stamp.acceptance_seq >
+        (index ? data.receipts[index - 1].stamp.acceptance_seq : after) &&
+      stamp.acceptance_seq <= data.snapshot.high_water && hex(stamp.operation_id, 32) &&
+      stamp.operation_id.startsWith(stamp.acceptance_seq.toString(16).padStart(16, '0')) &&
+      hex(stamp.candidate_sha256, 64);
+  });
+}
+
+async function exportV2Receipts() {
+  const lookup = state.configReceipt;
+  const authorityId = $('#config-receipt-authority').value;
+  if (!isAdmin() || !state.token || state.view !== 'config-operations' ||
+    $('#config-receipt-mode').value !== 'v2' || lookup.exporting) return;
+  const sequence = ++lookup.exportSequence;
+  const generation = state.authGeneration;
+  const token = state.token;
+  const identity = $('#config-receipt-sequence').value;
+  const stillCurrent = () => sequence === lookup.exportSequence && generation === state.authGeneration &&
+    token === state.token && state.view === 'config-operations' && isAdmin() &&
+    $('#config-receipt-mode').value === 'v2' && $('#config-receipt-authority').value === authorityId &&
+    $('#config-receipt-sequence').value === identity;
+  lookup.exportError = null;
+  lookup.exportNotice = null;
+  lookup.exportFetched = 0;
+  if (!/^[0-9a-f]{32}$/.test(authorityId)) {
+    lookup.exportError = 'Enter an exact 32-character lowercase authority ID to export V2 receipts.';
+    renderConfigReceiptExport();
+    return;
+  }
+  lookup.exporting = true;
+  renderConfigReceiptExport();
+  let snapshot = null;
+  let firstObserved = null;
+  let lastObserved = null;
+  let after = 0;
+  let pages = 0;
+  let complete = false;
+  const receipts = [];
+  try {
+    while (pages < 1000) {
+      if (!stillCurrent()) throw new StaleSessionError();
+      const query = new URLSearchParams({ authority_id: authorityId, after_seq: String(after), limit: '100' });
+      if (snapshot) {
+        query.set('snapshot_high_water', String(snapshot.high_water));
+        query.set('retention_generation', String(snapshot.retention_generation));
+      }
+      const { data } = await api(`/v1/config/commit-receipts-v2?${query}`);
+      if (!stillCurrent()) throw new StaleSessionError();
+      if (!validV2ReceiptPage(data, authorityId, after, snapshot))
+        throw new Error('Retained V2 receipt response is invalid. No file was downloaded.');
+      if (!data.supported) throw new Error('This store does not support retained V2 receipt export.');
+      snapshot ??= data.snapshot;
+      firstObserved ??= data.server_time_unix_ms;
+      lastObserved = data.server_time_unix_ms;
+      pages += 1;
+      receipts.push(...data.receipts);
+      if (receipts.length > 100000)
+        throw new Error('Retained V2 receipt export exceeded its 100,000-record bound. No file was downloaded.');
+      lookup.exportFetched = receipts.length;
+      renderConfigReceiptExport();
+      after = data.next_after;
+      if (!data.has_more) { complete = true; break; }
+    }
+    if (!snapshot || !complete)
+      throw new Error('Retained V2 receipt export was incomplete. No file was downloaded.');
+    // A pinned empty tail probe detects retention changes after the last data page.
+    const probe = new URLSearchParams({ authority_id: authorityId, after_seq: String(after), limit: '1',
+      snapshot_high_water: String(snapshot.high_water), retention_generation: String(snapshot.retention_generation) });
+    const { data: tail } = await api(`/v1/config/commit-receipts-v2?${probe}`);
+    if (!stillCurrent()) throw new StaleSessionError();
+    if (!validV2ReceiptPage(tail, authorityId, after, snapshot) || !tail.supported ||
+      tail.receipts.length || tail.has_more || tail.next_after !== after)
+      throw new Error('Retained V2 receipt snapshot changed or was incomplete. No file was downloaded.');
+    const archive = { scope: 'configuration_authority', export_scope: 'retained_v2_sql_commit_receipts_at_pinned_snapshot',
+      receipt_version: 2, authority_id: authorityId, snapshot, retained_receipt_count: receipts.length,
+      page_count: pages, first_observed_unix_ms: firstObserved,
+      final_observed_unix_ms: tail.server_time_unix_ms ?? lastObserved,
+      evidence_limit: 'Past SQL commits only; no proof of current configuration, local activation, or fleet acknowledgement.',
+      receipts };
+    if (!stillCurrent()) throw new StaleSessionError();
+    const url = URL.createObjectURL(new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' }));
+    try {
+      if (!stillCurrent()) throw new StaleSessionError();
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `hangang-sql-v2-receipts-${authorityId}-${snapshot.high_water}-${snapshot.retention_generation}.json`;
+      document.body.append(link); link.click(); link.remove();
+    } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    lookup.exportNotice = 'Retained V2 receipt JSON download started. Verify the file was saved; this is SQL commit evidence, not activation or fleet acknowledgement.';
+  } catch (error) {
+    if (!stillCurrent() || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    lookup.exportError = error.status === 409
+      ? 'Retained V2 receipt snapshot changed. No file was downloaded.'
+      : error.message;
+  } finally {
+    if (sequence === lookup.exportSequence) {
+      lookup.exporting = false;
+      renderConfigReceiptExport();
+    }
+  }
+}
+
 function configReceiptQueryChanged() {
   const lookup = state.configReceipt;
+  invalidateConfigReceiptExport();
   lookup.sequence += 1;
   lookup.data = null;
   lookup.error = null;
@@ -4271,6 +4430,7 @@ $('#audit-prune').addEventListener('click', pruneAuditPage);
 $('#config-operations-refresh').addEventListener('click', () => loadConfigOperations(0, []));
 $('#config-proof-refresh').addEventListener('click', loadConfigProof);
 $('#config-receipt-form').addEventListener('submit', searchConfigReceipt);
+$('#config-receipt-export-v2').addEventListener('click', exportV2Receipts);
 $('#config-receipt-mode').addEventListener('change', configReceiptModeChanged);
 $('#config-receipt-authority').addEventListener('input', configReceiptQueryChanged);
 $('#config-receipt-operation').addEventListener('input', configReceiptQueryChanged);
