@@ -2283,7 +2283,7 @@ impl Admin {
         use crate::admin_users::{Change, Role};
         if path == "/v1/users" {
             if req.method() == hyper::Method::GET {
-                return match self.users.list().await {
+                return match self.users.list(actor.mutation_authority()).await {
                     Ok(users) => auth_json(200, &serde_json::json!({"users":users})),
                     Err(error) => account_problem(error),
                 };

@@ -505,12 +505,15 @@ impl Store {
         .await?
     }
 
-    pub async fn list(&self) -> Result<Vec<User>> {
+    pub async fn list(&self, authority: MutationAuthority) -> Result<Vec<User>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = connection(&path)?;
+            let mut connection = connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            authorize_mutation(&transaction, &authority)?;
             let mut statement =
-                connection.prepare("SELECT id,username,role,enabled FROM users ORDER BY id")?;
+                transaction.prepare("SELECT id,username,role,enabled FROM users ORDER BY id")?;
             let users = statement
                 .query_map([], |row| {
                     Ok(User {
@@ -522,6 +525,8 @@ impl Store {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            transaction.commit()?;
             Ok(users)
         })
         .await?
@@ -1270,7 +1275,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(
+            store.list(MutationAuthority::System).await.unwrap().len(),
+            2
+        );
         connection(&path)
             .unwrap()
             .execute_batch("DROP TRIGGER fail_audit")
@@ -1431,7 +1439,10 @@ mod tests {
                 .unwrap_err()
                 .is::<AuditCapacity>()
         );
-        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert_eq!(
+            store.list(MutationAuthority::System).await.unwrap().len(),
+            1
+        );
         let pruned = store
             .prune_audit(MutationAuthority::System, 1000, before.latest_id)
             .await
@@ -1470,7 +1481,9 @@ mod tests {
             .count();
         assert_eq!(created, 1);
         assert!(!store.setup_required().await.unwrap());
-        let username = store.list().await.unwrap()[0].username.clone();
+        let username = store.list(MutationAuthority::System).await.unwrap()[0]
+            .username
+            .clone();
         assert!(
             store
                 .login(username.clone(), "wrong password".into())
@@ -1671,7 +1684,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(denied.downcast_ref::<AuthorizationRevoked>().is_some());
-        assert_eq!(store.list().await.unwrap()[1].role, Role::Viewer);
+        assert_eq!(
+            store.list(MutationAuthority::System).await.unwrap()[1].role,
+            Role::Viewer
+        );
         assert!(
             store
                 .delete(MutationAuthority::Session(root_login.token), viewer.id)
@@ -1718,7 +1734,96 @@ mod tests {
                 .is_some(),
             "expired sessions cannot mutate accounts"
         );
-        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(
+            store.list(MutationAuthority::System).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn account_list_rechecks_admin_session_in_its_read_transaction() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let viewer = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "viewer secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let root_session = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let authorized = store
+            .list(MutationAuthority::Session(root_session.token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            authorized.iter().map(|user| user.id).collect::<Vec<_>>(),
+            vec![root.id, viewer.id]
+        );
+        assert_eq!(
+            store
+                .list(MutationAuthority::System)
+                .await
+                .unwrap()
+                .iter()
+                .map(|user| user.id)
+                .collect::<Vec<_>>(),
+            authorized.iter().map(|user| user.id).collect::<Vec<_>>()
+        );
+
+        let viewer_session = store
+            .login("viewer".into(), "viewer secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .list(MutationAuthority::Session(viewer_session.token))
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+
+        store.logout(root_session.token.clone()).await.unwrap();
+        assert!(
+            store
+                .list(MutationAuthority::Session(root_session.token))
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+
+        let expiring = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let token_hash: [u8; 32] = Sha256::digest(expiring.token.as_bytes()).into();
+        connection(&directory.path().join("accounts.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET expires_at=0 WHERE token_hash=?1",
+                params![token_hash.as_slice()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .list(MutationAuthority::Session(expiring.token))
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
     }
 
     #[tokio::test]
@@ -1772,7 +1877,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let second = store
-            .list()
+            .list(MutationAuthority::System)
             .await
             .unwrap()
             .into_iter()
@@ -1796,7 +1901,10 @@ mod tests {
                 .downcast_ref::<AuthorizationRevoked>()
                 .is_some()
         );
-        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(
+            store.list(MutationAuthority::System).await.unwrap().len(),
+            2
+        );
     }
 
     /// Diagnostic only: SQLite FULL account writes with and without the
@@ -1879,12 +1987,12 @@ mod tests {
         std::fs::rename(&path, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &path).unwrap();
         assert!(
-            store.list().await.is_err(),
+            store.list(MutationAuthority::System).await.is_err(),
             "a swapped symlink must not be followed"
         );
         std::fs::remove_file(&path).unwrap();
         assert!(
-            store.list().await.is_err(),
+            store.list(MutationAuthority::System).await.is_err(),
             "a removed database must fail closed"
         );
         assert!(
