@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use crate::{balance::BackendRetirement, member_admission::MemberAdmission};
@@ -114,6 +114,13 @@ impl Registry {
                 .is_some(),
             "retired member registry identifier exhausted"
         );
+        // Account for every outstanding reservation. Commit happens after
+        // durable publication, so it must not need to grow this vector.
+        let additional = inner.pending + count;
+        inner
+            .records
+            .try_reserve(additional)
+            .context("retired member registry allocation failed")?;
         inner.pending += count;
         Ok(Reservation {
             registry: Arc::clone(self),
