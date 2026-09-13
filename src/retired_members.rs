@@ -205,9 +205,10 @@ mod tests {
     use std::sync::Barrier;
 
     fn registry(capacity: usize) -> Arc<Registry> {
-        let mut registry = Registry::default();
-        registry.capacity = capacity;
-        Arc::new(registry)
+        Arc::new(Registry {
+            capacity,
+            ..Registry::default()
+        })
     }
 
     fn tcp_record(name: &str, gate: &Arc<MemberAdmission>) -> Record {
