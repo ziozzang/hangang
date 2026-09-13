@@ -236,14 +236,17 @@ fn compatible_tcp_reorder_keeps_the_shared_generation_open() {
 }
 
 #[test]
-fn draining_member_is_still_rejected_until_lifecycle_publication_is_supported() {
+fn draining_member_starts_with_admission_closed() {
     let config: Config = serde_json::from_value(serde_json::json!({"tcp":[{
         "id":"stream", "listen":"127.0.0.1:19000", "backends":[
             {"id":"a", "address":"127.0.0.1:18001", "desired_state":"draining"}
         ]
     }]}))
     .unwrap();
-    assert!(Snapshot::new(config).is_err());
+    let snapshot = Snapshot::new(config).unwrap();
+    let gate = &snapshot.tcp_member_admissions["stream"][0];
+    assert!(!gate.is_open());
+    assert!(gate.lease().is_none());
 }
 
 #[test]
