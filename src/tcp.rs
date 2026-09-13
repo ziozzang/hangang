@@ -861,9 +861,11 @@ fn spawn_accept_loop(
                 let task_active = active.clone();
                 let task_cancel = connection_cancel.clone();
                 let task_metrics = metrics.clone();
+                let lease = Arc::new(crate::metrics::ConnectionLease::new(
+                    permit,
+                    task_metrics.clone(),
+                ));
                 connections.spawn(async move {
-                    let _permit = permit;
-                    let _active = ActiveConnection::new(task_metrics.clone());
                     crate::workload_http::serve(
                         client,
                         peer,
@@ -874,6 +876,7 @@ fn spawn_accept_loop(
                         idle_timeout,
                         task_cancel,
                         task_metrics,
+                        lease,
                     )
                     .await;
                 });
@@ -1168,7 +1171,7 @@ fn next_backend_index(
         })
 }
 
-fn workload_handshake_admission() -> Arc<Semaphore> {
+pub(crate) fn workload_handshake_admission() -> Arc<Semaphore> {
     static ADMISSION: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
         let limit = std::thread::available_parallelism()
             .map_or(2, |cpus| cpus.get().saturating_mul(2))
