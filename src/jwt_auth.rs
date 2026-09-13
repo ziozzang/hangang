@@ -12,6 +12,7 @@ use serde::{
     de::{MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -202,6 +203,7 @@ pub struct PreparedKey {
     kid: String,
     algorithm: JwtAlgorithm,
     key: DecodingKey,
+    public_jwk_fingerprint: [u8; 32],
 }
 
 impl PreparedKey {
@@ -245,13 +247,36 @@ impl PreparedKeys {
             "JWKS needs 1..32 keys"
         );
         let mut keys = HashMap::with_capacity(entries.len());
+        let mut seen_kids = HashSet::with_capacity(entries.len());
         for value in entries {
-            let key = prepare_jwk(value, allowed)?;
-            ensure!(
-                keys.insert(key.kid.clone(), Arc::new(key)).is_none(),
-                "duplicate JWKS kid"
-            );
+            let object = inspect_jwk(value)?;
+            let kid = object.get("kid").and_then(Value::as_str).unwrap();
+            ensure!(seen_kids.insert(kid), "duplicate JWKS kid");
+            // A provider may publish encryption or next-generation public
+            // keys beside the configured signing keys. They cannot authorize
+            // a token, but must still pass global bounds and kid uniqueness.
+            if object
+                .get("use")
+                .is_some_and(|use_value| use_value != "sig")
+                || object
+                    .get("key_ops")
+                    .is_some_and(|ops| ops.as_array().is_none_or(|items| items != &["verify"]))
+            {
+                continue;
+            }
+            let algorithm = match object.get("alg") {
+                Some(value) => value
+                    .as_str()
+                    .and_then(JwtAlgorithm::from_name)
+                    .filter(|alg| allowed.contains(alg)),
+                None => infer_unambiguous_algorithm(object, allowed),
+            };
+            if let Some(algorithm) = algorithm {
+                let key = prepare_jwk(object, algorithm)?;
+                keys.insert(key.kid.clone(), Arc::new(key));
+            }
         }
+        ensure!(!keys.is_empty(), "JWKS has no configured verification keys");
         Ok(Self { keys })
     }
 
@@ -272,9 +297,23 @@ impl PreparedKeys {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Keep the exact prepared key object when a refresh publishes identical
+    /// public JWK material. Consumers can fence a changed/removed key with
+    /// `Arc::ptr_eq` without invalidating an in-flight unchanged key.
+    pub fn reuse_unchanged(&mut self, previous: &Self) {
+        for (kid, current) in &mut self.keys {
+            if let Some(old) = previous.keys.get(kid)
+                && current.algorithm == old.algorithm
+                && current.public_jwk_fingerprint == old.public_jwk_fingerprint
+            {
+                *current = Arc::clone(old);
+            }
+        }
+    }
 }
 
-fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
+fn inspect_jwk(value: &Value) -> Result<&Map<String, Value>> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("JWK must be an object"))?;
@@ -293,20 +332,28 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
     };
     let kid = field("kid")?;
     ensure!(valid_kid(kid), "invalid JWK kid");
-    let algorithm = JwtAlgorithm::from_name(field("alg")?)
-        .ok_or_else(|| anyhow::anyhow!("unsupported JWK algorithm"))?;
-    ensure!(
-        allowed.contains(&algorithm),
-        "JWK algorithm is not configured"
-    );
+    field("kty")?;
+    if let Some(alg) = object.get("alg") {
+        ensure!(
+            alg.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 32),
+            "invalid JWK algorithm"
+        );
+    }
     if let Some(use_value) = object.get("use") {
-        ensure!(use_value.as_str() == Some("sig"), "JWK use must be sig");
+        ensure!(
+            use_value
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.len() <= 32),
+            "invalid JWK use"
+        );
     }
     if let Some(ops) = object.get("key_ops") {
         ensure!(
-            ops.as_array()
-                .is_some_and(|items| items.len() == 1 && items[0] == "verify"),
-            "JWK key_ops must be verify"
+            ops.as_array().is_some_and(|items| items.len() <= 8
+                && items
+                    .iter()
+                    .all(|op| op.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 32))),
+            "invalid JWK key_ops"
         );
     }
     for name in ["x5t", "x5t#S256"] {
@@ -328,6 +375,35 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
             "invalid JWK certificate metadata"
         );
     }
+    Ok(object)
+}
+
+fn infer_unambiguous_algorithm(
+    object: &Map<String, Value>,
+    allowed: &[JwtAlgorithm],
+) -> Option<JwtAlgorithm> {
+    let compatible = |alg| match (object.get("kty")?.as_str()?, alg) {
+        ("RSA", JwtAlgorithm::RS256 | JwtAlgorithm::PS256) => Some(()),
+        ("EC", JwtAlgorithm::ES256) if object.get("crv")?.as_str()? == "P-256" => Some(()),
+        ("OKP", JwtAlgorithm::EdDSA) if object.get("crv")?.as_str()? == "Ed25519" => Some(()),
+        _ => None,
+    };
+    let mut matches = allowed
+        .iter()
+        .copied()
+        .filter(|alg| compatible(*alg).is_some());
+    let one = matches.next()?;
+    matches.next().is_none().then_some(one)
+}
+
+fn prepare_jwk(object: &Map<String, Value>, algorithm: JwtAlgorithm) -> Result<PreparedKey> {
+    let field = |name| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("JWK missing string field {name}"))
+    };
+    let kid = field("kid")?;
     let key = match (field("kty")?, algorithm) {
         ("RSA", JwtAlgorithm::RS256 | JwtAlgorithm::PS256) => {
             ensure!(
@@ -350,6 +426,10 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
                 "RSA modulus must be odd and 2048..4096 bits"
             );
             ensure!(exponent == [1, 0, 1], "RSA exponent must be 65537");
+            let _ = rsa::RsaPublicKey::new(
+                rsa::BigUint::from_bytes_be(&modulus),
+                rsa::BigUint::from_bytes_be(&exponent),
+            )?;
             DecodingKey::from_rsa_components(n, e)?
         }
         ("EC", JwtAlgorithm::ES256) => {
@@ -385,9 +465,9 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
         }
         _ => bail!("JWK type and algorithm disagree"),
     };
-    // The library's verifier factory parses the actual public key. This
-    // rejects invalid EC points and malformed RSA/Ed25519 keys during
-    // candidate preparation, before the key set becomes authoritative.
+    // The library's verifier factory parses EC/Ed25519 public keys now.
+    // RSA was constructed and checked above because this factory otherwise
+    // defers RSA component parsing until each signature verification.
     let _ = (jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.verifier_factory)(
         &algorithm.library(),
         &key,
@@ -396,6 +476,9 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
         kid: kid.to_owned(),
         algorithm,
         key,
+        // serde_json Map has deterministic key ordering in this build. This
+        // hashes the whole public JWK, including metadata, conservatively.
+        public_jwk_fingerprint: Sha256::digest(serde_json::to_vec(object)?).into(),
     })
 }
 
@@ -432,6 +515,19 @@ pub struct Verified {
     pub groups: Vec<String>,
     pub issued_at: u64,
     pub expires_at: u64,
+    pub not_before: Option<u64>,
+}
+
+impl Verified {
+    /// Recheck the captured token's time bounds after queued/blocking work.
+    /// This does not replace signature verification or online revocation.
+    pub fn valid_at(&self, now_unix: u64, leeway_seconds: u64) -> bool {
+        self.expires_at.saturating_add(leeway_seconds) > now_unix
+            && self.issued_at <= now_unix.saturating_add(leeway_seconds)
+            && self
+                .not_before
+                .is_none_or(|nbf| nbf <= now_unix.saturating_add(leeway_seconds))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,22 +643,19 @@ impl JwtVerifier {
         }
         let exp = object.get("exp").and_then(Value::as_u64).ok_or(invalid)?;
         let iat = object.get("iat").and_then(Value::as_u64).ok_or(invalid)?;
-        if exp <= iat
-            || exp.saturating_sub(iat) > self.config.max_lifetime_seconds
-            || exp.saturating_add(self.config.leeway_seconds) <= now
-            || iat > now.saturating_add(self.config.leeway_seconds)
-        {
+        if exp <= iat || exp.saturating_sub(iat) > self.config.max_lifetime_seconds {
             return Err(invalid);
         }
-        if let Some(nbf) = object.get("nbf") {
-            let nbf = nbf.as_u64().ok_or(invalid)?;
-            if nbf > exp || nbf > now.saturating_add(self.config.leeway_seconds) {
-                return Err(invalid);
-            }
+        let not_before = object
+            .get("nbf")
+            .map(|nbf| nbf.as_u64().ok_or(invalid))
+            .transpose()?;
+        if not_before.is_some_and(|nbf| nbf > exp) {
+            return Err(invalid);
         }
         let scopes = parse_scopes(object.get(&self.config.scope_claim))?;
         let groups = parse_groups(object.get(&self.config.groups_claim))?;
-        Ok(Verified {
+        let verified = Verified {
             subject: subject.into(),
             issuer: issuer.into(),
             audiences,
@@ -572,7 +665,12 @@ impl JwtVerifier {
             groups,
             issued_at: iat,
             expires_at: exp,
-        })
+            not_before,
+        };
+        verified
+            .valid_at(now, self.config.leeway_seconds)
+            .then_some(verified)
+            .ok_or(invalid)
     }
 }
 
@@ -1030,6 +1128,144 @@ mod tests {
     }
 
     #[test]
+    fn mixed_public_jwks_filters_unselected_keys_but_checks_global_integrity() {
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        let selected = serde_json::json!({
+            "kty":"OKP", "crv":"Ed25519", "kid":"selected",
+            "x":URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes())
+        });
+        let other = serde_json::json!({
+            "kty":"OKP", "crv":"Ed25519", "kid":"next",
+            "alg":"EdDSA", "use":"enc",
+            "x":URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes())
+        });
+        let migration = serde_json::json!({
+            "kty":"EC", "crv":"P-384", "kid":"migration", "alg":"ES384",
+            "x":"public", "y":"public"
+        });
+        let jwks = serde_json::json!({"keys":[selected, other, migration]});
+        let keys =
+            PreparedKeys::from_jwks_json(jwks.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
+                .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.get("selected", JwtAlgorithm::EdDSA).is_some());
+        assert!(keys.get("next", JwtAlgorithm::EdDSA).is_none());
+        let duplicate = serde_json::json!({"keys":[selected, {
+            "kty":"OKP", "crv":"Ed25519", "kid":"selected", "alg":"ES384", "x":"public"
+        }]});
+        assert!(
+            PreparedKeys::from_jwks_json(duplicate.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
+                .is_err()
+        );
+        let private = serde_json::json!({"keys":[selected, {
+            "kty":"RSA", "kid":"private-skipped", "use":"enc", "d":"secret"
+        }]});
+        assert!(
+            PreparedKeys::from_jwks_json(private.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
+                .is_err()
+        );
+        let none = serde_json::json!({"keys":[other, migration]});
+        assert!(
+            PreparedKeys::from_jwks_json(none.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
+                .is_err()
+        );
+        let bad_selected = serde_json::json!({"keys":[selected, {
+            "kty":"EC", "crv":"P-256", "kid":"bad", "alg":"ES256", "x":"AA", "y":"AA"
+        }]});
+        assert!(
+            PreparedKeys::from_jwks_json(
+                bad_selected.to_string().as_bytes(),
+                &[JwtAlgorithm::EdDSA, JwtAlgorithm::ES256]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn absent_jwk_algorithm_binds_only_one_compatible_configured_algorithm() {
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let jwks = serde_json::json!({"keys":[{
+            "kty":"RSA", "kid":"rsa-no-alg",
+            "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+        }]});
+        let bytes = jwks.to_string();
+        let only_rs =
+            PreparedKeys::from_jwks_json(bytes.as_bytes(), &[JwtAlgorithm::RS256]).unwrap();
+        assert!(only_rs.get("rsa-no-alg", JwtAlgorithm::RS256).is_some());
+        assert!(only_rs.get("rsa-no-alg", JwtAlgorithm::PS256).is_none());
+        // Both RSA algorithms fit this key. Never infer one from a token.
+        assert!(
+            PreparedKeys::from_jwks_json(
+                bytes.as_bytes(),
+                &[JwtAlgorithm::RS256, JwtAlgorithm::PS256]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unchanged_jwk_refresh_reuses_arc_but_rotation_does_not() {
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        let next = SigningKey::from_bytes(&[43; 32]);
+        let make = |key: &SigningKey| {
+            serde_json::json!({"keys":[{
+                "kty":"OKP", "crv":"Ed25519", "kid":"key", "alg":"EdDSA",
+                "x":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }]})
+            .to_string()
+        };
+        let parse =
+            |s: &str| PreparedKeys::from_jwks_json(s.as_bytes(), &[JwtAlgorithm::EdDSA]).unwrap();
+        let old = parse(&make(&signing));
+        let mut unchanged = parse(&make(&signing));
+        let old_key = old.get("key", JwtAlgorithm::EdDSA).unwrap();
+        assert!(!Arc::ptr_eq(
+            &old_key,
+            &unchanged.get("key", JwtAlgorithm::EdDSA).unwrap()
+        ));
+        unchanged.reuse_unchanged(&old);
+        assert!(Arc::ptr_eq(
+            &old_key,
+            &unchanged.get("key", JwtAlgorithm::EdDSA).unwrap()
+        ));
+        let mut changed = parse(&make(&next));
+        changed.reuse_unchanged(&old);
+        assert!(!Arc::ptr_eq(
+            &old_key,
+            &changed.get("key", JwtAlgorithm::EdDSA).unwrap()
+        ));
+    }
+
+    #[test]
+    fn verified_time_recheck_handles_queue_delay_and_clock_bounds() {
+        let mut verified = Verified {
+            subject: "alice".into(),
+            issuer: "issuer".into(),
+            audiences: vec![],
+            client_id: "client".into(),
+            jti: "jti".into(),
+            scopes: vec![],
+            groups: vec![],
+            issued_at: 100,
+            expires_at: 200,
+            not_before: Some(120),
+        };
+        assert!(!verified.valid_at(119, 0));
+        assert!(verified.valid_at(120, 0));
+        assert!(verified.valid_at(199, 0));
+        assert!(!verified.valid_at(200, 0));
+        assert!(verified.valid_at(204, 5));
+        assert!(!verified.valid_at(205, 5));
+        verified.issued_at = 150;
+        assert!(!verified.valid_at(144, 5));
+        assert!(verified.valid_at(145, 5));
+        // A backward wall clock cannot validate a future-issued token.
+        assert!(!verified.valid_at(100, 0));
+    }
+
+    #[test]
     fn rsa_and_pss_valid_signatures_and_wrong_keys() {
         let mut rng = rand::rngs::OsRng;
         let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
@@ -1155,5 +1391,97 @@ mod tests {
         let key = keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap();
         assert!(verifier.verify(&token, &key, 1100).is_ok());
         assert!(valid_kid("issuer+opaque/id="));
+    }
+
+    /// Run explicitly with `cargo test --release --lib jwt_signature_microbenchmark -- --ignored --nocapture`.
+    /// Key generation and JWKS preparation are outside the timed verification loop.
+    #[test]
+    #[ignore]
+    fn jwt_signature_microbenchmark() {
+        use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint, pkcs8::EncodePrivateKey};
+        use std::time::Instant;
+
+        let mut cases: Vec<(&str, JwtVerifier, Arc<PreparedKey>, String)> = Vec::new();
+        let (ed_signing, ed_keys) = key_material();
+        cases.push((
+            "EdDSA",
+            JwtVerifier::prepare(config()).unwrap(),
+            ed_keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap(),
+            token(&ed_signing, &claims()),
+        ));
+
+        let mut rng = rand::rngs::OsRng;
+        let rsa_private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let rsa_der = rsa_private.to_pkcs1_der().unwrap();
+        let rsa_signing = jsonwebtoken::EncodingKey::from_rsa_der(rsa_der.as_bytes());
+        let rsa_jwks = serde_json::json!({"keys":[
+            {"kty":"RSA", "kid":"rs", "alg":"RS256",
+             "n":URL_SAFE_NO_PAD.encode(rsa_private.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(rsa_private.e().to_bytes_be())},
+            {"kty":"RSA", "kid":"ps", "alg":"PS256",
+             "n":URL_SAFE_NO_PAD.encode(rsa_private.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(rsa_private.e().to_bytes_be())}
+        ]});
+        let rsa_keys = PreparedKeys::from_jwks_json(
+            rsa_jwks.to_string().as_bytes(),
+            &[JwtAlgorithm::RS256, JwtAlgorithm::PS256],
+        )
+        .unwrap();
+        for (name, alg, kid) in [
+            ("RS256", JwtAlgorithm::RS256, "rs"),
+            ("PS256", JwtAlgorithm::PS256, "ps"),
+        ] {
+            let mut cfg = config();
+            cfg.algorithms = vec![alg];
+            let mut header = jsonwebtoken::Header::new(alg.library());
+            header.typ = Some("at+jwt".into());
+            header.kid = Some(kid.into());
+            cases.push((
+                name,
+                JwtVerifier::prepare(cfg).unwrap(),
+                rsa_keys.get(kid, alg).unwrap(),
+                jsonwebtoken::encode(&header, &claims(), &rsa_signing).unwrap(),
+            ));
+        }
+
+        let ec_private = SecretKey::random(&mut rng);
+        let point = ec_private.public_key().to_encoded_point(false);
+        let ec_jwks = serde_json::json!({"keys":[{
+            "kty":"EC", "crv":"P-256", "kid":"ec", "alg":"ES256",
+            "x":URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y":URL_SAFE_NO_PAD.encode(point.y().unwrap())
+        }]});
+        let ec_keys =
+            PreparedKeys::from_jwks_json(ec_jwks.to_string().as_bytes(), &[JwtAlgorithm::ES256])
+                .unwrap();
+        let ec_der = ec_private.to_pkcs8_der().unwrap();
+        let ec_signing = jsonwebtoken::EncodingKey::from_ec_der(ec_der.as_bytes());
+        let mut ec_header = jsonwebtoken::Header::new(Algorithm::ES256);
+        ec_header.typ = Some("at+jwt".into());
+        ec_header.kid = Some("ec".into());
+        let mut ec_cfg = config();
+        ec_cfg.algorithms = vec![JwtAlgorithm::ES256];
+        cases.push((
+            "ES256",
+            JwtVerifier::prepare(ec_cfg).unwrap(),
+            ec_keys.get("ec", JwtAlgorithm::ES256).unwrap(),
+            jsonwebtoken::encode(&ec_header, &claims(), &ec_signing).unwrap(),
+        ));
+
+        const ITERATIONS: usize = 1000;
+        for (name, verifier, key, token) in cases {
+            // Warm the code path before measuring, then use an injected fixed
+            // clock so only signature, strict parsing, and claims are timed.
+            assert!(verifier.verify(&token, &key, 1100).is_ok());
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                assert!(verifier.verify(&token, &key, 1100).is_ok());
+            }
+            let elapsed = start.elapsed();
+            eprintln!(
+                "{name}: {ITERATIONS} verifies in {elapsed:?} ({:.1} verifies/s)",
+                ITERATIONS as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 }
