@@ -188,6 +188,8 @@ pub struct HttpRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_policy: Option<crate::resource_policy::ResourcePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_policy: Option<crate::language_policy::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_auth: Option<crate::jwt_runtime::JwtAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_auth: Option<crate::workload_auth::Policy>,
@@ -744,6 +746,9 @@ impl Config {
                     );
                 }
             }
+            if let Some(policy) = &r.language_policy {
+                policy.compile()?;
+            }
             if let Some(policy) = &r.resource_policy {
                 ensure!(
                     r.access_mode == AccessMode::Protected,
@@ -764,6 +769,7 @@ impl Config {
                 if let Some(prior) = resources.insert(&policy.resource_id, r) {
                     ensure!(
                         prior.resource_policy == r.resource_policy
+                            && prior.language_policy == r.language_policy
                             && prior.basic_auth == r.basic_auth
                             && prior.auth == r.auth
                             && prior.jwt_auth == r.jwt_auth
@@ -1300,6 +1306,7 @@ pub struct HttpRuntime {
     pub request_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
+    pub language_policy: Option<crate::language_policy::CompiledLanguagePolicy>,
     pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
     pub workload_auth: Option<std::sync::Arc<crate::workload_auth::Runtime>>,
     pub auth_reserved: Vec<hyper::header::HeaderName>,
@@ -1660,6 +1667,10 @@ impl Snapshot {
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
                     response_transform: route.response_transform.clone().map(std::sync::Arc::new),
                     basic_auth,
+                    language_policy: route
+                        .language_policy
+                        .as_ref()
+                        .map(|policy| policy.compile().expect("validated language policy")),
                     cache_fingerprint: {
                         use sha2::Digest;
                         format!(

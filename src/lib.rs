@@ -9,6 +9,7 @@ pub mod config_store;
 pub mod discovery;
 pub mod docker;
 pub mod docker_connections;
+pub mod language_policy;
 pub mod metrics;
 pub mod policy;
 pub mod pool_member;

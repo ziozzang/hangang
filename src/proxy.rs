@@ -1174,6 +1174,30 @@ impl Proxy {
             ));
         }
 
+        // Native language preference filtering is an access decision on the
+        // already selected route, never a route predicate or Lua override.
+        if let Some(policy) = &runtime.language_policy
+            && runtime
+                .route
+                .language_policy
+                .as_ref()
+                .is_some_and(|p| p.enforce)
+        {
+            let language = match crate::language_policy::AcceptLanguage::parse_values(
+                request
+                    .headers()
+                    .get_all(header::ACCEPT_LANGUAGE)
+                    .iter()
+                    .map(|value| value.as_bytes()),
+            ) {
+                Ok(language) => language,
+                Err(_) => return Ok(response(400, "invalid Accept-Language preference")),
+            };
+            if !policy.allows(&language) {
+                return Ok(response(403, "language preference denied"));
+            }
+        }
+
         // Cache access follows route admission and IP policy. Sensitive/dynamic
         // policy routes bypass entirely; hits must not depend on origin health.
         let mut cache_fill = None;
@@ -3176,6 +3200,7 @@ mod tests {
         HttpRoute {
             access_mode: Default::default(),
             resource_policy: None,
+            language_policy: None,
             jwt_auth: None,
             workload_auth: None,
             enabled: true,
