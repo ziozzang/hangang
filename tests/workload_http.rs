@@ -691,7 +691,7 @@ async fn http2_stream_retirement_does_not_close_an_unrelated_workload_route() {
 /// 8 requests each, 1 MiB response per request. TLS handshakes are timed;
 /// certificate generation and server startup are not. This is not a claim
 /// about production or competing proxies' throughput.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run explicitly in release mode to measure loopback mTLS throughput"]
 async fn release_workload_http_mtls_throughput_diagnostic() {
     const CLIENTS: usize = 8;
@@ -716,6 +716,7 @@ async fn release_workload_http_mtls_throughput_diagnostic() {
             let payload = payload.clone();
             tokio::spawn(async move {
                 let socket = TcpStream::connect(listen).await.unwrap();
+                socket.set_nodelay(true).unwrap();
                 let tls = connector
                     .connect("localhost".try_into().unwrap(), socket)
                     .await
@@ -755,7 +756,7 @@ async fn release_workload_http_mtls_throughput_diagnostic() {
     let elapsed = started.elapsed();
     let mebibytes = (CLIENTS * REQUESTS_PER_CLIENT * PAYLOAD_BYTES) as f64 / 1_048_576.0;
     eprintln!(
-        "workload HTTP mTLS loopback diagnostic: {mebibytes:.0} MiB verified in {:.3} s = {:.1} MiB/s payload; {CLIENTS} concurrent keep-alive clients, {} requests, TLS handshakes included, setup excluded",
+        "workload HTTP mTLS loopback diagnostic: {mebibytes:.0} MiB verified in {:.3} s = {:.1} MiB/s payload; {CLIENTS} concurrent keep-alive clients, {} requests, 4 Tokio workers, client TCP_NODELAY, TLS handshakes included, setup excluded",
         elapsed.as_secs_f64(),
         mebibytes / elapsed.as_secs_f64(),
         CLIENTS * REQUESTS_PER_CLIENT
