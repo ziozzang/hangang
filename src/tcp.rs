@@ -526,10 +526,12 @@ type ListenerRoute = (
     Option<Arc<crate::tcp_member::TcpMemberActivity>>,
     Arc<[Arc<crate::member_admission::MemberAdmission>]>,
     Option<Arc<crate::workload_material::Slot>>,
+    Option<crate::country_policy::CompiledCountryPolicy>,
 );
 
 struct ListenerRoutes {
     source: Weak<Snapshot>,
+    geoip: Option<Arc<crate::geoip_runtime::Slot>>,
     routes: Vec<ListenerRoute>,
     legacy: Option<usize>,
     priorities: Vec<PriorityRoutes>,
@@ -561,6 +563,12 @@ impl ListenerRoutes {
             }
             found = true;
             let index = routes.len();
+            let country_policy = route
+                .country_policy
+                .as_ref()
+                .map(crate::country_policy::Policy::compile)
+                .transpose()
+                .ok()?;
             routes.push((
                 route.clone(),
                 snapshot.admissions[&route.id].clone(),
@@ -569,6 +577,7 @@ impl ListenerRoutes {
                 snapshot.tcp_member_activity.get(&route.id).cloned(),
                 Arc::from(member_admissions.clone()),
                 snapshot.tcp_inbound_tls.get(&route.id).cloned(),
+                country_policy,
             ));
             if let Some(sni) = &route.sni {
                 hello_settings = Some((sni.max_client_hello_bytes, sni.hello_timeout_ms));
@@ -611,6 +620,7 @@ impl ListenerRoutes {
         found.then(|| {
             Arc::new(Self {
                 source: Arc::downgrade(snapshot),
+                geoip: snapshot.geoip.clone(),
                 routes,
                 legacy,
                 priorities,
@@ -647,7 +657,7 @@ impl ListenerRoutes {
     }
 
     fn all_routes_deny(&self, peer: std::net::IpAddr) -> bool {
-        self.routes.iter().all(|(route, _, _, _, _, _, _)| {
+        self.routes.iter().all(|(route, _, _, _, _, _, _, _)| {
             route
                 .deny_cidrs
                 .iter()
@@ -951,7 +961,8 @@ fn spawn_accept_loop(
                     };
                     (route_index, hello.consumed)
                 };
-                let (route, counter, upstream_tls, health, member_activity, member_admissions, inbound_tls) =
+                let geoip = routes.geoip.clone();
+                let (route, counter, upstream_tls, health, member_activity, member_admissions, inbound_tls, country_policy) =
                     routes.routes[route_index].clone();
                 drop(routes);
                 if route
@@ -961,6 +972,27 @@ fn spawn_accept_loop(
                 {
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
+                }
+                // Country policy is admission on the selected SNI route, not
+                // a listener-wide prefilter or a reason to try another route.
+                // It uses the canonical accepted peer; TCP has no trusted
+                // forwarded-address mechanism. A missing/stale database or a
+                // lookup error is distinct from a successfully unknown IP.
+                if let Some(policy) = &country_policy
+                    && policy.enforced()
+                {
+                    let Some(database) = geoip.as_ref().and_then(|slot| slot.load()) else {
+                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    let Ok(country) = database.lookup(peer.ip()) else {
+                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    if !policy.evaluate(country) {
+                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                 }
                 let _route_permit =
                     match crate::admission::acquire(&counter, route.max_connections) {
