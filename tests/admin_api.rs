@@ -3550,3 +3550,472 @@ async fn jwt_revocation_publication_is_revisioned_validated_and_persistent() {
         route["jwt_auth"]["verification"]["revocation"]
     );
 }
+
+#[tokio::test]
+async fn user_audit_records_actor_target_and_durable_order_without_secrets() {
+    let (address, _manager, directory) = server().await;
+    let root = r#"{"username":"auditoperator","password":"correct horse battery"}"#;
+    let initial = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert_eq!(initial.0, 200);
+    let initial_latest = json(&initial.2)["latest_id"].as_i64().unwrap_or(0);
+    let (status, _, body) = request(address, "POST", "/v1/auth/bootstrap", Some(root), None).await;
+    assert_eq!(status, 201);
+    let actor_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) =
+        request_with_token(address, "POST", "/v1/auth/login", Some(root), None, None).await;
+    assert_eq!(status, 200);
+    let actor_token = json(&body)["token"].as_str().unwrap().to_owned();
+
+    let target = r#"{"username":"audit-target","password":"viewer password 123","role":"viewer"}"#;
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/users",
+        Some(target),
+        None,
+        Some(&actor_token),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let first_target_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request_with_token(
+        address,
+        "PUT",
+        &format!("/v1/users/{first_target_id}"),
+        Some(r#"{"password":"replacement password 123"}"#),
+        None,
+        Some(&actor_token),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["user"]["id"], first_target_id);
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"audit-target","password":"replacement password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/audit/users",
+            None,
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/audit/users", None, None, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "DELETE",
+            &format!("/v1/users/{first_target_id}"),
+            None,
+            None,
+            Some(&actor_token)
+        )
+        .await
+        .0,
+        204
+    );
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/users",
+        Some(r#"{"username":"audit-next","password":"viewer password 123","role":"viewer"}"#),
+        None,
+        Some(&actor_token),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let second_target_id = json(&body)["user"]["id"].as_i64().unwrap();
+    assert!(
+        second_target_id > first_target_id,
+        "deleted user ID was reused"
+    );
+
+    let path = format!("/v1/audit/users?after={initial_latest}&limit=100");
+    let (status, _, body) = request(address, "GET", &path, None, None).await;
+    assert_eq!(status, 200);
+    let raw = String::from_utf8(body.clone()).unwrap();
+    for sensitive in [
+        "correct horse battery",
+        "viewer password 123",
+        "replacement password 123",
+        actor_token.as_str(),
+        viewer_token.as_str(),
+        "audit-target",
+        "audit-next",
+    ] {
+        assert!(
+            !raw.contains(sensitive),
+            "audit response retained a credential or username"
+        );
+    }
+    let page = json(&body);
+    let records = page["records"].as_array().unwrap();
+    assert_eq!(records.len(), 5);
+    assert_eq!(
+        records
+            .iter()
+            .map(|item| item["action"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["bootstrap", "create", "update", "delete", "create"]
+    );
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0]["id"].as_i64().unwrap() < pair[1]["id"].as_i64().unwrap())
+    );
+    assert_eq!(records[0]["target_user_id"], actor_id);
+    for record in &records[1..] {
+        assert_eq!(record["actor_kind"], "account");
+        assert_eq!(record["actor_user_id"], actor_id);
+    }
+    assert_eq!(records[1]["target_user_id"], first_target_id);
+    assert_eq!(records[2]["target_user_id"], first_target_id);
+    assert_eq!(records[3]["target_user_id"], first_target_id);
+    assert_eq!(records[4]["target_user_id"], second_target_id);
+    assert_eq!(records[1]["after"]["role"], "viewer");
+    assert_eq!(records[2]["before"]["role"], "viewer");
+    assert_eq!(records[2]["after"]["role"], "viewer");
+    assert_eq!(records[2]["password_changed"], true);
+    assert_eq!(records[3]["after"], serde_json::Value::Null);
+    assert!(page["writes_available"].as_bool().unwrap());
+    assert!(page["server_time_unix_ms"].is_u64());
+    assert!(page["started_at_unix_ms"].is_u64());
+
+    let (reopened, _) = server_on(
+        directory.path().join("state.json"),
+        Config::default(),
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let (status, _, reopened_body) = request(reopened, "GET", &path, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&reopened_body)["records"], page["records"]);
+    assert_eq!(json(&reopened_body)["latest_id"], page["latest_id"]);
+}
+
+#[tokio::test]
+async fn user_audit_pages_validate_queries_and_prune_with_revision_fence() {
+    let (address, _manager, _directory) = server().await;
+    let bootstrap = r#"{"username":"auditroot","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/auth/bootstrap", Some(bootstrap), None)
+            .await
+            .0,
+        201
+    );
+    for name in ["one", "two", "three"] {
+        let body = format!(
+            r#"{{"username":"audit-{name}","password":"viewer password 123","role":"viewer"}}"#
+        );
+        assert_eq!(
+            request(address, "POST", "/v1/users", Some(&body), None)
+                .await
+                .0,
+            201
+        );
+    }
+    let (status, _, first_body) = request(
+        address,
+        "GET",
+        "/v1/audit/users?after=0&limit=2",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let first = json(&first_body);
+    let first_records = first["records"].as_array().unwrap();
+    assert_eq!(first_records.len(), 2);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["next_after"], first_records[1]["id"]);
+    assert_eq!(first["capacity"], 100000);
+    assert_eq!(first["stored_records"], 5);
+    let latest = first["latest_id"].as_i64().unwrap();
+    let after = first["next_after"].as_i64().unwrap();
+    let (status, _, login_body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"audit-one","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let viewer_token = json(&login_body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/audit/users",
+            None,
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/audit/users", None, None, None)
+            .await
+            .0,
+        401
+    );
+    let (status, _, next_body) = request(
+        address,
+        "GET",
+        &format!("/v1/audit/users?after={after}&limit=2"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let next = json(&next_body);
+    assert_eq!(next["records"].as_array().unwrap().len(), 2);
+    assert!(next["records"][0]["id"].as_i64().unwrap() > after);
+    for invalid in [
+        "after=-1",
+        "after=1&after=2",
+        "limit=0",
+        "limit=101",
+        "limit=1&limit=2",
+        "unknown=1",
+        "after=+1",
+        "after=18446744073709551616",
+    ] {
+        assert_eq!(
+            request(
+                address,
+                "GET",
+                &format!("/v1/audit/users?{invalid}"),
+                None,
+                None
+            )
+            .await
+            .0,
+            400,
+            "query {invalid}"
+        );
+    }
+
+    let through_id = first_records[0]["id"].as_i64().unwrap();
+    let stale = format!(
+        r#"{{"through_id":{through_id},"expected_latest_id":{}}}"#,
+        latest - 1
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/audit/users/prune",
+            Some(&stale),
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/audit/users/prune",
+            Some(&stale),
+            None,
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request(address, "POST", "/v1/audit/users/prune", Some(&stale), None)
+            .await
+            .0,
+        409
+    );
+    let (status, _, unchanged_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&unchanged_body)["latest_id"], latest);
+    assert_eq!(json(&unchanged_body)["pruned_through"], 0);
+
+    let valid = format!(r#"{{"through_id":{through_id},"expected_latest_id":{latest}}}"#);
+    let (status, _, prune_body) =
+        request(address, "POST", "/v1/audit/users/prune", Some(&valid), None).await;
+    assert_eq!(status, 200);
+    let prune = json(&prune_body);
+    assert!(prune["pruned_records"].as_u64().unwrap() >= 1);
+    assert_eq!(prune["record"]["action"], "prune");
+    assert_eq!(prune["record"]["through_id"], through_id);
+    assert_eq!(prune["record"]["actor_kind"], "system");
+    let (status, _, after_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert_eq!(status, 200);
+    let after = json(&after_body);
+    assert!(after["truncated"].as_bool().unwrap());
+    assert_eq!(after["pruned_through"], through_id);
+    assert!(after["oldest_id"].as_i64().unwrap() > through_id);
+    assert!(after["latest_id"].as_i64().unwrap() > latest);
+    assert_eq!(
+        after["records"].as_array().unwrap().last().unwrap()["action"],
+        "prune"
+    );
+}
+
+#[tokio::test]
+async fn audit_append_failure_rolls_back_user_password_and_session_mutations() {
+    let (address, _manager, directory) = server().await;
+    let bootstrap = r#"{"username":"auditroot","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/auth/bootstrap", Some(bootstrap), None)
+            .await
+            .0,
+        201
+    );
+    let target = r#"{"username":"auditvictim","password":"viewer password 123","role":"viewer"}"#;
+    let (status, _, body) = request(address, "POST", "/v1/users", Some(target), None).await;
+    assert_eq!(status, 201);
+    let target_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"auditvictim","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let victim_token = json(&body)["token"].as_str().unwrap().to_owned();
+    let (_, _, before_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    let before = json(&before_body);
+    let database = directory.path().join("state.admin-users.sqlite3");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_audit_append BEFORE INSERT ON admin_audit
+         BEGIN SELECT RAISE(ABORT, 'owned fixture audit failure'); END;",
+        )
+        .unwrap();
+
+    let attempted =
+        r#"{"username":"audit-failed","password":"viewer password 123","role":"viewer"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/users", Some(attempted), None)
+            .await
+            .0,
+        503
+    );
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            &format!("/v1/users/{target_id}"),
+            Some(r#"{"password":"replacement password 123"}"#),
+            None,
+        )
+        .await
+        .0,
+        503
+    );
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &format!("/v1/users/{target_id}"),
+            None,
+            None
+        )
+        .await
+        .0,
+        503
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_audit_append")
+        .unwrap();
+
+    let (status, _, users_body) = request(address, "GET", "/v1/users", None, None).await;
+    assert_eq!(status, 200);
+    let users = json(&users_body);
+    assert!(
+        users["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|user| user["username"] != "audit-failed")
+    );
+    assert!(
+        users["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|user| user["id"] == target_id)
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/status",
+            None,
+            None,
+            Some(&victim_token)
+        )
+        .await
+        .0,
+        200,
+        "password-update rollback must retain the existing session"
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/auth/login",
+            Some(r#"{"username":"auditvictim","password":"replacement password 123"}"#),
+            None,
+            None,
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/auth/login",
+            Some(r#"{"username":"auditvictim","password":"viewer password 123"}"#),
+            None,
+            None,
+        )
+        .await
+        .0,
+        200
+    );
+    let (status, _, after_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert_eq!(status, 200);
+    let after = json(&after_body);
+    assert_eq!(after["latest_id"], before["latest_id"]);
+    assert_eq!(after["records"], before["records"]);
+}
