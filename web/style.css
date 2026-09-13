@@ -215,5 +215,8 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 .config-proof-fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; margin: 12px 0 0; font-size: 11px; }
 .config-proof-fields dt { color: var(--muted); }
 .config-proof-fields dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); }
+.config-receipt-form { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr) auto; gap: 8px 12px; align-items: center; margin-top: 14px; }
+.config-receipt-form label { color: var(--muted); font-size: 11px; }.config-receipt-form input { min-width: 0; width: 100%; font-family: var(--mono); }
 @media(max-width:700px) { .config-proof-panel .section-heading { flex-direction: column; align-items: stretch; }.config-proof-fields { grid-template-columns: 1fr; gap: 3px; }.config-proof-fields dd { margin-bottom: 8px; } }
+@media(max-width:900px) { .config-receipt-form { grid-template-columns: 1fr; align-items: stretch; } }
 @media(max-width:700px) { .audit-panel .section-heading { flex-direction: column; align-items: stretch; }.audit-panel .section-heading .button-row { justify-content: flex-start; }.audit-pagination { flex-wrap: wrap; }.audit-pagination span { width: 100%; } }
