@@ -50,6 +50,7 @@ pub const EPOCH_LEN: usize = 32;
 pub const COMMIT_RECEIPT_CAPACITY: u64 = 100_000;
 pub const COMMIT_AUTHORITY_CAPACITY: u64 = 4_096;
 pub const MAX_ACCEPTANCE_SEQUENCE: u64 = 9_007_199_254_740_991;
+pub const SEQUENCED_RECEIPT_PAGE_LIMIT: usize = 100;
 /// ACME HTTP-01 token limits shared by every store.
 pub const MAX_CHALLENGE_TOKEN_LEN: usize = 128;
 pub const MAX_KEY_AUTHORIZATION_LEN: usize = 512;
@@ -601,6 +602,100 @@ fn sequenced_observation(
         writes_available: count < COMMIT_RECEIPT_CAPACITY
             && (high_water > 0 || authorities < COMMIT_AUTHORITY_CAPACITY),
     })
+}
+
+fn validate_sequenced_export_request(
+    authority_id: &str,
+    after_seq: u64,
+    snapshot: Option<SequencedReceiptSnapshot>,
+    limit: usize,
+) -> StoreResult<()> {
+    if !valid_hex(authority_id, 32)
+        || !(1..=SEQUENCED_RECEIPT_PAGE_LIMIT).contains(&limit)
+        || after_seq > MAX_ACCEPTANCE_SEQUENCE
+        || (after_seq != 0 && snapshot.is_none())
+        || snapshot.is_some_and(|snapshot| {
+            snapshot.high_water > MAX_ACCEPTANCE_SEQUENCE
+                || snapshot.retention_generation > i64::MAX as u64
+                || after_seq > snapshot.high_water
+        })
+    {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid sequenced receipt export cursor"
+        )));
+    }
+    Ok(())
+}
+
+fn sequenced_export_snapshot(
+    high_water: Option<i64>,
+    retention_generation: Option<i64>,
+    requested: Option<SequencedReceiptSnapshot>,
+) -> StoreResult<Option<SequencedReceiptSnapshot>> {
+    let (high_water, retention_generation) = match (high_water, retention_generation) {
+        (None, None) => (0, 0),
+        (Some(high_water), Some(retention_generation)) => (high_water, retention_generation),
+        _ => {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid receipt export authority"
+            )));
+        }
+    };
+    let high_water = u64::try_from(high_water)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export high water")))?;
+    let retention_generation = u64::try_from(retention_generation)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export generation")))?;
+    if high_water > MAX_ACCEPTANCE_SEQUENCE {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid receipt export high water"
+        )));
+    }
+    if let Some(requested) = requested {
+        if requested.high_water > high_water
+            || requested.retention_generation != retention_generation
+        {
+            return Ok(None);
+        }
+        Ok(Some(requested))
+    } else {
+        Ok(Some(SequencedReceiptSnapshot {
+            high_water,
+            retention_generation,
+        }))
+    }
+}
+
+fn sequenced_export_page(
+    authority_id: &str,
+    after_seq: u64,
+    snapshot: SequencedReceiptSnapshot,
+    limit: usize,
+    mut receipts: Vec<SequencedCommitReceipt>,
+) -> StoreResult<SequencedReceiptPageResult> {
+    let mut previous = after_seq;
+    for receipt in &receipts {
+        let seq = receipt.stamp.acceptance_seq;
+        if receipt.stamp.authority_id != authority_id
+            || seq <= previous
+            || seq > snapshot.high_water
+        {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid receipt export sequence"
+            )));
+        }
+        previous = seq;
+    }
+    let has_more = receipts.len() > limit;
+    receipts.truncate(limit);
+    let next_after = receipts
+        .last()
+        .map_or(after_seq, |receipt| receipt.stamp.acceptance_seq);
+    Ok(SequencedReceiptPageResult::Page(SequencedReceiptPage {
+        receipts,
+        snapshot,
+        next_after,
+        has_more,
+    }))
 }
 
 fn decode_operation_metadata(
@@ -1304,6 +1399,80 @@ impl ConfigStore for SqliteConfigStore {
         .await
     }
 
+    async fn list_commit_receipts_v2(
+        &self,
+        authority_id: &str,
+        after_seq: u64,
+        snapshot: Option<SequencedReceiptSnapshot>,
+        limit: usize,
+    ) -> StoreResult<SequencedReceiptPageResult> {
+        validate_sequenced_export_request(authority_id, after_seq, snapshot, limit)?;
+        let authority_id = authority_id.to_owned();
+        self.with_connection(Access::Read, move |connection| {
+            let tx = connection.transaction().map_err(sqlite_error)?;
+            let authority: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT high_water,retention_generation FROM hangang_sequenced_authorities WHERE authority_id=?1",
+                    [&authority_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let (high_water, generation) = authority.map_or((None, None), |(h, g)| {
+                (Some(h), Some(g))
+            });
+            let Some(snapshot) = sequenced_export_snapshot(high_water, generation, snapshot)? else {
+                return Ok(SequencedReceiptPageResult::SnapshotChanged);
+            };
+            let after = i64::try_from(after_seq)
+                .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export cursor")))?;
+            let fence = i64::try_from(snapshot.high_water)
+                .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export fence")))?;
+            let row_limit = i64::try_from(limit + 1)
+                .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export limit")))?;
+            let mut statement = tx
+                .prepare(
+                    "SELECT CASE WHEN octet_length(authority_id)<=32 THEN authority_id END,
+                        acceptance_seq,
+                        CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
+                        CASE WHEN octet_length(epoch)<=32 THEN epoch END,
+                        revision,
+                        CASE WHEN octet_length(candidate_sha256)<=64 THEN candidate_sha256 END
+                     FROM hangang_sequenced_receipts
+                     WHERE authority_id=?1 AND acceptance_seq>?2 AND acceptance_seq<=?3
+                     ORDER BY acceptance_seq LIMIT ?4",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![authority_id, after, fence, row_limit],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(sqlite_error)?;
+            let mut receipts = Vec::with_capacity(limit + 1);
+            for row in rows {
+                let (Some(a), s, Some(o), Some(e), r, Some(h)) = row.map_err(sqlite_error)? else {
+                    return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt")));
+                };
+                receipts.push(sequenced_receipt(a, s, o, e, r, h)?);
+            }
+            let result = sequenced_export_page(&authority_id, after_seq, snapshot, limit, receipts)?;
+            drop(statement);
+            tx.commit().map_err(sqlite_error)?;
+            Ok(result)
+        })
+        .await
+    }
+
     async fn compare_and_swap_operation_v2(
         &self,
         epoch: &str,
@@ -1571,7 +1740,8 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             ) STRICT;
             CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
                 authority_id TEXT PRIMARY KEY,
-                high_water INTEGER NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991)
+                high_water INTEGER NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991),
+                retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)
             ) STRICT;",
         )
         .map_err(sqlite_error)?;
@@ -1621,6 +1791,14 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             return Err(sqlite_error(error));
         }
     }
+    if !sqlite_sequenced_authorities_has_column(connection, "retention_generation")?
+        && let Err(error) = connection.execute_batch(
+            "ALTER TABLE hangang_sequenced_authorities ADD COLUMN retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)",
+        )
+        && !sqlite_sequenced_authorities_has_column(connection, "retention_generation")?
+    {
+        return Err(sqlite_error(error));
+    }
     connection.execute(
         "INSERT OR IGNORE INTO hangang_commit_receipt_meta(singleton, stored_records) VALUES(1, 0)",
         [],
@@ -1645,6 +1823,24 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
 fn sqlite_has_column(connection: &rusqlite::Connection, wanted: &str) -> StoreResult<bool> {
     let mut statement = connection
         .prepare("PRAGMA table_info(hangang_config)")
+        .map_err(sqlite_error)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?;
+    for name in names {
+        if name.map_err(sqlite_error)? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_sequenced_authorities_has_column(
+    connection: &rusqlite::Connection,
+    wanted: &str,
+) -> StoreResult<bool> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(hangang_sequenced_authorities)")
         .map_err(sqlite_error)?;
     let names = statement
         .query_map([], |row| row.get::<_, String>(1))
@@ -2122,6 +2318,76 @@ impl PostgresConfigStore {
         };
         sequenced_observation(receipt, high_water, count, authorities)
     }
+
+    async fn sequenced_export(
+        &self,
+        authority_id: &str,
+        after_seq: u64,
+        snapshot: Option<SequencedReceiptSnapshot>,
+        limit: usize,
+    ) -> StoreResult<SequencedReceiptPageResult> {
+        let after = i64::try_from(after_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export cursor")))?;
+        let fence = snapshot
+            .map(|snapshot| i64::try_from(snapshot.high_water))
+            .transpose()
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export fence")))?;
+        let row_limit = i64::try_from(limit + 1)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export limit")))?;
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&authority_id, &after, &fence, &row_limit];
+        let rows = self
+            .run(Access::Read, |client| async move {
+                client
+                    .query(
+                        "SELECT a.high_water,a.retention_generation,
+                            CASE WHEN octet_length(r.authority_id)<=32 THEN r.authority_id END,
+                            r.acceptance_seq,
+                            CASE WHEN octet_length(r.operation_id)<=32 THEN r.operation_id END,
+                            CASE WHEN octet_length(r.epoch)<=32 THEN r.epoch END,
+                            r.revision,
+                            CASE WHEN octet_length(r.candidate_sha256)<=64 THEN r.candidate_sha256 END
+                         FROM (SELECT 1) singleton
+                         LEFT JOIN hangang_sequenced_authorities a ON a.authority_id=$1
+                         LEFT JOIN LATERAL (
+                            SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+                            FROM hangang_sequenced_receipts
+                            WHERE authority_id=$1 AND acceptance_seq>$2
+                              AND acceptance_seq<=COALESCE($3::BIGINT,a.high_water,0)
+                            ORDER BY acceptance_seq LIMIT $4
+                         ) r ON TRUE",
+                        parameters,
+                    )
+                    .await
+            })
+            .await?
+            .value;
+        let first = rows
+            .first()
+            .ok_or_else(|| StoreError::Invalid(anyhow!("missing receipt export boundary")))?;
+        let high_water: Option<i64> = postgres_column(first, 0)?;
+        let generation: Option<i64> = postgres_column(first, 1)?;
+        let Some(snapshot) = sequenced_export_snapshot(high_water, generation, snapshot)? else {
+            return Ok(SequencedReceiptPageResult::SnapshotChanged);
+        };
+        let mut receipts = Vec::with_capacity(limit + 1);
+        for row in rows {
+            let authority: Option<String> = postgres_column(&row, 2)?;
+            let seq: Option<i64> = postgres_column(&row, 3)?;
+            let operation: Option<String> = postgres_column(&row, 4)?;
+            let epoch: Option<String> = postgres_column(&row, 5)?;
+            let revision: Option<i64> = postgres_column(&row, 6)?;
+            let digest: Option<String> = postgres_column(&row, 7)?;
+            match (authority, seq, operation, epoch, revision, digest) {
+                (None, None, None, None, None, None) if receipts.is_empty() => {}
+                (Some(a), Some(s), Some(o), Some(e), Some(r), Some(h)) => {
+                    receipts.push(sequenced_receipt(a, s, o, e, r, h)?);
+                }
+                _ => return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt"))),
+            }
+        }
+        sequenced_export_page(authority_id, after_seq, snapshot, limit, receipts)
+    }
     /// Connect without transport encryption. This intentionally rejects
     /// non-loopback TCP hosts and `sslmode=require`; production remote
     /// PostgreSQL integration must use a separately verified TLS constructor.
@@ -2276,8 +2542,10 @@ impl PostgresConfigStore {
             );
             CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
                 authority_id TEXT PRIMARY KEY,
-                high_water BIGINT NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991)
+                high_water BIGINT NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991),
+                retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)
             );
+            ALTER TABLE hangang_sequenced_authorities ADD COLUMN IF NOT EXISTS retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0);
             INSERT INTO hangang_commit_receipt_meta(singleton,stored_records)
             VALUES(1,0) ON CONFLICT(singleton) DO NOTHING;
             CREATE OR REPLACE FUNCTION hangang_stamped_generation_guard() RETURNS trigger
@@ -2643,6 +2911,18 @@ impl ConfigStore for PostgresConfigStore {
     ) -> StoreResult<SequencedReceiptObservation> {
         canonical_operation_id(authority_id, acceptance_seq)?;
         self.sequenced_observation(authority_id, acceptance_seq)
+            .await
+    }
+
+    async fn list_commit_receipts_v2(
+        &self,
+        authority_id: &str,
+        after_seq: u64,
+        snapshot: Option<SequencedReceiptSnapshot>,
+        limit: usize,
+    ) -> StoreResult<SequencedReceiptPageResult> {
+        validate_sequenced_export_request(authority_id, after_seq, snapshot, limit)?;
+        self.sequenced_export(authority_id, after_seq, snapshot, limit)
             .await
     }
 
