@@ -9,7 +9,7 @@ const operation = (id, state = 'candidate_activated') => ({
   store_kind: 'local_file', authority_epoch: null, state,
 });
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, holdExportPage = false, changedHistory = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false } = {}) {
   const calls = [];
   let pruned = false;
   let release;
@@ -33,6 +33,7 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       if (unavailable) return route.fulfill({ status: 503, json: { title: 'Unavailable', detail: 'history unavailable' } });
       if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
       const after = Number(url.searchParams.get('after'));
+      if (holdExportPage && after === 100) await blocked;
       const authorityId = changedAuthority && after ? 'c'.repeat(32) : 'b'.repeat(32);
       const rows = pruned ? [operation(1, 'accepted'), operation(101, 'indeterminate')].filter((record) => record.id > after)
         : longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
@@ -43,7 +44,7 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       const data = { scope: 'instance', coverage: ['acceptance', 'local_outcome'], authority_id: authorityId,
         started_at_unix_ms: 1788999999000, oldest_id: historyGap ? 2 : 1, latest_id: longHistory ? 10000 : 101, records: rows,
         next_after: rows.at(-1)?.id ?? after, has_more: pruned ? false : longHistory ? after < 9900 : after === 0,
-        history_revision: pruned ? 203 : 202, pruned_through: pruned ? 100 : historyGap ? 1 : 0,
+        history_revision: pruned || changedHistory && after ? 203 : 202, pruned_through: pruned ? 100 : historyGap ? 1 : 0,
         truncated: pruned || historyGap,
         capacity: 10000, stored_records: pruned ? 2 : historyGap ? 100 : longHistory ? 10000 : 101,
         writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
@@ -92,6 +93,65 @@ test('configuration history separates accepted, local activation and unknown out
   expect(calls.filter((call) => call.path === '/v1/config/operations').map((call) => call.search)).toEqual([
     '?after=0&limit=100', '?after=100&limit=100', '?after=0&limit=100',
   ]);
+});
+
+test('export all collects the complete stable retained revision before starting one download', async ({ page }) => {
+  const { calls } = await fixture(page);
+  await page.locator('[data-view="config-operations"]').click();
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#config-operations-export-all').click();
+  const download = await downloadPromise;
+  const contents = await (await import('node:fs/promises')).readFile(await download.path(), 'utf8');
+  const exported = JSON.parse(contents);
+  expect(exported.export_scope).toBe('all_retained_at_history_revision');
+  expect(exported.history_revision).toBe(202);
+  expect(exported.page_count).toBe(2);
+  expect(exported.records).toHaveLength(101);
+  expect(exported.records.at(-1).id).toBe(101);
+  await expect(page.locator('#config-operations-rows tr')).toHaveCount(100);
+  expect(calls.filter((call) => call.path === '/v1/config/operations').map((call) => call.search)).toEqual([
+    '?after=0&limit=100', '?after=0&limit=100', '?after=100&limit=100',
+  ]);
+});
+
+test('mutation between export pages aborts without downloading a partial archive', async ({ page }) => {
+  const downloads = []; page.on('download', (download) => downloads.push(download));
+  await fixture(page, { changedHistory: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-export-all').click();
+  await expect(page.locator('#config-operations-message')).toContainText('No file was downloaded');
+  expect(downloads).toHaveLength(0);
+  await expect(page.locator('#config-operations-rows tr')).toHaveCount(100);
+});
+
+test('logout while an export page is held starts no download and scrubs the page', async ({ page }) => {
+  const downloads = []; page.on('download', (download) => downloads.push(download));
+  const { calls, release } = await fixture(page, { holdExportPage: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-export-all').click();
+  await expect.poll(() => calls.filter((call) => call.path === '/v1/config/operations').some((call) => call.search === '?after=100&limit=100')).toBe(true);
+  await expect(page.locator('#config-operations-export-all')).toBeDisabled();
+  await expect(page.locator('#config-operations-prune')).toBeDisabled();
+  await expect(page.locator('#config-operations-export-all')).toContainText('100/101');
+  await page.locator('#logout-button').click();
+  release();
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
+  await expect(page.locator('#config-operations-export-all')).toBeDisabled();
+  expect(downloads).toHaveLength(0);
+});
+
+test('export all is bounded to exactly 10,000 retained records and 100 pages', async ({ page }) => {
+  test.setTimeout(60000);
+  const { calls } = await fixture(page, { longHistory: true });
+  await page.locator('[data-view="config-operations"]').click();
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#config-operations-export-all').click();
+  const download = await downloadPromise;
+  const contents = await (await import('node:fs/promises')).readFile(await download.path(), 'utf8');
+  const exported = JSON.parse(contents);
+  expect(exported.records).toHaveLength(10000);
+  expect(exported.page_count).toBe(100);
+  expect(calls.filter((call) => call.path === '/v1/config/operations')).toHaveLength(101);
 });
 
 test('unavailable or invalid history is never rendered as an empty successful result', async ({ page }) => {

@@ -814,6 +814,8 @@ export default {
   'Durable configuration write intentions and observed outcomes on this instance only.': '이 인스턴스의 영구 구성 쓰기 의도와 관측된 결과만 표시합니다.',
   'Accepted means durably authorized, not applied. Candidate activated means this instance observed activation; it does not prove fleet activation or a unique remote writer. Unresolved outcomes require operator reconciliation.': '접수는 영구적으로 승인되었다는 뜻이며 적용을 뜻하지 않습니다. 후보 활성화는 이 인스턴스에서 관측한 결과로, 전체 인스턴스의 활성화나 유일한 원격 작성자를 증명하지 않습니다. 미확정 결과는 운영자가 대조해야 합니다.',
   'Stored configuration operations': '저장된 구성 작업',
+  'Export all retained JSON': '보존된 전체 기록 JSON 내보내기',
+  'Exporting history… {done}/{total}': '이력 내보내는 중… {done}/{total}',
   'Prune terminal operations through this page': '이 페이지까지 완료된 작업 정리',
   'Accepted': '접수 시각', 'Expected revision': '예상 개정', 'State': '상태', 'Finished': '종료 시각', 'Details': '세부 정보',
   'Identifiers': '식별자',
@@ -836,4 +838,9 @@ export default {
   'Configuration operation prune response is invalid.': '구성 작업 정리 응답이 올바르지 않습니다.',
   '{pruned} terminal records pruned; {retained} unresolved retained.': '완료 기록 {pruned}개 정리, 미확정 기록 {retained}개 보존.',
   'Operation history changed; refresh before deciding whether to prune. No automatic retry was made.': '작업 이력이 바뀌었습니다. 새로고침 후 정리 여부를 다시 결정하세요. 자동 재시도하지 않았습니다.',
+  'Configuration operation history changed during export. No file was downloaded. Refresh and decide again.': '내보내는 중 구성 작업 이력이 바뀌어 파일을 다운로드하지 않았습니다. 새로고침 후 다시 결정하세요.',
+  'Configuration operation export exceeded its 10,000-record bound. No file was downloaded.': '구성 작업 내보내기가 10,000건 한도를 넘어서 파일을 다운로드하지 않았습니다.',
+  'Configuration operation export was incomplete. No file was downloaded.': '구성 작업 이력을 모두 받지 못해 파일을 다운로드하지 않았습니다.',
+  'Retained-history download started at revision {revision}. Verify the file was saved before pruning.': '이력 개정 {revision}의 보존 기록 다운로드를 시작했습니다. 정리 전에 파일 저장 여부를 확인하세요.',
+  'The exported revision differs from this displayed page. Refresh before deciding whether to prune.': '내보낸 이력 개정과 표시 중인 페이지가 다릅니다. 정리 여부를 결정하기 전에 새로고침하세요.',
 };

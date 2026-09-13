@@ -69,7 +69,7 @@ const state = {
   lastStatus: null,
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
-  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
+  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -3684,11 +3684,15 @@ function resetConfigOperations() {
   state.configOperations.pageNumber = 1;
   state.configOperations.error = null;
   state.configOperations.notice = null;
+  state.configOperations.exporting = false;
+  state.configOperations.exportFetched = 0;
+  state.configOperations.exportMismatch = false;
   $('#config-operations-rows').replaceChildren();
   $('#config-operations-meta').textContent = '';
   $('#config-operations-page-state').textContent = '';
   message($('#config-operations-message'));
-  for (const id of ['config-operations-export', 'config-operations-prune', 'config-operations-previous', 'config-operations-next']) $(`#${id}`).disabled = true;
+  for (const id of ['config-operations-export', 'config-operations-export-all', 'config-operations-prune', 'config-operations-previous', 'config-operations-next']) $(`#${id}`).disabled = true;
+  $('#config-operations-export-all').textContent = t('Export all retained JSON');
 }
 
 function validConfigOperationsPage(data, after) {
@@ -3752,6 +3756,7 @@ function renderConfigOperations() {
     });
     const notices = [];
     if (history.notice) notices.push(history.notice);
+    if (history.exportMismatch) notices.push(t('The exported revision differs from this displayed page. Refresh before deciding whether to prune.'));
     if (page.truncated || page.pruned_through > 0) notices.push(t('Earlier terminal configuration operations were pruned; unresolved records were retained. This is not complete history.'));
     if (!page.writes_available) notices.push(t('New governed configuration writes are blocked while operation history is full or unavailable.'));
     if (page.records.some((record) => record.state === 'accepted' || record.state === 'indeterminate'))
@@ -3778,7 +3783,12 @@ function renderConfigOperations() {
     $('#config-operations-page-state').textContent = t('Page {page} · cursor #{cursor}', { page: history.pageNumber, cursor: page.next_after });
   }
   $('#config-operations-export').disabled = !page?.records?.length;
-  $('#config-operations-prune').disabled = !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state));
+  $('#config-operations-export-all').disabled = !page || history.exporting;
+  $('#config-operations-export-all').textContent = history.exporting
+    ? t('Exporting history… {done}/{total}', { done: formatNumber(history.exportFetched), total: formatNumber(page?.stored_records ?? 0) })
+    : t('Export all retained JSON');
+  $('#config-operations-prune').disabled = history.exporting || history.exportMismatch ||
+    !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state));
   $('#config-operations-previous').disabled = !page || !history.previous.length;
   $('#config-operations-next').disabled = !page?.has_more || !page.records.length;
 }
@@ -3790,6 +3800,9 @@ async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
   state.configOperations.page = null;
   state.configOperations.error = null;
   state.configOperations.notice = null;
+  state.configOperations.exporting = false;
+  state.configOperations.exportFetched = 0;
+  state.configOperations.exportMismatch = false;
   renderConfigOperations();
   try {
     const { data } = await api(`/v1/config/operations?after=${after}&limit=100`);
@@ -3822,6 +3835,78 @@ function exportConfigOperationsPage() {
     link.href = url; link.download = `hangang-config-operations-page-${state.configOperations.after}.json`;
     document.body.append(link); link.click(); link.remove();
   } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
+
+async function exportAllConfigOperations() {
+  const history = state.configOperations;
+  const displayedPage = history.page;
+  if (!isAdmin() || !state.token || !displayedPage || history.exporting) return;
+  const sequence = history.sequence;
+  const generation = state.authGeneration;
+  const token = state.token;
+  const stillCurrent = () => sequence === history.sequence && generation === state.authGeneration &&
+    token === state.token && state.view === 'config-operations' && isAdmin();
+  const sameHistory = (first, next) => first.authority_id === next.authority_id &&
+    first.started_at_unix_ms === next.started_at_unix_ms &&
+    first.history_revision === next.history_revision && first.latest_id === next.latest_id &&
+    first.stored_records === next.stored_records && first.pruned_through === next.pruned_through &&
+    first.oldest_id === next.oldest_id && first.coverage.join('|') === next.coverage.join('|');
+  history.exporting = true;
+  history.exportFetched = 0;
+  history.notice = null;
+  renderConfigOperations();
+  let firstPage = null;
+  const records = [];
+  let after = 0;
+  let pageCount = 0;
+  let complete = false;
+  try {
+    while (pageCount < 100) {
+      if (!stillCurrent()) throw new StaleSessionError();
+      const { data } = await api(`/v1/config/operations?after=${after}&limit=100`);
+      if (!stillCurrent()) throw new StaleSessionError();
+      if (!validConfigOperationsPage(data, after) || (firstPage && !sameHistory(firstPage, data)))
+        throw new Error(t('Configuration operation history changed during export. No file was downloaded. Refresh and decide again.'));
+      firstPage ??= data;
+      pageCount += 1;
+      records.push(...data.records);
+      if (records.length > 10000) throw new Error(t('Configuration operation export exceeded its 10,000-record bound. No file was downloaded.'));
+      history.exportFetched = records.length;
+      renderConfigOperations();
+      after = data.next_after;
+      if (!data.has_more) { complete = true; break; }
+    }
+    if (!firstPage || !complete || records.length !== firstPage.stored_records)
+      throw new Error(t('Configuration operation export was incomplete. No file was downloaded.'));
+    if (!stillCurrent()) throw new StaleSessionError();
+    const archive = {
+      scope: 'instance', export_scope: 'all_retained_at_history_revision',
+      authority_id: firstPage.authority_id, coverage: firstPage.coverage,
+      started_at_unix_ms: firstPage.started_at_unix_ms, history_revision: firstPage.history_revision,
+      oldest_id: firstPage.oldest_id, latest_id: firstPage.latest_id, pruned_through: firstPage.pruned_through,
+      retained_record_count: records.length, page_count: pageCount,
+      server_time_unix_ms: firstPage.server_time_unix_ms, records,
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' }));
+    try {
+      if (!stillCurrent()) throw new StaleSessionError();
+      const link = document.createElement('a');
+      link.href = url; link.download = `hangang-config-operations-retained-${firstPage.authority_id}-${firstPage.history_revision}.json`;
+      document.body.append(link); link.click(); link.remove();
+    } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    history.exportMismatch = firstPage.history_revision !== displayedPage.history_revision ||
+      firstPage.authority_id !== displayedPage.authority_id;
+    history.notice = t('Retained-history download started at revision {revision}. Verify the file was saved before pruning.', { revision: firstPage.history_revision });
+  } catch (error) {
+    if (!stillCurrent() || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    history.notice = error.message;
+  } finally {
+    if (sequence === history.sequence) {
+      history.exporting = false;
+      renderConfigOperations();
+    }
+  }
 }
 
 async function pruneConfigOperationsPage() {
@@ -3950,6 +4035,7 @@ $('#config-operations-next').addEventListener('click', () => {
   loadConfigOperations(page.next_after, previous, state.configOperations.pageNumber + 1);
 });
 $('#config-operations-export').addEventListener('click', exportConfigOperationsPage);
+$('#config-operations-export-all').addEventListener('click', exportAllConfigOperations);
 $('#config-operations-prune').addEventListener('click', pruneConfigOperationsPage);
 $('#toggle-token').addEventListener('click', () => { const input = $('#token-input'); input.type = input.type === 'password' ? 'text' : 'password'; refreshTokenToggle(); });
 $('#logout-button').addEventListener('click', () => logout());
