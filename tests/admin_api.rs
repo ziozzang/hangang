@@ -1909,6 +1909,184 @@ async fn failed_intent_completion_reports_unknown_outcome_without_erasing_accept
 }
 
 #[tokio::test]
+async fn config_operation_history_is_admin_only_strict_paginated_and_redacted() {
+    let (address, _manager, _directory) = server().await;
+    let credentials = r#"{"username":"historyoperator","password":"history secure password 123"}"#;
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/auth/bootstrap",
+            Some(credentials),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(credentials),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let admin_token = json(&body)["token"].as_str().unwrap().to_owned();
+    let account_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request(
+        address,
+        "POST",
+        "/v1/users",
+        Some(r#"{"username":"historyviewer","password":"viewer secure password 123","role":"viewer"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"historyviewer","password":"viewer secure password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
+
+    let path = "/v1/config/operations?after=0&limit=1";
+    let (status, headers, body) = request_with_token(address, "GET", path, None, None, None).await;
+    assert_eq!(status, 401);
+    assert_eq!(headers["content-type"], "application/problem+json");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["status"], 401);
+    let (status, headers, body) =
+        request_with_token(address, "GET", path, None, None, Some(&viewer_token)).await;
+    assert_eq!(status, 403);
+    assert_eq!(headers["content-type"], "application/problem+json");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["status"], 403);
+
+    let first_route =
+        r#"{"id":"history-first","path_prefix":"/first","backends":["http://127.0.0.1:9"]}"#;
+    let second_route =
+        r#"{"id":"history-second","path_prefix":"/second","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/routes/http",
+            Some(first_route),
+            Some(0),
+            Some(&admin_token),
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/routes/http",
+            Some(second_route),
+            Some(1),
+        )
+        .await
+        .0,
+        201
+    );
+
+    let (status, headers, body) =
+        request_with_token(address, "GET", path, None, None, Some(&admin_token)).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["content-type"], "application/json");
+    let page = json(&body);
+    assert_eq!(page["scope"], "instance");
+    assert_eq!(
+        page["coverage"],
+        serde_json::json!(["acceptance", "local_outcome"])
+    );
+    assert_eq!(page["records"].as_array().unwrap().len(), 1);
+    assert_eq!(page["records"][0]["id"], 1);
+    assert_eq!(page["records"][0]["actor_kind"], "account");
+    assert_eq!(page["records"][0]["actor_user_id"], account_id);
+    assert_eq!(page["records"][0]["expected_revision"], 0);
+    assert_eq!(page["records"][0]["state"], "candidate_activated");
+    assert_eq!(page["oldest_id"], 1);
+    assert_eq!(page["latest_id"], 2);
+    assert_eq!(page["stored_records"], 2);
+    assert_eq!(page["capacity"], 10_000);
+    assert_eq!(page["next_after"], 1);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["writes_available"], true);
+    let authority_id = page["authority_id"].clone();
+    assert!(authority_id.as_str().is_some_and(|id| id.len() == 32));
+    let serialized = String::from_utf8(body).unwrap();
+    for sensitive in [
+        "historyoperator",
+        "historyviewer",
+        "history secure password 123",
+        "viewer secure password 123",
+        admin_token.as_str(),
+        viewer_token.as_str(),
+    ] {
+        assert!(
+            !serialized.contains(sensitive),
+            "operation history exposed private data"
+        );
+    }
+
+    let (status, _, body) = request_with_token(
+        address,
+        "GET",
+        "/v1/config/operations?after=1&limit=1",
+        None,
+        None,
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let second = json(&body);
+    assert_eq!(second["authority_id"], authority_id);
+    assert_eq!(second["records"].as_array().unwrap().len(), 1);
+    assert_eq!(second["records"][0]["id"], 2);
+    assert_eq!(second["records"][0]["actor_kind"], "system");
+    assert!(second["records"][0]["actor_user_id"].is_null());
+    assert_eq!(second["records"][0]["expected_revision"], 1);
+    assert_eq!(second["next_after"], 2);
+    assert_eq!(second["has_more"], false);
+
+    for query in [
+        "after=-1",
+        "after=9007199254740992",
+        "after=0&after=1",
+        "limit=0",
+        "limit=101",
+        "limit=1&limit=2",
+        "unknown=1",
+    ] {
+        let (status, headers, body) = request_with_token(
+            address,
+            "GET",
+            &format!("/v1/config/operations?{query}"),
+            None,
+            None,
+            Some(&admin_token),
+        )
+        .await;
+        assert_eq!(status, 400, "query {query}");
+        assert_eq!(headers["content-type"], "application/problem+json");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(json(&body)["status"], 400);
+    }
+}
+
+#[tokio::test]
 async fn protected_route_api_rejects_missing_or_removed_auth_without_advancing_revision() {
     let (address, manager, _dir) = server().await;
     let unauthenticated = r#"{"id":"guarded","access_mode":"protected","lua":"hangang.reject(403)","backends":["http://127.0.0.1:9"]}"#;
