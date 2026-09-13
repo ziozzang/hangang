@@ -90,7 +90,7 @@ function renderRows(rows) {
     load.append(node('span', 'operations-primary', row.protocol === 'tcp'
       ? t('{count} active route connections', { count: formatNumberLocale(row.route_active_connections ?? 0) })
       : row.active_requests === null ? t('Not tracked')
-        : t('{count} active request leases', { count: formatNumberLocale(row.active_requests) })));
+        : t('{count} active requests', { count: formatNumberLocale(row.active_requests) })));
     if (row.protocol === 'tcp') load.append(node('span', 'operations-secondary', t('Route-wide, not per target')));
     tr.append(route, target, selection, health, load);
     return tr;

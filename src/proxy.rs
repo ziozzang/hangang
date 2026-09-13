@@ -1258,7 +1258,13 @@ impl Proxy {
                 "selected backend is unavailable",
             ));
         }
-        let mut backend_lease = runtime.balancer.acquire(index);
+        let Some(lease) = runtime.balancer.acquire(index) else {
+            return Ok(self.failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "selected backend admission refused",
+            ));
+        };
+        let mut backend_lease = Some(lease);
         if backend.starts_with("docker://") {
             let Some(resolved) = self.discovery.as_ref().and_then(|discovery| {
                 discovery.resolve(&backend, crate::discovery::Protocol::Http)
@@ -1440,9 +1446,11 @@ impl Proxy {
                         && let Some(next) = runtime.balancer.select()
                     {
                         let candidate = runtime.route.backends[next].clone();
-                        if !candidate.starts_with("docker://") {
+                        if !candidate.starts_with("docker://")
+                            && let Some(lease) = runtime.balancer.acquire(next)
+                        {
                             backend = candidate;
-                            backend_lease = runtime.balancer.acquire(next);
+                            backend_lease = Some(lease);
                             continue;
                         }
                     }

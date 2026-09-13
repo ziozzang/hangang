@@ -162,7 +162,7 @@ fn validate_statuses(healthy: &[u16], unhealthy: &[u16]) -> anyhow::Result<()> {
 }
 #[derive(Default)]
 struct Node {
-    active: AtomicUsize,
+    active: crate::member_admission::MemberAdmission,
     failures: AtomicUsize,
     unavailable_until: AtomicU64,
     active_unhealthy: std::sync::atomic::AtomicBool,
@@ -193,7 +193,7 @@ pub struct BackendState {
     /// Whether a checking initial state has yet to pass its healthy probe
     /// threshold. None for backends without active health monitoring.
     pub initial_check_pending: Option<bool>,
-    /// None means this balancing mode does not acquire per-backend leases.
+    /// HTTP modes all acquire leases. Kept optional for API compatibility.
     pub active_requests: Option<usize>,
 }
 #[derive(Clone)]
@@ -205,7 +205,7 @@ struct LeaseInner {
 }
 impl Drop for LeaseInner {
     fn drop(&mut self) {
-        self.node.active.fetch_sub(1, Ordering::Relaxed);
+        self.node.active.release();
     }
 }
 impl BackendLease {
@@ -302,9 +302,10 @@ impl Balancer {
         }
     }
     pub fn available(&self, index: usize) -> bool {
-        !self.nodes[index]
-            .initial_check_pending
-            .load(Ordering::Acquire)
+        self.nodes[index].active.is_open()
+            && !self.nodes[index]
+                .initial_check_pending
+                .load(Ordering::Acquire)
             && !self.nodes[index].active_unhealthy.load(Ordering::Acquire)
             && !self.nodes[index].passive_unhealthy.load(Ordering::Acquire)
             && (self.config.health.is_none()
@@ -323,9 +324,6 @@ impl Balancer {
         } else {
             "unmonitored"
         };
-        let tracks_load = self.config.mode == Mode::LeastConnections
-            || self.config.health.is_some()
-            || self.config.passive_health.is_some();
         Some(BackendState {
             available: self.available(index),
             health_mode,
@@ -339,7 +337,7 @@ impl Balancer {
                 .active_health
                 .as_ref()
                 .map(|_| node.initial_check_pending.load(Ordering::Acquire)),
-            active_requests: tracks_load.then(|| node.active.load(Ordering::Relaxed)),
+            active_requests: Some(node.active.active()),
         })
     }
     fn weight(&self, index: usize) -> usize {
@@ -359,8 +357,8 @@ impl Balancer {
                     continue;
                 }
                 if best.is_none_or(|previous: usize| {
-                    self.nodes[index].active.load(Ordering::Relaxed) * self.weight(previous)
-                        < self.nodes[previous].active.load(Ordering::Relaxed) * self.weight(index)
+                    self.nodes[index].active.active() * self.weight(previous)
+                        < self.nodes[previous].active.active() * self.weight(index)
                 }) {
                     best = Some(index);
                 }
@@ -388,13 +386,9 @@ impl Balancer {
         if !self.available(index) {
             return None;
         }
-        if self.config.mode == Mode::RoundRobin
-            && self.config.health.is_none()
-            && self.config.passive_health.is_none()
-        {
+        if !self.nodes[index].active.acquire() {
             return None;
         }
-        self.nodes[index].active.fetch_add(1, Ordering::Relaxed);
         Some(BackendLease(Arc::new(LeaseInner {
             node: self.nodes[index].clone(),
             health: self.config.health,
@@ -528,7 +522,7 @@ mod tests {
             health: None,
             passive: Some(passive_policy()),
         }));
-        balancer.nodes[0].active.fetch_add(1, Ordering::Relaxed);
+        assert!(balancer.nodes[0].active.acquire());
         in_flight.record_http_status(200);
         in_flight.record_transport_failure();
         assert!(!balancer.available(0));
@@ -615,13 +609,31 @@ mod tests {
         assert!(balancer.available(0));
     }
     #[test]
+    fn round_robin_leases_count_once_and_retired_nodes_drain() {
+        let balancer = Balancer::new(BalanceConfig::default(), 1);
+        let lease = balancer
+            .acquire(0)
+            .expect("round robin must track its request");
+        let response_owner = lease.clone();
+        assert_eq!(balancer.backend_state(0).unwrap().active_requests, Some(1));
+        balancer.nodes[0].active.retire();
+        assert_eq!(balancer.select(), None);
+        assert!(balancer.acquire(0).is_none());
+        drop(lease);
+        assert_eq!(balancer.backend_state(0).unwrap().active_requests, Some(1));
+        drop(response_owner);
+        assert_eq!(balancer.backend_state(0).unwrap().active_requests, Some(0));
+        assert!(!balancer.available(0));
+    }
+
+    #[test]
     fn backend_state_reports_observation_and_real_lease_load() {
         let unmonitored = Balancer::new(BalanceConfig::default(), 1);
         let state = unmonitored.backend_state(0).unwrap();
         assert!(state.available);
         assert_eq!(state.health_mode, "unmonitored");
         assert_eq!(state.probe_observed, None);
-        assert_eq!(state.active_requests, None);
+        assert_eq!(state.active_requests, Some(0));
         assert!(unmonitored.backend_state(1).is_none());
 
         let balancer = Balancer::new(

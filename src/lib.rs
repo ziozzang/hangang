@@ -54,3 +54,5 @@ pub mod client_hello;
 pub mod host_match;
 pub mod http_outbound;
 pub mod upstream_dns;
+
+pub mod member_admission;

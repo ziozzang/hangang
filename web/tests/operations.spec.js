@@ -109,7 +109,7 @@ test('operations view shows real local eligibility, bounded paging and escaped t
   await expect(page.locator('#operations-rows tr')).toHaveCount(100);
   await expect(page.locator('#operations-rows')).toContainText('Excluded');
   await expect(page.locator('#operations-rows')).toContainText('Active + passive checks');
-  await expect(page.locator('#operations-rows')).toContainText('3 active request leases');
+  await expect(page.locator('#operations-rows')).toContainText('3 active requests');
   await expect(page.locator('#operations-capabilities')).toContainText('does not enumerate fleet peers');
   await expect(page.locator('#operations-rows')).toContainText(rows[0].address);
   await expect(page.locator('#operations-rows img')).toHaveCount(0);
@@ -130,6 +130,7 @@ test('operations view shows real local eligibility, bounded paging and escaped t
   await page.locator('#locale-select').selectOption('ko');
   await expect(page.locator('#operations-title')).toHaveText('운영');
   await expect(page.locator('#operations-rows')).toContainText('선택 제외');
+  await expect(page.locator('#operations-rows')).toContainText('처리 중인 요청 3개');
   await expect(page.locator('#operations-rows')).toContainText(rows[0].address);
 });
 

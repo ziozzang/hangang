@@ -159,6 +159,22 @@ mod tests {
     }
 
     #[test]
+    fn staged_members_are_not_accepted_as_live_route_configuration() {
+        // Remove this staging guard only when runtime/publish admission gates
+        // enforce every desired state, including Lua and retries.
+        for state in ["serving", "draining", "maintenance"] {
+            let member = serde_json::json!({"id":"origin", "address":"http://127.0.0.1:8080", "desired_state":state});
+            let typed: Backend = serde_json::from_value(member.clone()).unwrap();
+            validate_backends(&[typed], &[]).unwrap();
+            let document = serde_json::json!({"http":[{"id":"route", "backends":[member]}]});
+            assert!(serde_json::from_value::<crate::config::Config>(document).is_err());
+            let document = serde_json::json!({"tcp":[{"id":"stream", "listen":"127.0.0.1:9000",
+                "backends":[{"id":"origin", "address":"127.0.0.1:8080", "desired_state":state}]}]});
+            assert!(serde_json::from_value::<crate::config::Config>(document).is_err());
+        }
+    }
+
+    #[test]
     fn legacy_string_arrays_round_trip_without_conversion() {
         let wire = json!(["https://a.example:443", "https://b.example:443"]);
         let backends: Vec<Backend> = serde_json::from_value(wire.clone()).unwrap();

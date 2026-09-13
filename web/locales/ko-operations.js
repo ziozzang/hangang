@@ -54,7 +54,7 @@ export default {
   'Awaiting first connection probe': '첫 연결 프로브 대기 중',
   'Excluded after observed health evidence': '관찰된 상태 검사 결과에 따라 제외됨',
   '{count} active route connections': '활성 라우트 연결 {count}개',
-  '{count} active request leases': '활성 요청 임대 {count}개',
+  '{count} active requests': '처리 중인 요청 {count}개',
   'Not tracked': '추적하지 않음',
   'Route-wide, not per target': '라우트 전체 값이며 대상별 값이 아님',
   'Instance {id} · revision {revision}': '인스턴스 {id} · 리비전 {revision}',
