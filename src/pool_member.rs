@@ -105,17 +105,22 @@ fn is_serving(state: &DesiredState) -> bool {
     *state == DesiredState::Serving
 }
 
+pub(crate) fn validate_member_id(value: &str) -> Result<()> {
+    let id = value.as_bytes();
+    ensure!(
+        (1..=64).contains(&id.len())
+            && id[0].is_ascii_alphanumeric()
+            && id[1..].iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-')
+            }),
+        "pool member id must be 1..64 ASCII bytes using A-Z, a-z, 0-9, '.', '_' or '-' and start with a letter or digit"
+    );
+    Ok(())
+}
+
 impl PoolMember {
     pub fn validate(&self) -> Result<()> {
-        let id = self.id.as_bytes();
-        ensure!(
-            (1..=64).contains(&id.len())
-                && id[0].is_ascii_alphanumeric()
-                && id[1..].iter().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-')
-                }),
-            "pool member id must be 1..64 ASCII bytes using A-Z, a-z, 0-9, '.', '_' or '-' and start with a letter or digit"
-        );
+        validate_member_id(&self.id)?;
         ensure!(
             !self.address.is_empty() && self.address.trim() == self.address,
             "pool member address must be nonempty without surrounding whitespace"

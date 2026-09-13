@@ -258,6 +258,7 @@ async fn real_worker_evaluates_policy_and_is_reused() -> anyhow::Result<()> {
 
     let want = Decision {
         backend: Some("primary".to_owned()),
+        member_id: None,
         headers: BTreeMap::from([("x-policy".to_owned(), "applied".to_owned())]),
         reject: Some(429),
     };
@@ -604,4 +605,57 @@ fn worker_syscall_policy_denies_files_network_and_executable_memory() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("worker syscall restrictions verified")
     );
+}
+
+#[tokio::test]
+async fn member_selection_worker_is_bounded_and_last_selection_wins() -> anyhow::Result<()> {
+    let _fixture = FIXTURE_FORK_LOCK.lock().await;
+    let pool = PolicyPool::new(binary(), 1);
+    for (script, member, backend) in [
+        ("hangang.select_member('Blue-1')", Some("Blue-1"), None),
+        (
+            "hangang.select_backend('old'); hangang.select_member('green')",
+            Some("green"),
+            None,
+        ),
+        (
+            "hangang.select_member('green'); hangang.select_backend('new')",
+            None,
+            Some("new"),
+        ),
+        (
+            "hangang.select_member('green'); return 'returned'",
+            None,
+            Some("returned"),
+        ),
+        ("return nil", None, None),
+    ] {
+        let decision = pool.evaluate(input(script)).await?;
+        assert_eq!(decision.member_id.as_deref(), member);
+        assert_eq!(decision.backend.as_deref(), backend);
+    }
+    for id in [
+        "",
+        "_bad",
+        "contains space",
+        "한강",
+        "a/b",
+        "a\n",
+        &"a".repeat(65),
+    ] {
+        let script = format!("hangang.select_member({})", serde_json::to_string(id)?);
+        assert!(
+            pool.evaluate(input(&script)).await.is_err(),
+            "accepted invalid ID"
+        );
+        assert_eq!(
+            pool.evaluate(input("hangang.select_member('recovered')"))
+                .await?
+                .member_id
+                .as_deref(),
+            Some("recovered")
+        );
+    }
+    pool.shutdown().await;
+    Ok(())
 }

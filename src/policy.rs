@@ -90,6 +90,8 @@ pub struct TransformInput {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Decision {
     pub backend: Option<String>,
+    #[serde(default)]
+    pub member_id: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub reject: Option<u16>,
 }
@@ -463,7 +465,9 @@ fn evaluate_in_vm(input: PolicyInput) -> Result<Decision> {
                 .context("returned backend is not UTF-8")?
                 .to_owned();
             validate_backend(&backend)?;
-            decision.lock().expect("decision lock poisoned").backend = Some(backend);
+            let mut result = decision.lock().expect("decision lock poisoned");
+            result.backend = Some(backend);
+            result.member_id = None;
         }
         other => bail!(
             "policy must return nil or a backend string, got {}",
@@ -608,7 +612,21 @@ fn install_host_api(
         "select_backend",
         lua.create_function(move |_, backend: String| {
             validate_backend(&backend).map_err(mlua::Error::external)?;
-            selected.lock().expect("decision lock poisoned").backend = Some(backend);
+            let mut result = selected.lock().expect("decision lock poisoned");
+            result.backend = Some(backend);
+            result.member_id = None;
+            Ok(())
+        })?,
+    )?;
+
+    let selected = Arc::clone(&decision);
+    api.set(
+        "select_member",
+        lua.create_function(move |_, member_id: String| {
+            crate::pool_member::validate_member_id(&member_id).map_err(mlua::Error::external)?;
+            let mut result = selected.lock().expect("decision lock poisoned");
+            result.member_id = Some(member_id);
+            result.backend = None;
             Ok(())
         })?,
     )?;

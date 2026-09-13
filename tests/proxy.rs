@@ -2655,11 +2655,36 @@ async fn idempotent_requests_retry_to_a_healthy_backend_but_bodyful_ones_do_not(
 
 #[tokio::test]
 async fn policy_selected_backend_is_never_replaced_by_a_retry() {
+    policy_selected_backend_is_never_replaced_by_a_retry_case(false).await;
+}
+
+#[tokio::test]
+async fn policy_selected_backend_is_never_replaced_by_a_retry_by_member_id() {
+    policy_selected_backend_is_never_replaced_by_a_retry_case(true).await;
+}
+
+async fn policy_selected_backend_is_never_replaced_by_a_retry_case(named: bool) {
     let (healthy, seen, healthy_task) = upstream("unexpected").await;
     let selected = "http://127.0.0.1:1".to_owned();
     let mut r = route(vec![selected.clone(), format!("http://{healthy}")]);
     r.retries = 1;
     r.lua = Some(format!("hangang.select_backend({selected:?})"));
+    if named {
+        r.backends = r
+            .backends
+            .into_iter()
+            .enumerate()
+            .map(|(i, backend)| {
+                hangang::pool_member::Backend::Member(hangang::pool_member::PoolMember {
+                    id: format!("member-{i}"),
+                    address: backend.address().to_owned(),
+                    weight: 1,
+                    desired_state: Default::default(),
+                })
+            })
+            .collect();
+        r.lua = Some("hangang.select_member(\"member-0\")".into());
+    }
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config {
             revision: 1,
@@ -2694,11 +2719,36 @@ async fn policy_selected_backend_is_never_replaced_by_a_retry() {
 
 #[tokio::test]
 async fn checking_health_cannot_be_bypassed_by_lua_backend_selection() {
+    checking_health_cannot_be_bypassed_by_lua_backend_selection_case(false).await;
+}
+
+#[tokio::test]
+async fn checking_health_cannot_be_bypassed_by_lua_backend_selection_by_member_id() {
+    checking_health_cannot_be_bypassed_by_lua_backend_selection_case(true).await;
+}
+
+async fn checking_health_cannot_be_bypassed_by_lua_backend_selection_case(named: bool) {
     let (first, _first_seen, first_task) = upstream("first").await;
     let (second, _second_seen, second_task) = upstream("second").await;
     let selected = format!("http://{second}");
     let mut route = route(vec![format!("http://{first}"), selected.clone()]);
     route.lua = Some(format!("hangang.select_backend({selected:?})"));
+    if named {
+        route.backends = route
+            .backends
+            .into_iter()
+            .enumerate()
+            .map(|(i, backend)| {
+                hangang::pool_member::Backend::Member(hangang::pool_member::PoolMember {
+                    id: format!("member-{i}"),
+                    address: backend.address().to_owned(),
+                    weight: 1,
+                    desired_state: Default::default(),
+                })
+            })
+            .collect();
+        route.lua = Some("hangang.select_member(\"member-1\")".into());
+    }
     route.balance.active_health = Some(hangang::balance::ActiveHealthPolicy {
         path: "/ready".into(),
         host: None,
@@ -4094,4 +4144,99 @@ async fn disabled_domain_group_never_selects_its_upstream_and_can_reactivate() {
         front_task.abort();
     }
     origin_task.abort();
+}
+
+#[tokio::test]
+async fn lua_member_selection_is_route_scoped_and_survives_reorder() {
+    let (first, first_seen, first_task) = upstream("first").await;
+    let (second, second_seen, second_task) = upstream("second").await;
+    let mut r = route(vec![format!("http://{first}"), format!("http://{second}")]);
+    r.backends = r
+        .backends
+        .into_iter()
+        .zip(["Blue", "green"])
+        .map(|(backend, id)| {
+            hangang::pool_member::Backend::Member(hangang::pool_member::PoolMember {
+                id: id.into(),
+                address: backend.address().to_owned(),
+                weight: 1,
+                desired_state: Default::default(),
+            })
+        })
+        .collect();
+    r.lua = Some("hangang.select_member('green')".into());
+    let mut other = r.clone();
+    other.id = "other-route".into();
+    other.host = Some("other.example.test".into());
+    other.backends = vec![hangang::pool_member::Backend::Member(
+        hangang::pool_member::PoolMember {
+            id: "green".into(),
+            address: format!("http://{first}"),
+            weight: 1,
+            desired_state: Default::default(),
+        },
+    )];
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(Config {
+            revision: 1,
+            http: vec![other, r],
+            ..Config::default()
+        })
+        .unwrap(),
+    ));
+    let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 1));
+    let proxy = Proxy::new(active.clone(), policy.clone(), Arc::new(Metrics::default()));
+    let (front, front_task, _) = frontend(proxy).await;
+    let get = || async {
+        client()
+            .request(
+                Request::builder()
+                    .uri(format!("http://{front}/"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    for reversed in [false, true] {
+        if reversed {
+            let old = active.load_full();
+            let mut config = old.config.clone();
+            config.revision += 1;
+            config.http[1].backends.reverse();
+            active.store(Arc::new(Snapshot::replace(config, &old).unwrap()));
+        }
+        let response = get().await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "second"
+        );
+    }
+    assert!(first_seen.lock().unwrap().is_empty());
+    assert_eq!(second_seen.lock().unwrap().len(), 2);
+    for (id, legacy) in [("missing", false), ("blue", false), ("green", true)] {
+        let old = active.load_full();
+        let mut config = old.config.clone();
+        config.revision += 1;
+        config.http[1].lua = Some(format!("hangang.select_member({id:?})"));
+        if legacy {
+            config.http[1].backends = config.http[1]
+                .backends
+                .iter()
+                .map(|backend| backend.address().to_owned().into())
+                .collect();
+        }
+        active.store(Arc::new(Snapshot::replace(config, &old).unwrap()));
+        assert_eq!(get().await.status(), 503);
+    }
+    assert!(
+        first_seen.lock().unwrap().is_empty(),
+        "unknown member must never fall back"
+    );
+    assert_eq!(second_seen.lock().unwrap().len(), 2);
+    front_task.abort();
+    first_task.abort();
+    second_task.abort();
+    policy.shutdown().await;
 }

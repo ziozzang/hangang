@@ -1086,21 +1086,25 @@ impl Proxy {
                             .unwrap_or(StatusCode::FORBIDDEN);
                         return Ok(response(status.as_u16(), "request rejected by policy"));
                     }
-                    if let Some(chosen) = decision.backend {
-                        let Some(chosen_index) = runtime
-                            .route
-                            .backends
-                            .iter()
-                            .position(|backend| backend.address() == chosen)
-                        else {
+                    if decision.backend.is_some() || decision.member_id.is_some() {
+                        // Resolve only within the captured route snapshot. Member IDs are
+                        // not addresses and may never fall back to address matching.
+                        let chosen_index = runtime.route.backends.iter().position(|candidate| {
+                            if let Some(id) = decision.member_id.as_deref() {
+                                decision.backend.is_none() && candidate.id() == Some(id)
+                            } else {
+                                decision.backend.as_deref() == Some(candidate.address())
+                            }
+                        });
+                        let Some(chosen_index) = chosen_index else {
                             self.metrics.policy_errors.fetch_add(1, Ordering::Relaxed);
                             return Ok(self.failure(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                "policy selected an unknown backend",
+                                "policy selected an unknown or ambiguous backend",
                             ));
                         };
                         index = chosen_index;
-                        backend = chosen;
+                        backend = runtime.route.backends[index].address().to_owned();
                         policy_pinned_backend = true;
                     }
                     let protected = runtime
