@@ -1,6 +1,7 @@
 //! Wire-level checks for the separate, bearer-transparent management relay.
 //! All sockets and processes are owned by this test.
 use std::{
+    io::{BufRead, BufReader, Read},
     net::SocketAddr,
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -125,38 +126,57 @@ async fn serve_fake(mut stream: UnixStream) {
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-async fn start_relay(socket: &Path, port: u16, max_requests: usize) -> ChildGuard {
+async fn start_relay(socket: &Path, max_requests: usize) -> (ChildGuard, u16) {
     let child = Command::new(env!("CARGO_BIN_EXE_hangang-admin-gateway"))
         .args([
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--admin-socket",
             socket.to_str().unwrap(),
             "--max-requests",
             &max_requests.to_string(),
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .unwrap();
-    let child = ChildGuard(child);
-    let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    for _ in 0..100 {
-        if TcpStream::connect(address).await.is_ok() {
-            return child;
+    let mut child = ChildGuard(child);
+    let stdout = child.0.stdout.take().unwrap();
+    let line = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let mut line = String::new();
+            BufReader::new(stdout).read_line(&mut line).map(|_| line)
+        }),
+    )
+    .await
+    .expect("owned management relay did not report its bound address")
+    .unwrap()
+    .unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("HANGANG_ADMIN_GATEWAY_LISTEN ")
+        .and_then(|address| address.parse::<SocketAddr>().ok());
+    let status = child.0.try_wait().unwrap();
+    if address.is_none() || status.is_some() {
+        let mut detail = String::new();
+        if status.is_some() {
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut detail)
+                .unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        panic!(
+            "owned management relay startup failed: status={status:?}, line={line:?}, stderr={detail}"
+        );
     }
-    panic!("owned management relay did not start");
+    let address = address.unwrap();
+    assert!(address.ip().is_loopback() && address.port() != 0);
+    (child, address.port())
 }
 
 async fn exchange(port: u16, raw: &[u8]) -> String {
@@ -204,8 +224,7 @@ async fn preserves_authority_and_origin_but_rejects_ambiguous_framing() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("admin.sock");
     let fake = fake_admin(socket.clone()).await;
-    let port = free_port();
-    let _relay = start_relay(&socket, port, 2).await;
+    let (_relay, port) = start_relay(&socket, 2).await;
 
     let response = exchange(port, b"POST /echo HTTP/1.1\r\nHost: console.example.test\r\nOrigin: https://console.example.test\r\nAuthorization: Bearer owned-test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -268,9 +287,26 @@ async fn streams_sse_immediately_and_bounds_active_requests() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("admin.sock");
     let _fake = fake_admin(socket.clone()).await;
-    let port = free_port();
-    let _relay = start_relay(&socket, port, 1).await;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut relay, port) = start_relay(&socket, 1).await;
+    let mut stream = match TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let status = relay.0.try_wait().unwrap();
+            let mut detail = String::new();
+            if status.is_some() {
+                relay
+                    .0
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut detail)
+                    .unwrap();
+            }
+            panic!(
+                "owned relay refused its reported listener: {error}; child status={status:?}; stderr={detail}"
+            );
+        }
+    };
     stream
         .write_all(b"GET /events HTTP/1.1\r\nHost: console.example.test\r\n\r\n")
         .await
@@ -328,8 +364,6 @@ async fn native_admin_auth_and_status_stream_survive_the_separate_relay() {
     let socket = directory.path().join("admin.sock");
     let config = directory.path().join("config.json");
     std::fs::write(&config, r#"{"http":[],"tcp":[]}"#).unwrap();
-    let public_port = free_port();
-    let relay_port = free_port();
     let token = "owned-native-admin-token";
     let mut native = Command::new(env!("CARGO_BIN_EXE_hangang"));
     native
@@ -337,7 +371,7 @@ async fn native_admin_auth_and_status_stream_survive_the_separate_relay() {
             "--config",
             config.to_str().unwrap(),
             "--listen",
-            &format!("127.0.0.1:{public_port}"),
+            "127.0.0.1:0",
             "--admin-socket",
             socket.to_str().unwrap(),
             "--admin-users-db",
@@ -374,7 +408,7 @@ async fn native_admin_auth_and_status_stream_survive_the_separate_relay() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(socket.exists(), "owned native admin socket was not created");
-    let _relay = start_relay(&socket, relay_port, 4).await;
+    let (_relay, relay_port) = start_relay(&socket, 4).await;
 
     let unauthenticated = exchange(
         relay_port,
