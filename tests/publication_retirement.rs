@@ -168,6 +168,13 @@ fn http_candidate_drop_preserves_old_lease_and_publication_retires_only_displace
     if let hangang::pool_member::Backend::Member(member) = &mut changed.http[0].backends[0] {
         member.address = "http://127.0.0.1:18002".into();
     }
+    let mut invalid = changed.clone();
+    invalid.http[0].backends.clear();
+    assert!(Snapshot::replace(invalid, &old).is_err());
+    assert!(
+        old_balancer.available(0),
+        "failed preparation leaves old admission open"
+    );
     let abandoned = Snapshot::replace(changed.clone(), &old).unwrap();
     assert!(old_balancer.available(0));
     drop(abandoned);
