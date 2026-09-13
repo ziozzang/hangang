@@ -2832,7 +2832,7 @@ async fn failed_save_keeps_member_gates_open_and_successful_removal_retires_them
     })).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
-    let (_, manager) = server_on(
+    let (address, manager) = server_on(
         path.clone(),
         config,
         None,
@@ -2852,6 +2852,13 @@ async fn failed_save_keeps_member_gates_open_and_successful_removal_retires_them
     assert!(http.available(0));
     assert!(tcp.is_open());
     assert_eq!(tcp.active(), 1);
+    let (status, _, body) = request(address, "GET", "/v1/retired-members", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json(&body)["total"],
+        0,
+        "failed save publishes no retirement"
+    );
     std::fs::remove_dir(&path).unwrap();
     assert_eq!(
         manager.apply(Config::default(), 0).await.unwrap().revision,
@@ -2863,10 +2870,113 @@ async fn failed_save_keeps_member_gates_open_and_successful_removal_retires_them
     assert!(tcp.lease().is_none());
     assert_eq!(tcp.active(), 1, "retirement must preserve old ownership");
     assert_eq!(http.backend_state(0).unwrap().active_requests, Some(1));
+    let mut rows = Vec::new();
+    for offset in 0..2 {
+        let (status, headers, body) = request(
+            address,
+            "GET",
+            &format!("/v1/retired-members?offset={offset}&limit=1"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(headers["cache-control"], "no-store");
+        let page = json(&body);
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["limit"], 1);
+        assert_eq!(page["capacity"], 4096);
+        assert_eq!(page["rows"].as_array().unwrap().len(), 1);
+        rows.push(page["rows"][0].clone());
+    }
+    rows.sort_by(|a, b| a["protocol"].as_str().cmp(&b["protocol"].as_str()));
+    assert_eq!(rows[0]["protocol"], "http");
+    assert_eq!(rows[0]["route_id"], "http");
+    assert_eq!(rows[0]["member_id"], "a");
+    assert_eq!(rows[0]["address"], "http://127.0.0.1:18001");
+    assert_eq!(rows[0]["active_admissions"], 1);
+    assert_eq!(rows[1]["protocol"], "tcp");
+    assert_eq!(rows[1]["route_id"], "tcp");
+    assert_eq!(rows[1]["member_id"], "a");
+    assert_eq!(rows[1]["address"], "127.0.0.1:18002");
+    assert_eq!(rows[1]["active_admissions"], 1);
+    assert_ne!(rows[0]["retirement_id"], rows[1]["retirement_id"]);
     drop(http_owner);
     drop(tcp_owner);
     assert_eq!(tcp.active(), 0);
     assert_eq!(http.backend_state(0).unwrap().active_requests, Some(0));
+    let (status, _, body) = request(address, "GET", "/v1/retired-members", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["total"], 0, "completed owners are pruned");
     manager.tcp.shutdown(std::time::Duration::ZERO).await;
+    manager.policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn retired_member_inventory_requires_admin_and_rejects_unbounded_queries() {
+    let (address, manager, _directory) = server().await;
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/retired-members", None, None, None)
+            .await
+            .0,
+        401
+    );
+    let root = r#"{"username":"operator","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/auth/bootstrap", Some(root), None)
+            .await
+            .0,
+        201
+    );
+    let viewer = r#"{"username":"observer","password":"viewer password 123","role":"viewer"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/users", Some(viewer), None)
+            .await
+            .0,
+        201
+    );
+    let (_, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"observer","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/retired-members",
+            None,
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request(address, "POST", "/v1/retired-members", None, None)
+            .await
+            .0,
+        405
+    );
+    for path in [
+        "/v1/retired-members?limit=0",
+        "/v1/retired-members?limit=129",
+        "/v1/retired-members?offset=-1",
+        "/v1/retired-members?offset=1&offset=2",
+        "/v1/retired-members?unknown=1",
+    ] {
+        assert_eq!(
+            request(address, "GET", path, None, None).await.0,
+            400,
+            "{path}"
+        );
+    }
     manager.policy.shutdown().await;
 }
