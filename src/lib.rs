@@ -11,6 +11,7 @@ pub mod docker;
 pub mod docker_connections;
 pub mod metrics;
 pub mod policy;
+pub mod pool_member;
 pub mod proxy;
 pub mod redis_store;
 pub mod restart;
