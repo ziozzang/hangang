@@ -314,6 +314,121 @@ async fn http_origin(
 }
 
 #[tokio::test]
+async fn held_http_response_finishes_after_maintenance_but_new_requests_are_denied() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut chunk = [0; 512];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&chunk[..n]);
+            assert!(request.len() < 4096);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+            .await
+            .unwrap();
+        release_rx.await.unwrap();
+        stream.write_all(b"def").await.unwrap();
+    });
+    let config: Config = serde_json::from_value(serde_json::json!({"http":[{
+        "id":"web", "backends":[{"id":"a", "address":format!("http://{origin_address}")}]
+    }]}))
+    .unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
+    let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 1));
+    let proxy = Proxy::new(active.clone(), policy.clone(), Arc::new(Metrics::default()));
+    let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_address = front.local_addr().unwrap();
+    let front_task = tokio::spawn(async move {
+        while let Ok((stream, peer)) = front.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let proxy = proxy.clone();
+                    async move { proxy.handle(request, peer).await }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let reply = client
+        .request(
+            Request::builder()
+                .uri(format!("http://{front_address}/held"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    let old = active.load_full();
+    let old_balancer = old.http[0].balancer.clone();
+    assert_eq!(
+        old_balancer.backend_state(0).unwrap().active_requests,
+        Some(1)
+    );
+
+    let mut changed = old.config.clone();
+    if let hangang::pool_member::Backend::Member(member) = &mut changed.http[0].backends[0] {
+        member.desired_state = hangang::pool_member::DesiredState::Maintenance;
+    }
+    let candidate = Snapshot::replace(changed, &old).unwrap();
+    assert!(old_balancer.available(0));
+    candidate.activated();
+    active.store(Arc::new(candidate));
+    assert!(!old_balancer.available(0));
+    assert!(!active.load().http[0].balancer.available(0));
+    assert_eq!(active.load().retired_members.snapshot().len(), 1);
+    assert_eq!(
+        active.load().retired_members.snapshot()[0].active_admissions,
+        1
+    );
+    let rejected_client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let rejected = rejected_client
+        .request(
+            Request::builder()
+                .uri(format!("http://{front_address}/new"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 503);
+    rejected.into_body().collect().await.unwrap();
+    assert_eq!(
+        old_balancer.backend_state(0).unwrap().active_requests,
+        Some(1)
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        reply.into_body().collect().await.unwrap().to_bytes(),
+        "abcdef"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while old_balancer.backend_state(0).unwrap().active_requests != Some(0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(active.load().retired_members.snapshot().is_empty());
+    origin_task.await.unwrap();
+    front_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn lua_pinned_nonserving_member_cannot_bypass_but_automatic_selection_uses_alternate() {
     let (a, a_requests, a_task) = http_origin("a").await;
     let (b, b_requests, b_task) = http_origin("b").await;
