@@ -111,3 +111,16 @@ test('invalid native and advanced policies do not produce writes or erase the dr
   expect(writes).toHaveLength(0);
   expect(JSON.parse(await page.locator('#route-json').inputValue()).language_policy.allow).toEqual(['ko', 'KO']);
 });
+
+
+test('advanced null language lists are not silently converted during native edits', async ({ page }) => {
+  const { writes } = await fixture(page);
+  await edit(page); await page.locator('.advanced-editor summary').click();
+  const malformed = { ...baseRoute, language_policy: { mode: 'any', allow: null, deny: ['fr'], on_missing: 'deny' } };
+  await page.locator('#route-json').fill(JSON.stringify(malformed));
+  await page.locator('#route-field-priority').fill('2');
+  await expect(page.locator('#route-message')).toContainText('must contain basic language ranges');
+  await page.locator('#save-route').click();
+  expect(writes).toHaveLength(0);
+  expect(JSON.parse(await page.locator('#route-json').inputValue()).language_policy.allow).toBeNull();
+});

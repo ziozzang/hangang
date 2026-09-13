@@ -1677,7 +1677,7 @@ function validateLanguagePolicy(policy) {
     throw new Error(t('Language policy needs a valid mode, missing-header action and enforcement flag'));
   }
   const lists = ['allow', 'deny'].map((name) => {
-    const ranges = policy[name] ?? [];
+    const ranges = policy[name] === undefined ? [] : policy[name];
     if (!Array.isArray(ranges) || ranges.some((value) => typeof value !== 'string')) {
       throw new Error(t('Language allow and deny lists must contain basic language ranges'));
     }

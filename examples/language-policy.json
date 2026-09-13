@@ -1,0 +1,18 @@
+{
+  "revision": 0,
+  "http": [
+    {
+      "id": "language-preferences",
+      "host": "languages.example.test",
+      "path_prefix": "/",
+      "backends": ["http://127.0.0.1:8080"],
+      "language_policy": {
+        "mode": "preferred",
+        "allow": ["ko", "en"],
+        "deny": ["en-US"],
+        "on_missing": "deny"
+      }
+    }
+  ],
+  "tcp": []
+}
