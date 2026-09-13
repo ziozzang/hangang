@@ -416,7 +416,20 @@ mod tests {
         active.store(Arc::new(next));
 
         let slots = [original_slot.clone(), new_slot.clone()];
-        Slot::refresh_many(&active, &slots).await;
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch(active.clone(), cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if original_slot.load().is_some() && new_slot.load().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        watcher.await.unwrap();
         let first = original_slot.load().unwrap();
         assert!(Arc::ptr_eq(&first, &new_slot.load().unwrap()));
         let original = fs::read(&original_slot.policy.client_ca_file).unwrap();
@@ -428,6 +441,27 @@ mod tests {
         let recovered = original_slot.load().unwrap();
         assert!(Arc::ptr_eq(&recovered, &new_slot.load().unwrap()));
         assert!(!Arc::ptr_eq(&first, &recovered));
+    }
+
+    #[tokio::test]
+    async fn pending_alias_does_not_resurrect_an_existing_lease_generation() {
+        let (_dir, active, original_slot) = fixture();
+        Slot::refresh(&active, &original_slot).await;
+        let existing = original_slot.load().unwrap();
+        let mut config = active.load().config.clone();
+        let mut alias = config.tcp[0].clone();
+        alias.id = "alias".into();
+        alias.listen = "127.0.0.1:9444".parse().unwrap();
+        config.tcp.push(alias);
+        let next = Snapshot::replace(config, &active.load_full()).unwrap();
+        let pending = next.tcp_inbound_tls["alias"].clone();
+        assert!(!Arc::ptr_eq(&original_slot, &pending));
+        assert!(pending.load().is_none());
+        active.store(Arc::new(next));
+
+        Slot::refresh_many(&active, &[original_slot.clone(), pending.clone()]).await;
+        assert!(Arc::ptr_eq(&existing, &original_slot.load().unwrap()));
+        assert!(!Arc::ptr_eq(&existing, &pending.load().unwrap()));
     }
     #[tokio::test]
     async fn identical_new_tcp_policies_share_verification_without_coupling_disable() {
