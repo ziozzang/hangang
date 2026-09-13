@@ -18,6 +18,7 @@ fn config(revision: u64, id: &str) -> Config {
         http: vec![HttpRoute {
             access_mode: Default::default(),
             resource_policy: None,
+            jwt_auth: None,
             enabled: true,
             upstream: Default::default(),
             priority: 0,

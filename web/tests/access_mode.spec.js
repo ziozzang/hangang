@@ -74,7 +74,7 @@ test('protected requires gateway auth; public and application reject configured 
   await page.locator('#route-field-id').fill('new-protected');
   await reveal(page, '#route-field-access_mode');
   await page.locator('#route-field-access_mode').selectOption('protected');
-  await expect(page.locator('#route-message')).toContainText('Protected access requires Basic or external authorization');
+  await expect(page.locator('#route-message')).toContainText('Protected access requires Basic, JWT or external authorization');
   await page.locator('#save-route').click();
   expect(writes).toHaveLength(0);
   await reveal(page, '#route-field-auth_url');
@@ -91,11 +91,11 @@ test('protected requires gateway auth; public and application reject configured 
   await page.locator('#save-route').click();
   expect(writes).toHaveLength(1);
   await page.locator('#route-field-access_mode').selectOption('public');
-  await expect(page.locator('#route-message')).toContainText('public access cannot configure gateway Basic or external authorization');
+  await expect(page.locator('#route-message')).toContainText('public access cannot configure gateway Basic, JWT or external authorization');
   await page.locator('#save-route').click();
   expect(writes).toHaveLength(1);
   await page.locator('#route-field-access_mode').selectOption('application');
-  await expect(page.locator('#route-message')).toContainText('application access cannot configure gateway Basic or external authorization');
+  await expect(page.locator('#route-message')).toContainText('application access cannot configure gateway Basic, JWT or external authorization');
   await page.locator('#route-field-auth_url').fill('');
   await expect.poll(async () => JSON.parse(await page.locator('#route-json').inputValue()).access_mode).toBe('application');
   await page.locator('#save-route').click();
@@ -141,7 +141,7 @@ test('Korean access labels and validation preserve route ID and draft during loc
   await expect(page.locator('label[for="route-field-access_mode"]')).toHaveText('접근 방식');
   await reveal(page, '#route-field-access_mode');
   await page.locator('#route-field-access_mode').selectOption('protected');
-  await expect(page.locator('#route-message')).toContainText('보호된 접근에는 Basic 또는 외부 인가가 필요합니다');
+  await expect(page.locator('#route-message')).toContainText('보호된 접근에는 Basic, JWT 또는 외부 인가가 필요합니다');
   await page.locator('#locale-select-route').selectOption('en');
   await expect(page.locator('label[for="route-field-access_mode"]')).toHaveText('Access mode');
   await expect(page.locator('#route-field-id')).toHaveValue('public');

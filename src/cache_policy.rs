@@ -55,6 +55,7 @@ impl RouteCache {
 pub fn route_eligible(route: &crate::config::HttpRoute) -> bool {
     route.cache.is_some()
         && route.resource_policy.is_none()
+        && route.jwt_auth.is_none()
         && route.access_mode != crate::config::AccessMode::Protected
         && route.auth.is_none()
         && route.basic_auth.is_none()

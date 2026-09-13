@@ -257,6 +257,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
     HttpRoute {
         access_mode: Default::default(),
         resource_policy: None,
+        jwt_auth: None,
         enabled: true,
         upstream: Default::default(),
         priority: 0,
@@ -3806,6 +3807,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
     })
     .unwrap();
     let runtime = hangang::config::HttpRuntime {
+        jwt_auth: None,
         host_regex: None,
         admission: valid.admissions["route"].clone(),
         balancer: std::sync::Arc::new(hangang::balance::Balancer::new(Default::default(), 1)),

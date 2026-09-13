@@ -1149,7 +1149,7 @@ test('external and basic authentication are native controls with invalid-draft p
   await expect(page.locator('#route-message')).toContainText('Duplicate basic-auth username');
   await page.getByLabel('Credentials', { exact: true }).fill(CREDENTIAL);
   await page.getByLabel('Realm').fill('ops');
-  await page.getByLabel('Identity header').fill('x-authenticated-user');
+  await page.getByLabel('Identity header', { exact: true }).fill('x-authenticated-user');
   await page.getByLabel('Hide credentials from the upstream').check();
   await page.getByRole('button', { name: 'Create route' }).click();
   await expect(page.getByText('secure created.')).toBeVisible();
@@ -1201,7 +1201,7 @@ test('populated authentication and header controls round-trip an existing route 
   expect(routeWrites(calls, '/v1/routes/http/api', 'PUT')).toHaveLength(0);
   await expect(page.locator('#route-message')).toContainText('clear the realm');
   await page.getByLabel('Realm').fill('');
-  await page.getByLabel('Identity header').fill('');
+  await page.getByLabel('Identity header', { exact: true }).fill('');
   await page.getByLabel('Hide credentials from the upstream').uncheck();
   await page.getByLabel('Require TLS').uncheck();
   await page.getByRole('button', { name: 'Save route' }).click();

@@ -185,6 +185,8 @@ pub struct HttpRoute {
     pub access_mode: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_policy: Option<crate::resource_policy::ResourcePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_auth: Option<crate::jwt_runtime::JwtAuth>,
     /// Persist policy while excluding this route from new traffic.
     #[serde(default = "enabled_default", skip_serializing_if = "is_enabled")]
     pub enabled: bool,
@@ -605,13 +607,44 @@ impl Config {
             ensure!(ids.insert(id), "duplicate route id: {id}");
         }
         let mut resources: std::collections::HashMap<&str, &HttpRoute> = Default::default();
+        let mut jwt_policies = std::collections::HashSet::new();
         for r in &self.http {
+            if let Some(jwt) = &r.jwt_auth {
+                if jwt_policies.insert(serde_json::to_vec(jwt)?) {
+                    ensure!(
+                        jwt_policies.len() <= 64,
+                        "at most 64 distinct JWT policies per configuration"
+                    );
+                    jwt.validate()?;
+                }
+                ensure!(
+                    r.basic_auth.is_none(),
+                    "JWT and Basic authentication cannot share Authorization"
+                );
+                if let Some(name) = &jwt.identity_header {
+                    ensure!(
+                        valid_response_header_name(name),
+                        "JWT identity header is invalid or protected"
+                    );
+                    ensure!(
+                        !r.auth.as_ref().is_some_and(|auth| auth
+                            .response_headers
+                            .iter()
+                            .any(|other| other.eq_ignore_ascii_case(name))),
+                        "JWT identity header conflicts with external authorization identity"
+                    );
+                }
+            }
             if let Some(policy) = &r.resource_policy {
                 ensure!(
                     r.access_mode == AccessMode::Protected,
                     "resource policy requires access_mode protected"
                 );
-                policy.validate_binding(r.basic_auth.as_ref(), r.auth.as_ref())?;
+                policy.validate_binding_with_jwt(
+                    r.basic_auth.as_ref(),
+                    r.auth.as_ref(),
+                    r.jwt_auth.as_ref(),
+                )?;
                 if let Some(path) = &r.path_prefix {
                     ensure!(
                         crate::resource_policy::canonical_path(path)? == *path,
@@ -622,7 +655,8 @@ impl Config {
                     ensure!(
                         prior.resource_policy == r.resource_policy
                             && prior.basic_auth == r.basic_auth
-                            && prior.auth == r.auth,
+                            && prior.auth == r.auth
+                            && prior.jwt_auth == r.jwt_auth,
                         "routes sharing a resource_id must share policy and authenticators"
                     );
                 }
@@ -630,13 +664,13 @@ impl Config {
             match r.access_mode {
                 AccessMode::Legacy => {}
                 AccessMode::Protected => ensure!(
-                    r.basic_auth.is_some() || r.auth.is_some(),
-                    "route {} access_mode protected requires basic_auth or auth",
+                    r.basic_auth.is_some() || r.auth.is_some() || r.jwt_auth.is_some(),
+                    "route {} access_mode protected requires basic_auth or auth or jwt_auth",
                     r.id
                 ),
                 AccessMode::Public | AccessMode::Application => ensure!(
-                    r.basic_auth.is_none() && r.auth.is_none(),
-                    "route {} access_mode public/application conflicts with basic_auth or auth",
+                    r.basic_auth.is_none() && r.auth.is_none() && r.jwt_auth.is_none(),
+                    "route {} access_mode public/application conflicts with basic_auth or auth or jwt_auth",
                     r.id
                 ),
             }
@@ -714,6 +748,11 @@ impl Config {
                         r.auth
                             .iter()
                             .flat_map(|auth| auth.response_headers.iter().map(String::as_str)),
+                    )
+                    .chain(
+                        r.jwt_auth
+                            .iter()
+                            .filter_map(|jwt| jwt.identity_header.as_deref()),
                     )
                     .map(str::to_owned)
                     .chain(r.basic_auth.iter().flat_map(|basic| {
@@ -1085,6 +1124,7 @@ pub struct HttpRuntime {
     pub request_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
+    pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -1331,6 +1371,25 @@ impl Snapshot {
                 (id.clone(), counter)
             })
             .collect();
+        let mut jwt_runtimes = std::collections::HashMap::new();
+        for jwt in config
+            .http
+            .iter()
+            .filter_map(|route| route.jwt_auth.as_ref())
+        {
+            let key = serde_json::to_vec(jwt)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = jwt_runtimes.entry(key) {
+                let previous_runtime = previous
+                    .into_iter()
+                    .flat_map(|old| old.http.iter())
+                    .find(|old| old.route.jwt_auth.as_ref() == Some(jwt))
+                    .and_then(|old| old.jwt_auth.clone());
+                entry.insert(match previous_runtime {
+                    Some(runtime) => runtime,
+                    None => std::sync::Arc::new(crate::jwt_runtime::Runtime::new(jwt.clone())?),
+                });
+            }
+        }
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
@@ -1338,6 +1397,10 @@ impl Snapshot {
             .map(|route| {
                 std::sync::Arc::new(HttpRuntime {
                     host_regex: regexes.http.remove(&route.id),
+                    jwt_auth: route.jwt_auth.as_ref().map(|jwt| {
+                        jwt_runtimes[&serde_json::to_vec(jwt).expect("serializable JWT policy")]
+                            .clone()
+                    }),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),

@@ -47,6 +47,7 @@ fn is_enforced(value: &bool) -> bool {
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum PrincipalSource {
     Basic,
+    Jwt,
     External { subject_header: String },
 }
 
@@ -62,6 +63,7 @@ impl<'de> Deserialize<'de> for PrincipalSource {
         let wire = Wire::deserialize(deserializer)?;
         match (wire.source.as_str(), wire.subject_header) {
             ("basic", None) => Ok(Self::Basic),
+            ("jwt", None) => Ok(Self::Jwt),
             ("external", Some(subject_header)) => Ok(Self::External { subject_header }),
             ("basic", Some(_)) => Err(D::Error::custom("basic principal has no subject_header")),
             ("external", None) => Err(D::Error::custom("external principal needs subject_header")),
@@ -81,6 +83,7 @@ pub struct AllowRule {
 
 pub enum PrincipalEvidence<'a> {
     Basic(&'a str),
+    Jwt(&'a crate::jwt_auth::Verified),
     External(&'a HeaderMap),
 }
 
@@ -91,6 +94,14 @@ impl ResourcePolicy {
         &self,
         basic_auth: Option<&crate::config::BasicAuth>,
         external_auth: Option<&crate::config::ExternalAuth>,
+    ) -> Result<()> {
+        self.validate_binding_with_jwt(basic_auth, external_auth, None)
+    }
+    pub fn validate_binding_with_jwt(
+        &self,
+        basic_auth: Option<&crate::config::BasicAuth>,
+        external_auth: Option<&crate::config::ExternalAuth>,
+        jwt_auth: Option<&crate::jwt_runtime::JwtAuth>,
     ) -> Result<()> {
         ensure!(
             !self.resource_id.is_empty()
@@ -105,6 +116,10 @@ impl ResourcePolicy {
             "resource policy cannot use external auth terminal_response"
         );
         match &self.principal {
+            PrincipalSource::Jwt => ensure!(
+                jwt_auth.is_some(),
+                "resource principal jwt requires jwt_auth"
+            ),
             PrincipalSource::Basic => {
                 ensure!(
                     basic_auth.is_some(),
@@ -176,6 +191,7 @@ impl ResourcePolicy {
     /// rule, missing/duplicated external identity, or source mismatch denies access.
     pub fn allows(&self, method: &str, evidence: PrincipalEvidence<'_>) -> bool {
         let subject = match (&self.principal, evidence) {
+            (PrincipalSource::Jwt, PrincipalEvidence::Jwt(verified)) => verified.subject.as_str(),
             (PrincipalSource::Basic, PrincipalEvidence::Basic(subject)) => subject,
             (
                 PrincipalSource::External { subject_header },

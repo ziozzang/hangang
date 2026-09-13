@@ -92,6 +92,7 @@ pub struct Proxy {
     outbound: Arc<crate::http_outbound::Pools>,
     requests: Arc<tokio::sync::Semaphore>,
     inspections: Arc<tokio::sync::Semaphore>,
+    jwt_verifications: Arc<tokio::sync::Semaphore>,
     transformations: Arc<tokio::sync::Semaphore>,
     discovery: Arc<arc_swap::ArcSwapOption<crate::discovery::Discovery>>,
     // Optional unauthenticated health path on the public listener, for external
@@ -249,6 +250,7 @@ impl Proxy {
             outbound,
             requests: Arc::new(tokio::sync::Semaphore::new(4096)),
             inspections: Arc::new(tokio::sync::Semaphore::new(32)),
+            jwt_verifications: crate::jwt_runtime::verification_admission(),
             transformations: Arc::new(tokio::sync::Semaphore::new(32)),
             discovery,
             health_path: None,
@@ -929,7 +931,10 @@ impl Proxy {
         // policy routes bypass entirely; hits must not depend on origin health.
         let mut cache_fill = None;
         let only_if_cached = crate::cache_policy::only_if_cached(request.headers());
-        if only_if_cached && runtime.route.access_mode != crate::config::AccessMode::Protected {
+        if only_if_cached
+            && runtime.route.access_mode != crate::config::AccessMode::Protected
+            && runtime.route.jwt_auth.is_none()
+        {
             return Ok(response(504, "only-if-cached cannot be satisfied"));
         }
         if let Some(cache) = &snapshot.cache
@@ -1001,9 +1006,15 @@ impl Proxy {
         // Includes compatibility identity names whose authenticated value is
         // null: those names must remain absent all the way to the origin.
         let basic_reserved = runtime
-            .basic_auth
+            .jwt_auth
             .as_ref()
-            .map(|prepared| prepared.reserved_headers())
+            .map(|jwt| jwt.reserved_headers())
+            .or_else(|| {
+                runtime
+                    .basic_auth
+                    .as_ref()
+                    .map(|prepared| prepared.reserved_headers())
+            })
             .unwrap_or(&[]);
         // Session cookies issued by the authorization service on a 2xx.
         let mut auth_cookies: Vec<HeaderValue> = Vec::new();
@@ -1017,6 +1028,92 @@ impl Proxy {
             .as_ref()
             .filter(|policy| policy.enforce);
         let mut resource_allowed = resource_policy.is_none();
+        if let Some(jwt) = &runtime.route.jwt_auth {
+            for name in basic_reserved {
+                request.headers_mut().remove(name);
+            }
+            let authenticated = match bearer_token(request.headers()) {
+                Some(token) => match &runtime.jwt_auth {
+                    Some(prepared) => {
+                        prepared
+                            .authenticate(token, self.jwt_verifications.clone())
+                            .await
+                    }
+                    None => Err(crate::jwt_runtime::AuthFailure::Unavailable),
+                },
+                None => Err(crate::jwt_runtime::AuthFailure::Invalid),
+            };
+            let verified = match authenticated {
+                Ok(verified) => verified,
+                Err(error) => {
+                    use crate::jwt_runtime::AuthFailure;
+                    self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    let status = match error {
+                        AuthFailure::Invalid | AuthFailure::Forbidden => {
+                            self.metrics
+                                .jwt_auth_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            if error == AuthFailure::Invalid {
+                                401
+                            } else {
+                                403
+                            }
+                        }
+                        AuthFailure::Unavailable => {
+                            self.metrics
+                                .jwt_auth_unavailable
+                                .fetch_add(1, Ordering::Relaxed);
+                            503
+                        }
+                        AuthFailure::Capacity => {
+                            self.metrics
+                                .jwt_auth_capacity_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            503
+                        }
+                    };
+                    let mut denied = response(
+                        status,
+                        if status == 503 {
+                            "JWT verification unavailable"
+                        } else {
+                            "JWT authorization refused"
+                        },
+                    );
+                    if status == 401 {
+                        denied
+                            .headers_mut()
+                            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                    }
+                    if status == 403 {
+                        denied.headers_mut().insert(
+                            header::WWW_AUTHENTICATE,
+                            HeaderValue::from_static("Bearer error=\"insufficient_scope\""),
+                        );
+                    }
+                    return Ok(denied);
+                }
+            };
+            if let Some(policy) = resource_policy
+                && matches!(
+                    policy.principal,
+                    crate::resource_policy::PrincipalSource::Jwt
+                )
+            {
+                resource_allowed = policy.allows(
+                    request.method().as_str(),
+                    crate::resource_policy::PrincipalEvidence::Jwt(&verified),
+                );
+            }
+            if let Some(name) = &jwt.identity_header {
+                let name: HeaderName = name.parse().expect("validated JWT identity header");
+                let Ok(value) = HeaderValue::from_bytes(verified.subject.as_bytes()) else {
+                    return Ok(response(401, "JWT subject cannot be forwarded"));
+                };
+                request.headers_mut().insert(name.clone(), value.clone());
+                established_identity.push((name, value));
+            }
+        }
         if let Some(basic) = &runtime.route.basic_auth {
             let prepared = runtime
                 .basic_auth
@@ -1129,6 +1226,14 @@ impl Proxy {
             }
         }
 
+        if runtime
+            .route
+            .jwt_auth
+            .as_ref()
+            .is_some_and(|jwt| jwt.hide_credentials)
+        {
+            request.headers_mut().remove(header::AUTHORIZATION);
+        }
         if !resource_allowed {
             self.metrics.errors.fetch_add(1, Ordering::Relaxed);
             return Ok(response(403, "resource permission denied"));
@@ -1832,6 +1937,19 @@ async fn inspect_json_body(
     let bytes = collected.to_bytes();
     let json = serde_json::from_slice(&bytes).map_err(|_| InspectError::Invalid)?;
     Ok((Request::from_parts(parts, full_body(bytes)), json))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("Bearer")
+        && !token.is_empty()
+        && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
+    .then_some(token)
 }
 
 #[cfg(test)]
@@ -2648,6 +2766,7 @@ mod tests {
         HttpRoute {
             access_mode: Default::default(),
             resource_policy: None,
+            jwt_auth: None,
             enabled: true,
             upstream: Default::default(),
             priority: 0,

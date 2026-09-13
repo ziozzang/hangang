@@ -6,6 +6,9 @@ pub struct Metrics {
     pub cache_misses: AtomicU64,
     pub cache_bypasses: AtomicU64,
     pub errors: AtomicU64,
+    pub jwt_auth_rejections: AtomicU64,
+    pub jwt_auth_unavailable: AtomicU64,
+    pub jwt_auth_capacity_rejections: AtomicU64,
     pub rejected_requests: AtomicU64,
     pub active_connections: AtomicU64,
     pub rejected_connections: AtomicU64,
@@ -25,6 +28,21 @@ impl Metrics {
             ("cache_misses_total", "counter", &self.cache_misses),
             ("cache_bypasses_total", "counter", &self.cache_bypasses),
             ("errors_total", "counter", &self.errors),
+            (
+                "jwt_auth_rejections_total",
+                "counter",
+                &self.jwt_auth_rejections,
+            ),
+            (
+                "jwt_auth_unavailable_total",
+                "counter",
+                &self.jwt_auth_unavailable,
+            ),
+            (
+                "jwt_auth_capacity_rejections_total",
+                "counter",
+                &self.jwt_auth_capacity_rejections,
+            ),
             (
                 "rejected_requests_total",
                 "counter",

@@ -452,3 +452,35 @@ fn jwt_and_basic_cannot_compete_for_one_authorization_header() {
     let config: Config = serde_json::from_value(json!({"http":[route]})).unwrap();
     assert!(config.validate().is_err());
 }
+
+#[tokio::test]
+async fn alternate_and_duplicate_credentials_do_not_authenticate() {
+    let (upstream, seen, upstream_task) = origin().await;
+    let (front, policy, front_task) = gateway(vec![jwt_route(upstream)]).await;
+    let bearer = good_token();
+    let authorization = format!("Bearer {bearer}");
+    for headers in [
+        vec![("cookie", authorization.as_str())],
+        vec![("proxy-authorization", authorization.as_str())],
+        vec![
+            ("authorization", authorization.as_str()),
+            ("authorization", authorization.as_str()),
+        ],
+    ] {
+        assert_eq!(request(front, "/secure/records", None, &headers).await, 401);
+    }
+    assert_eq!(
+        request(
+            front,
+            &format!("/secure/records?access_token={bearer}"),
+            None,
+            &[]
+        )
+        .await,
+        401
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}

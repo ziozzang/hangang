@@ -598,6 +598,7 @@ async fn resource_policy_rejects_native_identity_transform_and_defensively_reass
     let mut route = previous.route.clone();
     route.request_transform = Some(transform.clone());
     let runtime = hangang::config::HttpRuntime {
+        jwt_auth: None,
         host_regex: previous.host_regex.clone(),
         admission: previous.admission.clone(),
         balancer: previous.balancer.clone(),

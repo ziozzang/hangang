@@ -1,0 +1,68 @@
+{
+  "http": [
+    {
+      "id": "orders-api",
+      "hosts": [
+        "api.example.test",
+        "www.api.example.test"
+      ],
+      "path_prefix": "/orders",
+      "path_match": "segment_prefix",
+      "access_mode": "protected",
+      "require_tls": true,
+      "backends": [
+        "http://127.0.0.1:8080"
+      ],
+      "jwt_auth": {
+        "verification": {
+          "issuer": "https://identity.example.test/",
+          "audiences": [
+            "orders-api"
+          ],
+          "profile": "rfc9068",
+          "algorithms": [
+            "RS256"
+          ],
+          "leeway_seconds": 0,
+          "max_lifetime_seconds": 3600,
+          "scope_claim": "scope",
+          "groups_claim": "groups",
+          "required_scopes": [
+            "orders:read"
+          ],
+          "required_groups": []
+        },
+        "keys": {
+          "source": "remote",
+          "config": {
+            "endpoint": {
+              "kind": "oidc"
+            },
+            "cache_ttl_seconds": 300,
+            "refresh_cooldown_seconds": 10,
+            "timeout_ms": 3000
+          }
+        },
+        "hide_credentials": true,
+        "identity_header": "x-verified-subject"
+      },
+      "resource_policy": {
+        "resource_id": "orders",
+        "principal": {
+          "source": "jwt"
+        },
+        "allow": [
+          {
+            "subjects": [
+              "service-reader"
+            ],
+            "methods": [
+              "GET",
+              "HEAD"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
