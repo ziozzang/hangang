@@ -114,6 +114,43 @@ test('named members show stable ID, configured address and effective weight in b
   await expect(row).toContainText('가중치 7');
 });
 
+test('named TCP rows show established member streams separately from route connections in both languages', async ({ page }) => {
+  await fixture(page, false, [{ ...last, route_id: 'tcp-streams', member_id: 'blue',
+    member_active_streams: 3, route_active_connections: 7 }]);
+  await page.locator('a[href="#operations"]').click();
+  const row = page.locator('#operations-rows tr').first();
+  await expect(row).toContainText('7 active route connections');
+  await expect(row).toContainText('3 established member streams');
+  await expect(row).toContainText('excludes pending dials');
+  await expect(row).toContainText('Not a drain-complete signal');
+  await expect(row).not.toContainText('active requests');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(row).toContainText('활성 라우트 연결 7개');
+  await expect(row).toContainText('확립된 멤버 스트림 3개');
+  await expect(row).toContainText('드레인 완료를 뜻하지 않습니다');
+});
+
+test('zero is measured only for named TCP; missing/null counts remain unavailable', async ({ page }) => {
+  await fixture(page, false, [
+    { ...last, route_id: 'measured-zero', member_id: 'blue', member_active_streams: 0 },
+    { ...last, route_id: 'unknown-null', member_id: 'green', member_active_streams: null },
+    { ...last, route_id: 'old-server', member_id: 'orange' },
+    { ...last, route_id: 'legacy-tcp', member_id: null, member_active_streams: null },
+    { ...first, route_id: 'http-member', member_id: 'http-blue', member_active_streams: null },
+  ]);
+  await page.locator('a[href="#operations"]').click();
+  const row = (id) => page.locator('#operations-rows tr').filter({ hasText: id });
+  await expect(row('measured-zero')).toContainText('0 established member streams');
+  for (const id of ['unknown-null', 'old-server']) {
+    await expect(row(id)).toContainText('Member stream count unavailable');
+    await expect(row(id)).not.toContainText('0 established member streams');
+  }
+  await expect(row('legacy-tcp')).toContainText('Route-wide, not per target');
+  await expect(row('legacy-tcp')).not.toContainText('established member streams');
+  await expect(row('http-member')).toContainText('3 active requests');
+  await expect(row('http-member')).not.toContainText('established member streams');
+});
+
 test('operations view shows real local eligibility, bounded paging and escaped target addresses', async ({ page }) => {
   const calls = await fixture(page);
   await page.locator('a[href="#operations"]').click();

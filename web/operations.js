@@ -91,9 +91,17 @@ function renderRows(rows) {
     const load = node('td');
     load.append(node('span', 'operations-primary', row.protocol === 'tcp'
       ? t('{count} active route connections', { count: formatNumberLocale(row.route_active_connections ?? 0) })
-      : row.active_requests === null ? t('Not tracked')
+      : row.active_requests == null ? t('Not tracked')
         : t('{count} active requests', { count: formatNumberLocale(row.active_requests) })));
-    if (row.protocol === 'tcp') load.append(node('span', 'operations-secondary', t('Route-wide, not per target')));
+    if (row.protocol === 'tcp') {
+      if (row.member_id) {
+        const count = row.member_active_streams;
+        load.append(node('span', 'operations-secondary', Number.isSafeInteger(count) && count >= 0
+          ? t('{count} established member streams', { count: formatNumberLocale(count) })
+          : t('Member stream count unavailable')));
+        load.append(node('span', 'operations-secondary', t('Instance-local; includes old endpoints, excludes pending dials. Not a drain-complete signal.')));
+      } else load.append(node('span', 'operations-secondary', t('Route-wide, not per target')));
+    }
     tr.append(route, target, selection, health, load);
     return tr;
   }));
