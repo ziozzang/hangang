@@ -1016,10 +1016,14 @@ async fn run(args: Args) -> Result<()> {
         cancel.cancel();
         anyhow::bail!("{authority} did not become ready within 10 seconds");
     }
-    let mut tls_watchers = vec![tokio::spawn(hangang::workload_material::watch(
+    // Trust withdrawal must remain active while old connections drain, even
+    // after the global accept/configuration cancellation token is cancelled.
+    let workload_cancel = CancellationToken::new();
+    let workload_watcher = tokio::spawn(hangang::workload_material::watch(
         active.clone(),
-        cancel.clone(),
-    ))];
+        workload_cancel.clone(),
+    ));
+    let mut tls_watchers = Vec::new();
     // New slots are quarantined until the watcher verifies their files after
     // publication. Do not signal startup readiness or accept traffic earlier.
     if tokio::time::timeout(Duration::from_secs(10), async {
@@ -1040,6 +1044,8 @@ async fn run(args: Args) -> Result<()> {
     .is_err()
     {
         cancel.cancel();
+        workload_cancel.cancel();
+        let _ = workload_watcher.await;
         anyhow::bail!("workload TLS material did not become ready within 10 seconds");
     }
     tcp.open_gate();
@@ -1202,6 +1208,8 @@ async fn run(args: Args) -> Result<()> {
         tcp.shutdown(grace),
         proxy.shutdown(grace)
     );
+    workload_cancel.cancel();
+    let _ = workload_watcher.await;
     pool.shutdown().await;
     validation_pool.shutdown().await;
     drop(lock);

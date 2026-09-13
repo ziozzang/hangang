@@ -72,8 +72,9 @@ class Restart(unittest.TestCase):
                                    "allow":[{"subjects":[identity],"methods":["GET"]}]}})
             state.write_text(json.dumps(config))
             with open(root/"log","w+") as log:
-                child=subprocess.Popen([str(executable),"--supervised","--config",str(state),"--listen",f"127.0.0.1:{public}","--admin",f"127.0.0.1:{admin}","--threads","2","--lua-workers","1","--drain-seconds","3"],env={**os.environ,"HANGANG_ADMIN_TOKEN":TOKEN},stdout=log,stderr=log)
+                child=subprocess.Popen([str(executable),"--supervised","--config",str(state),"--listen",f"127.0.0.1:{public}","--admin",f"127.0.0.1:{admin}","--threads","2","--lua-workers","1","--drain-seconds","10"],env={**os.environ,"HANGANG_ADMIN_TOKEN":TOKEN},stdout=log,stderr=log)
                 stream=None
+                held_workload=None
                 def status():
                     code,_,body=smoke.Smoke.request(admin,"GET","/v1/status",auth=True)
                     self.assertEqual(code,200);return json.loads(body)
@@ -107,9 +108,29 @@ class Restart(unittest.TestCase):
                     workload_request()
                     stream=socket.create_connection(("127.0.0.1",tcp),timeout=2)
                     stream.sendall(b"before");self.assertEqual(recv_exact(stream,6),b"before")
+                    held_workload=context.wrap_socket(socket.create_connection(("127.0.0.1",workload),timeout=3),server_hostname="localhost")
+                    def held_request():
+                        held_workload.sendall(b"GET /workload HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        response=http.client.HTTPResponse(held_workload);response.begin()
+                        self.assertEqual(response.status,200);response.read();response.close()
+                    held_request()
                     child.send_signal(signal.SIGHUP)
                     next_generation=await_status(lambda value:value["process_id"]!=initial["process_id"])
                     self.assertIsNone(child.poll())
+                    workload_request()
+                    held_request()
+                    # The old generation is draining this existing connection.
+                    # Its trust watcher must outlive the accept-loop shutdown.
+                    ca.write_bytes(b"invalid CA during old generation drain")
+                    await_status(lambda value: value["workload_materials"] == [{"kind":"http","id":"private","ready":False}])
+                    held_workload.settimeout(2)
+                    try:
+                        self.assertEqual(held_workload.recv(1),b"")
+                    except (ConnectionResetError,ssl.SSLError):
+                        pass
+                    held_workload.close();held_workload=None
+                    ca.write_bytes(original_ca)
+                    await_status(lambda value: value["workload_materials"] == [{"kind":"http","id":"private","ready":True}])
                     workload_request()
                     stream.sendall(b"after");self.assertEqual(recv_exact(stream,5),b"after")
                     self.assertEqual(smoke.Smoke.request(public,"GET","/")[0],200)
@@ -133,6 +154,7 @@ class Restart(unittest.TestCase):
                     self.assertNotEqual(child.wait(timeout=5),0)
                 finally:
                     if stream: stream.close()
+                    if held_workload: held_workload.close()
                     if child.poll() is None: child.terminate()
                     try:child.wait(timeout=10)
                     except subprocess.TimeoutExpired:child.kill();child.wait()
