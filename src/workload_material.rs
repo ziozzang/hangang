@@ -5,7 +5,7 @@
 //! which is still present in the active snapshot.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     os::unix::fs::MetadataExt,
     path::Path,
@@ -113,22 +113,41 @@ impl Slot {
                 .any(|item| Arc::ptr_eq(item, slot))
     }
 
+    #[cfg(test)]
     async fn refresh(active: &Arc<ArcSwap<Snapshot>>, slot: &Arc<Self>) {
-        let expected = slot.load();
-        let policy = slot.policy.clone();
-        let http = slot.http;
-        let now = Instant::now();
-        let (prior_stamps, prior_verified) = {
-            let check = slot.check.lock().unwrap();
-            (check.stamps.clone(), check.verified_at)
+        Self::refresh_many(active, std::slice::from_ref(slot)).await;
+    }
+
+    /// Verify one immutable policy and apply the result independently to all
+    /// active slots that use it. Reusing a parsed generation is safe for new
+    /// slots, while already-admitted old slots retain their exact Arc if the
+    /// fingerprint is unchanged.
+    async fn refresh_many(active: &Arc<ArcSwap<Snapshot>>, slots: &[Arc<Self>]) {
+        let Some(first) = slots.first() else {
+            return;
         };
+        let policy = first.policy.clone();
+        let http = first.http;
+        let now = Instant::now();
+        let prior = slots
+            .iter()
+            .map(|slot| {
+                let check = slot.check.lock().unwrap();
+                (slot.load(), check.stamps.clone(), check.verified_at)
+            })
+            .collect::<Vec<_>>();
+        let freshness = prior
+            .iter()
+            .map(|(_, stamps, verified)| (stamps.clone(), *verified))
+            .collect::<Vec<_>>();
         // All metadata and PEM operations run off the async executor. The
-        // single watcher awaits each job before starting the next one.
+        // single watcher awaits each policy group before starting the next.
         let checked = tokio::task::spawn_blocking(move || {
             let before = stamps(&policy)?;
-            if prior_stamps.as_ref() == Some(&before)
-                && prior_verified.is_some_and(|at| now.duration_since(at) < FULL_VERIFY_INTERVAL)
-            {
+            if freshness.iter().all(|(stamps, verified)| {
+                stamps.as_ref() == Some(&before)
+                    && verified.is_some_and(|at| now.duration_since(at) < FULL_VERIFY_INTERVAL)
+            }) {
                 return Ok::<_, anyhow::Error>(None);
             }
             let mut prepared = Prepared::load(&policy)?;
@@ -142,44 +161,50 @@ impl Slot {
         })
         .await;
 
-        if !Self::present(active, slot) {
-            return;
-        }
-        match checked {
-            Ok(Ok(None)) => {}
-            Ok(Ok(Some((prepared, stamps)))) => {
-                let keep_old = expected
-                    .as_ref()
-                    .is_some_and(|old| old.fingerprint() == prepared.fingerprint());
-                let next = if keep_old {
-                    expected.clone()
-                } else {
-                    Some(Arc::new(prepared))
-                };
-                let prior = slot.prepared.compare_and_swap(&expected, next);
-                if option_ptr_eq(&prior, &expected) {
-                    let mut check = slot.check.lock().unwrap();
-                    check.stamps = Some(stamps);
-                    check.verified_at = Some(Instant::now());
-                    if !keep_old {
-                        tracing::info!(
-                            kind = if http { "http" } else { "tcp" },
-                            "mTLS material verified"
-                        );
+        let verified = match checked {
+            Ok(Ok(Some((prepared, stamps)))) => Some((Arc::new(prepared), stamps)),
+            Ok(Ok(None)) => return,
+            _ => None,
+        };
+        for (slot, (expected, _, _)) in slots.iter().zip(prior) {
+            if !Self::present(active, slot) {
+                continue;
+            }
+            match &verified {
+                Some((prepared, stamps)) => {
+                    let keep_old = expected
+                        .as_ref()
+                        .is_some_and(|old| old.fingerprint() == prepared.fingerprint());
+                    let next = if keep_old {
+                        expected.clone()
+                    } else {
+                        Some(prepared.clone())
+                    };
+                    let prior = slot.prepared.compare_and_swap(&expected, next);
+                    if option_ptr_eq(&prior, &expected) {
+                        let mut check = slot.check.lock().unwrap();
+                        check.stamps = Some(stamps.clone());
+                        check.verified_at = Some(Instant::now());
+                        if !keep_old {
+                            tracing::info!(
+                                kind = if http { "http" } else { "tcp" },
+                                "mTLS material verified"
+                            );
+                        }
                     }
                 }
-            }
-            _ => {
-                let prior = slot.prepared.compare_and_swap(&expected, None);
-                if option_ptr_eq(&prior, &expected) {
-                    let mut check = slot.check.lock().unwrap();
-                    check.stamps = None;
-                    check.verified_at = None;
-                    if expected.is_some() {
-                        tracing::warn!(
-                            kind = if http { "http" } else { "tcp" },
-                            "mTLS material unavailable"
-                        );
+                None => {
+                    let prior = slot.prepared.compare_and_swap(&expected, None);
+                    if option_ptr_eq(&prior, &expected) {
+                        let mut check = slot.check.lock().unwrap();
+                        check.stamps = None;
+                        check.verified_at = None;
+                        if expected.is_some() {
+                            tracing::warn!(
+                                kind = if http { "http" } else { "tcp" },
+                                "mTLS material unavailable"
+                            );
+                        }
                     }
                 }
             }
@@ -211,13 +236,28 @@ pub async fn watch(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationToken) {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        let mut groups: HashMap<(bool, Vec<u8>), Vec<Arc<Slot>>> = HashMap::new();
         for slot in slots {
+            // Policy has already passed serialization during snapshot
+            // preparation. On an impossible serialization failure, use the
+            // ordinary fail-closed verification path with its active/CAS fence.
+            let policy = match serde_json::to_vec(&slot.policy) {
+                Ok(policy) => policy,
+                Err(_) => {
+                    tokio::select! { biased; _ = cancel.cancelled() => return,
+                    _ = Slot::refresh_many(&active, std::slice::from_ref(&slot)) => {} }
+                    continue;
+                }
+            };
+            groups.entry((slot.http, policy)).or_default().push(slot);
+        }
+        for group in groups.values() {
             if cancel.is_cancelled() {
                 return;
             }
-            if Slot::present(&active, &slot) {
+            if group.iter().any(|slot| Slot::present(&active, slot)) {
                 tokio::select! { biased; _ = cancel.cancelled() => return,
-                _ = Slot::refresh(&active, &slot) => {} }
+                _ = Slot::refresh_many(&active, group) => {} }
             }
         }
     }
@@ -358,6 +398,35 @@ mod tests {
         fs::write(&slot.policy.client_ca_file, original).unwrap();
         Slot::refresh(&active, &slot).await;
         let recovered = slot.load().unwrap();
+        assert!(!Arc::ptr_eq(&first, &recovered));
+    }
+
+    #[tokio::test]
+    async fn incremental_identical_policy_slots_share_one_parsed_generation() {
+        let (_dir, active, original_slot) = fixture();
+        let mut config = active.load().config.clone();
+        let mut alias = config.tcp[0].clone();
+        alias.id = "alias".into();
+        alias.listen = "127.0.0.1:9444".parse().unwrap();
+        config.tcp.push(alias);
+        let next = Snapshot::replace(config, &active.load_full()).unwrap();
+        let new_slot = next.tcp_inbound_tls["alias"].clone();
+        assert!(!Arc::ptr_eq(&original_slot, &new_slot));
+        assert!(original_slot.load().is_none() && new_slot.load().is_none());
+        active.store(Arc::new(next));
+
+        let slots = [original_slot.clone(), new_slot.clone()];
+        Slot::refresh_many(&active, &slots).await;
+        let first = original_slot.load().unwrap();
+        assert!(Arc::ptr_eq(&first, &new_slot.load().unwrap()));
+        let original = fs::read(&original_slot.policy.client_ca_file).unwrap();
+        fs::write(&original_slot.policy.client_ca_file, b"invalid CA").unwrap();
+        Slot::refresh_many(&active, &slots).await;
+        assert!(original_slot.load().is_none() && new_slot.load().is_none());
+        fs::write(&original_slot.policy.client_ca_file, original).unwrap();
+        Slot::refresh_many(&active, &slots).await;
+        let recovered = original_slot.load().unwrap();
+        assert!(Arc::ptr_eq(&recovered, &new_slot.load().unwrap()));
         assert!(!Arc::ptr_eq(&first, &recovered));
     }
     #[tokio::test]
