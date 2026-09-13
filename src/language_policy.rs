@@ -9,6 +9,7 @@
 //! Language preferences are client-controlled. They are not a country,
 //! location, or authenticated identity signal.
 
+use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 pub const MAX_HEADER_BYTES: usize = 4_096;
@@ -57,6 +58,186 @@ pub struct Preference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preferences {
     entries: Vec<Preference>,
+}
+
+/// How configured language ranges classify positive client preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    Any,
+    Preferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyError {
+    Empty,
+    TooManyRanges,
+    InvalidRange,
+    DuplicateRange,
+}
+
+impl fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Empty => "language policy needs at least one allow or deny range",
+            Self::TooManyRanges => "language policy has too many ranges",
+            Self::InvalidRange => "language policy has an invalid basic range",
+            Self::DuplicateRange => "language policy repeats a basic range",
+        };
+        f.write_str(message)
+    }
+}
+
+impl Error for PolicyError {}
+
+/// Route wire policy. `mode` and `on_missing` must be explicit whenever this
+/// object is configured. Disabled enforcement still validates every range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    pub mode: MatchMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+    pub on_missing: MissingAction,
+    #[serde(default = "enforce_default", skip_serializing_if = "is_enforced")]
+    pub enforce: bool,
+}
+
+fn enforce_default() -> bool {
+    true
+}
+
+fn is_enforced(value: &bool) -> bool {
+    *value
+}
+
+impl Policy {
+    pub fn compile(&self) -> Result<CompiledLanguagePolicy, PolicyError> {
+        CompiledLanguagePolicy::new(
+            self.mode,
+            self.on_missing,
+            self.enforce,
+            &self.allow,
+            &self.deny,
+        )
+    }
+}
+
+/// Compiled route admission only. The caller must select the route before
+/// evaluation, never treat this as a route predicate with fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledLanguagePolicy {
+    mode: MatchMode,
+    on_missing: MissingAction,
+    enforce: bool,
+    allow: Vec<String>,
+    deny: Vec<String>,
+}
+
+impl CompiledLanguagePolicy {
+    pub fn new<A, D>(
+        mode: MatchMode,
+        on_missing: MissingAction,
+        enforce: bool,
+        allow: A,
+        deny: D,
+    ) -> Result<Self, PolicyError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<str>,
+        D: IntoIterator,
+        D::Item: AsRef<str>,
+    {
+        let mut allow_ranges = Vec::new();
+        let mut deny_ranges = Vec::new();
+        append_policy_ranges(allow, &mut allow_ranges, 0)?;
+        append_policy_ranges(deny, &mut deny_ranges, allow_ranges.len())?;
+        if allow_ranges.is_empty() && deny_ranges.is_empty() {
+            return Err(PolicyError::Empty);
+        }
+        Ok(Self {
+            mode,
+            on_missing,
+            enforce,
+            allow: allow_ranges,
+            deny: deny_ranges,
+        })
+    }
+
+    pub fn enforced(&self) -> bool {
+        self.enforce
+    }
+
+    pub fn allows(&self, header: &HeaderState) -> bool {
+        if !self.enforce {
+            return true;
+        }
+        let HeaderState::Present(preferences) = header else {
+            return self.on_missing == MissingAction::Allow;
+        };
+        let highest = preferences
+            .entries
+            .iter()
+            .map(|preference| preference.quality)
+            .max()
+            .unwrap_or(0);
+        // An empty list or q=0-only header states no acceptable language;
+        // even a deny-only rule must not treat it as a positive admission.
+        if highest == 0 {
+            return false;
+        }
+        let selected = |preference: &&Preference| {
+            preference.quality > 0 && (self.mode == MatchMode::Any || preference.quality == highest)
+        };
+        let matches = |rule: &String| {
+            preferences
+                .entries
+                .iter()
+                .filter(selected)
+                .any(|preference| {
+                    // A client's '*' is not evidence for a named language.
+                    // An explicitly configured '*' may classify it.
+                    (preference.range != "*" || rule == "*")
+                        && basic_filter_validated(rule, &preference.range)
+                })
+        };
+        !self.deny.iter().any(matches) && (self.allow.is_empty() || self.allow.iter().any(matches))
+    }
+}
+
+fn append_policy_ranges<I>(
+    ranges: I,
+    target: &mut Vec<String>,
+    already: usize,
+) -> Result<(), PolicyError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    for range in ranges {
+        if already + target.len() == MAX_RANGES {
+            return Err(PolicyError::TooManyRanges);
+        }
+        let range = range.as_ref();
+        if !valid_basic_range(range.as_bytes(), true) {
+            return Err(PolicyError::InvalidRange);
+        }
+        let range = range.to_ascii_lowercase();
+        if target.contains(&range) {
+            return Err(PolicyError::DuplicateRange);
+        }
+        target.push(range);
+    }
+    Ok(())
 }
 
 /// Namespace for parsing one or several `Accept-Language` field lines.
@@ -391,6 +572,145 @@ mod tests {
         assert_eq!(
             parsed(&[b"ko"]).quality_for("ko-ü"),
             Err(LanguageError::InvalidTag)
+        );
+    }
+
+    fn policy(
+        mode: MatchMode,
+        allow: &[&str],
+        deny: &[&str],
+        on_missing: MissingAction,
+    ) -> CompiledLanguagePolicy {
+        CompiledLanguagePolicy::new(mode, on_missing, true, allow, deny).unwrap()
+    }
+
+    #[test]
+    fn route_wire_requires_mode_and_missing_choice_and_preserves_disabled_policy() {
+        assert!(serde_json::from_str::<Policy>(r#"{"allow":["ko"],"on_missing":"deny"}"#).is_err());
+        assert!(serde_json::from_str::<Policy>(r#"{"mode":"any","allow":["ko"]}"#).is_err());
+        assert!(
+            serde_json::from_str::<Policy>(r#"{"mode":"any","on_missing":"deny","extra":true}"#)
+                .is_err()
+        );
+        let enabled: Policy =
+            serde_json::from_str(r#"{"mode":"preferred","allow":["KO"],"on_missing":"deny"}"#)
+                .unwrap();
+        assert!(enabled.enforce);
+        assert!(
+            serde_json::to_value(&enabled)
+                .unwrap()
+                .get("enforce")
+                .is_none()
+        );
+        let mut disabled = enabled.clone();
+        disabled.enforce = false;
+        assert_eq!(serde_json::to_value(&disabled).unwrap()["enforce"], false);
+        let compiled = disabled.compile().unwrap();
+        assert!(!compiled.enforced());
+        assert!(compiled.allows(&HeaderState::Missing));
+        disabled.allow = vec!["bad-*".into()];
+        assert_eq!(disabled.compile(), Err(PolicyError::InvalidRange));
+    }
+
+    #[test]
+    fn configured_basic_range_classifies_client_ranges_in_one_direction() {
+        let ko = policy(MatchMode::Any, &["ko"], &[], MissingAction::Deny);
+        assert!(ko.allows(&HeaderState::Present(parsed(&[b"ko-KR;q=0.8"]))));
+        assert!(!ko.allows(&HeaderState::Present(parsed(&[b"koala;q=1"]))));
+        let regional = policy(MatchMode::Any, &["ko-KR"], &[], MissingAction::Deny);
+        assert!(!regional.allows(&HeaderState::Present(parsed(&[b"ko;q=1"]))));
+        assert!(regional.allows(&HeaderState::Present(parsed(&[b"ko-KR;q=1"]))));
+    }
+
+    #[test]
+    fn any_preferred_and_deny_precedence_are_explicit() {
+        let header = HeaderState::Present(parsed(&[b"en;q=1, ko-KR;q=0.8"]));
+        assert!(policy(MatchMode::Any, &["ko"], &[], MissingAction::Deny).allows(&header));
+        assert!(!policy(MatchMode::Preferred, &["ko"], &[], MissingAction::Deny).allows(&header));
+        assert!(policy(MatchMode::Preferred, &["en"], &[], MissingAction::Deny).allows(&header));
+        assert!(!policy(MatchMode::Any, &["ko"], &["ko-KR"], MissingAction::Deny).allows(&header));
+        // Both lists may name the same range; the explicit deny wins.
+        assert!(!policy(MatchMode::Any, &["ko"], &["KO"], MissingAction::Deny).allows(&header));
+        let tied = HeaderState::Present(parsed(&[b"en;q=0.9, ko;q=0.9"]));
+        assert!(policy(MatchMode::Preferred, &["ko"], &[], MissingAction::Deny).allows(&tied));
+    }
+
+    #[test]
+    fn wildcard_qzero_empty_and_missing_do_not_infer_a_named_language() {
+        let named = policy(MatchMode::Any, &["ko"], &[], MissingAction::Deny);
+        assert!(!named.allows(&HeaderState::Present(parsed(&[b"*;q=1"]))));
+        assert!(!named.allows(&HeaderState::Present(parsed(&[b"ko;q=0,*;q=1"]))));
+        assert!(!named.allows(&HeaderState::Missing));
+        let any = policy(MatchMode::Any, &["*"], &[], MissingAction::Allow);
+        assert!(any.allows(&HeaderState::Present(parsed(&[b"*;q=1"]))));
+        assert!(any.allows(&HeaderState::Missing));
+        let deny_only = policy(MatchMode::Any, &[], &["ko"], MissingAction::Allow);
+        assert!(!deny_only.allows(&HeaderState::Present(parsed(&[b""]))));
+        assert!(!deny_only.allows(&HeaderState::Present(parsed(&[b"ko;q=0"]))));
+        assert!(deny_only.allows(&HeaderState::Missing));
+        assert!(deny_only.allows(&HeaderState::Present(parsed(&[b"en;q=1"]))));
+        assert!(!deny_only.allows(&HeaderState::Present(parsed(&[b"ko;q=1"]))));
+        // A top-weight wildcard prevents a lower-weight concrete language
+        // from satisfying a preferred-only rule.
+        assert!(
+            !policy(MatchMode::Preferred, &["ko"], &[], MissingAction::Deny)
+                .allows(&HeaderState::Present(parsed(&[b"*;q=1,ko;q=0.8"])))
+        );
+    }
+
+    #[test]
+    fn policy_compilation_bounds_and_duplicate_scope_are_checked() {
+        assert_eq!(
+            CompiledLanguagePolicy::new(
+                MatchMode::Any,
+                MissingAction::Deny,
+                true,
+                [] as [&str; 0],
+                [] as [&str; 0]
+            ),
+            Err(PolicyError::Empty)
+        );
+        assert_eq!(
+            CompiledLanguagePolicy::new(
+                MatchMode::Any,
+                MissingAction::Deny,
+                true,
+                ["ko", "KO"],
+                [] as [&str; 0]
+            ),
+            Err(PolicyError::DuplicateRange)
+        );
+        assert_eq!(
+            CompiledLanguagePolicy::new(MatchMode::Any, MissingAction::Deny, true, ["ko"], ["KO"]),
+            Ok(policy(
+                MatchMode::Any,
+                &["ko"],
+                &["KO"],
+                MissingAction::Deny
+            ))
+        );
+        let many = (0..=MAX_RANGES)
+            .map(|i| format!("x-{i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            CompiledLanguagePolicy::new(
+                MatchMode::Any,
+                MissingAction::Deny,
+                true,
+                &many,
+                &[] as &[String]
+            ),
+            Err(PolicyError::TooManyRanges)
+        );
+        assert_eq!(
+            CompiledLanguagePolicy::new(
+                MatchMode::Any,
+                MissingAction::Deny,
+                false,
+                ["ko-*"],
+                [] as [&str; 0]
+            ),
+            Err(PolicyError::InvalidRange)
         );
     }
 }
