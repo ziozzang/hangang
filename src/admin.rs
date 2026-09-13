@@ -963,7 +963,7 @@ impl Admin {
             return Ok(problem(403, "Forbidden", "administrator role required"));
         }
         if path == "/v1/users" || path.starts_with("/v1/users/") {
-            return Ok(self.handle_users(req, &path).await);
+            return Ok(self.handle_users(req, &path, &actor).await);
         }
         if path == "/v1/update/status" {
             if req.method() != hyper::Method::GET {
@@ -1913,6 +1913,14 @@ impl AdminActor {
             Self::Account { user, .. } => user.role,
         }
     }
+    fn mutation_authority(&self) -> crate::admin_users::MutationAuthority {
+        match self {
+            Self::System => crate::admin_users::MutationAuthority::System,
+            Self::Account { token, .. } => {
+                crate::admin_users::MutationAuthority::Session(token.clone())
+            }
+        }
+    }
     fn user(&self) -> crate::admin_users::User {
         match self {
             Self::System => crate::admin_users::User {
@@ -2034,6 +2042,9 @@ fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {
 }
 
 fn account_problem(error: anyhow::Error) -> Response<Body> {
+    if error.is::<crate::admin_users::AuthorizationRevoked>() {
+        return problem(403, "Forbidden", "administrator role required");
+    }
     if error.to_string().contains("password capacity exhausted") {
         return problem(
             503,
@@ -2146,7 +2157,12 @@ impl Admin {
         }
     }
 
-    async fn handle_users(&self, req: Request<Incoming>, path: &str) -> Response<Body> {
+    async fn handle_users(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        actor: &AdminActor,
+    ) -> Response<Body> {
         use crate::admin_users::{Change, Role};
         if path == "/v1/users" {
             if req.method() == hyper::Method::GET {
@@ -2176,7 +2192,12 @@ impl Admin {
             }
             return match self
                 .users
-                .create(payload.username, payload.password, payload.role)
+                .create(
+                    actor.mutation_authority(),
+                    payload.username,
+                    payload.password,
+                    payload.role,
+                )
                 .await
             {
                 Ok(Some(user)) => auth_json(201, &serde_json::json!({"user":user})),
@@ -2196,7 +2217,7 @@ impl Admin {
             return problem(404, "Not Found", "user not found");
         };
         if req.method() == hyper::Method::DELETE {
-            return match self.users.delete(id).await {
+            return match self.users.delete(actor.mutation_authority(), id).await {
                 Ok(Change::Applied) => empty_response(204, None),
                 Ok(Change::Conflict) => problem(
                     409,
@@ -2231,7 +2252,13 @@ impl Admin {
         }
         match self
             .users
-            .update(id, payload.role, payload.enabled, payload.password)
+            .update(
+                actor.mutation_authority(),
+                id,
+                payload.role,
+                payload.enabled,
+                payload.password,
+            )
             .await
         {
             Ok((Change::Applied, Some(user))) => auth_json(200, &serde_json::json!({"user":user})),
