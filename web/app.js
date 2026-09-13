@@ -70,6 +70,7 @@ const state = {
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
   configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false },
+  configProof: { data: null, error: null, loading: false, sequence: 0 },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -105,6 +106,7 @@ function refreshAppCopy() {
   refreshDockerCopy();
   if (state.audit.page || state.audit.error) renderAudit();
   if (state.configOperations.page || state.configOperations.error) renderConfigOperations();
+  if (state.configProof.data || state.configProof.error || state.configProof.loading) renderConfigProof();
   if ($('#route-dialog').open && $('#route-form').dataset.invalidNative) {
     try { routeFromForm(); delete $('#route-form').dataset.invalidNative; message($('#route-message')); }
     catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); }
@@ -369,6 +371,7 @@ function scrubRenderedData() {
   resetDockerPanel();
   resetAudit();
   resetConfigOperations();
+  resetConfigProof();
   destroyLuaEditors();
   for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog']) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
   state.editing = null;
@@ -532,6 +535,7 @@ async function switchView() {
   state.view = name;
   if (name !== 'audit') state.audit.sequence += 1;
   if (name !== 'config-operations') state.configOperations.sequence += 1;
+  if (name !== 'config-operations') resetConfigProof();
   $$('.view').forEach((view) => {
     const active = view.id === `view-${name}`;
     view.hidden = !active;
@@ -558,7 +562,7 @@ async function loadView(name, quiet = false) {
     }
     if (name === 'users' && isAdmin()) await loadUsers();
     if (name === 'audit' && isAdmin()) await loadAudit(0, []);
-    if (name === 'config-operations' && isAdmin()) await loadConfigOperations(0, []);
+    if (name === 'config-operations' && isAdmin()) await Promise.all([loadConfigOperations(0, []), loadConfigProof()]);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'security' && isAdmin()) { const latest = await api('/v1/config'); renderSecurity(latest.data); }
@@ -734,6 +738,7 @@ async function verifySession() {
     if (!isAdmin()) {
       resetAudit();
       resetConfigOperations();
+      resetConfigProof();
       if (state.view !== 'status') location.hash = '#status';
     }
     message(result, t('Session valid: {username} · {role}', { username: data.user.username, role: t(data.user.role) }), 'success');
@@ -3676,6 +3681,79 @@ async function pruneAuditPage() {
   } finally { setBusy(button, false); renderAudit(); }
 }
 
+function resetConfigProof() {
+  state.configProof.sequence += 1;
+  state.configProof.data = null;
+  state.configProof.error = null;
+  state.configProof.loading = false;
+  $('#config-proof-fields').replaceChildren();
+  message($('#config-proof-state'));
+  $('#config-proof-refresh').disabled = true;
+}
+
+function validConfigProof(data) {
+  const hex = (value, size) => typeof value === 'string' && new RegExp(`^[0-9a-f]{${size}}$`).test(value);
+  const safe = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!isObject(data) || data.scope !== 'configuration_authority' ||
+    typeof data.supported !== 'boolean' || !safe(data.server_time_unix_ms)) return false;
+  if (!data.supported) return data.proof === null;
+  if (data.proof === null) return true;
+  const proof = data.proof;
+  return isObject(proof) && hex(proof.epoch, 32) && safe(proof.revision) &&
+    isObject(proof.stamp) && hex(proof.stamp.authority_id, 32) &&
+    hex(proof.stamp.operation_id, 32) && hex(proof.stamp.candidate_sha256, 64);
+}
+
+function renderConfigProof() {
+  const proofState = state.configProof;
+  const fields = $('#config-proof-fields'); fields.replaceChildren();
+  $('#config-proof-refresh').disabled = proofState.loading || !isAdmin() || !state.token;
+  const observed = proofState.data ? auditDate(proofState.data.server_time_unix_ms) : null;
+  if (proofState.loading) return message($('#config-proof-state'), t('Checking current store proof…'));
+  if (proofState.error) return message($('#config-proof-state'), t('Current store proof unavailable. No current commit identity is shown.'), 'error');
+  if (!proofState.data) return message($('#config-proof-state'));
+  if (!proofState.data.supported) return message($('#config-proof-state'),
+    t('This store does not expose a current commit proof. Observed: {time}.', { time: observed }), 'warning');
+  if (!proofState.data.proof) return message($('#config-proof-state'),
+    t('No matching current proof is available. A legacy write, later write, or stale metadata may explain this; it does not prove the operation never committed. Observed: {time}.', { time: observed }), 'warning');
+  message($('#config-proof-state'),
+    t('Current store commit identity observed at {time}. It does not prove local activation or fleet acknowledgement.', { time: observed }), 'success');
+  const proof = proofState.data.proof;
+  for (const [label, value] of [
+    ['Store epoch', proof.epoch], ['Store revision', proof.revision],
+    ['Proof authority ID', proof.stamp.authority_id], ['Proof operation ID', proof.stamp.operation_id],
+    ['Proof candidate SHA-256', proof.stamp.candidate_sha256],
+  ]) {
+    const dt = document.createElement('dt'); dt.textContent = t(label);
+    const dd = document.createElement('dd'); dd.textContent = String(value);
+    fields.append(dt, dd);
+  }
+}
+
+async function loadConfigProof() {
+  if (!isAdmin() || !state.token) { resetConfigProof(); return; }
+  const sequence = ++state.configProof.sequence;
+  state.configProof.data = null;
+  state.configProof.error = null;
+  state.configProof.loading = true;
+  renderConfigProof();
+  try {
+    const { data } = await api('/v1/config/operation-proof');
+    if (sequence !== state.configProof.sequence || state.view !== 'config-operations' || !isAdmin()) return;
+    if (!validConfigProof(data)) throw new Error(t('Current store proof response is invalid.'));
+    state.configProof.data = data;
+  } catch (error) {
+    if (sequence !== state.configProof.sequence || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    state.configProof.error = error.message;
+  } finally {
+    if (sequence === state.configProof.sequence) {
+      state.configProof.loading = false;
+      renderConfigProof();
+    }
+  }
+}
+
 function resetConfigOperations() {
   state.configOperations.sequence += 1;
   state.configOperations.page = null;
@@ -4021,6 +4099,7 @@ $('#audit-next').addEventListener('click', () => {
 $('#audit-export').addEventListener('click', exportAuditPage);
 $('#audit-prune').addEventListener('click', pruneAuditPage);
 $('#config-operations-refresh').addEventListener('click', () => loadConfigOperations(0, []));
+$('#config-proof-refresh').addEventListener('click', loadConfigProof);
 $('#config-operations-previous').addEventListener('click', () => {
   const previous = state.configOperations.previous.slice();
   if (!previous.length) return;

@@ -56,6 +56,7 @@ const coverage = new Map([
   ['DELETE /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
   ['GET /v1/audit/users', ['#view-audit', 'app', '/v1/audit/users?after=']],
   ['GET /v1/config/operations', ['#view-config-operations', 'app', '/v1/config/operations?after=']],
+  ['GET /v1/config/operation-proof', ['#config-proof-state', 'app', "api('/v1/config/operation-proof'"]],
   ['POST /v1/config/operations/prune', ['#config-operations-prune', 'app', "api('/v1/config/operations/prune', { method: 'POST'"]],
   ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
 ]);
