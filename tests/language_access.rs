@@ -23,6 +23,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 struct Fixture {
     front: String,
     origin_hits: Arc<AtomicUsize>,
+    active: Arc<ArcSwap<Snapshot>>,
     policy: Arc<PolicyPool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -77,7 +78,7 @@ async fn fixture(
     let snapshot = Snapshot::new(config).unwrap();
     let active = Arc::new(ArcSwap::from_pointee(snapshot));
     let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 2));
-    let proxy = Proxy::new(active, policy.clone(), Arc::new(Metrics::default()));
+    let proxy = Proxy::new(active.clone(), policy.clone(), Arc::new(Metrics::default()));
     let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let front = format!("http://{}", front_listener.local_addr().unwrap());
     let front_task = tokio::spawn(async move {
@@ -97,9 +98,24 @@ async fn fixture(
     Fixture {
         front,
         origin_hits,
+        active,
         policy,
         tasks: vec![origin_task, front_task],
     }
+}
+
+fn publish_language_policy(fixture: &Fixture, policy: Value) {
+    let current = fixture.active.load_full();
+    let mut config = current.config.clone();
+    config.revision += 1;
+    config.http[0].language_policy = Some(serde_json::from_value(policy).unwrap());
+    let next = Snapshot::replace(config, &current).unwrap();
+    assert!(Arc::ptr_eq(
+        current.cache.as_ref().unwrap(),
+        next.cache.as_ref().unwrap(),
+    ));
+    next.activated();
+    fixture.active.store(Arc::new(next));
 }
 
 fn route(id: &str, origin: std::net::SocketAddr, policy: Value) -> Value {
@@ -331,6 +347,55 @@ async fn language_denial_precedes_cache_only_and_lua_policy() {
     assert_eq!(status(&fixture, &[("accept-language", "fr")]).await, 403);
     assert_eq!(status(&fixture, &[("accept-language", "en")]).await, 418);
     assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn published_language_change_blocks_warmed_cache_with_same_request_headers() {
+    let fixture = fixture(
+        |origin| {
+            let mut selected = route("cached", origin, language("any", &["en"], &[], "deny"));
+            selected["cache"] = json!({"ttl_seconds":30,"max_ttl_seconds":60});
+            json!([selected])
+        },
+        true,
+    )
+    .await;
+    let english = &[("accept-language", "en")];
+    assert_eq!(status(&fixture, english).await, 200);
+    for _ in 0..200 {
+        if fixture.active.load().cache.as_ref().unwrap().active_fills() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(status(&fixture, english).await, 200);
+    assert_eq!(
+        fixture.origin_hits.load(Ordering::SeqCst),
+        1,
+        "cache must be warm"
+    );
+
+    publish_language_policy(&fixture, language("any", &["fr"], &[], "deny"));
+    assert_eq!(status(&fixture, english).await, 403);
+    assert_eq!(
+        status(
+            &fixture,
+            &[
+                ("accept-language", "en"),
+                ("cache-control", "only-if-cached")
+            ]
+        )
+        .await,
+        403,
+    );
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 1);
+
+    let mut disabled = language("any", &["fr"], &[], "deny");
+    disabled["enforce"] = json!(false);
+    publish_language_policy(&fixture, disabled);
+    assert_eq!(status(&fixture, english).await, 200);
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 2);
     fixture.close().await;
 }
 
