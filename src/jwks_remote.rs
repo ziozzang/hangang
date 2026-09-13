@@ -368,13 +368,11 @@ impl RemoteJwksProvider {
             .get("keys")
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len);
-        ensure!(
-            (1..=MAX_KEYS).contains(&count),
-            "JWKS key count is outside 1..32"
-        );
-        let prepared = PreparedKeys::from_jwks_json(&body, &self.allowed_algorithms)?;
-        ensure!(!prepared.is_empty(), "JWKS has no usable signing keys");
-        Ok(prepared)
+        ensure!(count <= MAX_KEYS, "JWKS key count exceeds 32");
+        // A valid zero-key set is an explicit withdrawal generation, not an
+        // IdP outage. The strict parser still rejects malformed maps, private
+        // fields, duplicate kids, and invalid selected signing keys.
+        PreparedKeys::from_remote_jwks_json(&body, &self.allowed_algorithms)
     }
 }
 
@@ -467,7 +465,9 @@ async fn fetch_bounded(client: &Client, url: &Url) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use base64::Engine;
+    use ed25519_dalek::Signer;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn config(endpoint: RemoteJwksEndpoint) -> RemoteJwksConfig {
@@ -617,6 +617,8 @@ mod tests {
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.as_bytes());
                     let body = if discovery {
                         format!(r#"{{"issuer":"{issuer}","jwks_uri":"{issuer}/keys"}}"#)
+                    } else if id.is_empty() {
+                        r#"{"keys":[]}"#.to_owned()
                     } else {
                         format!(
                             r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"{id}","alg":"EdDSA","use":"sig","x":"{x}"}}]}}"#
@@ -817,6 +819,88 @@ mod tests {
         assert!(
             !provider.is_current(&new, &new_key),
             "outage cannot extend hard expiry"
+        );
+
+        // An admitted long stream has no subsequent token request. Its one
+        // shared monitor must refresh identical keys before the hard TTL,
+        // then observe a valid empty JWKS as an immediate withdrawal.
+        error.store(false, Ordering::SeqCst);
+        let mut live_spec = config(RemoteJwksEndpoint::Oidc);
+        live_spec.ca_pem = Some(cert.cert.pem());
+        live_spec.cache_ttl_seconds = 4;
+        live_spec.refresh_cooldown_seconds = 1;
+        let auth = crate::jwt_runtime::JwtAuth {
+            verification: crate::jwt_auth::JwtConfig {
+                issuer: issuer.clone(),
+                audiences: vec!["hangang-api".into()],
+                profile: crate::jwt_auth::JwtProfile::Rfc9068,
+                algorithms: vec![JwtAlgorithm::EdDSA],
+                leeway_seconds: 0,
+                max_lifetime_seconds: 3600,
+                scope_claim: "scope".into(),
+                groups_claim: "groups".into(),
+                required_scopes: vec![],
+                required_groups: vec![],
+            },
+            keys: crate::jwt_runtime::KeySource::Remote { config: live_spec },
+            hide_credentials: true,
+            identity_header: None,
+        };
+        let runtime = crate::jwt_runtime::Runtime::new(auth).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let token = |expires| {
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(r#"{"alg":"EdDSA","kid":"new","typ":"at+jwt"}"#);
+            let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"iss":issuer,"aud":"hangang-api","sub":"alice",
+                    "client_id":"client-1","jti":"long-stream","iat":now-1,"exp":expires})
+                .to_string(),
+            );
+            let signed = format!("{header}.{claims}");
+            format!(
+                "{signed}.{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signing.sign(signed.as_bytes()).to_bytes())
+            )
+        };
+        let access_token = token(now + 30);
+        let session = runtime
+            .authenticate_session(&access_token, Arc::new(tokio::sync::Semaphore::new(1)))
+            .await
+            .unwrap();
+        assert!(runtime.session_current(&session));
+        let before_refresh = requests.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(4_250)).await;
+        assert!(
+            requests.load(Ordering::SeqCst) >= before_refresh + 2,
+            "session monitor should refresh without another bearer request"
+        );
+        assert!(
+            runtime.session_current(&session),
+            "unchanged key survives first hard TTL"
+        );
+        *key_id.lock().unwrap() = String::new();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while runtime.session_current(&session) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("valid empty JWKS must withdraw the active key");
+        *key_id.lock().unwrap() = "new".into();
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let restored = runtime
+            .authenticate_session(&access_token, Arc::new(tokio::sync::Semaphore::new(1)))
+            .await
+            .unwrap();
+        assert!(runtime.session_current(&restored));
+        assert!(
+            !runtime.session_current(&session),
+            "revoked generation cannot revive when the same public key returns"
         );
         task.abort();
     }

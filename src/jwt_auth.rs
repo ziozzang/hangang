@@ -222,6 +222,17 @@ pub struct PreparedKeys {
 
 impl PreparedKeys {
     pub fn from_jwks_json(bytes: &[u8], allowed: &[JwtAlgorithm]) -> Result<Self> {
+        Self::parse_jwks_json(bytes, allowed, false)
+    }
+
+    /// A successful remote JWKS publication may intentionally withdraw every
+    /// configured verification key. Local configuration still requires at
+    /// least one key so an accidental empty static trust set cannot publish.
+    pub fn from_remote_jwks_json(bytes: &[u8], allowed: &[JwtAlgorithm]) -> Result<Self> {
+        Self::parse_jwks_json(bytes, allowed, true)
+    }
+
+    fn parse_jwks_json(bytes: &[u8], allowed: &[JwtAlgorithm], allow_empty: bool) -> Result<Self> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= MAX_JWKS_BYTES,
             "JWKS exceeds 128 KiB"
@@ -243,8 +254,8 @@ impl PreparedKeys {
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("JWKS keys must be an array"))?;
         ensure!(
-            !entries.is_empty() && entries.len() <= MAX_KEYS,
-            "JWKS needs 1..32 keys"
+            entries.len() <= MAX_KEYS && (allow_empty || !entries.is_empty()),
+            "JWKS key count is outside the permitted range"
         );
         let mut keys = HashMap::with_capacity(entries.len());
         let mut seen_kids = HashSet::with_capacity(entries.len());
@@ -276,7 +287,10 @@ impl PreparedKeys {
                 keys.insert(key.kid.clone(), Arc::new(key));
             }
         }
-        ensure!(!keys.is_empty(), "JWKS has no configured verification keys");
+        ensure!(
+            allow_empty || !keys.is_empty(),
+            "JWKS has no configured verification keys"
+        );
         Ok(Self { keys })
     }
 
@@ -942,6 +956,35 @@ mod tests {
             PreparedKeys::from_jwks_json(jwks.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
                 .unwrap();
         (signing, keys)
+    }
+
+    #[test]
+    fn remote_empty_key_publication_withdraws_while_local_empty_remains_invalid() {
+        let empty = br#"{"keys":[]}"#;
+        assert!(PreparedKeys::from_jwks_json(empty, &[JwtAlgorithm::EdDSA]).is_err());
+        assert!(
+            PreparedKeys::from_remote_jwks_json(empty, &[JwtAlgorithm::EdDSA])
+                .unwrap()
+                .is_empty()
+        );
+        let other = serde_json::json!({"keys":[{"kty":"OKP","crv":"Ed25519",
+            "kid":"another-alg","alg":"EdDSA","use":"sig",
+            "x":URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[4;32]).verifying_key().to_bytes())}]});
+        assert!(
+            PreparedKeys::from_remote_jwks_json(
+                other.to_string().as_bytes(),
+                &[JwtAlgorithm::RS256],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        for invalid in [
+            br#"{"keys":[],"keys":[]}"#.as_slice(),
+            br#"{"keys":[{"kty":"OKP","kid":"bad","d":"private"}]}"#.as_slice(),
+            br#"{"keys":[{"kty":"OKP","kid":"bad"},{"kty":"OKP","kid":"bad"}]}"#.as_slice(),
+        ] {
+            assert!(PreparedKeys::from_remote_jwks_json(invalid, &[JwtAlgorithm::EdDSA]).is_err());
+        }
     }
 
     fn claims() -> Value {
