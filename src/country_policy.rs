@@ -251,6 +251,20 @@ mod tests {
         too_many.allow = vec!["US".to_owned(); MAX_COUNTRY_CODES + 1];
         assert_eq!(too_many.validate(), Err(PolicyError::TooManyCountryCodes));
 
+        let exactly_at_limit = Policy {
+            allow: (0..MAX_COUNTRY_CODES)
+                .map(|index| {
+                    let first = char::from(b'A' + (index / 26) as u8);
+                    let second = char::from(b'A' + (index % 26) as u8);
+                    format!("{first}{second}")
+                })
+                .collect(),
+            deny: Vec::new(),
+            on_unknown: UnknownAction::Deny,
+            enforce: true,
+        };
+        exactly_at_limit.validate().unwrap();
+
         // Cross-list overlap is deliberate and is resolved by deny precedence.
         policy(&["US"], &["US"], UnknownAction::Deny)
             .validate()
