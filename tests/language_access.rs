@@ -255,12 +255,16 @@ fn language_parser_and_policy_release_diagnostic() {
     };
     let typical = b"en-US,en;q=0.7".as_slice();
     let max_header = (0..32)
-        .map(|index| format!("l{index};q=0.9"))
+        .map(|index| {
+            let first = char::from(b'a' + (index / 26) as u8);
+            let second = char::from(b'a' + (index % 26) as u8);
+            format!("l{first}{second};q=0.9")
+        })
         .collect::<Vec<_>>()
         .join(",");
     let cases: [(&str, &[u8], &str); 2] = [
         ("typical", typical, "en"),
-        ("max_32_ranges", max_header.as_bytes(), "l31"),
+        ("max_32_ranges", max_header.as_bytes(), "lbf"),
     ];
     const ITERATIONS: usize = 100_000;
     for (name, header, allow) in cases {
