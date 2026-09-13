@@ -51,13 +51,10 @@ fn published_removed_members_remain_observable_only_while_their_owners_live() {
     assert_eq!(routes, HashSet::from(["web", "stream"]));
     let members: HashSet<_> = observations
         .iter()
-        .map(|row| row.member_id.as_str())
+        .filter_map(|row| row.member_id.as_deref())
         .collect();
     assert_eq!(members, HashSet::from(["web-a", "stream-a"]));
-    let ids: HashSet<_> = observations
-        .iter()
-        .map(|row| row.retirement_id.clone())
-        .collect();
+    let ids: HashSet<_> = observations.iter().map(|row| row.retirement_id).collect();
     assert_eq!(
         ids.len(),
         2,
