@@ -2312,7 +2312,7 @@ fn geoip_lookup_query(query: Option<&str>) -> Option<std::net::IpAddr> {
     if query.len() > 128 {
         return None;
     }
-    let mut parsed = url::Url::parse("http://localhost/").ok()?;
+    let mut parsed = reqwest::Url::parse("http://localhost/").ok()?;
     parsed.set_query(Some(query));
     let mut pairs = parsed.query_pairs();
     let (key, value) = pairs.next()?;

@@ -42,6 +42,11 @@ async fn serve(
     Arc<Manager>,
     tokio::task::JoinHandle<()>,
 ) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let state_path = dir.path().join("admin-state.json");
     let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
     let metrics = Arc::new(Metrics::default());
@@ -119,13 +124,15 @@ async fn admin_geoip_status_and_lookup_are_bounded_path_free_and_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("private-country.mmdb");
     std::fs::write(&file, b"invalid mmdb").unwrap();
-    let mut config = Config::default();
-    config.geoip_database = Some(Source {
-        file: file.clone(),
-        max_file_bytes: 32 * 1024 * 1024,
-        max_age_days: 14,
-        reload_interval_seconds: 1,
-    });
+    let config = Config {
+        geoip_database: Some(Source {
+            file: file.clone(),
+            max_file_bytes: 32 * 1024 * 1024,
+            max_age_days: 14,
+            reload_interval_seconds: 1,
+        }),
+        ..Config::default()
+    };
     let (address, manager, server) = serve(config, &dir).await;
     let base = format!("http://{address}");
     let client = reqwest::Client::builder()

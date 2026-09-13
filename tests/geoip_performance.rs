@@ -37,7 +37,7 @@ fn fresh_fixture() -> Vec<u8> {
 #[ignore = "run explicitly with cargo test --release --test geoip_performance -- --ignored --nocapture"]
 fn geoip_lookup_and_country_policy_release_diagnostic() {
     assert!(
-        !cfg!(debug_assertions),
+        !black_box(cfg!(debug_assertions)),
         "this diagnostic requires release mode"
     );
     let directory = tempfile::tempdir().unwrap();
