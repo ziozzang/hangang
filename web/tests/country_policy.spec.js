@@ -52,6 +52,11 @@ async function save(page) {
   await expect(page.locator('#route-dialog')).toBeHidden();
 }
 
+async function openGeoIp(page) {
+  const panel = page.locator('#geoip-section');
+  if (!(await panel.evaluate((node) => node.open))) await panel.locator('summary').click();
+}
+
 test('HTTP native country policy configures, disables and removes with exact wire values', async ({ page }) => {
   const { routeWrites } = await fixture(page);
   await edit(page, 'http');
@@ -156,4 +161,97 @@ test('logout removes node-local GeoIP file metadata from configuration controls'
   await page.locator('#logout-button').click();
   await expect(page.locator('#geoip-file')).toHaveValue('');
   await expect(page.locator('#config-editor')).toHaveValue('');
+});
+
+const readyStatus = {
+  scope: 'instance', revision: 7, configured: true, ready: true, error_code: null,
+  checked_at_unix_ms: 1_700_000_000_000,
+  database: { database_type: 'GeoIP2-Country', ip_version: 6, build_epoch_unix_seconds: 1_699_000_000,
+    expires_at_unix_seconds: 1_710_000_000, loaded_at_unix_ms: 1_700_000_000_000,
+    generation_sha256: 'a'.repeat(64), file_bytes: 12000 },
+};
+
+test('local status distinguishes ready, blocked and unconfigured without inventing fleet readiness', async ({ page }) => {
+  await fixture(page);
+  let observed = readyStatus;
+  await page.route('**/v1/geoip/status', (handled) => handled.fulfill({ json: observed }));
+  await page.locator('[data-view="config"]').click();
+  await openGeoIp(page);
+  await expect(page.locator('#geoip-runtime-status')).toContainText('Local database ready');
+  await expect(page.locator('#geoip-runtime-status')).toContainText('Observed revision 7');
+  await expect(page.locator('#geoip-runtime-status')).toContainText('a'.repeat(64));
+  await expect(page.locator('#geoip-runtime-status')).toContainText('Expires:');
+
+  observed = { ...readyStatus, ready: false, error_code: 'stale_database' };
+  await page.locator('#geoip-refresh-status').click();
+  await expect(page.locator('#geoip-runtime-status')).toContainText('Local database blocked or pending');
+  await expect(page.locator('#geoip-runtime-status')).toContainText('stale_database');
+  await expect(page.locator('#geoip-runtime-status')).not.toContainText('Local database ready');
+
+  observed = { ...readyStatus, configured: false, ready: false, error_code: null, database: null };
+  await page.locator('#geoip-refresh-status').click();
+  await expect(page.locator('#geoip-runtime-status')).toContainText('No GeoIP database source');
+
+  observed = { ...readyStatus, ready: true, database: null };
+  await page.locator('#geoip-refresh-status').click();
+  await expect(page.locator('#geoip-runtime-status')).toContainText('GeoIP status unavailable');
+  await expect(page.locator('#geoip-runtime-status')).not.toContainText('Local database ready');
+});
+
+test('explicit IP lookup sends Bearer in header, encodes query and separates unknown from unavailable', async ({ page }) => {
+  await fixture(page);
+  await page.route('**/v1/geoip/status', (handled) => handled.fulfill({ json: readyStatus }));
+  const requests = [];
+  let lookupResult = { ip: '2001:db8::1', country: 'KR', revision: 7 };
+  await page.route('**/v1/geoip/lookup?*', (handled) => {
+    requests.push(handled.request());
+    if (lookupResult === null) return handled.fulfill({ status: 503, json: { title: 'GeoIP Unavailable', detail: 'country database is not ready' } });
+    return handled.fulfill({ json: lookupResult });
+  });
+  await page.locator('[data-view="config"]').click();
+  await openGeoIp(page);
+  await page.locator('#geoip-lookup-ip').fill('2001:db8::1');
+  await page.locator('#geoip-lookup-submit').click();
+  await expect(page.locator('#geoip-lookup-result')).toContainText('2001:db8::1 → KR');
+  expect(new URL(requests[0].url()).searchParams.get('ip')).toBe('2001:db8::1');
+  expect(requests[0].headers().authorization).toBe('Bearer fixture-token');
+  expect(requests[0].url()).not.toContain('fixture-token');
+
+  lookupResult = { ip: '192.0.2.1', country: null, revision: 7 };
+  await page.locator('#geoip-lookup-ip').fill('192.0.2.1');
+  await page.locator('#geoip-lookup-submit').click();
+  await expect(page.locator('#geoip-lookup-result')).toContainText('Unknown country');
+  lookupResult = null;
+  await page.locator('#geoip-lookup-submit').click();
+  await expect(page.locator('#geoip-lookup-result')).toContainText('Country lookup unavailable');
+  await expect(page.locator('#geoip-lookup-result')).not.toContainText('Unknown country');
+});
+
+test('GeoIP responses arriving after view change, changed input or logout cannot repopulate controls', async ({ page }) => {
+  await fixture(page);
+  let releaseStatus;
+  const statusGate = new Promise((resolve) => { releaseStatus = resolve; });
+  await page.route('**/v1/geoip/status', async (handled) => { await statusGate; await handled.fulfill({ json: readyStatus }).catch(() => {}); });
+  await page.locator('[data-view="config"]').click();
+  await page.locator('[data-view="http"]').click();
+  releaseStatus();
+  await expect(page.locator('#geoip-runtime-status')).toBeEmpty();
+
+  await page.unroute('**/v1/geoip/status');
+  await page.route('**/v1/geoip/status', (handled) => handled.fulfill({ json: readyStatus }));
+  let releaseLookup;
+  const lookupGate = new Promise((resolve) => { releaseLookup = resolve; });
+  await page.route('**/v1/geoip/lookup?*', async (handled) => { await lookupGate; await handled.fulfill({ json: { ip: '192.0.2.1', country: 'KR', revision: 7 } }).catch(() => {}); });
+  await page.locator('[data-view="config"]').click();
+  await openGeoIp(page);
+  await expect(page.locator('#geoip-runtime-status')).toContainText('Local database ready');
+  await page.locator('#geoip-lookup-ip').fill('192.0.2.1');
+  await page.locator('#geoip-lookup-submit').click();
+  await page.locator('#geoip-lookup-ip').fill('192.0.2.2');
+  await expect(page.locator('#geoip-lookup-submit')).toBeEnabled();
+  releaseLookup();
+  await expect(page.locator('#geoip-lookup-result')).toBeEmpty();
+  await page.locator('#logout-button').click();
+  await expect(page.locator('#geoip-runtime-status')).toBeEmpty();
+  await expect(page.locator('#geoip-lookup-ip')).toHaveValue('');
 });

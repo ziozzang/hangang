@@ -56,6 +56,7 @@ const state = {
   /** Why the fleet-settings controls could not be mirrored into the document; blocks validate/apply. */
   settingsError: null,
   geoipError: null,
+  geoipRuntime: { status: null, lookup: null, statusError: null, lookupError: null, statusSequence: 0, lookupSequence: 0, statusAbort: null, lookupAbort: null },
   certificateDirty: false,
   certificateInventory: null,
   certificateInventoryOffset: 0,
@@ -103,6 +104,8 @@ function refreshAppCopy() {
   if (state.certificateInventory) renderCertificateInventory(state.certificateInventory);
   if (state.config && $('#certificate-list').children.length) renderCertificates(state.config.certificates || []);
   if (state.config) updateConfigPreview();
+  renderGeoIpStatus();
+  renderGeoIpLookup();
   for (const type of ['http', 'tcp']) if ($(`#${type}-routes`).querySelector('.route-inventory, .empty-state')) renderRoutes(type);
   if (state.openapi) renderDocs(state.openapi);
   refreshOperationsCopy();
@@ -372,6 +375,7 @@ function updateAccess() {
 
 /** Remove every rendered piece of server data so a signed-out tab exposes nothing. */
 function scrubRenderedData() {
+  resetGeoIpRuntime(true);
   resetConsole();
   resetOperations();
   resetDockerPanel();
@@ -542,6 +546,7 @@ async function switchView() {
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
   state.view = name;
+  if (name !== 'config') resetGeoIpRuntime(true);
   if (name !== 'audit') state.audit.sequence += 1;
   if (name !== 'config-operations') state.configOperations.sequence += 1;
   if (name !== 'config-operations') resetConfigProof();
@@ -566,6 +571,7 @@ async function loadView(name, quiet = false) {
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
     if (name === 'config') await loadConfig(false);
+    if (name === 'config' && isAdmin()) await loadGeoIpStatus();
     if (name === 'config' || name === 'tcp') {
       await refreshWorkloadMaterialStatus();
       startWorkloadMaterialPolling();
@@ -1769,7 +1775,7 @@ function countryPolicySection(route) {
   return section({ title: 'GeoIP country policy', configured: Boolean(policy),
     note: 'Countries come from an offline database file whose path is published in configuration and resolved locally on each node. An unavailable or stale database denies enforced routes; unknown addresses use the explicit action. This is route admission, not identity or a live location guarantee. Routes sharing one protected resource ID need the same country policy.', fields: [
       span2(action),
-      field('Unknown country', 'country_policy_on_unknown', policy?.on_unknown ?? 'deny', { group: 'country_policy', select: [['deny', 'Deny unknown country'], ['allow', 'Allow unknown country']], help: 'Private, unmapped and unrepresented addresses are unknown after a successful lookup. Database failures are never treated as unknown.' }),
+      field('Unknown country action', 'country_policy_on_unknown', policy?.on_unknown ?? 'deny', { group: 'country_policy', select: [['deny', 'Deny unknown country'], ['allow', 'Allow unknown country']], help: 'Private, unmapped and unrepresented addresses are unknown after a successful lookup. Database failures are never treated as unknown.' }),
       span2(field('Allow country codes', 'country_policy_allow', Array.isArray(policy?.allow) ? policy.allow.join('\n') : '', { group: 'country_policy', textarea: true, help: 'One uppercase two-letter country code per line. An allowlist excludes every other known country; a denial wins if a code appears in both lists.' })),
       span2(field('Deny country codes', 'country_policy_deny', Array.isArray(policy?.deny) ? policy.deny.join('\n') : '', { group: 'country_policy', textarea: true, help: 'One uppercase two-letter country code per line. At least one allow or deny code is required; 256 combined maximum.' })),
       span2(field('Enforce country policy', 'country_policy_enforce', policy?.enforce !== false, { group: 'country_policy', checkbox: true, help: 'Off retains valid rules. Enforced rules require a GeoIP database source in the published configuration.' })),
@@ -3528,7 +3534,139 @@ function ensureGeoIpPanel() {
   const result = document.createElement('div'); result.id = 'geoip-message'; result.className = 'inline-message span-2'; result.setAttribute('aria-live', 'polite'); form.append(result);
   form.addEventListener('submit', (event) => event.preventDefault());
   form.addEventListener('input', syncGeoIpToDocument); form.addEventListener('change', syncGeoIpToDocument);
-  panel.append(summary, form); $('#settings-section').after(panel);
+  const runtime = document.createElement('div'); runtime.className = 'form-grid'; runtime.id = 'geoip-runtime';
+  const runtimeNote = document.createElement('p'); runtimeNote.className = 'section-note'; copy(runtimeNote, 'Runtime observation is from this instance only. It may differ from the draft or other nodes. A loaded database is not ready when it has expired. Refresh reads status; lookup uses this instance’s currently ready database.');
+  const refresh = document.createElement('button'); refresh.id = 'geoip-refresh-status'; refresh.className = 'button button-secondary'; refresh.type = 'button'; copy(refresh, 'Refresh local GeoIP status'); refresh.addEventListener('click', loadGeoIpStatus);
+  const status = document.createElement('div'); status.id = 'geoip-runtime-status'; status.className = 'field-help-inline span-2'; status.style.whiteSpace = 'pre-line'; status.setAttribute('aria-live', 'polite');
+  const lookup = document.createElement('form'); lookup.id = 'geoip-lookup-form'; lookup.className = 'form-grid span-2';
+  const ipField = document.createElement('div'); ipField.className = 'field';
+  const ipLabel = document.createElement('label'); ipLabel.htmlFor = 'geoip-lookup-ip'; copy(ipLabel, 'IPv4 or IPv6 address');
+  const ip = document.createElement('input'); ip.id = 'geoip-lookup-ip'; ip.name = 'ip'; ip.type = 'text'; ip.maxLength = 45; ip.autocomplete = 'off'; ip.spellcheck = false; ip.placeholder = '2001:db8::1';
+  ipField.append(ipLabel, ip);
+  const lookupButton = document.createElement('button'); lookupButton.type = 'submit'; lookupButton.className = 'button button-secondary'; lookupButton.id = 'geoip-lookup-submit'; copy(lookupButton, 'Look up country');
+  const lookupResult = document.createElement('div'); lookupResult.id = 'geoip-lookup-result'; lookupResult.className = 'field-help-inline span-2'; lookupResult.setAttribute('aria-live', 'polite');
+  lookup.append(ipField, lookupButton, lookupResult); lookup.addEventListener('submit', lookupGeoIp);
+  ip.addEventListener('input', () => {
+    const observed = state.geoipRuntime;
+    observed.lookupSequence++; observed.lookupAbort?.abort(); observed.lookupAbort = null;
+    observed.lookup = null; observed.lookupError = null; lookupButton.disabled = false; renderGeoIpLookup();
+  });
+  runtime.append(runtimeNote, refresh, status, lookup);
+  panel.append(summary, form, runtime); $('#settings-section').after(panel);
+}
+
+function resetGeoIpRuntime(clearInput = false) {
+  const runtime = state.geoipRuntime;
+  runtime.statusSequence++; runtime.lookupSequence++;
+  runtime.statusAbort?.abort(); runtime.lookupAbort?.abort();
+  runtime.statusAbort = null; runtime.lookupAbort = null;
+  runtime.status = null; runtime.lookup = null; runtime.statusError = null; runtime.lookupError = null;
+  if (clearInput && $('#geoip-lookup-ip')) $('#geoip-lookup-ip').value = '';
+  if ($('#geoip-runtime-status')) $('#geoip-runtime-status').textContent = '';
+  if ($('#geoip-lookup-result')) $('#geoip-lookup-result').textContent = '';
+  if ($('#geoip-refresh-status')) $('#geoip-refresh-status').disabled = false;
+  if ($('#geoip-lookup-submit')) $('#geoip-lookup-submit').disabled = false;
+}
+
+function validGeoIpStatus(data) {
+  if (!isObject(data) || data.scope !== 'instance' || !Number.isSafeInteger(data.revision) || data.revision < 0
+    || typeof data.configured !== 'boolean' || typeof data.ready !== 'boolean'
+    || (data.error_code !== null && (typeof data.error_code !== 'string' || data.error_code.length > 64))
+    || (data.checked_at_unix_ms !== null && (!Number.isSafeInteger(data.checked_at_unix_ms) || data.checked_at_unix_ms < 0))) return false;
+  const db = data.database;
+  if (!data.configured && (data.ready || db !== null || data.error_code !== null)) return false;
+  if (db === null) return !data.ready;
+  return isObject(db) && ['GeoIP2-Country', 'GeoLite2-Country'].includes(db.database_type) && db.ip_version === 6
+    && /^[a-f0-9]{64}$/.test(db.generation_sha256)
+    && ['build_epoch_unix_seconds', 'expires_at_unix_seconds', 'loaded_at_unix_ms', 'file_bytes']
+      .every((key) => Number.isSafeInteger(db[key]) && db[key] >= 0)
+    && db.file_bytes >= 1 && db.file_bytes <= 67108864;
+}
+
+function geoIpTime(ms) {
+  return Number.isSafeInteger(ms) && ms >= 0 ? new Date(ms).toLocaleString(getLocale()) : '—';
+}
+
+function renderGeoIpStatus() {
+  const target = $('#geoip-runtime-status'); if (!target) return;
+  target.replaceChildren();
+  const runtime = state.geoipRuntime;
+  if (runtime.statusError) { target.textContent = t('GeoIP status unavailable: {detail}', { detail: runtime.statusError }); return; }
+  if (!runtime.status) { target.textContent = t('Local GeoIP status has not been checked.'); return; }
+  const status = runtime.status;
+  const headline = !status.configured ? t('No GeoIP database source is published on this instance.')
+    : status.ready ? t('Local database ready') : t('Local database blocked or pending');
+  const lines = [headline, t('Observed revision {revision}', { revision: status.revision })];
+  if (status.error_code) lines.push(t('Reason code: {code}', { code: status.error_code }));
+  if (status.checked_at_unix_ms !== null) lines.push(t('Checked at: {time}', { time: geoIpTime(status.checked_at_unix_ms) }));
+  if (status.database) {
+    const db = status.database;
+    lines.push(t('Database: {type} · IPv{version} · {bytes} bytes', { type: db.database_type, version: db.ip_version, bytes: formatNumber(db.file_bytes) }));
+    lines.push(t('Built: {time} · Expires: {expires}', { time: geoIpTime(db.build_epoch_unix_seconds * 1000), expires: geoIpTime(db.expires_at_unix_seconds * 1000) }));
+    lines.push(t('Loaded: {time}', { time: geoIpTime(db.loaded_at_unix_ms) }));
+    lines.push(t('Generation SHA-256: {digest}', { digest: db.generation_sha256 }));
+  }
+  target.textContent = lines.join('\n');
+}
+
+function renderGeoIpLookup() {
+  const target = $('#geoip-lookup-result'); if (!target) return;
+  const runtime = state.geoipRuntime;
+  target.textContent = runtime.lookupError ? t('Country lookup unavailable: {detail}', { detail: runtime.lookupError })
+    : runtime.lookup ? t('{ip} → {country} · revision {revision}', { ip: runtime.lookup.ip, country: runtime.lookup.country ?? t('Unknown country'), revision: runtime.lookup.revision }) : '';
+}
+
+async function loadGeoIpStatus() {
+  if (!isAdmin() || !state.token || state.view !== 'config') return;
+  const runtime = state.geoipRuntime;
+  runtime.statusAbort?.abort(); const controller = new AbortController(); runtime.statusAbort = controller;
+  const sequence = ++runtime.statusSequence; const generation = state.authGeneration; const token = state.token;
+  const current = () => sequence === runtime.statusSequence && generation === state.authGeneration && token === state.token && state.view === 'config' && isAdmin();
+  const button = $('#geoip-refresh-status'); button.disabled = true; runtime.statusError = null; runtime.status = null; renderGeoIpStatus();
+  try {
+    const { data } = await api('/v1/geoip/status', { signal: controller.signal });
+    if (!current()) return;
+    if (!validGeoIpStatus(data)) throw new Error(t('The server returned invalid GeoIP status metadata.'));
+    runtime.status = data;
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    if (!controller.signal.aborted && !(error instanceof StaleSessionError)) runtime.statusError = error.message;
+  } finally {
+    if (current()) { runtime.statusAbort = null; button.disabled = false; renderGeoIpStatus(); }
+  }
+}
+
+async function lookupGeoIp(event) {
+  event.preventDefault();
+  if (!isAdmin() || !state.token || state.view !== 'config') return;
+  const runtime = state.geoipRuntime;
+  const ip = $('#geoip-lookup-ip').value.trim();
+  runtime.lookupSequence++; runtime.lookupAbort?.abort(); runtime.lookupAbort = null;
+  $('#geoip-lookup-submit').disabled = false;
+  runtime.lookup = null; runtime.lookupError = null;
+  if (!ip || ip.length > 45 || !/^[0-9A-Fa-f:.]+$/.test(ip)) {
+    runtime.lookupError = t('Enter one IPv4 or IPv6 address without a port or zone.'); renderGeoIpLookup(); return;
+  }
+  const controller = new AbortController(); runtime.lookupAbort = controller;
+  const sequence = ++runtime.lookupSequence; const generation = state.authGeneration; const token = state.token;
+  const current = () => sequence === runtime.lookupSequence && generation === state.authGeneration && token === state.token && state.view === 'config' && isAdmin() && $('#geoip-lookup-ip').value.trim() === ip;
+  const button = $('#geoip-lookup-submit'); button.disabled = true; renderGeoIpLookup();
+  try {
+    const { data } = await api(`/v1/geoip/lookup?ip=${encodeURIComponent(ip)}`, { signal: controller.signal });
+    if (!current()) return;
+    if (!isObject(data) || typeof data.ip !== 'string' || data.ip.length > 45 || !/^[0-9A-Fa-f:.]+$/.test(data.ip)
+      || (data.country !== null && (typeof data.country !== 'string' || !COUNTRY_CODE.test(data.country)))
+      || !Number.isSafeInteger(data.revision) || data.revision < 0)
+      throw new Error(t('The server returned invalid country lookup metadata.'));
+    runtime.lookup = data;
+  } catch (error) {
+    if (!current()) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    if (!controller.signal.aborted && !(error instanceof StaleSessionError)) runtime.lookupError = error.message;
+  } finally {
+    if (current()) { runtime.lookupAbort = null; button.disabled = false; renderGeoIpLookup(); }
+  }
 }
 
 function updateGeoIpControls() {
@@ -4795,6 +4933,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', () => { state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
+ensureGeoIpPanel();
 state.view = normalizeView(location.hash);
 if (!location.hash) history.replaceState(null, '', '#status');
 switchView();
