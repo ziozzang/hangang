@@ -1,6 +1,5 @@
-//! Pool-member wire model. Routes deserialize the enum, but validation rejects
-//! named nonserving members until lifecycle publication is wired. Serving
-//! members are supported by local-file routes, with stable state mapping.
+//! Pool-member wire model with local-file desired lifecycle states.
+//! Shared-store named documents remain fenced by fleet reader capability.
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,13 @@ impl Backend {
         match self {
             Self::Legacy(_) => None,
             Self::Member(member) => Some(&member.id),
+        }
+    }
+
+    pub fn desired_state(&self) -> DesiredState {
+        match self {
+            Self::Legacy(_) => DesiredState::Serving,
+            Self::Member(member) => member.desired_state,
         }
     }
 
@@ -199,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_members_validate_but_unimplemented_lifecycle_states_remain_closed() {
+    fn local_member_lifecycle_states_validate_for_enabled_and_disabled_routes() {
         for state in ["serving", "draining", "maintenance"] {
             for protocol in ["http", "tcp"] {
                 for enabled in [true, false] {
@@ -213,17 +219,7 @@ mod tests {
                     let config: crate::config::Config =
                         serde_json::from_value(serde_json::json!({protocol:[route]})).unwrap();
                     assert!(config.has_named_members());
-                    if state == "serving" {
-                        config.validate().unwrap();
-                    } else {
-                        assert!(
-                            config
-                                .validate()
-                                .unwrap_err()
-                                .to_string()
-                                .contains("lifecycle publication")
-                        );
-                    }
+                    config.validate().unwrap();
                 }
             }
         }

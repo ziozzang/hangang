@@ -824,7 +824,6 @@ impl Config {
                 r.id
             );
             crate::pool_member::validate_backends(&r.backends, &r.balance.weights)?;
-            validate_serving_members(&r.backends)?;
             ensure!(
                 r.deny_cidrs.len() <= 1024 && r.headers.len() <= 64 && r.json.len() <= 64,
                 "too many route conditions"
@@ -944,7 +943,6 @@ impl Config {
                 "TCP route needs 1..128 backends"
             );
             crate::pool_member::validate_backends(&r.backends, &[])?;
-            validate_serving_members(&r.backends)?;
             ensure!(r.deny_cidrs.len() <= 1024, "too many CIDRs");
             for b in &r.backends {
                 let b = b.address();
@@ -1071,18 +1069,6 @@ fn named_backends(backends: &[crate::pool_member::Backend]) -> bool {
         .is_some_and(|backend| backend.id().is_some())
 }
 
-fn validate_serving_members(backends: &[crate::pool_member::Backend]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        backends.iter().all(|backend| match backend {
-            crate::pool_member::Backend::Legacy(_) => true,
-            crate::pool_member::Backend::Member(member) =>
-                member.desired_state == crate::pool_member::DesiredState::Serving,
-        }),
-        "draining and maintenance members require lifecycle publication support"
-    );
-    Ok(())
-}
-
 fn stable_backend_mapping(
     current: &[crate::pool_member::Backend],
     previous: &[crate::pool_member::Backend],
@@ -1090,7 +1076,11 @@ fn stable_backend_mapping(
     let old: std::collections::HashMap<_, _> = previous
         .iter()
         .enumerate()
-        .filter_map(|(index, backend)| backend.id().map(|id| (id, (index, backend.address()))))
+        .filter_map(|(index, backend)| {
+            backend
+                .id()
+                .map(|id| (id, (index, backend.address(), backend.desired_state())))
+        })
         .collect();
     current
         .iter()
@@ -1098,8 +1088,10 @@ fn stable_backend_mapping(
             backend
                 .id()
                 .and_then(|id| old.get(id))
-                .filter(|(_, address)| *address == backend.address())
-                .map(|(index, _)| *index)
+                .filter(|(_, address, state)| {
+                    *address == backend.address() && *state == backend.desired_state()
+                })
+                .map(|(index, _, _)| *index)
         })
         .collect()
 }
@@ -1134,14 +1126,31 @@ fn prepare_http_balancer(
             return old.balancer.clone();
         }
         if named && named_backends(&old.route.backends) && transport_matches {
-            return std::sync::Arc::new(crate::balance::Balancer::with_reused_nodes(
+            return std::sync::Arc::new(crate::balance::Balancer::with_member_states(
                 balance,
-                &old.balancer,
+                Some(&old.balancer),
                 &stable_backend_mapping(&route.backends, &old.route.backends),
+                &route
+                    .backends
+                    .iter()
+                    .map(|backend| backend.desired_state())
+                    .collect::<Vec<_>>(),
             ));
         }
     }
-    std::sync::Arc::new(crate::balance::Balancer::new(balance, route.backends.len()))
+    if !named {
+        return std::sync::Arc::new(crate::balance::Balancer::new(balance, route.backends.len()));
+    }
+    std::sync::Arc::new(crate::balance::Balancer::with_member_states(
+        balance,
+        None,
+        &[],
+        &route
+            .backends
+            .iter()
+            .map(|backend| backend.desired_state())
+            .collect::<Vec<_>>(),
+    ))
 }
 
 impl Snapshot {
@@ -1350,14 +1359,19 @@ impl Snapshot {
                     previous.and_then(|snapshot| snapshot.tcp_member_admissions.get(&route.id));
                 let gates = mapping
                     .into_iter()
-                    .map(|index| {
+                    .enumerate()
+                    .map(|(current_index, index)| {
                         index
                             .and_then(|index| old.and_then(|gates| gates.get(index)))
                             .cloned()
                             .unwrap_or_else(|| {
-                                std::sync::Arc::new(
-                                    crate::member_admission::MemberAdmission::serving(),
-                                )
+                                let gate = crate::member_admission::MemberAdmission::serving();
+                                if route.backends[current_index].desired_state()
+                                    != crate::pool_member::DesiredState::Serving
+                                {
+                                    gate.retire();
+                                }
+                                std::sync::Arc::new(gate)
                             })
                     })
                     .collect();

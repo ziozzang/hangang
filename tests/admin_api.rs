@@ -2980,3 +2980,61 @@ async fn retired_member_inventory_requires_admin_and_rejects_unbounded_queries()
     }
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn desired_member_state_publishes_only_after_save_and_reports_current_gate() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "http":[{"id":"pool", "backends":[{"id":"blue", "address":"http://127.0.0.1:18001"}]}]
+    }))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let (address, manager) = server_on(
+        path.clone(),
+        config.clone(),
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let old = manager.active.load_full();
+    let owner = old.http[0].balancer.acquire(0).unwrap();
+    let mut next = config.clone();
+    let hangang::pool_member::Backend::Member(member) = &mut next.http[0].backends[0] else {
+        unreachable!()
+    };
+    member.desired_state = hangang::pool_member::DesiredState::Maintenance;
+    std::fs::create_dir(&path).unwrap();
+    assert!(manager.apply(next.clone(), 0).await.is_err());
+    assert!(old.http[0].balancer.available(0));
+    assert!(old.retired_members.snapshot().is_empty());
+    let (_, _, body) = request(address, "GET", "/v1/operations", None, None).await;
+    let row = &json(&body)["rows"][0];
+    assert_eq!(row["desired_state"], "serving");
+    assert_eq!(row["active_admissions"], 1);
+    assert_eq!(row["admission_open"], true);
+    std::fs::remove_dir(&path).unwrap();
+    manager.apply(next, 0).await.unwrap();
+    assert!(old.http[0].balancer.acquire(0).is_none());
+    assert_eq!(old.retired_members.snapshot()[0].active_admissions, 1);
+    let (_, _, body) = request(address, "GET", "/v1/operations", None, None).await;
+    let row = &json(&body)["rows"][0];
+    assert_eq!(row["desired_state"], "maintenance");
+    assert_eq!(row["admission_open"], false);
+    assert_eq!(row["available"], false);
+    assert_eq!(
+        row["active_admissions"], 0,
+        "old work remains in the retired inventory"
+    );
+    manager.apply(config, 1).await.unwrap();
+    assert!(manager.active.load().http[0].balancer.acquire(0).is_some());
+    assert!(
+        old.http[0].balancer.acquire(0).is_none(),
+        "reactivation cannot reopen old nodes"
+    );
+    drop(owner);
+    assert!(old.retired_members.snapshot().is_empty());
+    manager.tcp.shutdown(std::time::Duration::ZERO).await;
+    manager.policy.shutdown().await;
+}

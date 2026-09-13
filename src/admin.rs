@@ -1372,6 +1372,7 @@ impl Admin {
                             "backend_index": backend_index,
                             "address": address.address(),
                             "member_id": address.id(),
+                            "desired_state": address.desired_state(),
                             "match_host": match_host,
                             "listen": null,
                             "balance_mode": runtime.route.balance.mode,
@@ -1384,6 +1385,8 @@ impl Admin {
                             "probe_observed": state.probe_observed,
                             "initial_check_pending": state.initial_check_pending,
                             "active_requests": state.active_requests,
+                            "active_admissions": state.active_requests.unwrap_or_default(),
+                            "admission_open": runtime.balancer.admission_open(backend_index),
                             "member_active_streams": null,
                             "route_active_connections": null
                         }));
@@ -1419,16 +1422,19 @@ impl Admin {
                             "backend_index": backend_index,
                             "address": address.address(),
                             "member_id": address.id(),
+                            "desired_state": address.desired_state(),
                             "match_host": null,
                             "listen": route.listen.to_string(),
                             "balance_mode": "round_robin",
                             "weight": address.weight(),
                             "enabled": route.enabled,
-                            "available": route.enabled && health.as_ref().is_none_or(|state| state.available),
+                            "available": route.enabled && snapshot.tcp_member_admissions[&route.id][backend_index].is_open() && health.as_ref().is_none_or(|state| state.available),
                             "health_mode": if health.is_some() { "active_tcp" } else { "unmonitored" },
                             "probe_observed": health.as_ref().map(|state| state.probe_observed),
                             "initial_check_pending": health.as_ref().map(|state| state.initial_check_pending),
                             "active_requests": null,
+                            "active_admissions": snapshot.tcp_member_admissions[&route.id][backend_index].active(),
+                            "admission_open": snapshot.tcp_member_admissions[&route.id][backend_index].is_open(),
                             "member_active_streams": snapshot.tcp_member_activity.get(&route.id)
                                 .and_then(|activity| activity.node(backend_index)).map(|counter| counter.active()),
                             "route_active_connections": active_connections
