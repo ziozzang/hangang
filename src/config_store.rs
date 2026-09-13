@@ -413,6 +413,11 @@ fn resolve_operation_cas(
         {
             return Ok(CasResult::Applied(stored));
         }
+        if uncertain {
+            return Err(StoreError::Indeterminate(anyhow!(
+                "operation CAS acknowledgement was lost and the current document cannot prove the same operation"
+            )));
+        }
         return Err(StoreError::Invalid(anyhow!(
             "operation identifier reused with another candidate or precondition"
         )));
@@ -2202,6 +2207,28 @@ mod tests {
         assert!(matches!(
             resolve_operation_cas(current(), &epoch, &different, &first, false).unwrap_err(),
             StoreError::Invalid(_)
+        ));
+        assert!(matches!(
+            resolve_operation_cas(current(), &epoch, &different, &first, true).unwrap_err(),
+            StoreError::Indeterminate(_)
+        ));
+        // A committed, unanswered write followed by an older SQL writer can
+        // leave this same ID on a newer, different document. It is not proof
+        // of reuse by the caller, nor proof that the first write never landed.
+        let old_writer_current = Ok(Some((
+            Stored {
+                epoch: epoch.clone(),
+                config: different.clone(),
+            },
+            encode(&different).unwrap(),
+            Some(OperationMetadata {
+                revision: 1,
+                stamp: first.clone(),
+            }),
+        )));
+        assert!(matches!(
+            resolve_operation_cas(old_writer_current, &epoch, &next, &first, true).unwrap_err(),
+            StoreError::Indeterminate(_)
         ));
         assert!(matches!(
             validate_operation_stamp(&first, &encode(&different).unwrap()),
