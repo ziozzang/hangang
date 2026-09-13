@@ -7,8 +7,10 @@ use hangang::{
     policy::PolicyPool,
     proxy::Proxy,
 };
-use http_body_util::Full;
-use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+use http_body_util::{BodyExt, Full};
+use hyper::{
+    HeaderMap, Request, Response, body::Incoming, server::conn::http1, service::service_fn,
+};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,7 +18,7 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -80,13 +82,44 @@ async fn origin(label: &'static str) -> (SocketAddr, Arc<AtomicUsize>, JoinHandl
     (address, hits, task)
 }
 
+async fn capture_origin() -> (SocketAddr, Arc<Mutex<Vec<HeaderMap>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let records = seen.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let records = records.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let records = records.clone();
+                    async move {
+                        let headers = request.headers().clone();
+                        let _ = request.into_body().collect().await;
+                        records.lock().unwrap().push(headers);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (address, seen, task)
+}
+
 async fn gateway(routes: Vec<Value>) -> (SocketAddr, Arc<PolicyPool>, JoinHandle<()>) {
     gateway_document(json!({"http":routes})).await
 }
 
 async fn gateway_document(document: Value) -> (SocketAddr, Arc<PolicyPool>, JoinHandle<()>) {
     let config: Config = serde_json::from_value(document).unwrap();
-    let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
+    serve_snapshot(Snapshot::new(config).unwrap()).await
+}
+
+async fn serve_snapshot(snapshot: Snapshot) -> (SocketAddr, Arc<PolicyPool>, JoinHandle<()>) {
+    let active = Arc::new(ArcSwap::from_pointee(snapshot));
     let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 2));
     let proxy = Proxy::new(active, policy.clone(), Arc::new(Metrics::default()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -472,6 +505,141 @@ async fn disabled_guard_and_overlapping_resource_ids_fail_closed() {
         403
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn lua_cannot_replace_verified_resource_principal_or_origin_identity() {
+    let (upstream, seen, upstream_task) = capture_origin().await;
+    let mut route = protected_route(upstream);
+    route["lua"] = json!("hangang.set_header('x-app-mutated', 'yes')");
+    let (front, policy, front_task) = gateway(vec![route]).await;
+    assert_eq!(
+        request(
+            front,
+            "GET",
+            "/secure/records",
+            Some("bob"),
+            &[("x-verified-user", "alice")],
+            None
+        )
+        .await,
+        403
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "Bob cannot become Alice through a request header or Lua"
+    );
+    assert_eq!(
+        request(
+            front,
+            "GET",
+            "/secure/records",
+            Some("alice"),
+            &[("x-verified-user", "bob")],
+            None
+        )
+        .await,
+        200
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].get_all("x-verified-user").iter().count(), 1);
+        assert_eq!(seen[0]["x-verified-user"], "alice");
+        assert_eq!(
+            seen[0]["x-app-mutated"], "yes",
+            "Lua application mutation actually ran"
+        );
+    }
+    front_task.abort();
+    policy.shutdown().await;
+
+    let mut rejected = protected_route(upstream);
+    rejected["lua"] = json!("hangang.set_header('x-verified-user', 'bob')");
+    let (front, policy, front_task) = gateway(vec![rejected]).await;
+    assert_eq!(
+        request(front, "GET", "/secure/records", Some("alice"), &[], None).await,
+        503
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "reserved Lua identity mutation must not reach origin"
+    );
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn resource_policy_rejects_native_identity_transform_and_defensively_reasserts() {
+    let (upstream, seen, upstream_task) = capture_origin().await;
+    let mut document = json!({"http":[protected_route(upstream)]});
+    document["http"][0]["resource_policy"]["allow"][0]["methods"] = json!(["GET", "POST"]);
+    let valid: Config = serde_json::from_value(document).unwrap();
+    let mut transform = hangang::transform::BodyTransform::default();
+    transform
+        .set_headers
+        .insert("X-Verified-User".into(), "bob".into());
+    let mut rejected = valid.clone();
+    rejected.http[0].request_transform = Some(transform.clone());
+    assert!(
+        rejected.validate().is_err(),
+        "configuration cannot publish an identity rewrite"
+    );
+
+    // The active document remains valid. A test-only forged runtime exercises
+    // defense in depth if a lower layer ever bypasses configuration validation.
+    let mut snapshot = Snapshot::new(valid).unwrap();
+    let previous = snapshot.http[0].clone();
+    let mut route = previous.route.clone();
+    route.request_transform = Some(transform.clone());
+    let runtime = hangang::config::HttpRuntime {
+        host_regex: previous.host_regex.clone(),
+        admission: previous.admission.clone(),
+        balancer: previous.balancer.clone(),
+        cache_fingerprint: previous.cache_fingerprint.clone(),
+        request_transform: Some(Arc::new(transform)),
+        response_transform: previous.response_transform.clone(),
+        basic_auth: Some(hangang::basic_auth::prepare(route.basic_auth.as_ref().unwrap()).unwrap()),
+        route,
+    };
+    snapshot.http = vec![Arc::new(runtime)];
+    let (front, policy, front_task) = serve_snapshot(snapshot).await;
+    assert_eq!(
+        request(
+            front,
+            "POST",
+            "/secure/records",
+            Some("bob"),
+            &[("x-verified-user", "alice")],
+            Some("payload")
+        )
+        .await,
+        403
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(
+        request(
+            front,
+            "POST",
+            "/secure/records",
+            Some("alice"),
+            &[("x-verified-user", "mallory")],
+            Some("payload")
+        )
+        .await,
+        200
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].get_all("x-verified-user").iter().count(), 1);
+        assert_eq!(seen[0]["x-verified-user"], "alice");
+    }
     front_task.abort();
     upstream_task.abort();
     policy.shutdown().await;
