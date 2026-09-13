@@ -2093,36 +2093,6 @@ impl ConfigStore for PostgresConfigStore {
         validate_operation_stamp(&stamp, &encoded)?;
         let next_revision = revision_to_i64(next.revision)?;
         let expected_revision = revision_to_i64(expected)?;
-        let prior = self
-            .receipt_observation(&stamp.authority_id, &stamp.operation_id)
-            .await?;
-        if let Some(receipt) = prior.receipt {
-            if receipt.epoch != epoch || receipt.revision != next.revision || receipt.stamp != stamp
-            {
-                return Err(StoreError::Invalid(anyhow!(
-                    "operation identifier reused with another candidate or precondition"
-                )));
-            }
-            let current = self.load_stored_with_proof().await?.ok_or_else(|| {
-                StoreError::Invalid(anyhow!("PostgreSQL configuration store is not initialized"))
-            })?;
-            return Ok(
-                if current.0.epoch == epoch
-                    && current.0.config == next
-                    && current_operation_proof(&current.0, &current.1, &current.2)
-                        .is_some_and(|proof| proof.stamp == stamp)
-                {
-                    CasResult::Applied(current.0)
-                } else {
-                    CasResult::Conflict { current: current.0 }
-                },
-            );
-        }
-        if !prior.writes_available {
-            return Err(StoreError::Unavailable(anyhow!(
-                "retained commit receipt capacity exhausted"
-            )));
-        }
         let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &next_revision,
             &encoded,
