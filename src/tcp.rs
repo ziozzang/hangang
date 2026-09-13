@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncWriteExt, copy_bidirectional},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Mutex, Semaphore},
     task::JoinHandle,
     time::{Instant, timeout},
@@ -429,6 +429,7 @@ type ListenerRoute = (
     Option<Arc<crate::tcp_health::TcpHealth>>,
     Option<Arc<crate::tcp_member::TcpMemberActivity>>,
     Arc<[Arc<crate::member_admission::MemberAdmission>]>,
+    Option<Arc<crate::workload_tls::Prepared>>,
 );
 
 struct ListenerRoutes {
@@ -471,6 +472,7 @@ impl ListenerRoutes {
                 snapshot.tcp_health.get(&route.id).cloned(),
                 snapshot.tcp_member_activity.get(&route.id).cloned(),
                 Arc::from(member_admissions.clone()),
+                snapshot.tcp_inbound_tls.get(&route.id).cloned(),
             ));
             if let Some(sni) = &route.sni {
                 hello_settings = Some((sni.max_client_hello_bytes, sni.hello_timeout_ms));
@@ -549,7 +551,7 @@ impl ListenerRoutes {
     }
 
     fn all_routes_deny(&self, peer: std::net::IpAddr) -> bool {
-        self.routes.iter().all(|(route, _, _, _, _, _)| {
+        self.routes.iter().all(|(route, _, _, _, _, _, _)| {
             route
                 .deny_cidrs
                 .iter()
@@ -750,6 +752,7 @@ fn spawn_accept_loop(
             let task_cancel = connection_cancel.clone();
             let task_discovery = discovery.clone();
             let task_backend_counter = next_backend.clone();
+            let task_active = active.clone();
             connections.spawn(async move {
                 let _permit = permit;
                 let _active = ActiveConnection::new(task_metrics.clone());
@@ -790,7 +793,7 @@ fn spawn_accept_loop(
                     };
                     (route_index, hello.consumed)
                 };
-                let (route, counter, upstream_tls, health, member_activity, member_admissions) =
+                let (route, counter, upstream_tls, health, member_activity, member_admissions, inbound_tls) =
                     routes.routes[route_index].clone();
                 drop(routes);
                 if route
@@ -809,6 +812,57 @@ fn spawn_accept_loop(
                             return;
                         }
                     };
+                // Mandatory inbound authentication finishes before selecting
+                // a member or opening any upstream socket. Passthrough routes
+                // never manufacture an authenticated workload identity.
+                let (client, identity_lease): (crate::upstream::BoxIo, Option<WorkloadLease>) =
+                    if let Some(policy) = &route.inbound_tls {
+                        let Some(prepared) = inbound_tls else {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        let Ok(handshake_permit) = workload_handshake_admission().try_acquire_owned() else {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        let acceptor = tokio_rustls::TlsAcceptor::from(prepared.server_config.clone());
+                        let accepted = tokio::select! {
+                            biased;
+                            _ = task_cancel.cancelled() => return,
+                            accepted = timeout(Duration::from_millis(policy.handshake_timeout_ms), acceptor.accept(client)) => accepted,
+                        };
+                        let Ok(Ok(stream)) = accepted else {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        let identity = stream.get_ref().1.peer_certificates()
+                            .ok_or_else(|| anyhow::anyhow!("client certificate missing"))
+                            .and_then(|chain| prepared.authorize_peer(chain));
+                        let Ok(identity) = identity else {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        drop(handshake_permit);
+                        let lifetime = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()
+                            .and_then(|now| identity.expires_at.checked_sub(now.as_secs()))
+                            .and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)));
+                        let Some(deadline) = lifetime else {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        };
+                        let lease = WorkloadLease { active: task_active, route_id: route.id.clone(), prepared, expires_at: identity.expires_at, deadline };
+                        if !lease.current() {
+                            task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        (Box::new(stream), Some(lease))
+                    } else { (Box::new(client), None) };
                 let Some(index) = next_backend_index(&task_backend_counter, &route, &member_admissions, health.as_deref(), task_discovery.as_deref()) else {
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -849,7 +903,7 @@ fn spawn_accept_loop(
                     member_lease,
                     index,
                 };
-                if let Err(error) =
+                let connection = async {
                     // SNI inspection remains passthrough. When this route also
                     // configures upstream TLS, the consumed ClientHello is sent
                     // as application data inside that explicitly requested TLS
@@ -862,9 +916,21 @@ fn spawn_accept_loop(
                         &consumed,
                         idle_timeout,
                         task_cancel,
+                        identity_lease.as_ref(),
                     )
                     .await
-                {
+                };
+                let result = if let Some(lease) = &identity_lease {
+                    tokio::select! {
+                        biased;
+                        _ = lease.revoked() => {
+                            task_metrics.tcp_mtls_lease_terminations.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        },
+                        result = connection => result,
+                    }
+                } else { connection.await };
+                if let Err(error) = result {
                     task_metrics.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(%peer, %backend, %error, "TCP proxy connection failed");
                 }
@@ -947,6 +1013,52 @@ fn next_backend_index(
         })
 }
 
+fn workload_handshake_admission() -> Arc<Semaphore> {
+    static ADMISSION: std::sync::LazyLock<Arc<Semaphore>> = std::sync::LazyLock::new(|| {
+        let limit = std::thread::available_parallelism()
+            .map_or(2, |cpus| cpus.get().saturating_mul(2))
+            .clamp(2, 64);
+        Arc::new(Semaphore::new(limit))
+    });
+    ADMISSION.clone()
+}
+
+/// A connection belongs to one authenticated policy/material generation.
+/// Changes withdraw existing opaque streams rather than reinterpreting their
+/// already-authenticated peer under a new trust policy.
+struct WorkloadLease {
+    active: Arc<ArcSwap<Snapshot>>,
+    route_id: String,
+    prepared: Arc<crate::workload_tls::Prepared>,
+    expires_at: u64,
+    deadline: Instant,
+}
+impl WorkloadLease {
+    fn current(&self) -> bool {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        if now.as_secs() >= self.expires_at || Instant::now() >= self.deadline {
+            return false;
+        }
+        let snapshot = self.active.load();
+        snapshot
+            .tcp_inbound_tls
+            .get(&self.route_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.prepared))
+    }
+    async fn revoked(&self) {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if !self.current() {
+                return;
+            }
+        }
+    }
+}
+
 struct TcpDialAdmission {
     configured: String,
     target: crate::discovery::ResolvedTarget,
@@ -957,15 +1069,21 @@ struct TcpDialAdmission {
     index: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_connection(
-    client: TcpStream,
+    client: crate::upstream::BoxIo,
     admission: &TcpDialAdmission,
     options: &crate::upstream::OutboundOptions,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     consumed: &[u8],
     idle_timeout: Duration,
     cancel: CancellationToken,
+    identity_lease: Option<&WorkloadLease>,
 ) -> Result<()> {
+    ensure!(
+        identity_lease.is_none_or(WorkloadLease::current),
+        "workload identity no longer authorized"
+    );
     let mut upstream = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Ok(()),
@@ -973,6 +1091,10 @@ async fn proxy_connection(
             result.context("connect TCP backend")?
         },
     };
+    ensure!(
+        identity_lease.is_none_or(WorkloadLease::current),
+        "workload identity changed while connecting"
+    );
     // The dial can await proxy negotiation and TLS. Revalidate immediately
     // before forwarding any downstream bytes, including a buffered ClientHello.
     ensure!(

@@ -413,3 +413,76 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     manager.shutdown(Duration::from_secs(1)).await;
     backend_task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owned throughput diagnostic; run release explicitly"]
+async fn tcp_mtls_owned_echo_throughput() {
+    let material = material();
+    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend_address = backend.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 65536];
+                while let Ok(count) = stream.read(&mut buffer).await {
+                    if count == 0 || stream.write_all(&buffer[..count]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let listen = held.local_addr().unwrap();
+    let document = config(listen, backend_address, &material, &[GOOD_ID]);
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(document.clone()).unwrap(),
+    ));
+    let manager = TcpManager::new(active, Arc::new(Metrics::default()), 32);
+    let prepared = manager
+        .prepare_with_inherited(&document, vec![(listen, OwnedFd::from(held))])
+        .await
+        .unwrap();
+    manager.commit(prepared).await;
+    let connector = connector(&material, Some((&material.good_cert, &material.good_key)));
+    let concurrency = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 8);
+    let started = std::time::Instant::now();
+    let mut clients = tokio::task::JoinSet::new();
+    for client in 0..concurrency {
+        let connector = connector.clone();
+        clients.spawn(async move {
+            let socket = TcpStream::connect(listen).await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut stream = connector
+                .connect("localhost".try_into().unwrap(), socket)
+                .await
+                .unwrap();
+            let payload = vec![client as u8; 65536];
+            let mut reply = vec![0u8; payload.len()];
+            for _ in 0..128 {
+                stream.write_all(&payload).await.unwrap();
+                stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, payload);
+            }
+            stream.shutdown().await.unwrap();
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(result) = clients.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    eprintln!(
+        "TCP mTLS echo: {concurrency} clients, {} MiB payload plus equal replies, {elapsed:.3}s, {:.1} payload MiB/s; includes TLS handshakes",
+        concurrency * 8,
+        (concurrency * 8) as f64 / elapsed
+    );
+    manager.shutdown(Duration::from_secs(1)).await;
+    backend_task.abort();
+}

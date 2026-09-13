@@ -31,6 +31,7 @@ fn route(id: &str, listen: SocketAddr, backend: SocketAddr) -> TcpRoute {
         enabled: true,
         upstream: Default::default(),
         health: None,
+        inbound_tls: None,
         priority: 0,
         max_connections: None,
         sni: None,

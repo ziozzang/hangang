@@ -8,6 +8,8 @@ pub struct Metrics {
     pub errors: AtomicU64,
     pub jwt_auth_rejections: AtomicU64,
     pub jwt_auth_unavailable: AtomicU64,
+    pub tcp_mtls_rejections: AtomicU64,
+    pub tcp_mtls_lease_terminations: AtomicU64,
     pub jwt_auth_capacity_rejections: AtomicU64,
     pub rejected_requests: AtomicU64,
     pub active_connections: AtomicU64,
@@ -32,6 +34,16 @@ impl Metrics {
                 "jwt_auth_rejections_total",
                 "counter",
                 &self.jwt_auth_rejections,
+            ),
+            (
+                "tcp_mtls_rejections_total",
+                "counter",
+                &self.tcp_mtls_rejections,
+            ),
+            (
+                "tcp_mtls_lease_terminations_total",
+                "counter",
+                &self.tcp_mtls_lease_terminations,
             ),
             (
                 "jwt_auth_unavailable_total",

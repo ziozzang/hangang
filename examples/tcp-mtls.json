@@ -1,0 +1,21 @@
+{
+  "tcp": [
+    {
+      "id": "workload-database",
+      "listen": "0.0.0.0:9443",
+      "backends": [
+        "127.0.0.1:5432"
+      ],
+      "inbound_tls": {
+        "cert_file": "/etc/hangang/workload/server.pem",
+        "key_file": "/etc/hangang/workload/server-key.pem",
+        "client_ca_file": "/etc/hangang/workload/client-ca.pem",
+        "client_crl_file": "/etc/hangang/workload/client.crl.pem",
+        "allowed_uri_sans": [
+          "spiffe://example.test/services/orders"
+        ],
+        "handshake_timeout_ms": 5000
+      }
+    }
+  ]
+}

@@ -46,6 +46,7 @@ fn route(listen: SocketAddr, backends: Vec<String>) -> TcpRoute {
             unhealthy_failures: 1,
             initial_state: InitialHealthState::Checking,
         }),
+        inbound_tls: None,
         sni: None,
         max_connections: None,
         listen,

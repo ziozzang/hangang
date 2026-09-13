@@ -344,6 +344,8 @@ pub struct TcpRoute {
     pub upstream: crate::upstream::OutboundOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<crate::tcp_health::TcpHealthPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_tls: Option<crate::workload_tls::Policy>,
     #[serde(default)]
     pub sni: Option<crate::client_hello::SniMatch>,
     #[serde(default)]
@@ -941,11 +943,25 @@ impl Config {
                 ensure!(code.len() <= 16384, "Lua script exceeds 16 KiB");
             }
         }
+        let mut inbound_policies = std::collections::HashSet::new();
         let mut listens = std::collections::HashMap::<_, &TcpRoute>::new();
         let mut sni_hosts = HashSet::new();
         let mut sni_globs = std::collections::HashMap::<std::net::SocketAddr, usize>::new();
         for r in &self.tcp {
             r.upstream.validate()?;
+            if let Some(policy) = &r.inbound_tls {
+                if inbound_policies.insert(serde_json::to_vec(policy)?) {
+                    ensure!(
+                        inbound_policies.len() <= 64,
+                        "at most 64 distinct inbound mTLS policies"
+                    );
+                    policy.validate()?;
+                }
+                ensure!(
+                    r.sni.is_none(),
+                    "inbound TLS termination cannot use SNI passthrough"
+                );
+            }
             if let Some(health) = &r.health {
                 health.validate()?;
             }
@@ -1036,6 +1052,23 @@ impl Config {
                 }),
                 "resource {} scope cannot be removed or moved; first publish enforce=false at its existing scope",
                 policy.resource_id
+            );
+        }
+        // A direct active-listener replacement must not silently remove
+        // workload authentication (including a rename or SNI route split).
+        // Disable or remove the protected listener in an earlier revision
+        // before explicitly repurposing that socket for unauthenticated use.
+        for old in previous
+            .tcp
+            .iter()
+            .filter(|route| route.enabled && route.inbound_tls.is_some())
+        {
+            ensure!(
+                self.tcp
+                    .iter()
+                    .filter(|route| route.enabled && route.listen == old.listen)
+                    .all(|route| route.inbound_tls.is_some()),
+                "active TCP mTLS listener must be disabled or removed in a prior revision before removing authentication"
             );
         }
         let protected: std::collections::HashSet<&str> = previous
@@ -1145,6 +1178,8 @@ pub struct Snapshot {
     // Never re-read files to decide whether health observations may be reused.
     #[doc(hidden)]
     pub upstream_trust: std::collections::HashMap<String, [u8; 32]>,
+    pub tcp_inbound_tls:
+        std::collections::HashMap<String, std::sync::Arc<crate::workload_tls::Prepared>>,
     pub certificates: Option<std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
     pub cache: Option<std::sync::Arc<crate::cache::CacheRuntime>>,
     pub config: Config,
@@ -1560,6 +1595,41 @@ impl Snapshot {
                     .and_then(|old| old.cache.clone())
                     .unwrap_or_else(|| crate::cache::CacheRuntime::new(settings.clone()))
             });
+        let mut tcp_inbound_tls = std::collections::HashMap::new();
+        let mut inbound_material: std::collections::HashMap<
+            Vec<u8>,
+            std::sync::Arc<crate::workload_tls::Prepared>,
+        > = std::collections::HashMap::new();
+        for route in config.tcp.iter().filter(|route| route.enabled) {
+            let Some(policy) = &route.inbound_tls else {
+                continue;
+            };
+            // Read on configuration preparation, never on a connection. A
+            // rejected replacement leaves the published generation intact.
+            let policy_key = serde_json::to_vec(policy)?;
+            let prepared = match inbound_material.entry(policy_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry
+                    .insert(std::sync::Arc::new(crate::workload_tls::Prepared::load(
+                        policy,
+                    )?))
+                    .clone(),
+            };
+            let old = previous
+                .filter(|old| {
+                    old.config.tcp.iter().any(|prior| {
+                        prior.id == route.id && prior.enabled && prior.listen == route.listen
+                    })
+                })
+                .and_then(|old| old.tcp_inbound_tls.get(&route.id));
+            let prepared = match old {
+                Some(old) if old.fingerprint() == prepared.fingerprint() => old.clone(),
+                _ => prepared,
+            };
+            if route.enabled {
+                tcp_inbound_tls.insert(route.id.clone(), prepared);
+            }
+        }
         let certificates = if config.certificates.is_empty() {
             None
         } else {
@@ -1586,6 +1656,7 @@ impl Snapshot {
             sni_regex: regexes.sni,
             upstream_tls,
             upstream_trust,
+            tcp_inbound_tls,
             certificates,
             cache,
             config,

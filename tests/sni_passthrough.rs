@@ -53,6 +53,7 @@ fn route(
         enabled: true,
         upstream: Default::default(),
         health: None,
+        inbound_tls: None,
         id: id.to_owned(),
         priority: 0,
         sni: Some(SniMatch {
@@ -613,6 +614,7 @@ async fn listener_wide_cidr_denial_precedes_hello_and_global_admission() {
         enabled: true,
         upstream: Default::default(),
         health: None,
+        inbound_tls: None,
         id: "allowed-legacy".into(),
         priority: 0,
         sni: None,
