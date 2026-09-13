@@ -385,6 +385,13 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
         }
         _ => bail!("JWK type and algorithm disagree"),
     };
+    // The library's verifier factory parses the actual public key. This
+    // rejects invalid EC points and malformed RSA/Ed25519 keys during
+    // candidate preparation, before the key set becomes authoritative.
+    let _ = (jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.verifier_factory)(
+        &algorithm.library(),
+        &key,
+    )?;
     Ok(PreparedKey {
         kid: kid.to_owned(),
         algorithm,
@@ -395,9 +402,10 @@ fn prepare_jwk(value: &Value, allowed: &[JwtAlgorithm]) -> Result<PreparedKey> {
 fn valid_kid(kid: &str) -> bool {
     !kid.is_empty()
         && kid.len() <= MAX_KEY_ID
+        // A kid is an opaque exact-match key, not a route ID or URL segment.
         && kid
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+            .all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 fn decode_url(encoded: &str, max: usize) -> Result<Vec<u8>> {
@@ -458,6 +466,21 @@ impl JwtVerifier {
         if !self.config.algorithms.contains(&header.algorithm) {
             return Err(VerifyError::Invalid);
         }
+        let claims = decode_segment(parts.1, MAX_CLAIMS_BYTES)?;
+        if !strict_json(&claims)
+            .map_err(|_| VerifyError::Invalid)?
+            .is_object()
+        {
+            return Err(VerifyError::Invalid);
+        }
+        let signature = decode_segment(parts.2, 512)?;
+        let valid_signature_size = match header.algorithm {
+            JwtAlgorithm::RS256 | JwtAlgorithm::PS256 => (256..=512).contains(&signature.len()),
+            JwtAlgorithm::ES256 | JwtAlgorithm::EdDSA => signature.len() == 64,
+        };
+        if !valid_signature_size {
+            return Err(VerifyError::Invalid);
+        }
         Ok(header)
     }
 
@@ -467,8 +490,8 @@ impl JwtVerifier {
         key: &PreparedKey,
         now_unix: u64,
     ) -> std::result::Result<Verified, VerifyError> {
-        let (header, claims, _) = split_token(token)?;
-        let requested = parse_header(header)?;
+        let (_, claims, _) = split_token(token)?;
+        let requested = self.key_request(token)?;
         if requested.kid != key.kid
             || requested.algorithm != key.algorithm
             || !self.config.algorithms.contains(&key.algorithm)
@@ -504,7 +527,11 @@ impl JwtVerifier {
                 .filter(|value| valid_identity(value))
                 .ok_or(invalid)
         };
-        let issuer = text("iss")?;
+        let issuer = object
+            .get("iss")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .ok_or(invalid)?;
         if issuer != self.config.issuer {
             return Err(invalid);
         }
@@ -700,7 +727,9 @@ pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value> {
     Ok(serde_json::from_slice::<StrictValue>(bytes)?.0)
 }
 
-struct StrictValue(Value);
+/// Duplicate-free JSON value for configuration fields that serde would
+/// otherwise materialize as `Value` and silently collapse duplicate keys.
+pub(crate) struct StrictValue(pub(crate) Value);
 
 impl<'de> Deserialize<'de> for StrictValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
@@ -787,6 +816,7 @@ impl<'de> Deserialize<'de> for StrictValue {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
 
     fn config() -> JwtConfig {
         JwtConfig {
@@ -856,6 +886,22 @@ mod tests {
         assert_eq!(verified.expires_at, 1300);
         assert_eq!(verified.client_id, "client-1");
         assert!(verifier.config().allows(&verified));
+        let wrong_signing = SigningKey::from_bytes(&[43; 32]);
+        let wrong_jwks = serde_json::json!({"keys":[{
+            "kty":"OKP", "crv":"Ed25519", "kid":"signer-1", "alg":"EdDSA",
+            "x":URL_SAFE_NO_PAD.encode(wrong_signing.verifying_key().to_bytes())
+        }]});
+        let wrong_keys =
+            PreparedKeys::from_jwks_json(wrong_jwks.to_string().as_bytes(), &[JwtAlgorithm::EdDSA])
+                .unwrap();
+        assert_eq!(
+            verifier.verify(
+                &access_token,
+                &wrong_keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap(),
+                1100
+            ),
+            Err(VerifyError::Invalid)
+        );
         let mut reduced = claims();
         reduced["scope"] = serde_json::json!("profile");
         let token = token(&signing, &reduced);
@@ -895,15 +941,21 @@ mod tests {
         let claim_text = claims()
             .to_string()
             .replace("\"sub\":\"alice\"", "\"sub\":\"alice\",\"sub\":\"bob\"");
-        let token = signed(
+        let duplicate_token = signed(
             &signing,
             r#"{"alg":"EdDSA","kid":"signer-1","typ":"at+jwt"}"#,
             &claim_text,
         );
         assert_eq!(
-            verifier.verify(&token, &key, 1100),
+            verifier.key_request(&duplicate_token),
             Err(VerifyError::Invalid)
         );
+        assert_eq!(
+            verifier.verify(&duplicate_token, &key, 1100),
+            Err(VerifyError::Invalid)
+        );
+        let token = format!("{}=", token(&signing, &claims()));
+        assert_eq!(verifier.key_request(&token), Err(VerifyError::Invalid));
         let token = signed(
             &signing,
             r#"{"alg":"EdDSA","kid":"signer-1","typ":"application/at+jwt"}"#,
@@ -975,5 +1027,133 @@ mod tests {
                 "{jwks}"
             );
         }
+    }
+
+    #[test]
+    fn rsa_and_pss_valid_signatures_and_wrong_keys() {
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let wrong = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let der = private.to_pkcs1_der().unwrap();
+        let signing = jsonwebtoken::EncodingKey::from_rsa_der(der.as_bytes());
+        let jwks = serde_json::json!({"keys":[
+            {"kty":"RSA", "kid":"rsa+main/1=", "alg":"RS256",
+             "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())},
+            {"kty":"RSA", "kid":"pss", "alg":"PS256",
+             "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}
+        ]});
+        let wrong_jwks = serde_json::json!({"keys":[
+            {"kty":"RSA", "kid":"rsa+main/1=", "alg":"RS256",
+             "n":URL_SAFE_NO_PAD.encode(wrong.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(wrong.e().to_bytes_be())},
+            {"kty":"RSA", "kid":"pss", "alg":"PS256",
+             "n":URL_SAFE_NO_PAD.encode(wrong.n().to_bytes_be()),
+             "e":URL_SAFE_NO_PAD.encode(wrong.e().to_bytes_be())}
+        ]});
+        let keys = PreparedKeys::from_jwks_json(
+            jwks.to_string().as_bytes(),
+            &[JwtAlgorithm::RS256, JwtAlgorithm::PS256],
+        )
+        .unwrap();
+        let wrong_keys = PreparedKeys::from_jwks_json(
+            wrong_jwks.to_string().as_bytes(),
+            &[JwtAlgorithm::RS256, JwtAlgorithm::PS256],
+        )
+        .unwrap();
+        let mut config = config();
+        config.algorithms = vec![JwtAlgorithm::RS256, JwtAlgorithm::PS256];
+        let verifier = JwtVerifier::prepare(config).unwrap();
+        for (alg, kid) in [(Algorithm::RS256, "rsa+main/1="), (Algorithm::PS256, "pss")] {
+            let mut header = jsonwebtoken::Header::new(alg);
+            header.typ = Some("at+jwt".into());
+            header.kid = Some(kid.into());
+            let token = jsonwebtoken::encode(&header, &claims(), &signing).unwrap();
+            let request = verifier.key_request(&token).unwrap();
+            let key = keys.get(&request.kid, request.algorithm).unwrap();
+            assert_eq!(
+                verifier.verify(&token, &key, 1100).unwrap().subject,
+                "alice"
+            );
+            let wrong_key = wrong_keys.get(&request.kid, request.algorithm).unwrap();
+            assert_eq!(
+                verifier.verify(&token, &wrong_key, 1100),
+                Err(VerifyError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn es256_valid_signature_and_invalid_public_point() {
+        use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint, pkcs8::EncodePrivateKey};
+        let mut rng = rand::rngs::OsRng;
+        let private = SecretKey::random(&mut rng);
+        let wrong = SecretKey::random(&mut rng);
+        let point = private.public_key().to_encoded_point(false);
+        let wrong_point = wrong.public_key().to_encoded_point(false);
+        let key_json = |kid: &str, point: &p256::EncodedPoint| {
+            serde_json::json!({"kty":"EC", "crv":"P-256", "kid":kid, "alg":"ES256",
+                "x":URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y":URL_SAFE_NO_PAD.encode(point.y().unwrap())})
+        };
+        let jwks = serde_json::json!({"keys":[key_json("ec-main", &point)]});
+        let wrong_jwks = serde_json::json!({"keys":[key_json("ec-main", &wrong_point)]});
+        let keys =
+            PreparedKeys::from_jwks_json(jwks.to_string().as_bytes(), &[JwtAlgorithm::ES256])
+                .unwrap();
+        let wrong_keys =
+            PreparedKeys::from_jwks_json(wrong_jwks.to_string().as_bytes(), &[JwtAlgorithm::ES256])
+                .unwrap();
+        let der = private.to_pkcs8_der().unwrap();
+        let signing = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
+        let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
+        header.typ = Some("at+jwt".into());
+        header.kid = Some("ec-main".into());
+        let token = jsonwebtoken::encode(&header, &claims(), &signing).unwrap();
+        let mut config = config();
+        config.algorithms = vec![JwtAlgorithm::ES256];
+        let verifier = JwtVerifier::prepare(config).unwrap();
+        assert!(
+            verifier
+                .verify(
+                    &token,
+                    &keys.get("ec-main", JwtAlgorithm::ES256).unwrap(),
+                    1100
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            verifier.verify(
+                &token,
+                &wrong_keys.get("ec-main", JwtAlgorithm::ES256).unwrap(),
+                1100
+            ),
+            Err(VerifyError::Invalid)
+        );
+        let invalid = serde_json::json!({"keys":[{
+            "kty":"EC", "crv":"P-256", "kid":"not-on-curve", "alg":"ES256",
+            "x":URL_SAFE_NO_PAD.encode([0u8;32]), "y":URL_SAFE_NO_PAD.encode([0u8;32])
+        }]});
+        assert!(
+            PreparedKeys::from_jwks_json(invalid.to_string().as_bytes(), &[JwtAlgorithm::ES256])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn long_valid_issuer_and_bounded_opaque_kid_are_accepted() {
+        let issuer = format!("https://issuer.example.test/{}", "a".repeat(260));
+        assert!(issuer.len() > MAX_IDENTITY_BYTES);
+        let mut config = config();
+        config.issuer = issuer.clone();
+        let verifier = JwtVerifier::prepare(config).unwrap();
+        let (signing, keys) = key_material();
+        let mut claims = claims();
+        claims["iss"] = Value::String(issuer);
+        let token = token(&signing, &claims);
+        let key = keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap();
+        assert!(verifier.verify(&token, &key, 1100).is_ok());
+        assert!(valid_kid("issuer+opaque/id="));
     }
 }
