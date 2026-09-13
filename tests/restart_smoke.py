@@ -105,6 +105,22 @@ class Restart(unittest.TestCase):
                     code,_,body=smoke.Smoke.request(admin,"POST","/v1/users",json.dumps({"username":"audit-viewer","password":"owned viewer fixture password","role":"viewer"}),account_headers)
                     self.assertEqual(code,201)
                     audit_target=json.loads(body)["user"]["id"]
+                    def config_operations():
+                        code,_,body=smoke.Smoke.request(admin,"GET","/v1/config/operations",headers=account_headers)
+                        self.assertEqual(code,200)
+                        return json.loads(body)
+                    operations_empty=config_operations()
+                    self.assertEqual(operations_empty["records"],[])
+                    code,_,body=smoke.Smoke.request(admin,"GET","/v1/config",headers=account_headers)
+                    self.assertEqual(code,200)
+                    candidate=json.loads(body)
+                    config_headers={**account_headers,"If-Match":f'"{candidate["revision"]}"'}
+                    code,_,_=smoke.Smoke.request(admin,"PUT","/v1/config",json.dumps(candidate),config_headers)
+                    self.assertEqual(code,200)
+                    operations_before=config_operations()
+                    self.assertEqual(operations_before["authority_id"],operations_empty["authority_id"])
+                    self.assertEqual([row["state"] for row in operations_before["records"]],["candidate_activated"])
+                    initial=status()
                     audit_before=account_audit()
                     self.assertEqual([row["action"] for row in audit_before["records"]],["baseline","bootstrap","create"])
 
@@ -134,6 +150,9 @@ class Restart(unittest.TestCase):
                     held_request()
                     child.send_signal(signal.SIGHUP)
                     next_generation=await_status(lambda value:value["process_id"]!=initial["process_id"])
+                    operations_after=config_operations()
+                    self.assertEqual(operations_after["authority_id"],operations_before["authority_id"])
+                    self.assertEqual(operations_after["records"],operations_before["records"])
                     audit_after=account_audit()
                     self.assertEqual(audit_after["records"],audit_before["records"])
                     self.assertEqual(audit_after["started_at_unix_ms"],audit_before["started_at_unix_ms"])
@@ -175,6 +194,7 @@ class Restart(unittest.TestCase):
                     self.assertEqual(code,202)
                     final_generation=await_status(lambda value:value["process_id"]!=next_generation["process_id"])
                     self.assertEqual(account_audit()["records"],audit_changed["records"])
+                    self.assertEqual(config_operations()["records"],operations_before["records"])
                     workload_request()
                     # An unexpected serving-process death must be visible to the
                     # service manager as failure, rather than a clean shutdown.

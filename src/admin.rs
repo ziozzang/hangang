@@ -22,6 +22,20 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+struct ConfigAuthority {
+    users: Arc<crate::admin_users::Store>,
+    authority: crate::admin_users::MutationAuthority,
+}
+
+#[derive(Debug)]
+struct ConfigOperationUnavailable;
+impl std::fmt::Display for ConfigOperationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("configuration operation journal unavailable; outcome may be unknown")
+    }
+}
+impl std::error::Error for ConfigOperationUnavailable {}
+
 pub struct Manager {
     pub active: Arc<ArcSwap<Snapshot>>,
     pub tcp: Arc<TcpManager>,
@@ -227,6 +241,26 @@ impl Manager {
     }
 
     pub async fn apply(self: &Arc<Self>, config: Config, expected: u64) -> anyhow::Result<Config> {
+        self.apply_inner(config, expected, None).await
+    }
+
+    pub async fn apply_authorized(
+        self: &Arc<Self>,
+        users: Arc<crate::admin_users::Store>,
+        authority: crate::admin_users::MutationAuthority,
+        config: Config,
+        expected: u64,
+    ) -> anyhow::Result<Config> {
+        self.apply_inner(config, expected, Some(ConfigAuthority { users, authority }))
+            .await
+    }
+
+    async fn apply_inner(
+        self: &Arc<Self>,
+        config: Config,
+        expected: u64,
+        authority: Option<ConfigAuthority>,
+    ) -> anyhow::Result<Config> {
         // Complete a transaction even if its HTTP caller disconnects. Otherwise
         // a cancelled spawn_blocking save could persist without publication.
         anyhow::ensure!(
@@ -242,7 +276,9 @@ impl Manager {
         tokio::spawn(async move {
             let _permit = permit;
             let _guard = manager.writes.lock().await;
-            manager.apply_locked(config, expected, true, None).await
+            manager
+                .apply_locked(config, expected, true, None, authority)
+                .await
         })
         .await?
     }
@@ -284,7 +320,7 @@ impl Manager {
                 config
             } else {
                 manager
-                    .apply_locked(config, current.config.revision, false, tls)
+                    .apply_locked(config, current.config.revision, false, tls, None)
                     .await?
             };
             if !manager.stopping.load(Ordering::Acquire) {
@@ -317,7 +353,7 @@ impl Manager {
         if config == current.config {
             return Ok(false);
         }
-        self.apply_locked(config, current.config.revision, false, None)
+        self.apply_locked(config, current.config.revision, false, None, None)
             .await?;
         Ok(true)
     }
@@ -543,6 +579,7 @@ impl Manager {
         expected: u64,
         persist: bool,
         tls: Option<Arc<rustls::ServerConfig>>,
+        authority: Option<ConfigAuthority>,
     ) -> anyhow::Result<Config> {
         if self.config_store.is_some() {
             crate::config_store::ensure_reader_compatibility(&config)?;
@@ -586,60 +623,111 @@ impl Manager {
                 .certificates = Some(Arc::new(arc_swap::ArcSwap::from(tls)));
         }
         let prepared = self.tcp.prepare(&config).await?;
-        if persist {
-            if let Some(store) = &self.config_store {
-                let epoch = self
-                    .recorded_epoch()
-                    .ok_or_else(|| anyhow::anyhow!("shared configuration authority is unknown"))?;
-                match store
-                    .compare_and_swap(&epoch, expected, config.clone())
-                    .await?
-                {
-                    crate::config_store::CasResult::Applied(committed) => {
-                        anyhow::ensure!(
-                            committed.config == config,
-                            "store returned an unexpected committed snapshot"
-                        );
+        // This durable acceptance, not header admission, orders the operation
+        // against account revocation. No account DB transaction spans store I/O.
+        let accepted = if let Some(authority) = authority {
+            use sha2::{Digest, Sha256};
+            let request = crate::admin_users::ConfigAcceptRequest {
+                store_kind: if self.config_store.is_some() {
+                    crate::admin_users::ConfigStoreKind::SharedStore
+                } else {
+                    crate::admin_users::ConfigStoreKind::LocalFile
+                },
+                authority_epoch: if self.config_store.is_some() {
+                    self.recorded_epoch()
+                } else {
+                    None
+                },
+                expected_revision: expected,
+                candidate_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&config)?)),
+            };
+            let operation = authority
+                .users
+                .accept_config(authority.authority, request)
+                .await
+                .map_err(|error| {
+                    if error.is::<crate::admin_users::AuthorizationRevoked>() {
+                        error
+                    } else {
+                        ConfigOperationUnavailable.into()
                     }
-                    crate::config_store::CasResult::Conflict { current } => {
-                        if current.epoch != epoch {
-                            self.store_failure(
-                                "authority_changed",
-                                format!(
-                                    "store epoch {} differs from the followed epoch",
-                                    current.epoch
-                                ),
-                                false,
+                })?;
+            Some((authority.users, operation.operation_id))
+        } else {
+            None
+        };
+        let outcome: anyhow::Result<Config> = async {
+            if persist {
+                if let Some(store) = &self.config_store {
+                    let epoch = self.recorded_epoch().ok_or_else(|| {
+                        anyhow::anyhow!("shared configuration authority is unknown")
+                    })?;
+                    match store
+                        .compare_and_swap(&epoch, expected, config.clone())
+                        .await?
+                    {
+                        crate::config_store::CasResult::Applied(committed) => {
+                            anyhow::ensure!(
+                                committed.config == config,
+                                "store returned an unexpected committed snapshot"
                             );
-                            anyhow::bail!("shared configuration authority changed");
                         }
-                        // The conflict carries the authoritative document:
-                        // judge and adopt it directly (evidence of staleness
-                        // must not be discarded behind another read), so the
-                        // client's next read on this instance is current.
-                        // The losing transaction's prepared listeners are
-                        // released first: the winner may use those addresses.
-                        drop(prepared);
-                        drop(next);
-                        self.reconcile_stored(current).await?;
-                        anyhow::bail!("revision conflict")
+                        crate::config_store::CasResult::Conflict { current } => {
+                            if current.epoch != epoch {
+                                self.store_failure(
+                                    "authority_changed",
+                                    format!(
+                                        "store epoch {} differs from the followed epoch",
+                                        current.epoch
+                                    ),
+                                    false,
+                                );
+                                anyhow::bail!("shared configuration authority changed");
+                            }
+                            // The conflict carries the authoritative document:
+                            // judge and adopt it directly (evidence of staleness
+                            // must not be discarded behind another read), so the
+                            // client's next read on this instance is current.
+                            // The losing transaction's prepared listeners are
+                            // released first: the winner may use those addresses.
+                            drop(prepared);
+                            drop(next);
+                            self.reconcile_stored(current).await?;
+                            anyhow::bail!("revision conflict")
+                        }
                     }
+                } else {
+                    store::save(self.state_path.clone(), config.clone()).await?;
                 }
-            } else {
-                store::save(self.state_path.clone(), config.clone()).await?;
             }
+            // Publication-time side effects (cache generation adoption) run
+            // before the snapshot becomes visible, so no request can observe the
+            // new revision with the previous invalidation fence.
+            self.tcp
+                .commit_with_publication(prepared, || {
+                    next.activated();
+                    self.active.store(next);
+                })
+                .await?;
+            self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(config)
         }
-        // Publication-time side effects (cache generation adoption) run
-        // before the snapshot becomes visible, so no request can observe the
-        // new revision with the previous invalidation fence.
-        self.tcp
-            .commit_with_publication(prepared, || {
-                next.activated();
-                self.active.store(next);
-            })
-            .await?;
-        self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
-        Ok(config)
+        .await;
+        if let Some((users, operation_id)) = accepted {
+            use crate::admin_users::ConfigOperationState;
+            let state = match &outcome {
+                Ok(_) => ConfigOperationState::CandidateActivated,
+                Err(error) if error.to_string() == "revision conflict" => {
+                    ConfigOperationState::Conflict
+                }
+                Err(_) => ConfigOperationState::Indeterminate,
+            };
+            users
+                .finish_config(&operation_id, state)
+                .await
+                .map_err(|_| ConfigOperationUnavailable)?;
+        }
+        outcome
     }
 }
 #[derive(Clone)]
@@ -924,6 +1012,7 @@ impl Admin {
         let Some(actor) = actor else {
             let is_new = path == "/v1/status"
                 || path == "/v1/config/validate"
+                || path == "/v1/config/operations"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -962,6 +1051,28 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/operations" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let Some((after, limit)) = user_audit_query(req.uri().query()) else {
+                return Ok(problem(
+                    400,
+                    "Invalid Operation Query",
+                    "after must be a nonnegative safe integer and limit must be 1..100; unknown or duplicate parameters are rejected",
+                ));
+            };
+            return Ok(
+                match self
+                    .users
+                    .config_operations(actor.mutation_authority(), after, limit)
+                    .await
+                {
+                    Ok(page) => auth_json(200, &page),
+                    Err(error) => account_problem(error),
+                },
+            );
         }
         if path == "/v1/audit/users" || path == "/v1/audit/users/prune" {
             return Ok(self.handle_user_audit(req, &path, &actor).await);
@@ -1194,7 +1305,16 @@ impl Admin {
                 let generation = bumped.generation;
                 config.cache = Some(bumped);
                 return Ok(
-                    match self.manager.apply(config, snapshot.config.revision).await {
+                    match self
+                        .manager
+                        .apply_authorized(
+                            self.users.clone(),
+                            actor.mutation_authority(),
+                            config,
+                            snapshot.config.revision,
+                        )
+                        .await
+                    {
                         Ok(applied) => json_value(
                             200,
                             &serde_json::json!({"purged":true,"scope":"fleet","generation":generation,"revision":applied.revision}),
@@ -1617,10 +1737,21 @@ impl Admin {
                     return Ok(problem(409, "Route Conflict", "route id already exists"));
                 }
                 config.http.push(route.clone());
-                return Ok(match self.manager.apply(config, expected).await {
-                    Ok(config) => json_value(201, &route, Some(config.revision)),
-                    Err(error) => apply_problem(error),
-                });
+                return Ok(
+                    match self
+                        .manager
+                        .apply_authorized(
+                            self.users.clone(),
+                            actor.mutation_authority(),
+                            config,
+                            expected,
+                        )
+                        .await
+                    {
+                        Ok(config) => json_value(201, &route, Some(config.revision)),
+                        Err(error) => apply_problem(error),
+                    },
+                );
             }
             let route: crate::config::TcpRoute = match read_json(req, 1024 * 1024).await {
                 Ok(value) => value,
@@ -1633,10 +1764,21 @@ impl Admin {
                 return Ok(problem(409, "Route Conflict", "route id already exists"));
             }
             config.tcp.push(route.clone());
-            return Ok(match self.manager.apply(config, expected).await {
-                Ok(config) => json_value(201, &route, Some(config.revision)),
-                Err(error) => apply_problem(error),
-            });
+            return Ok(
+                match self
+                    .manager
+                    .apply_authorized(
+                        self.users.clone(),
+                        actor.mutation_authority(),
+                        config,
+                        expected,
+                    )
+                    .await
+                {
+                    Ok(config) => json_value(201, &route, Some(config.revision)),
+                    Err(error) => apply_problem(error),
+                },
+            );
         }
         let route_item = path
             .strip_prefix("/v1/routes/http/")
@@ -1689,10 +1831,21 @@ impl Admin {
                 };
                 if req.method() == hyper::Method::DELETE {
                     config.http.remove(index);
-                    return Ok(match self.manager.apply(config, expected).await {
-                        Ok(config) => empty_response(204, Some(config.revision)),
-                        Err(error) => apply_problem(error),
-                    });
+                    return Ok(
+                        match self
+                            .manager
+                            .apply_authorized(
+                                self.users.clone(),
+                                actor.mutation_authority(),
+                                config,
+                                expected,
+                            )
+                            .await
+                        {
+                            Ok(config) => empty_response(204, Some(config.revision)),
+                            Err(error) => apply_problem(error),
+                        },
+                    );
                 }
                 let route: crate::config::HttpRoute = match read_json(req, 1024 * 1024).await {
                     Ok(value) => value,
@@ -1702,20 +1855,42 @@ impl Admin {
                     return Ok(problem(400, "Invalid Route", "body id must match path id"));
                 }
                 config.http[index] = route.clone();
-                return Ok(match self.manager.apply(config, expected).await {
-                    Ok(config) => json_value(200, &route, Some(config.revision)),
-                    Err(error) => apply_problem(error),
-                });
+                return Ok(
+                    match self
+                        .manager
+                        .apply_authorized(
+                            self.users.clone(),
+                            actor.mutation_authority(),
+                            config,
+                            expected,
+                        )
+                        .await
+                    {
+                        Ok(config) => json_value(200, &route, Some(config.revision)),
+                        Err(error) => apply_problem(error),
+                    },
+                );
             }
             let Some(index) = config.tcp.iter().position(|route| route.id == id) else {
                 return Ok(problem(404, "Not Found", "route not found"));
             };
             if req.method() == hyper::Method::DELETE {
                 config.tcp.remove(index);
-                return Ok(match self.manager.apply(config, expected).await {
-                    Ok(config) => empty_response(204, Some(config.revision)),
-                    Err(error) => apply_problem(error),
-                });
+                return Ok(
+                    match self
+                        .manager
+                        .apply_authorized(
+                            self.users.clone(),
+                            actor.mutation_authority(),
+                            config,
+                            expected,
+                        )
+                        .await
+                    {
+                        Ok(config) => empty_response(204, Some(config.revision)),
+                        Err(error) => apply_problem(error),
+                    },
+                );
             }
             let route: crate::config::TcpRoute = match read_json(req, 1024 * 1024).await {
                 Ok(value) => value,
@@ -1725,10 +1900,21 @@ impl Admin {
                 return Ok(problem(400, "Invalid Route", "body id must match path id"));
             }
             config.tcp[index] = route.clone();
-            return Ok(match self.manager.apply(config, expected).await {
-                Ok(config) => json_value(200, &route, Some(config.revision)),
-                Err(error) => apply_problem(error),
-            });
+            return Ok(
+                match self
+                    .manager
+                    .apply_authorized(
+                        self.users.clone(),
+                        actor.mutation_authority(),
+                        config,
+                        expected,
+                    )
+                    .await
+                {
+                    Ok(config) => json_value(200, &route, Some(config.revision)),
+                    Err(error) => apply_problem(error),
+                },
+            );
         }
         if path == "/v1/docker/resolve" {
             if req.method() != hyper::Method::POST {
@@ -1872,8 +2058,23 @@ impl Admin {
             Ok(c) => c,
             Err(_) => return Ok(response(400, "invalid configuration JSON\n")),
         };
-        match self.manager.apply(config, expected).await {
+        match self
+            .manager
+            .apply_authorized(
+                self.users.clone(),
+                actor.mutation_authority(),
+                config,
+                expected,
+            )
+            .await
+        {
             Ok(c) => Ok(json_config(&c)),
+            Err(e)
+                if e.is::<crate::admin_users::AuthorizationRevoked>()
+                    || e.is::<ConfigOperationUnavailable>() =>
+            {
+                Ok(apply_problem(e))
+            }
             Err(e) if e.to_string() == "configuration capacity exhausted" => {
                 Ok(response(503, "configuration capacity exhausted\n"))
             }
@@ -2586,6 +2787,20 @@ pub fn config_digest(config: &Config) -> String {
 }
 
 fn apply_problem(error: anyhow::Error) -> Response<Body> {
+    if error.is::<crate::admin_users::AuthorizationRevoked>() {
+        return problem(
+            403,
+            "Forbidden",
+            "administrator authority withdrawn before configuration acceptance",
+        );
+    }
+    if error.is::<ConfigOperationUnavailable>() {
+        return problem(
+            503,
+            "Configuration Operation Unavailable",
+            "configuration operation journal unavailable or full; reload configuration and operation history before retrying",
+        );
+    }
     use crate::config_store::StoreError;
     if let Some(store) = error.downcast_ref::<StoreError>() {
         tracing::warn!(%error, "shared configuration store failed during a write");
