@@ -120,9 +120,24 @@ class Restart(unittest.TestCase):
                     operations_before=config_operations()
                     self.assertEqual(operations_before["authority_id"],operations_empty["authority_id"])
                     self.assertEqual([row["state"] for row in operations_before["records"]],["candidate_activated"])
+                    first_operation_id=operations_before["records"][0]["id"]
+                    candidate["revision"]+=1
+                    config_headers["If-Match"]=f'"{candidate["revision"]}"'
+                    code,_,_=smoke.Smoke.request(admin,"PUT","/v1/config",json.dumps(candidate),config_headers)
+                    self.assertEqual(code,200)
+                    unpruned=config_operations()
+                    code,_,body=smoke.Smoke.request(admin,"POST","/v1/config/operations/prune",json.dumps({
+                        "through_id":first_operation_id,"expected_latest_id":unpruned["latest_id"],
+                        "expected_history_revision":unpruned["history_revision"]}),account_headers)
+                    self.assertEqual(code,200)
+                    self.assertEqual(json.loads(body)["record"]["action"],"config_operations_prune")
+                    operations_before=config_operations()
+                    self.assertEqual(operations_before["stored_records"],1)
+                    self.assertGreater(operations_before["records"][0]["id"],first_operation_id)
+                    self.assertTrue(operations_before["truncated"])
                     initial=status()
                     audit_before=account_audit()
-                    self.assertEqual([row["action"] for row in audit_before["records"]],["baseline","bootstrap","create"])
+                    self.assertEqual([row["action"] for row in audit_before["records"]],["baseline","bootstrap","create","config_operations_prune"])
 
                     workload_request()
                     self.assertEqual(initial["workload_materials"], [{"kind":"http","id":"private","ready":True}])

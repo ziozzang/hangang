@@ -1013,6 +1013,7 @@ impl Admin {
             let is_new = path == "/v1/status"
                 || path == "/v1/config/validate"
                 || path == "/v1/config/operations"
+                || path == "/v1/config/operations/prune"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -1051,6 +1052,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/operations/prune" {
+            return Ok(self.handle_config_operation_prune(req, &actor).await);
         }
         if path == "/v1/config/operations" {
             if req.method() != hyper::Method::GET {
@@ -2277,6 +2281,13 @@ fn user_audit_query(query: Option<&str>) -> Option<(i64, usize)> {
 }
 
 fn account_problem(error: anyhow::Error) -> Response<Body> {
+    if error.is::<crate::admin_users::ConfigOperationConflict>() {
+        return problem(
+            409,
+            "Configuration History Conflict",
+            "configuration history changed or has no eligible records in the selected boundary; refresh before deciding again",
+        );
+    }
     if error.is::<crate::admin_users::AuditCapacity>() {
         return problem(
             503,
@@ -2402,6 +2413,57 @@ impl Admin {
                 &serde_json::json!({"token":login.token,"expires_in_seconds":login.expires_in_seconds,"user":login.user}),
             ),
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
+            Err(error) => account_problem(error),
+        }
+    }
+
+    async fn handle_config_operation_prune(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.method() != hyper::Method::POST {
+            return problem(405, "Method Not Allowed", "POST required");
+        }
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Operation Query",
+                "prune does not accept query parameters",
+            );
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Prune {
+            through_id: i64,
+            expected_latest_id: i64,
+            expected_history_revision: u64,
+        }
+        let body: Prune = match read_json(req, 4096).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        if !(1..=9_007_199_254_740_991).contains(&body.through_id)
+            || !(1..=9_007_199_254_740_991).contains(&body.expected_latest_id)
+            || body.expected_history_revision > 9_007_199_254_740_991
+        {
+            return problem(
+                400,
+                "Invalid Operation Boundary",
+                "sequence boundaries must be positive safe integers and history revision must be a nonnegative safe integer",
+            );
+        }
+        match self
+            .users
+            .prune_config_operations(
+                actor.mutation_authority(),
+                body.through_id,
+                body.expected_latest_id,
+                body.expected_history_revision,
+            )
+            .await
+        {
+            Ok(result) => auth_json(200, &result),
             Err(error) => account_problem(error),
         }
     }
