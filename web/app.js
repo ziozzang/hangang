@@ -69,6 +69,7 @@ const state = {
   lastStatus: null,
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
+  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -103,6 +104,7 @@ function refreshAppCopy() {
   refreshOperationsCopy();
   refreshDockerCopy();
   if (state.audit.page || state.audit.error) renderAudit();
+  if (state.configOperations.page || state.configOperations.error) renderConfigOperations();
   if ($('#route-dialog').open && $('#route-form').dataset.invalidNative) {
     try { routeFromForm(); delete $('#route-form').dataset.invalidNative; message($('#route-message')); }
     catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); }
@@ -366,6 +368,7 @@ function scrubRenderedData() {
   resetOperations();
   resetDockerPanel();
   resetAudit();
+  resetConfigOperations();
   destroyLuaEditors();
   for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog']) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
   state.editing = null;
@@ -517,7 +520,7 @@ async function login(event) {
 
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
-  return ['status', 'http', 'tcp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
+  return ['status', 'http', 'tcp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 
 async function switchView() {
@@ -528,6 +531,7 @@ async function switchView() {
   }
   state.view = name;
   if (name !== 'audit') state.audit.sequence += 1;
+  if (name !== 'config-operations') state.configOperations.sequence += 1;
   $$('.view').forEach((view) => {
     const active = view.id === `view-${name}`;
     view.hidden = !active;
@@ -554,6 +558,7 @@ async function loadView(name, quiet = false) {
     }
     if (name === 'users' && isAdmin()) await loadUsers();
     if (name === 'audit' && isAdmin()) await loadAudit(0, []);
+    if (name === 'config-operations' && isAdmin()) await loadConfigOperations(0, []);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'security' && isAdmin()) { const latest = await api('/v1/config'); renderSecurity(latest.data); }
@@ -728,6 +733,7 @@ async function verifySession() {
     updateAccess();
     if (!isAdmin()) {
       resetAudit();
+      resetConfigOperations();
       if (state.view !== 'status') location.hash = '#status';
     }
     message(result, t('Session valid: {username} · {role}', { username: data.user.username, role: t(data.user.role) }), 'success');
@@ -3667,6 +3673,131 @@ async function pruneAuditPage() {
   } finally { setBusy(button, false); renderAudit(); }
 }
 
+function resetConfigOperations() {
+  state.configOperations.sequence += 1;
+  state.configOperations.page = null;
+  state.configOperations.after = 0;
+  state.configOperations.previous = [];
+  state.configOperations.pageNumber = 1;
+  state.configOperations.error = null;
+  $('#config-operations-rows').replaceChildren();
+  $('#config-operations-meta').textContent = '';
+  $('#config-operations-page-state').textContent = '';
+  message($('#config-operations-message'));
+  for (const id of ['config-operations-export', 'config-operations-previous', 'config-operations-next']) $(`#${id}`).disabled = true;
+}
+
+function validConfigOperationsPage(data, after) {
+  const safe = (value) => Number.isSafeInteger(value) && value >= 0;
+  const idValue = (value) => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+  if (!isObject(data) || data.scope !== 'instance' || !idValue(data.authority_id) ||
+    !Array.isArray(data.records) || data.records.length > 100 || !safe(data.next_after) ||
+    typeof data.has_more !== 'boolean' || data.capacity !== 10000 ||
+    !safe(data.stored_records) || data.stored_records > data.capacity ||
+    typeof data.writes_available !== 'boolean' || !safe(data.server_time_unix_ms)) return false;
+  if (data.has_more && !data.records.length) return false;
+  if (data.next_after !== (data.records.at(-1)?.id ?? after)) return false;
+  return data.records.every((record, index) => isObject(record) && safe(record.id) &&
+    record.id > (index ? data.records[index - 1].id : after) &&
+    idValue(record.operation_id) && record.authority_id === data.authority_id &&
+    ['system', 'account'].includes(record.actor_kind) &&
+    (record.actor_kind === 'system' ? record.actor_user_id == null : safe(record.actor_user_id) && record.actor_user_id > 0) &&
+    safe(record.accepted_at_unix_ms) &&
+    (record.finished_at_unix_ms == null || safe(record.finished_at_unix_ms)) &&
+    safe(record.expected_revision) && /^[0-9a-f]{64}$/.test(record.candidate_sha256) &&
+    ['local_file', 'shared_store'].includes(record.store_kind) &&
+    (record.authority_epoch == null || idValue(record.authority_epoch)) &&
+    ['accepted', 'candidate_activated', 'conflict', 'failed', 'indeterminate'].includes(record.state));
+}
+
+function configOperationState(record) {
+  return {
+    accepted: t('Accepted; outcome not yet recorded'),
+    candidate_activated: t('Candidate activated on this instance'),
+    conflict: t('Conflict'),
+    failed: t('Failed'),
+    indeterminate: t('Indeterminate; outcome unknown'),
+  }[record.state];
+}
+
+function renderConfigOperations() {
+  const history = state.configOperations;
+  const page = history.page;
+  const rows = $('#config-operations-rows'); rows.replaceChildren();
+  if (!page) {
+    $('#config-operations-meta').textContent = history.error ? t('Configuration operation history unavailable; no records are shown.') : '';
+    $('#config-operations-page-state').textContent = '';
+    message($('#config-operations-message'), history.error || '', 'error');
+  } else {
+    $('#config-operations-meta').textContent = t('This instance only · Authority: {authority} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
+      authority: page.authority_id, stored: formatNumber(page.stored_records), capacity: formatNumber(page.capacity),
+      observed: auditDate(page.server_time_unix_ms), writes: page.writes_available ? t('available') : t('blocked'),
+    });
+    const notices = [];
+    if (!page.writes_available) notices.push(t('New governed configuration writes are blocked while operation history is full or unavailable.'));
+    if (page.records.some((record) => record.state === 'accepted' || record.state === 'indeterminate'))
+      notices.push(t('Accepted or indeterminate operations have no proven final outcome here. Do not infer fleet activation.'));
+    message($('#config-operations-message'), notices.join(' '), notices.length ? 'warning' : '');
+    for (const record of page.records) {
+      const tr = document.createElement('tr');
+      const actor = record.actor_kind === 'system' ? t('System authority') : t('Account #{id}', { id: record.actor_user_id });
+      const values = [record.id, auditDate(record.accepted_at_unix_ms), actor, record.expected_revision,
+        configOperationState(record), record.finished_at_unix_ms == null ? '—' : auditDate(record.finished_at_unix_ms)];
+      for (const value of values) { const td = document.createElement('td'); td.textContent = String(value); tr.append(td); }
+      const detailCell = document.createElement('td');
+      const details = document.createElement('details');
+      const summary = document.createElement('summary'); summary.textContent = t('Identifiers');
+      const detailText = document.createElement('p');
+      detailText.textContent = t('Operation: {operation} · Candidate SHA-256: {digest} · Store: {store} · Authority epoch: {epoch}', {
+        operation: record.operation_id, digest: record.candidate_sha256,
+        store: record.store_kind, epoch: record.authority_epoch ?? '—',
+      });
+      details.append(summary, detailText); detailCell.append(details); tr.append(detailCell);
+      rows.append(tr);
+    }
+    if (!page.records.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 7; td.className = 'audit-empty'; td.textContent = t('No configuration operations on this page.'); tr.append(td); rows.append(tr); }
+    $('#config-operations-page-state').textContent = t('Page {page} · cursor #{cursor}', { page: history.pageNumber, cursor: page.next_after });
+  }
+  $('#config-operations-export').disabled = !page?.records?.length;
+  $('#config-operations-previous').disabled = !page || !history.previous.length;
+  $('#config-operations-next').disabled = !page?.has_more || !page.records.length;
+}
+
+async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
+  if (!isAdmin() || !state.token) { resetConfigOperations(); return; }
+  const sequence = ++state.configOperations.sequence;
+  state.configOperations.page = null;
+  state.configOperations.error = null;
+  renderConfigOperations();
+  try {
+    const { data } = await api(`/v1/config/operations?after=${after}&limit=100`);
+    if (sequence !== state.configOperations.sequence || state.view !== 'config-operations' || !isAdmin()) return;
+    if (!validConfigOperationsPage(data, after)) throw new Error(t('Configuration operation response is invalid.'));
+    state.configOperations.page = data;
+    state.configOperations.after = after;
+    state.configOperations.previous = previous;
+    state.configOperations.pageNumber = pageNumber;
+    renderConfigOperations();
+  } catch (error) {
+    if (sequence !== state.configOperations.sequence || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    state.configOperations.error = error.message;
+    renderConfigOperations();
+  }
+}
+
+function exportConfigOperationsPage() {
+  const page = state.configOperations.page;
+  if (!isAdmin() || !page?.records?.length) return;
+  const documentValue = { ...page, exported_page_after: state.configOperations.after, export_scope: 'current_page_only' };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(documentValue, null, 2)], { type: 'application/json' }));
+  try {
+    const link = document.createElement('a');
+    link.href = url; link.download = `hangang-config-operations-page-${state.configOperations.after}.json`;
+    document.body.append(link); link.click(); link.remove();
+  } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
+
 async function createUser(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -3748,6 +3879,21 @@ $('#audit-next').addEventListener('click', () => {
 });
 $('#audit-export').addEventListener('click', exportAuditPage);
 $('#audit-prune').addEventListener('click', pruneAuditPage);
+$('#config-operations-refresh').addEventListener('click', () => loadConfigOperations(0, []));
+$('#config-operations-previous').addEventListener('click', () => {
+  const previous = state.configOperations.previous.slice();
+  if (!previous.length) return;
+  const after = previous.pop();
+  loadConfigOperations(after, previous, state.configOperations.pageNumber - 1);
+});
+$('#config-operations-next').addEventListener('click', () => {
+  const page = state.configOperations.page;
+  if (!page?.has_more) return;
+  const previous = [...state.configOperations.previous, state.configOperations.after];
+  if (previous.length > 63) previous.shift();
+  loadConfigOperations(page.next_after, previous, state.configOperations.pageNumber + 1);
+});
+$('#config-operations-export').addEventListener('click', exportConfigOperationsPage);
 $('#toggle-token').addEventListener('click', () => { const input = $('#token-input'); input.type = input.type === 'password' ? 'text' : 'password'; refreshTokenToggle(); });
 $('#logout-button').addEventListener('click', () => logout());
 $('#refresh-security').addEventListener('click', () => loadView('security'));
