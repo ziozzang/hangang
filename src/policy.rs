@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
-use mlua::{ChunkMode, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value, VmState};
+use mlua::{
+    ChunkMode, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, UserData, UserDataFields, Value,
+    VmState,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -77,6 +80,8 @@ pub struct PolicyInput {
     pub method: String,
     pub path: String,
     pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub geoip: crate::country_observation::Observation,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +90,8 @@ pub struct TransformInput {
     #[serde(with = "base64_bytes")]
     pub body: Vec<u8>,
     pub phase: String,
+    #[serde(default)]
+    pub geoip: crate::country_observation::Observation,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -574,6 +581,47 @@ fn install_budget(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
+/// A userdata snapshot has getter-only fields. Lua can shadow its own global
+/// `hangang` binding, but cannot change these captured host values or native
+/// country admission; the worker returns only an ordinary routing decision.
+struct LuaGeoip(crate::country_observation::Observation);
+
+impl UserData for LuaGeoip {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        use crate::country_observation::State;
+        fields.add_field_method_get("state", |_, observed| {
+            Ok(match observed.0.state {
+                State::NotChecked => "not_checked",
+                State::NotConfigured => "not_configured",
+                State::Known => "known",
+                State::Unknown => "unknown",
+                State::Unavailable => "unavailable",
+            })
+        });
+        fields.add_field_method_get("country", |_, observed| Ok(observed.0.country.clone()));
+        fields.add_field_method_get("generation_sha256", |_, observed| {
+            Ok(observed.0.generation_sha256.clone())
+        });
+        fields.add_field_method_get("error_code", |_, observed| {
+            Ok(observed.0.error_code.clone())
+        });
+    }
+}
+
+fn install_geoip_api(
+    lua: &Lua,
+    api: &mlua::Table,
+    observation: &crate::country_observation::Observation,
+) -> Result<()> {
+    observation.validate().map_err(|error| anyhow!(error))?;
+    let snapshot = lua.create_userdata(LuaGeoip(observation.clone()))?;
+    api.set(
+        "geoip",
+        lua.create_function(move |_, ()| Ok(snapshot.clone()))?,
+    )?;
+    Ok(())
+}
+
 fn install_host_api(
     lua: &Lua,
     input: &PolicyInput,
@@ -581,6 +629,7 @@ fn install_host_api(
 ) -> Result<()> {
     let api = lua.create_table()?;
     api.raw_set("api_version", 1)?;
+    install_geoip_api(lua, &api, &input.geoip)?;
 
     let headers = input.headers.clone();
     api.set(
@@ -675,6 +724,7 @@ fn install_transform_api(
 ) -> Result<()> {
     let api = lua.create_table()?;
     api.raw_set("api_version", 1)?;
+    install_geoip_api(lua, &api, &input.geoip)?;
 
     let body = input.body.clone();
     api.set(
@@ -822,6 +872,7 @@ impl Write for BoundedJsonWriter {
 
 fn validate_input(input: &PolicyInput) -> Result<()> {
     validate_script_size(&input.script)?;
+    input.geoip.validate().map_err(|error| anyhow!(error))?;
     if input.method.is_empty() || input.method.len() > MAX_METHOD_BYTES {
         bail!("policy method has an invalid length");
     }
@@ -847,6 +898,7 @@ fn validate_input(input: &PolicyInput) -> Result<()> {
 
 fn validate_transform_input(input: &TransformInput) -> Result<()> {
     validate_script_size(&input.script)?;
+    input.geoip.validate().map_err(|error| anyhow!(error))?;
     validate_transform_body(&input.body)?;
     if !matches!(input.phase.as_str(), "request" | "response") {
         bail!("body transform phase must be request or response");
@@ -994,6 +1046,7 @@ mod tests {
             method: "POST".to_owned(),
             path: "/v1/items".to_owned(),
             headers: BTreeMap::from([("X-Tenant".to_owned(), "green".to_owned())]),
+            geoip: Default::default(),
         }
     }
 

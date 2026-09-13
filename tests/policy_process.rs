@@ -1,3 +1,4 @@
+use hangang::country_observation::{Observation, State};
 use hangang::policy::{
     Decision, PolicyInput, PolicyPool, TransformInput, WorkerCapacityUnavailable,
 };
@@ -25,6 +26,7 @@ fn input(script: &str) -> PolicyInput {
         method: "GET".to_owned(),
         path: "/resource".to_owned(),
         headers: BTreeMap::from([("x-tenant".to_owned(), "blue".to_owned())]),
+        geoip: Observation::default(),
     }
 }
 
@@ -33,6 +35,7 @@ fn transform_input(script: &str, body: impl Into<Vec<u8>>, phase: &str) -> Trans
         script: script.to_owned(),
         body: body.into(),
         phase: phase.to_owned(),
+        geoip: Observation::default(),
     }
 }
 
@@ -656,6 +659,105 @@ async fn member_selection_worker_is_bounded_and_last_selection_wins() -> anyhow:
             Some("recovered")
         );
     }
+    pool.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn geoip_userdata_is_read_only_and_identical_in_policy_and_body_workers() -> anyhow::Result<()>
+{
+    let _fixture = FIXTURE_FORK_LOCK.lock().await;
+    let pool = PolicyPool::new(binary(), 1);
+    let digest = "a".repeat(64);
+    let known = Observation {
+        state: State::Known,
+        country: Some("GB".to_owned()),
+        generation_sha256: Some(digest.clone()),
+        error_code: None,
+    };
+    let mut request = input(
+        r#"
+            local geo = hangang.geoip()
+            assert(geo.state == "known" and geo.country == "GB")
+            assert(#geo.generation_sha256 == 64 and geo.error_code == nil)
+            assert(hangang.header("x-client-country") == "ZZ")
+            hangang.set_header("x-observed-country", geo.country)
+        "#,
+    );
+    request
+        .headers
+        .insert("x-client-country".into(), "ZZ".into());
+    request.geoip = known.clone();
+    let decision = pool.evaluate(request.clone()).await?;
+    assert_eq!(
+        decision
+            .headers
+            .get("x-observed-country")
+            .map(String::as_str),
+        Some("GB")
+    );
+
+    for field in ["state", "country", "generation_sha256", "error_code"] {
+        request.script = format!("hangang.geoip().{field} = 'spoofed'");
+        assert!(
+            pool.evaluate(request.clone()).await.is_err(),
+            "{field} was writable"
+        );
+    }
+    request.script = "assert(hangang.geoip().country == 'GB')".into();
+    pool.evaluate(request).await?;
+
+    for phase in ["request", "response"] {
+        let mut transformed = transform_input(
+            "local geo = hangang.geoip(); assert(geo.state == 'known'); return geo.country .. ':' .. hangang.phase() .. ':' .. hangang.body()",
+            b"body".to_vec(),
+            phase,
+        );
+        transformed.geoip = known.clone();
+        assert_eq!(
+            pool.transform(transformed).await?,
+            format!("GB:{phase}:body").as_bytes()
+        );
+    }
+
+    let unknown = Observation {
+        state: State::Unknown,
+        country: None,
+        generation_sha256: Some(digest.clone()),
+        error_code: None,
+    };
+    let mut request = input(
+        "local geo = hangang.geoip(); assert(geo.state == 'unknown' and geo.country == nil and geo.generation_sha256 ~= nil)",
+    );
+    request.geoip = unknown;
+    pool.evaluate(request).await?;
+    let unavailable = Observation {
+        state: State::Unavailable,
+        country: None,
+        generation_sha256: Some(digest),
+        error_code: Some("invalid_record".to_owned()),
+    };
+    let mut request = input(
+        "local geo = hangang.geoip(); assert(geo.state == 'unavailable' and geo.country == nil and geo.error_code == 'invalid_record')",
+    );
+    request.geoip = unavailable;
+    pool.evaluate(request).await?;
+
+    let malformed = Observation {
+        state: State::Known,
+        country: Some("ZZ".to_owned()),
+        generation_sha256: None,
+        error_code: None,
+    };
+    let mut request = input("return nil");
+    request.geoip = malformed;
+    assert!(pool.evaluate(request).await.is_err());
+    assert!(
+        serde_json::from_value::<Observation>(serde_json::json!({
+            "state":"known", "country":"ZZ"
+        }))
+        .is_err()
+    );
     pool.shutdown().await;
     Ok(())
 }

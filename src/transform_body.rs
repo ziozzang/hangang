@@ -1,5 +1,6 @@
 //! Demand-driven, bounded body transformation. There is no background producer or queue.
 use crate::{
+    country_observation::Observation,
     policy::{PolicyPool, WorkerCapacityUnavailable},
     proxy::{Body, BodyError},
     transform::{BodyTransform, TransformMode},
@@ -104,7 +105,30 @@ pub async fn transform(
     budget: Budget,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<Body, TransformError> {
-    match transform_inner(body, config, policy, phase, budget).await {
+    transform_with_geoip(
+        body,
+        config,
+        policy,
+        phase,
+        Observation::default(),
+        budget,
+        metrics,
+    )
+    .await
+}
+
+/// Carries one request-admission GeoIP observation through every body record.
+/// The observation is copied into worker IPC; no body worker opens the MMDB.
+pub async fn transform_with_geoip(
+    body: Body,
+    config: Arc<BodyTransform>,
+    policy: Arc<PolicyPool>,
+    phase: &'static str,
+    geoip: Observation,
+    budget: Budget,
+    metrics: Arc<crate::metrics::Metrics>,
+) -> Result<Body, TransformError> {
+    match transform_inner(body, config, policy, phase, geoip, budget).await {
         Ok(body) => Ok(body
             .map_err(move |error| {
                 metrics
@@ -132,6 +156,7 @@ async fn transform_inner(
     config: Arc<BodyTransform>,
     policy: Arc<PolicyPool>,
     phase: &'static str,
+    geoip: Observation,
     budget: Budget,
 ) -> Result<Body, TransformError> {
     if config.mode == TransformMode::Buffered {
@@ -151,7 +176,7 @@ async fn transform_inner(
                     }
                 })?
                 .to_bytes();
-            let bytes = apply(bytes.to_vec(), config, policy, phase, budget.clone()).await?;
+            let bytes = apply(bytes.to_vec(), config, policy, phase, geoip, budget.clone()).await?;
             Ok(hold(
                 Full::new(Bytes::from(bytes))
                     .map_err(|never| match never {})
@@ -174,6 +199,7 @@ async fn transform_inner(
         config,
         policy,
         phase,
+        geoip,
         budget,
         first: true,
     };
@@ -197,6 +223,7 @@ async fn apply(
     config: Arc<BodyTransform>,
     policy: Arc<PolicyPool>,
     phase: &'static str,
+    geoip: Observation,
     budget: Budget,
 ) -> Result<Vec<u8>, TransformError> {
     let cfg = config.clone();
@@ -242,6 +269,7 @@ async fn apply(
                 script: script.clone(),
                 body: output,
                 phase: phase.to_owned(),
+                geoip,
             })
             .await
             .map_err(|error| {
@@ -273,6 +301,7 @@ struct State {
     config: Arc<BodyTransform>,
     policy: Arc<PolicyPool>,
     phase: &'static str,
+    geoip: Observation,
     budget: Budget,
     first: bool,
 }
@@ -293,6 +322,7 @@ impl State {
             self.config.clone(),
             self.policy.clone(),
             self.phase,
+            self.geoip.clone(),
             self.budget.clone(),
         )
         .await?;
@@ -361,6 +391,7 @@ impl State {
                     self.config.clone(),
                     self.policy.clone(),
                     self.phase,
+                    self.geoip.clone(),
                     self.budget.clone(),
                 )
                 .await?,
