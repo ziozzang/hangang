@@ -525,6 +525,17 @@ impl Balancer {
             active_requests: Some(node.active.active()),
         })
     }
+    /// Read health evidence only for the caller's resolved endpoint. A
+    /// replacement observed during the read invalidates the whole snapshot;
+    /// the caller can then render its conservative unknown state.
+    pub fn backend_state_for(&self, index: usize, epoch: u64) -> Option<BackendState> {
+        let node = self.nodes.get(index)?;
+        if node.endpoint_epoch.load(Ordering::Acquire) != epoch {
+            return None;
+        }
+        let state = self.backend_state(index)?;
+        (node.endpoint_epoch.load(Ordering::Acquire) == epoch).then_some(state)
+    }
     fn weight(&self, index: usize) -> usize {
         self.config.weights.get(index).copied().unwrap_or(1) as usize
     }
@@ -1188,6 +1199,11 @@ mod tests {
         assert!(!balancer.available_for(0, 7));
         assert!(balancer.observe_epoch(0, 8));
         assert!(!balancer.observe_epoch(0, 7));
+        assert!(balancer.backend_state_for(0, 7).is_none());
+        assert_eq!(
+            balancer.backend_state_for(0, 8).unwrap().probe_observed,
+            Some(false)
+        );
         balancer.record_active_status_for(0, 7, 200);
         balancer.record_active_timeout_for(0, 7);
         assert_eq!(
