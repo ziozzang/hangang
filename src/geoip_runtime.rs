@@ -6,7 +6,10 @@
 
 use std::{
     path::{Component, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +19,7 @@ use tokio::{sync::Semaphore, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::geoip::{
-    DEFAULT_MAX_AGE, DEFAULT_MAX_FILE_BYTES, Database, DatabaseStatus, GeoIpError, MAX_AGE,
+    Database, DatabaseStatus, GeoIpError, DEFAULT_MAX_AGE, DEFAULT_MAX_FILE_BYTES, MAX_AGE,
     MAX_FILE_BYTES,
 };
 
@@ -48,6 +51,18 @@ pub struct Source {
     pub max_age_days: u32,
     #[serde(default = "reload_default")]
     pub reload_interval_seconds: u64,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Source")
+            .field("file", &"<redacted>")
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("max_age_days", &self.max_age_days)
+            .field("reload_interval_seconds", &self.reload_interval_seconds)
+            .finish()
+    }
 }
 
 impl Source {
@@ -116,6 +131,10 @@ pub struct Slot {
     clock: Arc<Clock>,
     freshness: Arc<Freshness>,
     limiter: Arc<Semaphore>,
+    // Once a build epoch has failed freshness, reloading the same or older
+    // epoch cannot undo that failure after a wall-clock rollback. Zero means
+    // no poisoned epoch; stored values are epoch + 1.
+    poisoned_epoch_floor: AtomicU64,
 }
 
 impl Slot {
@@ -148,6 +167,7 @@ impl Slot {
             clock,
             freshness,
             limiter,
+            poisoned_epoch_floor: AtomicU64::new(0),
         }))
     }
 
@@ -155,11 +175,35 @@ impl Slot {
         &self.source
     }
 
+    fn poison(&self, database: &Database) {
+        self.poisoned_epoch_floor.fetch_max(
+            database.status().build_epoch_unix_seconds.saturating_add(1),
+            Ordering::AcqRel,
+        );
+    }
+
+    fn is_poisoned(&self, database: &Database) -> bool {
+        database.status().build_epoch_unix_seconds
+            < self.poisoned_epoch_floor.load(Ordering::Acquire)
+    }
+
+    fn freshness_checked(&self, database: &Database, now: SystemTime) -> Result<(), GeoIpError> {
+        if let Err(error) = (self.freshness)(database, now) {
+            self.poison(database);
+            return Err(error);
+        }
+        if self.is_poisoned(database) {
+            Err(GeoIpError::StaleDatabase)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Returns no database after age expiry or clock reversal even between
     /// watcher ticks. The database independently checks freshness at lookup.
     pub fn load(&self) -> Option<Arc<Database>> {
         let database = self.current.load_full()?;
-        (self.freshness)(&database, (self.clock)())
+        self.freshness_checked(&database, (self.clock)())
             .ok()
             .map(|()| database)
     }
@@ -169,7 +213,7 @@ impl Slot {
         let now = (self.clock)();
         let freshness = loaded
             .as_ref()
-            .map(|database| (self.freshness)(database, now));
+            .map(|database| self.freshness_checked(database, now));
         let observation = self.observation.lock().unwrap();
         let ready = freshness.as_ref().is_some_and(Result::is_ok);
         SlotStatus {
@@ -200,8 +244,15 @@ impl Slot {
                 // publishes a fresh Arc, even when the restored bytes match.
                 let keep_existing = existing.as_ref().is_some_and(|old| {
                     old.status().generation_sha256 == database.status().generation_sha256
-                        && (self.freshness)(old, now).is_ok()
+                        && self.freshness_checked(old, now).is_ok()
                 });
+                if self.is_poisoned(&database) {
+                    self.current.store(None);
+                    let mut observation = self.observation.lock().unwrap();
+                    observation.error = Some(GeoIpError::StaleDatabase);
+                    observation.checked_at_unix_ms = checked_at_unix_ms;
+                    return;
+                }
                 if !keep_existing {
                     self.current.store(Some(database));
                 }
@@ -246,9 +297,12 @@ impl Slot {
             return;
         }
         let result = result.and_then(|database| {
-            (self.freshness)(&database, (self.clock)())?;
+            self.freshness_checked(&database, (self.clock)())?;
             Ok(database)
         });
+        if cancel.is_cancelled() || !published(self) {
+            return;
+        }
         self.publish(result, (self.clock)());
     }
 }
@@ -397,6 +451,88 @@ mod tests {
         assert!(slot.load().is_none());
         assert!(!slot.status().ready);
         assert_eq!(slot.status().error_code, Some("stale_database"));
+    }
+
+    #[tokio::test]
+    async fn expired_build_cannot_reopen_after_clock_rollback_and_same_byte_reload() {
+        let (dir, source, seconds) = fixture();
+        let slot = test_slot(source.clone(), seconds.clone());
+        let published: Arc<Published> = Arc::new(|_| true);
+        let cancel = CancellationToken::new();
+        slot.refresh_once(&published, &cancel).await;
+        let old = slot.load().unwrap();
+        let expiry = old.status().expires_at_unix_seconds;
+        seconds.store(expiry + 1, Ordering::SeqCst);
+        assert!(slot.load().is_none());
+        seconds.store(old.status().build_epoch_unix_seconds + 60, Ordering::SeqCst);
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_none());
+        assert_eq!(slot.status().error_code, Some("stale_database"));
+
+        let replacement = dir.path().join("invalid.mmdb");
+        fs::write(&replacement, b"invalid").unwrap();
+        fs::rename(&replacement, &source.file).unwrap();
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_none());
+        fs::write(&replacement, FAKE_DB).unwrap();
+        fs::rename(&replacement, &source.file).unwrap();
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_none());
+        assert_eq!(slot.status().error_code, Some("stale_database"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_freshness_check_cannot_publish() {
+        let (_dir, source, seconds) = fixture();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let clock_seconds = seconds.clone();
+        let freshness_entered = entered.clone();
+        let freshness_release = release.clone();
+        let slot = Slot::with_dependencies(
+            source,
+            Arc::new(|source, now| {
+                Database::load_at(&source.file, source.max_file_bytes, source.max_age(), now)
+            }),
+            Arc::new(move || {
+                UNIX_EPOCH + Duration::from_secs(clock_seconds.load(Ordering::SeqCst))
+            }),
+            Arc::new(move |_, _| {
+                freshness_entered.wait();
+                freshness_release.wait();
+                Ok(())
+            }),
+            Arc::new(Semaphore::new(1)),
+        )
+        .unwrap();
+        let published: Arc<Published> = Arc::new(|_| true);
+        let cancel = CancellationToken::new();
+        let task_slot = slot.clone();
+        let task_published = published.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            task_slot.refresh_once(&task_published, &task_cancel).await;
+        });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        cancel.cancel();
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slot.load().is_none());
+    }
+
+    #[test]
+    fn source_debug_redacts_file_path() {
+        let (_dir, source, _) = fixture();
+        let rendered = format!("{source:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(source.file.to_str().unwrap()));
     }
 
     #[tokio::test]
