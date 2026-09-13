@@ -183,6 +183,17 @@ pub struct Balancer {
     cursor: AtomicU64,
     total_weight: u64,
 }
+/// An old generation selected for retirement after durable publication.
+/// Constructing or dropping this handle never changes admission state.
+#[allow(dead_code)] // Used by the snapshot publication step that follows this isolated slice.
+pub(crate) struct BackendRetirement(Arc<Node>);
+
+#[allow(dead_code)]
+impl BackendRetirement {
+    pub(crate) fn retire(&self) {
+        self.0.active.retire();
+    }
+}
 /// A read-only view of the current selection state. `available` means the
 /// balancer may select this node; it does not prove network reachability.
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +332,21 @@ impl Balancer {
             }
         }
         next
+    }
+
+    /// Collect old nodes absent from the successor by pointer identity. This
+    /// is preparation-only: the caller retires them after the publication
+    /// boundary, never while validating or building a candidate snapshot.
+    #[allow(dead_code)]
+    pub(crate) fn retirements(&self, successor: Option<&Self>) -> Vec<BackendRetirement> {
+        self.nodes
+            .iter()
+            .filter(|old| {
+                successor.is_none_or(|next| !next.nodes.iter().any(|node| Arc::ptr_eq(old, node)))
+            })
+            .cloned()
+            .map(BackendRetirement)
+            .collect()
     }
 
     pub fn available(&self, index: usize) -> bool {
@@ -710,6 +736,44 @@ mod tests {
         drop(response_owner);
         assert_eq!(balancer.backend_state(0).unwrap().active_requests, Some(0));
         assert!(!balancer.available(0));
+    }
+
+    #[test]
+    fn retirement_plan_excludes_shared_nodes_and_has_no_prepublication_effect() {
+        let old = Balancer::new(BalanceConfig::default(), 2);
+        let held = old.acquire(0).unwrap();
+        // Successor index 0 is old member 1; index 1 is a fresh generation.
+        let successor =
+            Balancer::with_reused_nodes(BalanceConfig::default(), &old, &[Some(1), None]);
+        assert!(old.retirements(Some(&old)).is_empty());
+        assert_eq!(old.retirements(None).len(), 2);
+        let abandoned = old.retirements(Some(&successor));
+        assert_eq!(abandoned.len(), 1);
+        drop(abandoned);
+        assert!(
+            old.available(0),
+            "dropping a candidate cannot retire live work"
+        );
+        assert!(old.acquire(0).is_some());
+        assert_eq!(old.backend_state(0).unwrap().active_requests, Some(1));
+
+        for retirement in old.retirements(Some(&successor)) {
+            retirement.retire();
+        }
+        assert!(!old.available(0));
+        assert!(old.acquire(0).is_none());
+        assert_eq!(old.backend_state(0).unwrap().active_requests, Some(1));
+        assert!(old.available(1), "shared old node must remain open");
+        assert!(
+            successor.available(0),
+            "shared successor node must remain open"
+        );
+        assert!(
+            successor.available(1),
+            "fresh successor node must remain open"
+        );
+        drop(held);
+        assert_eq!(old.backend_state(0).unwrap().active_requests, Some(0));
     }
 
     #[test]
