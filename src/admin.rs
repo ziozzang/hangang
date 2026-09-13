@@ -628,6 +628,15 @@ impl Manager {
         let accepted = if let Some(authority) = authority {
             use sha2::{Digest, Sha256};
             let request = crate::admin_users::ConfigAcceptRequest {
+                receipt_version: if self
+                    .config_store
+                    .as_ref()
+                    .is_some_and(|store| store.supports_sequenced_operation_cas())
+                {
+                    2
+                } else {
+                    1
+                },
                 store_kind: if self.config_store.is_some() {
                     crate::admin_users::ConfigStoreKind::SharedStore
                 } else {
@@ -662,20 +671,38 @@ impl Manager {
                     let epoch = self.recorded_epoch().ok_or_else(|| {
                         anyhow::anyhow!("shared configuration authority is unknown")
                     })?;
-                    let result = if store.supports_operation_cas() {
+                    let result = if store.supports_operation_cas()
+                        || store.supports_sequenced_operation_cas()
+                    {
                         if let Some((_, operation)) = &accepted {
-                            store
-                                .compare_and_swap_operation(
-                                    &epoch,
-                                    expected,
-                                    config.clone(),
-                                    crate::config_store::OperationStamp {
-                                        authority_id: operation.authority_id.clone(),
-                                        operation_id: operation.operation_id.clone(),
-                                        candidate_sha256: operation.candidate_sha256.clone(),
-                                    },
-                                )
-                                .await?
+                            if operation.receipt_version == 2 {
+                                store
+                                    .compare_and_swap_operation_v2(
+                                        &epoch,
+                                        expected,
+                                        config.clone(),
+                                        crate::config_store::SequencedOperationStamp {
+                                            authority_id: operation.authority_id.clone(),
+                                            acceptance_seq: u64::try_from(operation.id)?,
+                                            operation_id: operation.operation_id.clone(),
+                                            candidate_sha256: operation.candidate_sha256.clone(),
+                                        },
+                                    )
+                                    .await?
+                            } else {
+                                store
+                                    .compare_and_swap_operation(
+                                        &epoch,
+                                        expected,
+                                        config.clone(),
+                                        crate::config_store::OperationStamp {
+                                            authority_id: operation.authority_id.clone(),
+                                            operation_id: operation.operation_id.clone(),
+                                            candidate_sha256: operation.candidate_sha256.clone(),
+                                        },
+                                    )
+                                    .await?
+                            }
                         } else {
                             store
                                 .compare_and_swap(&epoch, expected, config.clone())
@@ -1039,6 +1066,7 @@ impl Admin {
                 || path == "/v1/config/operations/prune"
                 || path == "/v1/config/operation-proof"
                 || path == "/v1/config/commit-receipt"
+                || path == "/v1/config/commit-receipt-v2"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -1077,6 +1105,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/commit-receipt-v2" {
+            return Ok(self.handle_config_commit_receipt_v2(req, &actor).await);
         }
         if path == "/v1/config/commit-receipt" {
             return Ok(self.handle_config_commit_receipt(req, &actor).await);
@@ -2281,6 +2312,42 @@ fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {
     Some((offset, limit))
 }
 
+fn commit_receipt_v2_query(query: Option<&str>) -> Option<(String, u64)> {
+    let mut authority_id = None;
+    let mut acceptance_seq = None;
+    let mut parsed = reqwest::Url::parse("http://receipt.invalid/").ok()?;
+    parsed.set_query(query);
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "authority_id" if authority_id.is_none() => {
+                if value.len() != 32
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return None;
+                }
+                authority_id = Some(value.into_owned());
+            }
+            "acceptance_seq" if acceptance_seq.is_none() => {
+                if value.is_empty()
+                    || value.starts_with('0')
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return None;
+                }
+                let seq = value.parse::<u64>().ok()?;
+                if seq > 9_007_199_254_740_991 {
+                    return None;
+                }
+                acceptance_seq = Some(seq);
+            }
+            _ => return None,
+        }
+    }
+    Some((authority_id?, acceptance_seq?))
+}
+
 fn commit_receipt_query(query: Option<&str>) -> Option<(String, String)> {
     let mut authority_id = None;
     let mut operation_id = None;
@@ -2468,6 +2535,91 @@ impl Admin {
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
             Err(error) => account_problem(error),
         }
+    }
+
+    async fn handle_config_commit_receipt_v2(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.method() != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET required");
+        }
+        let Some((authority_id, acceptance_seq)) = commit_receipt_v2_query(req.uri().query())
+        else {
+            return problem(
+                400,
+                "Invalid Commit Receipt Query",
+                "exactly one 32-character lowercase hexadecimal authority_id and positive canonical safe-integer acceptance_seq are required",
+            );
+        };
+        let observation = match self.manager.config_store.as_ref() {
+            Some(store) if store.supports_sequenced_operation_cas() => {
+                match store
+                    .lookup_commit_receipt_v2(&authority_id, acceptance_seq)
+                    .await
+                {
+                    Ok(observation) => Some(observation),
+                    Err(_) => {
+                        return problem(
+                            503,
+                            "Commit Receipt Unavailable",
+                            "configuration store commit receipt could not be read",
+                        );
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        let observed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|value| u64::try_from(value.as_millis()).ok())
+            .filter(|value| *value <= 9_007_199_254_740_991);
+        let Some(observed_ms) = observed_ms else {
+            return problem(
+                503,
+                "Commit Receipt Unavailable",
+                "observation clock unavailable",
+            );
+        };
+        if observation.as_ref().is_some_and(|o| {
+            o.registered_authorities > o.authority_capacity
+                || o.authority_capacity > 9_007_199_254_740_991
+                || o.high_water > 9_007_199_254_740_991
+                || o.capacity > 9_007_199_254_740_991
+                || o.stored_records > o.capacity
+                || o.receipt.as_ref().is_some_and(|r| {
+                    r.revision == 0
+                        || r.revision > 9_007_199_254_740_991
+                        || r.stamp.acceptance_seq != acceptance_seq
+                        || r.stamp.authority_id != authority_id
+                        || r.stamp.acceptance_seq > o.high_water
+                })
+        }) {
+            return problem(
+                503,
+                "Commit Receipt Unavailable",
+                "observation exceeds supported numeric range",
+            );
+        }
+        auth_json(
+            200,
+            &serde_json::json!({
+                "scope":"configuration_authority", "supported":observation.is_some(),
+                "receipt":observation.as_ref().and_then(|o| o.receipt.as_ref()),
+                "stored_records":observation.as_ref().map(|o| o.stored_records),
+                "capacity":observation.as_ref().map(|o| o.capacity),
+                "high_water":observation.as_ref().map(|o| o.high_water),
+                "registered_authorities":observation.as_ref().map(|o| o.registered_authorities),
+                "authority_capacity":observation.as_ref().map(|o| o.authority_capacity),
+                "writes_available":observation.as_ref().map(|o| o.writes_available),
+                "server_time_unix_ms":observed_ms,
+            }),
+        )
     }
 
     async fn handle_config_commit_receipt(
