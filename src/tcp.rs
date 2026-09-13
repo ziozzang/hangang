@@ -416,6 +416,7 @@ type ListenerRoute = (
     Option<Arc<rustls::ClientConfig>>,
     Option<Arc<crate::tcp_health::TcpHealth>>,
     Option<Arc<crate::tcp_member::TcpMemberActivity>>,
+    Arc<[Arc<crate::member_admission::MemberAdmission>]>,
 );
 
 struct ListenerRoutes {
@@ -445,6 +446,10 @@ impl ListenerRoutes {
             if !route.enabled || route.listen != address {
                 continue;
             }
+            let member_admissions = snapshot.tcp_member_admissions.get(&route.id)?;
+            if member_admissions.len() != route.backends.len() {
+                return None;
+            }
             found = true;
             let index = routes.len();
             routes.push((
@@ -453,6 +458,7 @@ impl ListenerRoutes {
                 snapshot.upstream_tls.get(&route.id).cloned(),
                 snapshot.tcp_health.get(&route.id).cloned(),
                 snapshot.tcp_member_activity.get(&route.id).cloned(),
+                Arc::from(member_admissions.clone()),
             ));
             if let Some(sni) = &route.sni {
                 hello_settings = Some((sni.max_client_hello_bytes, sni.hello_timeout_ms));
@@ -531,7 +537,7 @@ impl ListenerRoutes {
     }
 
     fn all_routes_deny(&self, peer: std::net::IpAddr) -> bool {
-        self.routes.iter().all(|(route, _, _, _, _)| {
+        self.routes.iter().all(|(route, _, _, _, _, _)| {
             route
                 .deny_cidrs
                 .iter()
@@ -768,7 +774,7 @@ fn spawn_accept_loop(
                     };
                     (route_index, hello.consumed)
                 };
-                let (route, counter, upstream_tls, health, member_activity) =
+                let (route, counter, upstream_tls, health, member_activity, member_admissions) =
                     routes.routes[route_index].clone();
                 drop(routes);
                 if route
@@ -787,7 +793,14 @@ fn spawn_accept_loop(
                             return;
                         }
                     };
-                let Some(index) = next_backend_index(&task_backend_counter, &route, health.as_deref(), task_discovery.as_deref()) else {
+                let Some(index) = next_backend_index(&task_backend_counter, &route, &member_admissions, health.as_deref(), task_discovery.as_deref()) else {
+                    task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                // The gate owns the pending dial as well as the eventual
+                // stream. A concurrent closure between selection and acquire
+                // conservatively rejects this connection before any dial.
+                let Some(member_lease) = member_admissions[index].lease() else {
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
@@ -817,6 +830,7 @@ fn spawn_accept_loop(
                     health,
                     discovery: task_discovery,
                     member_counter,
+                    member_lease,
                     index,
                 };
                 if let Err(error) =
@@ -862,6 +876,7 @@ fn resolve_probe_target(
 fn next_backend_index(
     counters: &StdMutex<HashMap<String, usize>>,
     route: &TcpRoute,
+    member_admissions: &[Arc<crate::member_admission::MemberAdmission>],
     health: Option<&crate::tcp_health::TcpHealth>,
     discovery: Option<&crate::discovery::Discovery>,
 ) -> Option<usize> {
@@ -903,14 +918,16 @@ fn next_backend_index(
     (0..route.backends.len())
         .map(|offset| (index + offset) % route.backends.len())
         .find(|candidate| {
-            health.is_none_or(|health| {
-                resolve_probe_target(route.backends[*candidate].address(), discovery).is_some_and(
-                    |target| {
-                        health.observe_epoch(*candidate, target.epoch)
-                            && health.available_for(*candidate, target.epoch)
-                    },
-                )
-            })
+            member_admissions
+                .get(*candidate)
+                .is_some_and(|gate| gate.is_open())
+                && health.is_none_or(|health| {
+                    resolve_probe_target(route.backends[*candidate].address(), discovery)
+                        .is_some_and(|target| {
+                            health.observe_epoch(*candidate, target.epoch)
+                                && health.available_for(*candidate, target.epoch)
+                        })
+                })
         })
 }
 
@@ -920,6 +937,7 @@ struct TcpDialAdmission {
     health: Option<Arc<crate::tcp_health::TcpHealth>>,
     discovery: Option<Arc<crate::discovery::Discovery>>,
     member_counter: Option<Arc<crate::tcp_member::StreamCounter>>,
+    member_lease: crate::member_admission::AdmissionLease,
     index: usize,
 }
 
@@ -952,6 +970,10 @@ async fn proxy_connection(
             .as_ref()
             .is_none_or(|health| health.available_for(admission.index, admission.target.epoch)),
         "TCP backend became unavailable while connecting"
+    );
+    ensure!(
+        admission.member_lease.is_open(),
+        "TCP member admission closed while connecting"
     );
     // Count only established streams. A failed dial or an endpoint/health
     // change during the dial never acquires a member lease. Keep the guard
