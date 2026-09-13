@@ -239,12 +239,18 @@ impl Slot {
         match result {
             Ok(database) => {
                 let existing = self.current.load_full();
+                // Observe the retired generation even when the replacement
+                // bytes differ. Otherwise an expired old build could be
+                // reintroduced after a wall-clock rollback.
+                let existing_fresh = existing
+                    .as_ref()
+                    .is_some_and(|old| self.freshness_checked(old, now).is_ok());
                 // Stable bytes preserve identity and any leases of the still
                 // valid generation. Recovery after an invalidated slot always
                 // publishes a fresh Arc, even when the restored bytes match.
                 let keep_existing = existing.as_ref().is_some_and(|old| {
-                    old.status().generation_sha256 == database.status().generation_sha256
-                        && self.freshness_checked(old, now).is_ok()
+                    existing_fresh
+                        && old.status().generation_sha256 == database.status().generation_sha256
                 });
                 if self.is_poisoned(&database) {
                     self.current.store(None);
@@ -261,6 +267,12 @@ impl Slot {
                 observation.checked_at_unix_ms = checked_at_unix_ms;
             }
             Err(error) => {
+                // The loader may be the first observer of expiry. Check the
+                // previously admitted generation before clearing it so its
+                // build epoch stays poisoned across this unavailable period.
+                if let Some(old) = self.current.load_full() {
+                    let _ = self.freshness_checked(&old, now);
+                }
                 self.current.store(None);
                 let mut observation = self.observation.lock().unwrap();
                 observation.error = Some(error);
@@ -333,6 +345,7 @@ pub async fn watch(slot: Arc<Slot>, published: Arc<Published>, cancel: Cancellat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use std::{
         fs,
         sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -476,6 +489,67 @@ mod tests {
         assert!(slot.load().is_none());
         fs::write(&replacement, FAKE_DB).unwrap();
         fs::rename(&replacement, &source.file).unwrap();
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_none());
+        assert_eq!(slot.status().error_code, Some("stale_database"));
+    }
+
+    #[tokio::test]
+    async fn loader_first_observes_expiry_before_slot_load_or_status() {
+        let (_dir, source, seconds) = fixture();
+        let slot = test_slot(source, seconds.clone());
+        let published: Arc<Published> = Arc::new(|_| true);
+        let cancel = CancellationToken::new();
+        slot.refresh_once(&published, &cancel).await;
+        let build = seconds.load(Ordering::SeqCst) - 60;
+        seconds.store(build + 90 * 86_400 + 1, Ordering::SeqCst);
+        // The loader reports stale first. No request/status call has observed
+        // the old generation since the clock moved forward.
+        slot.refresh_once(&published, &cancel).await;
+        seconds.store(build + 60, Ordering::SeqCst);
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_none());
+        assert_eq!(slot.status().error_code, Some("stale_database"));
+    }
+
+    #[tokio::test]
+    async fn changed_bytes_with_same_expired_build_cannot_bypass_floor() {
+        let (dir, source, seconds) = fixture();
+        let original_digest = format!("{:x}", sha2::Sha256::digest(FAKE_DB));
+        let expired = Arc::new(AtomicBool::new(false));
+        let expired_for_freshness = expired.clone();
+        let clock_seconds = seconds.clone();
+        let slot = Slot::with_dependencies(
+            source.clone(),
+            Arc::new(|source, now| {
+                Database::load_at(&source.file, source.max_file_bytes, source.max_age(), now)
+            }),
+            Arc::new(move || {
+                UNIX_EPOCH + Duration::from_secs(clock_seconds.load(Ordering::SeqCst))
+            }),
+            Arc::new(move |database, _| {
+                if expired_for_freshness.load(Ordering::SeqCst)
+                    && database.status().generation_sha256 == original_digest
+                {
+                    Err(GeoIpError::StaleDatabase)
+                } else {
+                    Ok(())
+                }
+            }),
+            Arc::new(Semaphore::new(1)),
+        )
+        .unwrap();
+        let published: Arc<Published> = Arc::new(|_| true);
+        let cancel = CancellationToken::new();
+        slot.refresh_once(&published, &cancel).await;
+        assert!(slot.load().is_some());
+        let mut changed = FAKE_DB.to_vec();
+        assert_eq!(&changed[12097..12099], b"GB");
+        changed[12097] = b'g';
+        let replacement = dir.path().join("changed.mmdb");
+        fs::write(&replacement, changed).unwrap();
+        fs::rename(&replacement, &source.file).unwrap();
+        expired.store(true, Ordering::SeqCst);
         slot.refresh_once(&published, &cancel).await;
         assert!(slot.load().is_none());
         assert_eq!(slot.status().error_code, Some("stale_database"));
