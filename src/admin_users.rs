@@ -297,19 +297,30 @@ impl Store {
                 next_audit_id INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE admin_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                time_unix_ms INTEGER NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id BETWEEN 1 AND 9007199254740991),
+                time_unix_ms INTEGER NOT NULL CHECK(time_unix_ms BETWEEN 0 AND 9007199254740991),
                 action TEXT NOT NULL CHECK(action IN ('baseline','bootstrap','create','update','delete','prune')),
                 actor_kind TEXT NOT NULL CHECK(actor_kind IN ('system','account')),
-                actor_user_id INTEGER,
-                target_user_id INTEGER,
+                actor_user_id INTEGER CHECK(actor_user_id BETWEEN 1 AND 9007199254740991),
+                target_user_id INTEGER CHECK(target_user_id BETWEEN 1 AND 9007199254740991),
                 before_role TEXT CHECK(before_role IN ('admin','viewer')),
                 before_enabled INTEGER CHECK(before_enabled IN (0,1)),
                 after_role TEXT CHECK(after_role IN ('admin','viewer')),
                 after_enabled INTEGER CHECK(after_enabled IN (0,1)),
                 password_changed INTEGER NOT NULL CHECK(password_changed IN (0,1)),
-                affected_count INTEGER NOT NULL,
-                through_id INTEGER
+                affected_count INTEGER NOT NULL CHECK(affected_count BETWEEN 0 AND 9007199254740991),
+                through_id INTEGER CHECK(through_id BETWEEN 1 AND 9007199254740991),
+                CHECK((actor_kind='system' AND actor_user_id IS NULL) OR (actor_kind='account' AND actor_user_id IS NOT NULL)),
+                CHECK((before_role IS NULL AND before_enabled IS NULL) OR (before_role IS NOT NULL AND before_enabled IS NOT NULL)),
+                CHECK((after_role IS NULL AND after_enabled IS NULL) OR (after_role IS NOT NULL AND after_enabled IS NOT NULL)),
+                CHECK(COALESCE(
+                    (action='baseline' AND actor_kind='system' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND through_id IS NULL)
+                    OR (action='bootstrap' AND actor_kind='system' AND target_user_id IS NOT NULL AND before_role IS NULL AND after_role='admin' AND after_enabled=1 AND password_changed=1 AND affected_count=1 AND through_id IS NULL)
+                    OR (action='create' AND target_user_id IS NOT NULL AND before_role IS NULL AND after_role IS NOT NULL AND after_enabled=1 AND password_changed=1 AND affected_count=1 AND through_id IS NULL)
+                    OR (action='update' AND target_user_id IS NOT NULL AND before_role IS NOT NULL AND after_role IS NOT NULL AND affected_count=1 AND through_id IS NULL)
+                    OR (action='delete' AND target_user_id IS NOT NULL AND before_role IS NOT NULL AND after_role IS NULL AND password_changed=0 AND affected_count=1 AND through_id IS NULL)
+                    OR (action='prune' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND affected_count>0 AND through_id IS NOT NULL AND through_id<id)
+                ,0))
             );",
         )?;
             let started_at = now_ms()?;
@@ -337,7 +348,7 @@ impl Store {
             )?;
             transaction.execute_batch("PRAGMA user_version=2")?;
         }
-        let (next_user_id,next_audit_id,stored_records,pruned_through):(i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
                 row.get(0)
@@ -349,15 +360,27 @@ impl Store {
         )?;
         ensure!(
             next_user_id > max_user_id
-                && next_user_id <= MAX_SAFE_ID + 1
+                && (1..=MAX_SAFE_ID + 1).contains(&next_user_id)
                 && count == stored_records
                 && (1..=AUDIT_CAPACITY).contains(&count)
                 && next_audit_id == max_audit_id + 1
                 && next_audit_id <= MAX_SAFE_ID + 1
                 && pruned_through >= 0
-                && pruned_through < next_audit_id,
+                && pruned_through < next_audit_id
+                && (0..=MAX_SAFE_ID).contains(&started_at),
             "administrator audit metadata inconsistent"
         );
+        {
+            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit ORDER BY id")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let record = read_audit_record(row)?;
+                ensure!(
+                    record.id > pruned_through,
+                    "administrator audit history crosses pruned range"
+                );
+            }
+        }
         transaction.commit()?;
         Ok(Self {
             path,
@@ -657,6 +680,7 @@ impl Store {
             let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_audit",[],|row|row.get(0))?;
             let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_audit_record)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(records.iter().all(|record|record.id>pruned_through),"administrator audit history crosses pruned range");
             let has_more=records.len()>limit;
             records.truncate(limit);
             let next_after=records.last().map_or(after,|record|record.id);
@@ -800,6 +824,10 @@ fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Resul
         return Err(AuditCapacity.into());
     }
     record.id = id;
+    ensure!(
+        valid_audit_record(&record),
+        "invalid administrator audit event"
+    );
     let before_role = record.before.map(|s| s.role.as_str());
     let before_enabled = record.before.map(|s| i64::from(s.enabled));
     let after_role = record.after.map(|s| s.role.as_str());
@@ -814,18 +842,23 @@ fn read_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
     let before_enabled: Option<i64> = row.get(7)?;
     let after_role: Option<String> = row.get(8)?;
     let after_enabled: Option<i64> = row.get(9)?;
-    let state =
-        |role: Option<String>, enabled: Option<i64>| -> rusqlite::Result<Option<AuditUserState>> {
-            match (role, enabled) {
-                (None, None) => Ok(None),
-                (Some(role), Some(enabled)) => Ok(Some(AuditUserState {
-                    role: Role::parse(&role).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    enabled: enabled == 1,
-                })),
-                _ => Err(rusqlite::Error::InvalidQuery),
-            }
-        };
-    Ok(AuditRecord {
+    let state = |role: Option<String>,
+                 enabled: Option<i64>|
+     -> rusqlite::Result<Option<AuditUserState>> {
+        match (role, enabled) {
+            (None, None) => Ok(None),
+            (Some(role), Some(enabled)) if (0..=1).contains(&enabled) => Ok(Some(AuditUserState {
+                role: Role::parse(&role).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                enabled: enabled == 1,
+            })),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    };
+    let password_changed: i64 = row.get(10)?;
+    if !(0..=1).contains(&password_changed) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let record = AuditRecord {
         id: row.get(0)?,
         time_unix_ms: row.get(1)?,
         action: AuditAction::parse(&row.get::<_, String>(2)?)
@@ -836,11 +869,91 @@ fn read_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
         target_user_id: row.get(5)?,
         before: state(before_role, before_enabled)?,
         after: state(after_role, after_enabled)?,
-        password_changed: row.get::<_, i64>(10)? == 1,
+        password_changed: password_changed == 1,
         affected_count: u64::try_from(row.get::<_, i64>(11)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         through_id: row.get(12)?,
-    })
+    };
+    if !valid_audit_record(&record) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(record)
+}
+
+fn valid_audit_record(record: &AuditRecord) -> bool {
+    if !(1..=MAX_SAFE_ID).contains(&record.id)
+        || !(0..=MAX_SAFE_ID).contains(&record.time_unix_ms)
+        || record.affected_count > MAX_SAFE_ID as u64
+        || record
+            .actor_user_id
+            .is_some_and(|id| !(1..=MAX_SAFE_ID).contains(&id))
+        || record
+            .target_user_id
+            .is_some_and(|id| !(1..=MAX_SAFE_ID).contains(&id))
+        || record
+            .through_id
+            .is_some_and(|id| !(1..=MAX_SAFE_ID).contains(&id))
+        || !match record.actor_kind {
+            AuditActorKind::System => record.actor_user_id.is_none(),
+            AuditActorKind::Account => record.actor_user_id.is_some(),
+        }
+    {
+        return false;
+    }
+    match record.action {
+        AuditAction::Baseline => {
+            record.actor_kind == AuditActorKind::System
+                && record.target_user_id.is_none()
+                && record.before.is_none()
+                && record.after.is_none()
+                && !record.password_changed
+                && record.through_id.is_none()
+        }
+        AuditAction::Bootstrap => {
+            record.actor_kind == AuditActorKind::System
+                && record.target_user_id.is_some()
+                && record.before.is_none()
+                && record.after
+                    == Some(AuditUserState {
+                        role: Role::Admin,
+                        enabled: true,
+                    })
+                && record.password_changed
+                && record.affected_count == 1
+                && record.through_id.is_none()
+        }
+        AuditAction::Create => {
+            record.target_user_id.is_some()
+                && record.before.is_none()
+                && record.after.is_some_and(|after| after.enabled)
+                && record.password_changed
+                && record.affected_count == 1
+                && record.through_id.is_none()
+        }
+        AuditAction::Update => {
+            record.target_user_id.is_some()
+                && record.before.is_some()
+                && record.after.is_some()
+                && record.affected_count == 1
+                && record.through_id.is_none()
+        }
+        AuditAction::Delete => {
+            record.target_user_id.is_some()
+                && record.before.is_some()
+                && record.after.is_none()
+                && !record.password_changed
+                && record.affected_count == 1
+                && record.through_id.is_none()
+        }
+        AuditAction::Prune => {
+            record.target_user_id.is_none()
+                && record.before.is_none()
+                && record.after.is_none()
+                && !record.password_changed
+                && record.affected_count > 0
+                && record.through_id.is_some_and(|through| through < record.id)
+        }
+    }
 }
 
 fn connection(path: &Path) -> Result<Connection> {
@@ -1050,6 +1163,52 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_audit_provenance_fails_reads_and_reopen() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE admin_audit SET actor_kind='account',actor_user_id=NULL WHERE id=1",
+                    []
+                )
+                .is_err(),
+            "new v2 SQL constraints reject malformed provenance"
+        );
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        for invalid in [
+            "UPDATE admin_audit SET actor_kind='account',actor_user_id=NULL WHERE id=1",
+            "UPDATE admin_audit SET action='create',target_user_id=NULL WHERE id=1",
+            "UPDATE admin_audit SET time_unix_ms=-1 WHERE id=1",
+            "UPDATE admin_audit SET action='prune',through_id=NULL,affected_count=1 WHERE id=1",
+            "UPDATE admin_audit SET before_role='admin',before_enabled=NULL WHERE id=1",
+            "UPDATE admin_audit SET target_user_id=-5 WHERE id=1",
+        ] {
+            connection.execute(invalid, []).unwrap();
+            assert!(
+                store
+                    .audit_page(MutationAuthority::System, 0, 10)
+                    .await
+                    .is_err(),
+                "invalid row was returned: {invalid}"
+            );
+            assert!(
+                Store::open(path.clone()).is_err(),
+                "invalid row passed startup scan: {invalid}"
+            );
+            connection.execute_batch("UPDATE admin_audit SET actor_kind='system',actor_user_id=NULL,action='baseline',target_user_id=NULL,time_unix_ms=0,affected_count=0,before_role=NULL,before_enabled=NULL,after_role=NULL,after_enabled=NULL,password_changed=0,through_id=NULL WHERE id=1").unwrap();
+        }
+        assert!(Store::open(path).is_ok());
     }
 
     #[tokio::test]
