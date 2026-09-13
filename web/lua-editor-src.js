@@ -17,6 +17,7 @@ const policyMembers = [
   ['method', '()', 'Read the request method.'],
   ['path', '()', 'Read the request path.'],
   ['select_backend', '(configured_backend_url)', 'Select a backend already configured on this route.'],
+  ['select_member', '(configured_member_id)', 'Select a configured named member by exact ID. Unknown or unavailable members fail closed without retry.'],
   ['set_header', '(name, value)', 'Set an application request header; authenticator-owned identity names are reserved.'],
   ['reject', '(status_400_to_599)', 'Reject this request with a 4xx or 5xx status.'],
 ];

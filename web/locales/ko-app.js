@@ -34,6 +34,7 @@ export default {
   'Read the request method.': '요청 메서드를 읽습니다.',
   'Read the request path.': '요청 경로를 읽습니다.',
   'Select a backend already configured on this route.': '이 경로에 이미 설정된 백엔드를 선택합니다.',
+  'Select a configured named member by exact ID. Unknown or unavailable members fail closed without retry.': '설정된 이름 있는 멤버를 정확한 ID로 선택합니다. 알 수 없거나 사용할 수 없는 멤버는 재시도 없이 요청을 차단합니다.',
   'Set an application request header; authenticator-owned identity names are reserved.': '애플리케이션 요청 헤더를 설정합니다. 인증기가 소유한 신원 헤더 이름은 사용할 수 없습니다.',
   'Reject this request with a 4xx or 5xx status.': '4xx 또는 5xx 상태로 요청을 거부합니다.',
   'Read the bounded complete body or record as a binary-safe string.': '제한된 전체 본문 또는 레코드를 바이너리 안전 문자열로 읽습니다.',

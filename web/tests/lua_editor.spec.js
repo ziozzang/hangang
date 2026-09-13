@@ -125,6 +125,7 @@ test('policy completion saves through the textarea while body suggestions stay p
   const suggestions = page.locator('.cm-tooltip-autocomplete');
   await expect(suggestions).toBeVisible();
   await expect(suggestions).toContainText('select_backend');
+  await expect(suggestions).toContainText('select_member');
   await expect(suggestions).not.toContainText('set_body');
   await suggestions.locator('.cm-completionLabel', { hasText: /^method$/ }).click();
   await expect(page.locator('#route-field-lua')).toHaveValue('hangang.method()');
@@ -136,12 +137,47 @@ test('policy completion saves through the textarea while body suggestions stay p
   await request.press('Control+Space');
   await expect(suggestions).toContainText('set_body');
   await expect(suggestions).not.toContainText('select_backend');
+  await expect(suggestions).not.toContainText('select_member');
   await page.locator('[name="request_transform_enabled"]').uncheck();
   await page.getByRole('button', { name: 'Save route' }).click();
   await expect(page.locator('#route-dialog')).toBeHidden();
   expect(writes).toHaveLength(1);
   expect(writes[0].lua).toBe('hangang.method()');
   expect(writes[0].request_transform).toBeNull();
+});
+
+test('named member completion is policy-only, localized, and saves an exact ID selection', async ({ page }) => {
+  const named = {
+    ...original,
+    backends: [{ id: 'blue', address: 'http://127.0.0.1:8080', weight: 2 }],
+    balance: { mode: 'round_robin', weights: [] },
+    lua: null, request_transform: null, response_transform: null,
+  };
+  const writes = await fixture(page, named);
+  await openEditor(page);
+  const policySection = page.locator('#route-field-lua').locator('xpath=ancestor::details[1]');
+  if (!(await policySection.evaluate((element) => element.open))) await policySection.locator('summary').click();
+  await page.locator('#locale-select-route').selectOption('ko');
+  const policy = page.getByRole('textbox', { name: 'Lua 정책' });
+  await policy.fill('hangang.');
+  await policy.press('Control+Space');
+  const suggestions = page.locator('.cm-tooltip-autocomplete');
+  await expect(suggestions).toBeVisible();
+  const member = suggestions.locator('.cm-completionLabel', { hasText: /^select_member$/ });
+  await expect(member).toBeVisible();
+  expect(await page.evaluate(async () => {
+    const { t } = await import('/ui/i18n.js');
+    return t('Select a configured named member by exact ID. Unknown or unavailable members fail closed without retry.');
+  })).toContain('정확한 ID');
+  await member.click();
+  await page.keyboard.type('"blue"');
+  await expect(page.locator('#route-field-lua')).toHaveValue('hangang.select_member("blue")');
+  await expect(page.locator('#route-json')).toHaveValue(/hangang\.select_member\(\\"blue\\"\)/);
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-dialog')).toBeHidden();
+  expect(writes).toHaveLength(1);
+  expect(writes[0].lua).toBe('hangang.select_member("blue")');
+  expect(writes[0].backends).toEqual(named.backends);
 });
 
 test('advanced JSON Lua edits survive a later native field change and save', async ({ page }) => {
