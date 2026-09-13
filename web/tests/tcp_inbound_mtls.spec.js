@@ -119,6 +119,32 @@ test('malformed advanced inbound TLS cannot be silently normalized', async ({ pa
   expect(writes).toHaveLength(0);
 });
 
+test('noncanonical SPIFFE identities and material paths are rejected before save', async ({ page }) => {
+  const writes = await fixture(page);
+  await edit(page);
+  await page.locator('#route-field-inbound_tls_enabled').check();
+  await page.locator('#route-field-inbound_tls_cert_file').fill(inboundTls.cert_file);
+  await page.locator('#route-field-inbound_tls_key_file').fill(inboundTls.key_file);
+  await page.locator('#route-field-inbound_tls_client_ca_file').fill(inboundTls.client_ca_file);
+  const identity = page.locator('#route-field-inbound_tls_allowed_uri_sans');
+  for (const invalid of [
+    'spiffe://Example.test/ns/service', 'spiffe://example.test:443/ns/service',
+    'spiffe://user@example.test/ns/service', 'spiffe://example.test/ns/%2e/service',
+    'spiffe://example.test/ns/../service', 'spiffe://example.test/ns/service/',
+  ]) {
+    await identity.fill(invalid);
+    await expect(page.locator('#route-message')).toContainText('distinct exact SPIFFE URIs');
+  }
+  await identity.fill(inboundTls.allowed_uri_sans[0]);
+  const certificate = page.locator('#route-field-inbound_tls_cert_file');
+  for (const invalid of ['/etc/./hangang/server.crt', '/etc//hangang/server.crt', '/etc/../hangang/server.crt']) {
+    await certificate.fill(invalid);
+    await expect(page.locator('#route-message')).toContainText('absolute normalized file path');
+  }
+  await page.locator('#save-route').click();
+  expect(writes).toHaveLength(0);
+});
+
 test('Korean inbound mTLS copy and existing TCP passthrough stay intact', async ({ page }) => {
   const writes = await fixture(page, baseRoute, 'ko');
   await edit(page, 'ko');

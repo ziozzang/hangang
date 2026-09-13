@@ -1922,6 +1922,22 @@ function applyGroupToggles(form) {
 }
 
 function nonemptyLines(value) { return value.split('\n').map((v) => v.trim()).filter(Boolean); }
+function validInboundTlsPath(value) {
+  return value.startsWith('/') && value !== '/' && new TextEncoder().encode(value).length <= 4096
+    && !/[\0\r\n\\]/.test(value)
+    && value.slice(1).split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+function validSpiffeIdentity(uri) {
+  if (uri.length > 2048 || !/^[\x00-\x7f]*$/.test(uri) || !uri.startsWith('spiffe://')) return false;
+  const rest = uri.slice('spiffe://'.length);
+  if (/[?#%@:]/.test(rest)) return false;
+  const slash = rest.indexOf('/');
+  const domain = slash < 0 ? rest : rest.slice(0, slash);
+  const path = slash < 0 ? null : rest.slice(slash + 1);
+  if (!domain || domain.length > 255 || !/^[a-z0-9._-]+$/.test(domain)) return false;
+  if (path === null) return true;
+  return Boolean(path) && path.split('/').every((segment) => segment !== '.' && segment !== '..' && /^[A-Za-z0-9._-]+$/.test(segment));
+}
 function pairsToLines(obj = {}) { return Object.entries(obj || {}).map(([k,v]) => `${k}: ${v}`).join('\n'); }
 function jsonPairsToLines(obj = {}) { return Object.entries(obj || {}).map(([k,v]) => `${k} = ${JSON.stringify(v)}`).join('\n'); }
 function parseHeaderLines(value, what = 'Header') { return Object.fromEntries(nonemptyLines(value).map((line) => { const at = line.indexOf(':'); if (at < 1) throw new Error(t('{field} needs “name: value”: {line}', { field: t(what), line })); const name = line.slice(0, at).trim(); if (!HEADER_NAME.test(name)) throw new Error(t('{field} name is invalid: {name}', { field: t(what), name })); return [name, line.slice(at + 1).trim()]; })); }
@@ -2382,16 +2398,13 @@ function routeFromForm() {
       const filePath = (name, label, optional = false) => {
         const value = text(name);
         if (!value && optional) return null;
-        if (!value.startsWith('/') || value.includes('\0') || value.includes('\n') || value.includes('\r'))
-          throw new Error(t('{field} must be an absolute file path', { field: t(label) }));
+        if (!validInboundTlsPath(value))
+          throw new Error(t('{field} must be an absolute normalized file path', { field: t(label) }));
         return value;
       };
       const allowed = lines('inbound_tls_allowed_uri_sans');
-      if (!allowed.length || allowed.length > 128 || new Set(allowed).size !== allowed.length || allowed.some((uri) => {
-        if (new TextEncoder().encode(uri).length > 2048 || !uri.startsWith('spiffe://') || /[\s?#]/.test(uri)) return true;
-        try { const parsed = new URL(uri); return parsed.protocol !== 'spiffe:' || !parsed.hostname || parsed.pathname === '/'; }
-        catch { return true; }
-      })) throw new Error(t('Allowed client identities need 1–128 distinct exact SPIFFE URIs of at most 2,048 bytes'));
+      if (!allowed.length || allowed.length > 128 || new Set(allowed).size !== allowed.length || allowed.some((uri) => !validSpiffeIdentity(uri)))
+        throw new Error(t('Allowed client identities need 1–128 distinct exact SPIFFE URIs of at most 2,048 bytes'));
       route.inbound_tls = { ...(isObject(route.inbound_tls) ? route.inbound_tls : {}),
         cert_file: filePath('inbound_tls_cert_file', 'Server certificate file'),
         key_file: filePath('inbound_tls_key_file', 'Server private key file'),

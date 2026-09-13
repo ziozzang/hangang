@@ -707,6 +707,6 @@ export default {
   '1–10,000 ms; default 5,000. The client certificate and URI SAN are checked before any upstream dial.': '1–10,000ms, 기본값 5,000ms입니다. 업스트림 연결 전에 클라이언트 인증서와 URI SAN을 확인합니다.',
   'Advanced inbound TLS JSON must contain an object with allowed_uri_sans array': '고급 수신 TLS JSON에는 allowed_uri_sans 배열을 가진 객체가 필요합니다',
   'Inbound mutual TLS cannot be combined with SNI passthrough': '수신 상호 TLS와 SNI 통과 방식을 함께 사용할 수 없습니다',
-  '{field} must be an absolute file path': '{field}에는 파일의 절대 경로를 입력해야 합니다',
+  '{field} must be an absolute normalized file path': '{field}에는 정규화된 파일 절대 경로를 입력해야 합니다',
   'Allowed client identities need 1–128 distinct exact SPIFFE URIs of at most 2,048 bytes': '허용할 클라이언트 ID는 중복 없는 정확한 SPIFFE URI 1–128개여야 하며 각각 최대 2,048바이트입니다',
 };
