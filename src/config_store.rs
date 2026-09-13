@@ -29,6 +29,8 @@ use crate::{
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use rusqlite::OptionalExtension;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -56,6 +58,22 @@ pub const MAX_CHALLENGE_TTL: Duration = Duration::from_secs(60 * 60);
 pub struct Stored {
     pub epoch: String,
     pub config: Config,
+}
+
+/// Opaque identity accepted by the local account authority for one candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationStamp {
+    pub authority_id: String,
+    pub operation_id: String,
+    pub candidate_sha256: String,
+}
+
+/// Identity present on the current authoritative configuration document only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationProof {
+    pub epoch: String,
+    pub revision: u64,
+    pub stamp: OperationStamp,
 }
 
 /// Why a store operation failed. Callers use the distinction for readiness
@@ -161,6 +179,25 @@ pub trait ConfigStore: Send + Sync {
         expected: u64,
         next: Config,
     ) -> StoreResult<CasResult>;
+    fn supports_operation_cas(&self) -> bool {
+        false
+    }
+    async fn compare_and_swap_operation(
+        &self,
+        _epoch: &str,
+        _expected: u64,
+        _next: Config,
+        _stamp: OperationStamp,
+    ) -> StoreResult<CasResult> {
+        Err(StoreError::Invalid(anyhow!(
+            "operation-specific CAS is unsupported by this store"
+        )))
+    }
+    async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
+        Err(StoreError::Invalid(anyhow!(
+            "operation-specific proof is unsupported by this store"
+        )))
+    }
     /// ACME HTTP-01 sharing: every instance behind a load balancer can answer
     /// the CA's validation request. `token`: 1..=128 chars of `[A-Za-z0-9_-]`;
     /// `key_authorization`: 1..=512 printable ASCII; `ttl`: 1 s..=1 h.
@@ -253,6 +290,139 @@ pub(crate) fn resolve_cas(current: Stored, epoch: &str, next: &Config) -> CasRes
     } else {
         CasResult::Conflict { current }
     }
+}
+
+#[derive(Debug, Clone)]
+struct OperationMetadata {
+    revision: u64,
+    stamp: OperationStamp,
+}
+
+fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn validate_operation_stamp(stamp: &OperationStamp, encoded: &str) -> StoreResult<()> {
+    if !valid_hex(&stamp.authority_id, 32)
+        || !valid_hex(&stamp.operation_id, 32)
+        || !valid_hex(&stamp.candidate_sha256, 64)
+        || stamp.candidate_sha256 != sha256_hex(encoded.as_bytes())
+    {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid operation stamp or candidate fingerprint"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_operation_metadata(
+    authority_id: Option<String>,
+    operation_id: Option<String>,
+    revision: Option<i64>,
+    candidate_sha256: Option<String>,
+) -> StoreResult<Option<OperationMetadata>> {
+    if authority_id.is_none()
+        && operation_id.is_none()
+        && revision.is_none()
+        && candidate_sha256.is_none()
+    {
+        return Ok(None);
+    }
+    let (Some(authority_id), Some(operation_id), Some(revision), Some(candidate_sha256)) =
+        (authority_id, operation_id, revision, candidate_sha256)
+    else {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid stored operation stamp"
+        )));
+    };
+    let revision = i64_to_revision(revision)?;
+    let stamp = OperationStamp {
+        authority_id,
+        operation_id,
+        candidate_sha256,
+    };
+    if !valid_hex(&stamp.authority_id, 32)
+        || !valid_hex(&stamp.operation_id, 32)
+        || !valid_hex(&stamp.candidate_sha256, 64)
+    {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid stored operation stamp"
+        )));
+    }
+    Ok(Some(OperationMetadata { revision, stamp }))
+}
+
+fn current_operation_proof(
+    stored: &Stored,
+    encoded: &str,
+    metadata: &Option<OperationMetadata>,
+) -> Option<OperationProof> {
+    let metadata = metadata.as_ref()?;
+    (metadata.revision == stored.config.revision
+        && metadata.stamp.candidate_sha256 == sha256_hex(encoded.as_bytes()))
+    .then(|| OperationProof {
+        epoch: stored.epoch.clone(),
+        revision: metadata.revision,
+        stamp: metadata.stamp.clone(),
+    })
+}
+
+fn resolve_operation_cas(
+    current: StoreResult<Option<(Stored, String, Option<OperationMetadata>)>>,
+    epoch: &str,
+    next: &Config,
+    stamp: &OperationStamp,
+    uncertain: bool,
+) -> StoreResult<CasResult> {
+    let (stored, encoded, metadata) = match current {
+        Ok(Some(value)) => value,
+        Ok(None) if uncertain => {
+            return Err(StoreError::Indeterminate(anyhow!(
+                "operation CAS outcome is not provable from an empty store"
+            )));
+        }
+        Ok(None) => {
+            return Err(StoreError::Invalid(anyhow!(
+                "configuration store is not initialized"
+            )));
+        }
+        Err(error) if uncertain => {
+            return Err(StoreError::Indeterminate(
+                error
+                    .into_inner()
+                    .context("operation CAS recovery read failed"),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let proof = current_operation_proof(&stored, &encoded, &metadata);
+    if metadata
+        .as_ref()
+        .is_some_and(|current| current.stamp.operation_id == stamp.operation_id)
+    {
+        if stored.epoch == epoch
+            && stored.config == *next
+            && proof.as_ref().is_some_and(|proof| proof.stamp == *stamp)
+        {
+            return Ok(CasResult::Applied(stored));
+        }
+        return Err(StoreError::Invalid(anyhow!(
+            "operation identifier reused with another candidate or precondition"
+        )));
+    }
+    if uncertain {
+        return Err(StoreError::Indeterminate(anyhow!(
+            "operation CAS acknowledgement was lost and the current document has no matching operation identity"
+        )));
+    }
+    Ok(CasResult::Conflict { current: stored })
 }
 
 pub(crate) fn check_challenge_token(token: &str) -> StoreResult<()> {
@@ -724,7 +894,7 @@ impl ConfigStore for SqliteConfigStore {
                 .map_err(sqlite_error)?;
             let changed = transaction
                 .execute(
-                    "UPDATE hangang_config SET revision = ?1, config_json = ?2 WHERE singleton = 1 AND revision = ?3 AND epoch = ?4",
+                    "UPDATE hangang_config SET revision = ?1, config_json = ?2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL WHERE singleton = 1 AND revision = ?3 AND epoch = ?4",
                     rusqlite::params![next_revision, encoded, expected_revision, epoch],
                 )
                 .map_err(sqlite_error)?;
@@ -745,6 +915,56 @@ impl ConfigStore for SqliteConfigStore {
             Ok(result)
         })
         .await
+    }
+
+    fn supports_operation_cas(&self) -> bool {
+        true
+    }
+
+    async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
+        self.with_connection(Access::Read, move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_error)?;
+            let result =
+                sqlite_load_operation(&transaction)?.and_then(|(stored, encoded, metadata)| {
+                    current_operation_proof(&stored, &encoded, &metadata)
+                });
+            transaction.commit().map_err(sqlite_error)?;
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn compare_and_swap_operation(
+        &self,
+        epoch: &str,
+        expected: u64,
+        mut next: Config,
+        stamp: OperationStamp,
+    ) -> StoreResult<CasResult> {
+        check_epoch(epoch)?;
+        next.revision = next_revision(expected)?;
+        let encoded = encode(&next)?;
+        validate_operation_stamp(&stamp, &encoded)?;
+        let next_revision = revision_to_i64(next.revision)?;
+        let expected_revision = revision_to_i64(expected)?;
+        let epoch = epoch.to_owned();
+        self.with_connection(Access::Mutation,move |connection|{
+            let transaction=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sqlite_error)?;
+            let current=sqlite_load_operation(&transaction)?.ok_or_else(||StoreError::Invalid(anyhow!("SQLite configuration store is not initialized")))?;
+            if current.2.as_ref().is_some_and(|metadata|metadata.stamp.operation_id==stamp.operation_id) {
+                return resolve_operation_cas(Ok(Some(current)),&epoch,&next,&stamp,false);
+            }
+            let changed=transaction.execute(
+                "UPDATE hangang_config SET revision=?1,config_json=?2,operation_authority_id=?3,operation_id=?4,operation_revision=?1,operation_sha256=?5 WHERE singleton=1 AND revision=?6 AND epoch=?7 AND (operation_id IS NULL OR operation_id!=?4)",
+                rusqlite::params![next_revision,encoded,stamp.authority_id,stamp.operation_id,stamp.candidate_sha256,expected_revision,epoch]
+            ).map_err(sqlite_error)?;
+            let result=if changed==1 {CasResult::Applied(Stored{epoch,config:next})}
+                else {resolve_operation_cas(Ok(Some(current)),&epoch,&next,&stamp,false)?};
+            transaction.commit().map_err(sqlite_error)?;
+            Ok(result)
+        }).await
     }
 
     async fn publish_challenge(
@@ -845,7 +1065,11 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 revision INTEGER NOT NULL CHECK (revision >= 0),
                 config_json TEXT NOT NULL,
-                epoch TEXT NOT NULL DEFAULT ''
+                epoch TEXT NOT NULL DEFAULT '',
+                operation_authority_id TEXT,
+                operation_id TEXT,
+                operation_revision INTEGER,
+                operation_sha256 TEXT
             ) STRICT;
             CREATE TABLE IF NOT EXISTS hangang_acme_challenges (
                 token TEXT PRIMARY KEY,
@@ -856,17 +1080,42 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
         .map_err(sqlite_error)?;
     // Legacy files predate the epoch column. A concurrent upgrader may add
     // it first; that is success, not failure.
-    if !sqlite_has_epoch_column(connection)?
+    if !sqlite_has_column(connection, "epoch")?
         && let Err(error) = connection
             .execute_batch("ALTER TABLE hangang_config ADD COLUMN epoch TEXT NOT NULL DEFAULT ''")
-        && !sqlite_has_epoch_column(connection)?
+        && !sqlite_has_column(connection, "epoch")?
     {
         return Err(sqlite_error(error));
+    }
+    for (name, ddl) in [
+        (
+            "operation_authority_id",
+            "ALTER TABLE hangang_config ADD COLUMN operation_authority_id TEXT",
+        ),
+        (
+            "operation_id",
+            "ALTER TABLE hangang_config ADD COLUMN operation_id TEXT",
+        ),
+        (
+            "operation_revision",
+            "ALTER TABLE hangang_config ADD COLUMN operation_revision INTEGER",
+        ),
+        (
+            "operation_sha256",
+            "ALTER TABLE hangang_config ADD COLUMN operation_sha256 TEXT",
+        ),
+    ] {
+        if !sqlite_has_column(connection, name)?
+            && let Err(error) = connection.execute_batch(ddl)
+            && !sqlite_has_column(connection, name)?
+        {
+            return Err(sqlite_error(error));
+        }
     }
     Ok(())
 }
 
-fn sqlite_has_epoch_column(connection: &rusqlite::Connection) -> StoreResult<bool> {
+fn sqlite_has_column(connection: &rusqlite::Connection, wanted: &str) -> StoreResult<bool> {
     let mut statement = connection
         .prepare("PRAGMA table_info(hangang_config)")
         .map_err(sqlite_error)?;
@@ -874,7 +1123,7 @@ fn sqlite_has_epoch_column(connection: &rusqlite::Connection) -> StoreResult<boo
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(sqlite_error)?;
     for name in names {
-        if name.map_err(sqlite_error)? == "epoch" {
+        if name.map_err(sqlite_error)? == wanted {
             return Ok(true);
         }
     }
@@ -951,6 +1200,47 @@ fn sqlite_row(connection: &rusqlite::Connection) -> StoreResult<Option<(i64, Str
         Ok((revision, json, epoch))
     })
     .transpose()
+}
+
+/// Call under one SQLite transaction so document and optional identity are a
+/// single consistent row observation, including legacy epoch upgrades.
+fn sqlite_load_operation(
+    connection: &rusqlite::Connection,
+) -> StoreResult<Option<(Stored, String, Option<OperationMetadata>)>> {
+    let Some(stored) = sqlite_load(connection)? else {
+        return Ok(None);
+    };
+    let (revision, encoded, epoch) = sqlite_row(connection)?
+        .ok_or_else(|| StoreError::Invalid(anyhow!("SQLite configuration row vanished")))?;
+    if i64_to_revision(revision)? != stored.config.revision || epoch != stored.epoch {
+        return Err(StoreError::Invalid(anyhow!(
+            "SQLite configuration row changed during proof read"
+        )));
+    }
+    let (present,authority_id,operation_id,operation_revision,candidate_sha256):
+        (i64,Option<String>,Option<String>,Option<i64>,Option<String>)=connection.query_row(
+        "SELECT (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL),
+                CASE WHEN octet_length(operation_authority_id)<=32 THEN operation_authority_id END,
+                CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
+                operation_revision,
+                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END
+         FROM hangang_config WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).map_err(sqlite_error)?;
+    let metadata = if present == 0 {
+        None
+    } else {
+        decode_operation_metadata(
+            authority_id,
+            operation_id,
+            operation_revision,
+            candidate_sha256,
+        )?
+    };
+    if present != 0 && metadata.is_none() {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid stored operation stamp"
+        )));
+    }
+    Ok(Some((stored, encoded, metadata)))
 }
 
 #[derive(Clone)]
@@ -1202,9 +1492,17 @@ impl PostgresConfigStore {
                 singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
                 revision BIGINT NOT NULL CHECK (revision >= 0),
                 config_json TEXT NOT NULL,
-                epoch TEXT NOT NULL DEFAULT ''
+                epoch TEXT NOT NULL DEFAULT '',
+                operation_authority_id TEXT,
+                operation_id TEXT,
+                operation_revision BIGINT,
+                operation_sha256 TEXT
             );
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS epoch TEXT NOT NULL DEFAULT '';
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_authority_id TEXT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_id TEXT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_revision BIGINT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_sha256 TEXT;
             CREATE TABLE IF NOT EXISTS hangang_acme_challenges (
                 token TEXT PRIMARY KEY,
                 key_authorization TEXT NOT NULL,
@@ -1359,6 +1657,59 @@ impl PostgresConfigStore {
         let config = decode(i64_to_revision(revision)?, &json)?;
         Ok(Some(Stored { epoch, config }))
     }
+
+    /// One row read supplies both the document and its optional stamp. The
+    /// initial load also performs the existing one-time legacy epoch upgrade.
+    async fn load_stored_with_proof(
+        &self,
+    ) -> StoreResult<Option<(Stored, String, Option<OperationMetadata>)>> {
+        self.load_stored().await?;
+        let max_config_bytes = i32::try_from(MAX_CONFIG_BYTES).expect("1 MiB fits i32");
+        let max_epoch_bytes = i32::try_from(EPOCH_LEN).expect("epoch length fits i32");
+        let Some(row)=self.query_opt(Access::Read,
+            "SELECT revision,
+                CASE WHEN octet_length(config_json)<=$1 THEN config_json END,
+                CASE WHEN octet_length(epoch)<=$2 THEN epoch END,
+                (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL),
+                CASE WHEN octet_length(operation_authority_id)<=32 THEN operation_authority_id END,
+                CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
+                operation_revision,
+                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END
+             FROM hangang_config WHERE singleton=1",
+            &[&max_config_bytes,&max_epoch_bytes]).await? else {return Ok(None)};
+        let revision: i64 = postgres_column(&row, 0)?;
+        let encoded: String = postgres_column::<Option<String>>(&row, 1)?.ok_or_else(|| {
+            StoreError::Invalid(anyhow!("stored PostgreSQL configuration exceeds 1 MiB"))
+        })?;
+        let epoch: String = postgres_column::<Option<String>>(&row, 2)?.ok_or_else(|| {
+            StoreError::Invalid(anyhow!(
+                "stored PostgreSQL authority epoch exceeds {EPOCH_LEN} bytes"
+            ))
+        })?;
+        check_epoch(&epoch)?;
+        let present: bool = postgres_column(&row, 3)?;
+        let authority_id: Option<String> = postgres_column(&row, 4)?;
+        let operation_id: Option<String> = postgres_column(&row, 5)?;
+        let operation_revision: Option<i64> = postgres_column(&row, 6)?;
+        let candidate_sha256: Option<String> = postgres_column(&row, 7)?;
+        let metadata = if present {
+            decode_operation_metadata(
+                authority_id,
+                operation_id,
+                operation_revision,
+                candidate_sha256,
+            )?
+        } else {
+            None
+        };
+        if present && metadata.is_none() {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid stored operation stamp"
+            )));
+        }
+        let config = decode(i64_to_revision(revision)?, &encoded)?;
+        Ok(Some((Stored { epoch, config }, encoded, metadata)))
+    }
 }
 
 fn postgres_column<'a, T>(row: &'a tokio_postgres::Row, index: usize) -> StoreResult<T>
@@ -1417,7 +1768,7 @@ impl ConfigStore for PostgresConfigStore {
             .run(Access::Mutation, |client| async move {
                 client
                     .query_opt(
-                        "UPDATE hangang_config SET revision = $1, config_json = $2 WHERE singleton = 1 AND revision = $3 AND epoch = $4 RETURNING revision",
+                        "UPDATE hangang_config SET revision = $1, config_json = $2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL WHERE singleton = 1 AND revision = $3 AND epoch = $4 RETURNING revision",
                         parameters,
                     )
                     .await
@@ -1439,6 +1790,61 @@ impl ConfigStore for PostgresConfigStore {
         // "nothing changed".
         let current = self.load_stored().await;
         resolve_unchanged_cas(current, epoch, &next, uncertain)
+    }
+
+    fn supports_operation_cas(&self) -> bool {
+        true
+    }
+
+    async fn load_current_operation_proof(&self) -> StoreResult<Option<OperationProof>> {
+        Ok(self
+            .load_stored_with_proof()
+            .await?
+            .and_then(|(stored, encoded, metadata)| {
+                current_operation_proof(&stored, &encoded, &metadata)
+            }))
+    }
+
+    async fn compare_and_swap_operation(
+        &self,
+        epoch: &str,
+        expected: u64,
+        mut next: Config,
+        stamp: OperationStamp,
+    ) -> StoreResult<CasResult> {
+        check_epoch(epoch)?;
+        next.revision = next_revision(expected)?;
+        let encoded = encode(&next)?;
+        validate_operation_stamp(&stamp, &encoded)?;
+        let next_revision = revision_to_i64(next.revision)?;
+        let expected_revision = revision_to_i64(expected)?;
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &next_revision,
+            &encoded,
+            &stamp.authority_id,
+            &stamp.operation_id,
+            &stamp.candidate_sha256,
+            &expected_revision,
+            &epoch,
+        ];
+        let Attempted{value:row,uncertain}=self.run(Access::Mutation,|client|async move{
+            client.query_opt(
+                "UPDATE hangang_config SET revision=$1,config_json=$2,operation_authority_id=$3,operation_id=$4,operation_revision=$1,operation_sha256=$5 WHERE singleton=1 AND revision=$6 AND epoch=$7 AND (operation_id IS NULL OR operation_id<>$4) RETURNING revision",
+                parameters).await
+        }).await?;
+        if row.is_some() {
+            return Ok(CasResult::Applied(Stored {
+                epoch: epoch.to_owned(),
+                config: next,
+            }));
+        }
+        resolve_operation_cas(
+            self.load_stored_with_proof().await,
+            epoch,
+            &next,
+            &stamp,
+            uncertain,
+        )
     }
 
     async fn publish_challenge(
@@ -1750,6 +2156,134 @@ mod tests {
         };
         config.settings.allow_dot_segments = Some(dot_segments);
         config
+    }
+
+    fn test_stamp(id: char, config: &Config) -> OperationStamp {
+        OperationStamp {
+            authority_id: "a".repeat(32),
+            operation_id: id.to_string().repeat(32),
+            candidate_sha256: sha256_hex(encode(config).unwrap().as_bytes()),
+        }
+    }
+
+    #[test]
+    fn operation_resolver_requires_exact_stamp_even_for_identical_document() {
+        let next = document(1, false);
+        let encoded = encode(&next).unwrap();
+        let epoch = new_epoch().unwrap();
+        let first = test_stamp('b', &next);
+        let second = test_stamp('c', &next);
+        let current = || {
+            Ok(Some((
+                Stored {
+                    epoch: epoch.clone(),
+                    config: next.clone(),
+                },
+                encoded.clone(),
+                Some(OperationMetadata {
+                    revision: 1,
+                    stamp: first.clone(),
+                }),
+            )))
+        };
+        assert!(matches!(
+            resolve_operation_cas(current(), &epoch, &next, &first, false).unwrap(),
+            CasResult::Applied(_)
+        ));
+        assert!(matches!(
+            resolve_operation_cas(current(), &epoch, &next, &second, false).unwrap(),
+            CasResult::Conflict { .. }
+        ));
+        assert!(matches!(
+            resolve_operation_cas(current(), &epoch, &next, &second, true).unwrap_err(),
+            StoreError::Indeterminate(_)
+        ));
+        let different = document(2, true);
+        assert!(matches!(
+            resolve_operation_cas(current(), &epoch, &different, &first, false).unwrap_err(),
+            StoreError::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_operation_stamp(&first, &encode(&different).unwrap()),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_current_operation_proof_is_atomic_and_old_writer_is_unproven() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.db");
+        let store = SqliteConfigStore::open(&path).await.unwrap();
+        assert!(store.supports_operation_cas());
+        let initial = store.bootstrap(document(0, false)).await.unwrap();
+        let next = document(1, false);
+        let stamp = test_stamp('b', &next);
+        let first = store
+            .compare_and_swap_operation(&initial.epoch, 0, document(0, false), stamp.clone())
+            .await
+            .unwrap();
+        assert!(matches!(first, CasResult::Applied(_)));
+        assert_eq!(
+            store.load_current_operation_proof().await.unwrap(),
+            Some(OperationProof {
+                epoch: initial.epoch.clone(),
+                revision: 1,
+                stamp: stamp.clone()
+            })
+        );
+        assert!(matches!(
+            store
+                .compare_and_swap_operation(&initial.epoch, 0, document(0, false), stamp.clone())
+                .await
+                .unwrap(),
+            CasResult::Applied(_)
+        ));
+        assert!(matches!(
+            store
+                .compare_and_swap_operation(
+                    &initial.epoch,
+                    0,
+                    document(0, false),
+                    test_stamp('c', &next)
+                )
+                .await
+                .unwrap(),
+            CasResult::Conflict { .. }
+        ));
+        assert!(matches!(
+            store
+                .compare_and_swap_operation(
+                    &initial.epoch,
+                    1,
+                    document(0, true),
+                    test_stamp('b', &document(2, true))
+                )
+                .await
+                .unwrap_err(),
+            StoreError::Invalid(_)
+        ));
+        // A pre-upgrade SQL writer advances revision but does not know the
+        // optional stamp columns. Their stale values cannot prove its write.
+        let old_writer = rusqlite::Connection::open(&path).unwrap();
+        old_writer
+            .execute(
+                "UPDATE hangang_config SET revision=2,config_json=?1 WHERE singleton=1",
+                rusqlite::params![encode(&document(2, true)).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(store.load_current_operation_proof().await.unwrap(), None);
+        assert_eq!(
+            store.load_latest().await.unwrap().unwrap().config,
+            document(2, true)
+        );
+        assert!(matches!(
+            store
+                .compare_and_swap(&initial.epoch, 2, document(0, false))
+                .await
+                .unwrap(),
+            CasResult::Applied(_)
+        ));
+        assert_eq!(store.load_current_operation_proof().await.unwrap(), None);
     }
 
     /// F5: a legacy reader that loses the race against a wipe-and-reseed
