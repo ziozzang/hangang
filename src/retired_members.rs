@@ -267,6 +267,53 @@ mod tests {
     }
 
     #[test]
+    fn lease_started_after_reservation_is_retained_at_commit() {
+        let registry = registry(1);
+        let gate = Arc::new(MemberAdmission::serving());
+        let reservation = registry.reserve(1).unwrap();
+        assert_eq!(gate.active(), 0);
+        let lease = gate.lease().unwrap();
+        reservation.commit(vec![tcp_record("racing", &gate)]);
+        assert!(!gate.is_open());
+        assert_eq!(registry.snapshot()[0].active_admissions, 1);
+        drop(lease);
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn overlapping_reservations_preallocate_all_commits() {
+        let registry = registry(16);
+        let gates: Vec<_> = (0..16)
+            .map(|_| Arc::new(MemberAdmission::serving()))
+            .collect();
+        let leases: Vec<_> = gates.iter().map(|gate| gate.lease().unwrap()).collect();
+        let first = registry.reserve(8).unwrap();
+        let second = registry.reserve(8).unwrap();
+        let allocated = registry.inner.lock().unwrap().records.capacity();
+        assert!(allocated >= 16);
+        second.commit(
+            gates[8..]
+                .iter()
+                .enumerate()
+                .map(|(index, gate)| tcp_record(&format!("second-{index}"), gate))
+                .collect(),
+        );
+        first.commit(
+            gates[..8]
+                .iter()
+                .enumerate()
+                .map(|(index, gate)| tcp_record(&format!("first-{index}"), gate))
+                .collect(),
+        );
+        let inner = registry.inner.lock().unwrap();
+        assert_eq!(inner.records.len(), 16);
+        assert_eq!(inner.records.capacity(), allocated);
+        drop(inner);
+        drop(leases);
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
     fn concurrent_reservations_share_one_capacity_budget() {
         let registry = registry(1);
         let barrier = Arc::new(Barrier::new(3));
