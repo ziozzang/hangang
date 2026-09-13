@@ -177,6 +177,72 @@ test('Korean JWT controls and raw public JWKS remain readable', async ({ page })
   await expect(page.locator('#route-field-jwt_local_jwks')).toHaveValue(/"kid": "fixture"/);
 });
 
+test('native revocation controls preserve exact token IDs and allow an explicit clear', async ({ page }) => {
+  const initial = structuredClone(baseRoute);
+  initial.jwt_auth.verification.revocation = { issued_before: 1700000000, token_ids: ['first-id', 'id with space'] };
+  const { writes } = await fixture(page, initial);
+  await edit(page);
+  await reveal(page, 'jwt_issued_before');
+  await expect(page.locator('#route-field-jwt_issued_before')).toHaveValue('1700000000');
+  await expect(page.locator('#route-field-jwt_token_ids')).toHaveValue('first-id\nid with space');
+  await page.locator('#route-field-priority').fill('9');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-dialog')).toBeHidden();
+  expect(writes[0].jwt_auth.verification.revocation).toEqual(initial.jwt_auth.verification.revocation);
+
+  await edit(page);
+  await reveal(page, 'jwt_issued_before');
+  await page.locator('#route-field-jwt_issued_before').fill('');
+  await page.locator('#route-field-jwt_token_ids').fill('');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-dialog')).toBeHidden();
+  expect(writes[1].jwt_auth.verification).not.toHaveProperty('revocation');
+  expect(writes[1].jwt_auth.keys).toEqual(initial.jwt_auth.keys);
+});
+
+test('advanced JWT revocation JSON survives an unrelated native edit', async ({ page }) => {
+  const { writes } = await fixture(page);
+  await edit(page);
+  await page.locator('.advanced-editor summary').click();
+  const draft = structuredClone(baseRoute);
+  draft.jwt_auth.verification.revocation = { issued_before: 253402300799, token_ids: ['exact-α', 'exact-id'] };
+  await page.locator('#route-json').fill(JSON.stringify(draft));
+  await expect(page.locator('#route-field-jwt_issued_before')).toHaveValue('253402300799');
+  await expect(page.locator('#route-field-jwt_token_ids')).toHaveValue('exact-α\nexact-id');
+  await page.locator('#route-field-priority').fill('4');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-dialog')).toBeHidden();
+  expect(writes[0].jwt_auth).toEqual(draft.jwt_auth);
+});
+
+test('invalid duplicate, whitespace and out-of-range JWT revocation inputs do not publish', async ({ page }) => {
+  const { writes } = await fixture(page);
+  await edit(page);
+  await reveal(page, 'jwt_token_ids');
+  await page.locator('#route-field-jwt_token_ids').fill('same-id\nsame-id');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-message')).toContainText('at most 1,024 distinct exact values');
+  expect(writes).toHaveLength(0);
+  await page.locator('#route-field-jwt_token_ids').fill(' leading-space');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-message')).toContainText('without surrounding whitespace');
+  expect(writes).toHaveLength(0);
+  await page.locator('#route-field-jwt_token_ids').fill('valid-id');
+  await page.locator('#route-field-jwt_issued_before').fill('253402300800');
+  await page.locator('#save-route').click();
+  await expect(page.locator('#route-message')).toContainText('Reject tokens issued before');
+  expect(writes).toHaveLength(0);
+});
+
+test('Korean revocation controls explain publication and exact jti values', async ({ page }) => {
+  await fixture(page, baseRoute, 'ko');
+  await page.locator('[data-route-id="jwt-route"]').getByRole('button', { name: '편집' }).click();
+  await reveal(page, 'jwt_issued_before');
+  await expect(page.locator('label[for="route-field-jwt_issued_before"]')).toContainText('이 시각 이전 발급 토큰 거부');
+  await expect(page.locator('label[for="route-field-jwt_token_ids"]')).toContainText('거부할 토큰 ID');
+  await expect(page.locator('#route-field-jwt_token_ids-help')).toContainText('Bearer 토큰을 입력하지 마세요');
+});
+
 for (const locale of ['en', 'ko']) {
   test(`JWT lease counter exposes unavailable and refreshed evidence in ${locale}`, async ({ page }) => {
     const control = await fixture(page, baseRoute, locale);

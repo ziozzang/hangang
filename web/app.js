@@ -1647,6 +1647,7 @@ function updateJwtControls(form) {
 function jwtSection(route) {
   const jwt = isObject(route.jwt_auth) ? route.jwt_auth : null;
   const verification = isObject(jwt?.verification) ? jwt.verification : {};
+  const revocation = isObject(verification.revocation) ? verification.revocation : {};
   const keys = isObject(jwt?.keys) ? jwt.keys : {};
   const remote = isObject(keys.config) ? keys.config : {};
   const endpoint = isObject(remote.endpoint) ? remote.endpoint : {};
@@ -1656,7 +1657,7 @@ function jwtSection(route) {
   keySource.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
   endpointKind.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
   return section({ title: 'JWT access token', configured: Boolean(jwt),
-    note: 'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access. Long uploads, SSE and WebSocket streams end when the token expires (including leeway), its signing key is withdrawn, or this route changes. This does not provide per-token online revocation.', fields: [
+    note: 'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access. Long uploads, SSE and WebSocket streams end when the token expires (including leeway), its signing key is withdrawn, or this route changes. Revocation edits take effect on configuration publication; removing a rule may reallow an unexpired token. Issuer logout is not synchronized automatically.', fields: [
       span2(field('Enable JWT authentication', 'jwt_auth_enabled', Boolean(jwt), { checkbox: true, toggles: 'jwt_auth', help: 'When off, the existing route remains unchanged until saved. A configured JWT policy disables route response caching.' })),
       span2(field('Issuer', 'jwt_issuer', verification.issuer ?? '', { group: 'jwt_auth', maxlength: 512, placeholder: 'https://issuer.example.test/', help: 'Exact HTTPS issuer including its path and trailing slash; must equal the signed iss claim.' })),
       span2(field('Audiences', 'jwt_audiences', Array.isArray(verification.audiences) ? verification.audiences.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One expected resource audience per line, 1–8 distinct values. The signed aud claim must contain one.' })),
@@ -1668,6 +1669,8 @@ function jwtSection(route) {
       field('Groups claim', 'jwt_groups_claim', verification.groups_claim ?? 'groups', { group: 'jwt_auth', maxlength: 64, help: 'Claim name containing a group array.' }),
       field('Required scopes', 'jwt_required_scopes', Array.isArray(verification.required_scopes) ? verification.required_scopes.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One exact scope per line. All listed scopes are required; blank adds no scope condition.' }),
       field('Required groups', 'jwt_required_groups', Array.isArray(verification.required_groups) ? verification.required_groups.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One exact group per line. All listed groups are required; blank adds no group condition.' }),
+      field('Reject tokens issued before (Unix seconds)', 'jwt_issued_before', revocation.issued_before ?? '', { group: 'jwt_auth', type: 'number', min: 0, max: 253402300799, help: 'Optional UTC Unix-second cutoff. Tokens with iat earlier than this value are rejected; an equal iat is allowed. Clock leeway does not soften this cutoff. Save the route to publish it.' }),
+      span2(field('Denied token IDs (jti)', 'jwt_token_ids', Array.isArray(revocation.token_ids) ? revocation.token_ids.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One exact signed jti per line, up to 1,024 distinct IDs of 255 UTF-8 bytes each. Do not enter bearer tokens. Saving the route retires existing route streams.' })),
       keySource,
       span2(field('Local public JWKS JSON', 'jwt_local_jwks', keys.source === 'local' && isObject(keys.jwks) ? JSON.stringify(keys.jwks, null, 2) : '', { group: 'jwt_local', textarea: true, help: 'A public {"keys":[...]} document; at most 32 signing keys and 128 KiB. Private JWK fields are rejected by the server.' })),
       endpointKind,
@@ -2131,6 +2134,17 @@ function jwtFromForm(form, previous) {
     max_lifetime_seconds: readInteger(form, 'jwt_max_lifetime_seconds', 'Maximum token lifetime', { min: 1, max: 86400 }),
     scope_claim: scopeClaim, groups_claim: groupsClaim,
     required_scopes: requiredScopes, required_groups: requiredGroups };
+  const issuedBefore = readInteger(form, 'jwt_issued_before', 'Reject tokens issued before (Unix seconds)', { min: 0, max: 253402300799, optional: true });
+  const tokenIds = form.elements['jwt_token_ids'].value.split('\n').filter((id) => id.length > 0);
+  if (tokenIds.length > 1024 || new Set(tokenIds).size !== tokenIds.length || tokenIds.some((id) =>
+    new TextEncoder().encode(id).length > 255 || id.trim() !== id || [...id].some((char) => /\p{Cc}/u.test(char))))
+    throw new Error(t('JWT denied token IDs need at most 1,024 distinct exact values of 255 bytes without surrounding whitespace or control characters'));
+  if (issuedBefore !== null || tokenIds.length) {
+    const revocation = { ...(isObject(verification.revocation) ? verification.revocation : {}), token_ids: tokenIds };
+    if (issuedBefore === null) delete revocation.issued_before;
+    else revocation.issued_before = issuedBefore;
+    verification.revocation = revocation;
+  } else delete verification.revocation;
   const source = value('jwt_key_source');
   let keys;
   if (source === 'local') {
@@ -2595,6 +2609,8 @@ function syncRouteControlsFromJson() {
     set('jwt_groups_claim', verification.groups_claim ?? 'groups');
     set('jwt_required_scopes', Array.isArray(verification.required_scopes) ? verification.required_scopes.join('\n') : verification.required_scopes);
     set('jwt_required_groups', Array.isArray(verification.required_groups) ? verification.required_groups.join('\n') : verification.required_groups);
+    set('jwt_issued_before', verification.revocation?.issued_before);
+    set('jwt_token_ids', Array.isArray(verification.revocation?.token_ids) ? verification.revocation.token_ids.join('\n') : '');
     set('jwt_key_source', keys.source ?? 'local');
     set('jwt_local_jwks', keys.jwks === undefined ? '' : JSON.stringify(keys.jwks, null, 2));
     set('jwt_endpoint_kind', endpoint.kind ?? 'oidc');
