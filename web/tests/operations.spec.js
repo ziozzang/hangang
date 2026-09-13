@@ -102,6 +102,18 @@ test('TCP health rows describe transport probes rather than application health',
   await expect(failed).toContainText('관찰된 연결 실패로 선택 제외');
 });
 
+test('named members show stable ID, configured address and effective weight in both languages', async ({ page }) => {
+  await fixture(page, false, [{ ...first, member_id: 'blue-1', address: 'http://192.0.2.10:8080', weight: 7 }]);
+  await page.locator('a[href="#operations"]').click();
+  const row = page.locator('#operations-rows tr').first();
+  await expect(row).toContainText('Member blue-1 · #1');
+  await expect(row).toContainText('http://192.0.2.10:8080');
+  await expect(row).toContainText('weight 7');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(row).toContainText('멤버 blue-1 · #1');
+  await expect(row).toContainText('가중치 7');
+});
+
 test('operations view shows real local eligibility, bounded paging and escaped target addresses', async ({ page }) => {
   const calls = await fixture(page);
   await page.locator('a[href="#operations"]').click();

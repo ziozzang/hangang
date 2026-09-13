@@ -64,4 +64,5 @@ export default {
   'Invalid operations response.': '운영 API 응답이 올바르지 않습니다.',
   'Could not load operations.': '운영 정보를 불러올 수 없습니다.',
   'Refresh failed; showing last loaded snapshot. {error}': '새로고침에 실패하여 이전에 불러온 정보를 표시합니다. {error}',
+  'Member {id} · #{index}': '멤버 {id} · #{index}',
 };

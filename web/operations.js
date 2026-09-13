@@ -70,7 +70,9 @@ function renderRows(rows) {
       : row.match_host || t('Any host')));
     const target = node('td');
     target.append(node('code', 'operations-address', row.address || '—'));
-    target.append(node('span', 'operations-secondary', `${String(row.protocol || '').toUpperCase()} · #${Number(row.backend_index) + 1}`));
+    target.append(node('span', 'operations-secondary', row.member_id
+      ? t('Member {id} · #{index}', { id: row.member_id, index: Number(row.backend_index) + 1 })
+      : `${String(row.protocol || '').toUpperCase()} · #${Number(row.backend_index) + 1}`));
     const selection = node('td');
     const inactive = row.enabled === false;
     selection.append(node('span', `operations-eligibility ${!inactive && row.available ? 'is-eligible' : 'is-excluded'}`,

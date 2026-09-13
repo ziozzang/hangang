@@ -1154,9 +1154,11 @@ function routeMatch(type, route) {
   return names.length ? names.join(', ') : (route.listen || t('Any TCP'));
 }
 
+function backendAddress(backend) { return typeof backend === 'string' ? backend : backend?.address || ''; }
+
 function routeSearchText(type, route) {
   return [route.id, routeMatch(type, route), ...(route.hosts || []), route.listen, route.path_prefix, route.upstream_host,
-    route.upstream?.connect_address, route.upstream?.unix_socket, ...(route.backends || [])].filter(Boolean).join(' ').toLowerCase();
+    route.upstream?.connect_address, route.upstream?.unix_socket, ...(route.backends || []).flatMap((backend) => [backendAddress(backend), backend?.id])].filter(Boolean).join(' ').toLowerCase();
 }
 
 function routeHasPolicy(type, route, policy) {
@@ -1187,7 +1189,7 @@ function updateRouteInventory(type, content, pagination, count) {
     if (settings.sort.startsWith('priority')) order = (Number(a.route.priority) || 0) - (Number(b.route.priority) || 0);
     else if (settings.sort.startsWith('match')) order = compareText(routeMatch(type, a.route), routeMatch(type, b.route));
     else if (settings.sort.startsWith('id')) order = compareText(a.route.id, b.route.id);
-    else if (settings.sort.startsWith('upstream')) order = compareText(a.route.backends?.[0], b.route.backends?.[0]);
+    else if (settings.sort.startsWith('upstream')) order = compareText(backendAddress(a.route.backends?.[0]), backendAddress(b.route.backends?.[0]));
     if (settings.sort.endsWith('desc')) order = -order;
     return order || a.index - b.index;
   });
@@ -1257,7 +1259,7 @@ function routeRow(type, route) {
   const match = routeMatch(type, route);
   const matchDetail = type === 'http' ? `${route.path_match === 'exact' ? t('Exact ') : ''}${route.path_prefix || '/'}` : (route.sni ? t('Listen {address}', { address: route.listen || '—' }) : t('Any TCP connection'));
   const backends = route.backends || [];
-  const upstream = cell(backends[0] || '—', backends.length > 1 ? t(backends.length === 2 ? '+{count} more backend' : '+{count} more backends', { count: backends.length - 1 }) : ''); upstream.className = 'route-upstream-cell';
+  const upstream = cell(backendAddress(backends[0]) || '—', backends.length > 1 ? t(backends.length === 2 ? '+{count} more backend' : '+{count} more backends', { count: backends.length - 1 }) : ''); upstream.className = 'route-upstream-cell';
   const policy = document.createElement('td'); policy.className = 'route-policy-cell'; const tags = routeSummaryTags(type, route); if (type === 'tcp' && route.sni) tags.unshift('SNI');
   policy.append(...tags.slice(0, 3).map(tagNode)); if (tags.length > 3) policy.append(tagNode(`+${tags.length - 3}`)); if (!tags.length) policy.textContent = '—';
   const action = document.createElement('td'); const edit = document.createElement('button'); edit.className = 'button button-secondary'; edit.type = 'button'; edit.textContent = t('Edit'); edit.addEventListener('click', () => openRoute(type, route)); action.append(edit);
@@ -1331,6 +1333,7 @@ async function openRoute(type, route = null) {
   destroyLuaEditors();
   $('#route-form-fields').replaceChildren(buildRouteFields(type, value));
   applyGroupToggles($('#route-form'));
+  updateBackendModeUi();
   $('#route-json').value = JSON.stringify(value, null, 2);
   $('.advanced-editor', $('#route-dialog')).open = false;
   $('#route-dialog').showModal();
@@ -1359,6 +1362,131 @@ function dockerButton() {
   const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-quiet'; copy(button, 'Resolve Docker backend…');
   button.addEventListener('click', () => { message($('#docker-message')); $('#docker-dialog').showModal(); });
   wrap.append(button); return wrap;
+}
+
+let memberControlSequence = 0;
+const MEMBER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function memberRow(member = {}, sourceIndex = -1) {
+  const row = document.createElement('div'); row.className = 'backend-member-row'; row.dataset.sourceIndex = String(sourceIndex);
+  const id = field('Member ID', `member_id_${++memberControlSequence}`, member.id || '', { required: true, maxlength: 64, help: 'Stable within this route; 1–64 ASCII letters, digits, dots, underscores or dashes. Starts with a letter or digit.' });
+  const address = field('Member address', `member_address_${memberControlSequence}`, member.address || '', { required: true, help: 'HTTP(S) URL, host:port for TCP, or docker://container/network/port.' });
+  const weight = field('Member weight', `member_weight_${memberControlSequence}`, member.weight ?? 1, { type: 'number', min: 1, max: 1000, required: true, help: '1–1,000. Weight 1 is the default.' });
+  id.querySelector('input').classList.add('backend-member-id');
+  address.querySelector('input').classList.add('backend-member-address');
+  weight.querySelector('input').classList.add('backend-member-weight');
+  const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet backend-member-remove'; copy(remove, 'Remove member');
+  remove.addEventListener('click', () => { row.remove(); syncRouteJsonFromForm(); });
+  row.append(id, address, weight, remove);
+  return row;
+}
+
+function nextMemberId(rows) {
+  const used = new Set([...rows.querySelectorAll('.backend-member-id')].map((input) => input.value));
+  for (let number = 1; number <= 128; number++) if (!used.has(`member-${number}`)) return `member-${number}`;
+  throw new Error(t('At most 128 members are allowed'));
+}
+
+function updateBackendModeUi() {
+  const editor = $('#route-form .backend-editor'); if (!editor) return;
+  const named = editor.dataset.mode === 'named';
+  editor.querySelector('.backend-legacy').hidden = named;
+  editor.querySelector('.backend-named').hidden = !named;
+  editor.querySelector('.backend-legacy textarea').disabled = named;
+  for (const input of editor.querySelectorAll('.backend-named input')) input.disabled = !named;
+  const convert = editor.querySelector('.backend-convert');
+  copy(convert, named ? 'Convert to legacy addresses' : 'Convert to named members');
+  const weights = $('#route-form [name="balance_weights"]');
+  if (weights) { weights.disabled = named; weights.closest('.field').hidden = named; }
+}
+
+function readBackendValues(base) {
+  const editor = $('#route-form .backend-editor');
+  if (editor?.dataset.mode === 'invalid') throw new Error(t('Backends must be all addresses or all named members'));
+  if (editor?.dataset.mode !== 'named') {
+    const values = nonemptyLines($('#route-form [name="backends"]').value);
+    if (values.length < 1 || values.length > 128) throw new Error(t('Backends must list 1–128 entries'));
+    return values;
+  }
+  const rows = [...editor.querySelectorAll('.backend-member-row')];
+  if (rows.length < 1 || rows.length > 128) throw new Error(t('Backends must list 1–128 entries'));
+  const ids = new Set(); const addresses = new Set();
+  return rows.map((row) => {
+    const index = Number(row.dataset.sourceIndex);
+    const previous = Number.isInteger(index) && index >= 0 && isObject(base?.[index]) ? base[index] : {};
+    const id = row.querySelector('.backend-member-id').value.trim();
+    const address = row.querySelector('.backend-member-address').value.trim();
+    const rawWeight = row.querySelector('.backend-member-weight').value.trim();
+    if (!MEMBER_ID.test(id)) throw new Error(t('Member ID must be 1–64 ASCII characters, starting with a letter or digit'));
+    if (ids.has(id)) throw new Error(t('Member IDs must be unique within a route'));
+    if (!address) throw new Error(t('Member address is required'));
+    if (addresses.has(address)) throw new Error(t('Member addresses must be unique within a route'));
+    if (!/^\d+$/.test(rawWeight) || Number(rawWeight) < 1 || Number(rawWeight) > 1000) throw new Error(t('Member weight must be a whole number from 1 to 1,000'));
+    if (previous.desired_state !== undefined && previous.desired_state !== 'serving') throw new Error(t('Only serving members are supported in this release'));
+    ids.add(id); addresses.add(address);
+    const member = { ...previous, id, address };
+    const weight = Number(rawWeight);
+    if (weight !== 1 || Object.hasOwn(previous, 'weight')) member.weight = weight;
+    return member;
+  });
+}
+
+function syncBackendControlsFromJson(draft) {
+  const editor = $('#route-form .backend-editor'); if (!editor || !Array.isArray(draft.backends)) return;
+  const backends = draft.backends;
+  const named = backends.length > 0 && backends.every(isObject);
+  const legacy = backends.length > 0 && backends.every((value) => typeof value === 'string');
+  editor.dataset.mode = named ? 'named' : legacy ? 'legacy' : 'invalid';
+  if (named) editor.querySelector('.backend-member-list').replaceChildren(...backends.map((member, index) => memberRow(member, index)));
+  if (legacy) editor.querySelector('[name="backends"]').value = backends.join('\n');
+  updateBackendModeUi();
+}
+
+function backendFields(type, route) {
+  const editor = document.createElement('div'); editor.className = 'backend-editor span-2';
+  const named = Array.isArray(route.backends) && route.backends.length > 0 && route.backends.every(isObject);
+  editor.dataset.mode = named ? 'named' : 'legacy';
+  const legacy = field('Backends', 'backends', named ? '' : (route.backends || []).join('\n'), { required: true, textarea: true, help: type === 'http'
+    ? 'One http:// or https:// URL per line (or docker://container/network/port); 1–128 entries.'
+    : 'One host:port per line (or docker://container/network/port); 1–128 entries.' });
+  legacy.classList.add('backend-legacy'); legacy.hidden = named;
+  const namedWrap = document.createElement('div'); namedWrap.className = 'backend-named'; namedWrap.hidden = !named;
+  const note = document.createElement('p'); note.className = 'field-help-inline'; copy(note, 'Named members keep stable IDs and per-member weights. Only serving is supported in this release. Local-file configuration authority is required; shared stores reject named members.');
+  const rows = document.createElement('div'); rows.className = 'backend-member-list';
+  if (named) rows.append(...route.backends.map((member, index) => memberRow(member, index)));
+  const add = document.createElement('button'); add.type = 'button'; add.className = 'button button-quiet backend-member-add'; copy(add, 'Add member');
+  add.addEventListener('click', () => { try { rows.append(memberRow({ id: nextMemberId(rows), address: '' })); syncRouteJsonFromForm(); } catch (error) { message($('#route-message'), error.message, 'error'); } });
+  namedWrap.append(note, rows, add);
+  const convert = document.createElement('button'); convert.type = 'button'; convert.className = 'button button-secondary backend-convert'; copy(convert, named ? 'Convert to legacy addresses' : 'Convert to named members');
+  const help = document.createElement('p'); help.className = 'field-help-inline'; copy(help, 'Conversion changes member identity and may reset health qualification. String routes remain unchanged until you explicitly convert.');
+  convert.addEventListener('click', () => {
+    try {
+      const draft = JSON.parse($('#route-json').value);
+      if (!isObject(draft)) throw new Error(t('A route must be a JSON object.'));
+      if (editor.dataset.mode === 'invalid') throw new Error(t('Backends must be all addresses or all named members'));
+      if (editor.dataset.mode === 'named') {
+        const members = readBackendValues(draft.backends);
+        const weights = members.map((member) => member.weight ?? 1);
+        if (type === 'tcp' && weights.some((weight) => weight !== 1)) throw new Error(t('TCP member weights cannot be preserved in legacy address mode'));
+        draft.backends = members.map((member) => member.address);
+        if (type === 'http') draft.balance = { ...(isObject(draft.balance) ? draft.balance : {}), weights: weights.every((weight) => weight === 1) ? [] : weights };
+      } else {
+        const addresses = nonemptyLines(legacy.querySelector('textarea').value);
+        if (addresses.length < 1 || addresses.length > 128) throw new Error(t('Backends must list 1–128 entries'));
+        if (new Set(addresses).size !== addresses.length) throw new Error(t('Member addresses must be unique within a route'));
+        const weights = type === 'http' ? parseWeights($('#route-form [name="balance_weights"]').value.trim()) : [];
+        if (weights.length && weights.length !== addresses.length) throw new Error(t('Backend weights must list exactly {count} values, one per backend', { count: addresses.length }));
+        draft.backends = addresses.map((address, index) => ({ id: `member-${index + 1}`, address, ...(weights[index] && weights[index] !== 1 ? { weight: weights[index] } : {}) }));
+        if (type === 'http') draft.balance = { ...(isObject(draft.balance) ? draft.balance : {}), weights: [] };
+      }
+      $('#route-json').value = JSON.stringify(draft, null, 2);
+      syncRouteControlsFromJson();
+      delete $('#route-form').dataset.invalidNative;
+      message($('#route-message'));
+    } catch (error) { message($('#route-message'), error.message, 'error'); }
+  });
+  editor.append(legacy, namedWrap, convert, help);
+  return editor;
 }
 
 function upstreamSection(type, route) {
@@ -1459,7 +1587,7 @@ function httpSections(route) {
       span2(field('Require TLS', 'require_tls', Boolean(route.require_tls), { checkbox: true, help: 'Plaintext requests (by terminated transport or, behind a trusted proxy, X-Forwarded-Proto) are answered with the HTTPS redirect configured by --https-redirect-code instead of being proxied.' })),
     ] }),
     section({ title: 'Backends', open: true, fields: [
-      span2(field('Backends', 'backends', (route.backends || []).join('\n'), { required: true, textarea: true, help: 'One http:// or https:// URL per line (or docker://container/network/port); 1–128 entries.' })),
+      backendFields('http', route),
       field('Upstream Host override', 'upstream_host', route.upstream_host || '', { placeholder: 'foo.bar', help: 'HTTP Host / HTTP/2 authority sent upstream; TLS SNI is configured under Upstream connection.' }),
       field('Concurrent request limit', 'max_requests', route.max_requests ?? '', { type: 'number', min: 1, max: 1000000, help: 'Optional, 1–1,000,000. Blank uses only the global limit.' }),
       field('Upstream timeout (ms)', 'upstream_timeout_ms', route.upstream_timeout_ms ?? '', { type: 'number', min: 1, max: 86400000, help: 'Time budget for the upstream to return response headers (upload plus first byte), 1–86,400,000 ms. Blank uses --upstream-timeout-seconds.' }),
@@ -1469,7 +1597,7 @@ function httpSections(route) {
     ] }),
     section({ title: 'Load balancing', configured: Boolean((balance.mode && balance.mode !== 'round_robin') || (balance.weights || []).length || health), note: 'Legacy failure cooldown conflicts with active health checks. Clear both legacy health fields before enabling active probes.', fields: [
       field('Balancing mode', 'balance_mode', balance.mode || 'round_robin', { select: [['round_robin', 'Round robin (weighted)'], ['least_connections', 'Least connections (weighted)']] }),
-      field('Backend weights', 'balance_weights', (balance.weights || []).join(', '), { placeholder: '3, 1, 1', help: 'Comma-separated, one per backend in order, 1–1,000 each. Blank gives every backend weight 1.' }),
+      field('Backend weights', 'balance_weights', (balance.weights || []).join(', '), { placeholder: '3, 1, 1', help: 'Legacy address mode only. Comma-separated, one per backend in order, 1–1,000 each. Named members carry their own weights.' }),
       field('Failure threshold', 'health_failure_threshold', health?.failure_threshold ?? '', { type: 'number', min: 1, max: 100, help: 'Consecutive connection failures or HTTP 5xx responses before a backend is skipped (1–100). Both legacy health fields are required together.' }),
       field('Cooldown (ms)', 'health_cooldown_ms', health?.cooldown_ms ?? '', { type: 'number', min: 10, max: 300000, help: 'How long a failed backend stays skipped, 10–300,000 ms.' }),
     ] }),
@@ -1553,7 +1681,7 @@ function tcpSections(route) {
       field('ClientHello timeout (ms)', 'sni_hello_timeout_ms', sni?.hello_timeout_ms ?? '', { type: 'number', min: 1, max: 30000, placeholder: '3000', help: '1–30,000 ms to receive the ClientHello.' }),
     ] }),
     section({ title: 'Backends', open: true, fields: [
-      span2(field('Backends', 'backends', (route.backends || []).join('\n'), { required: true, textarea: true, help: 'One host:port per line (or docker://container/network/port); 1–128 entries.' })),
+      backendFields('tcp', route),
       dockerButton(),
     ] }),
     section({ title: 'TCP connection health checks', configured: Boolean(health), note: 'A probe opens an outbound connection (including configured DNS, SOCKS5 and TLS handshake), then closes it without sending application bytes. It checks transport reachability, not application health.', fields: [
@@ -1743,8 +1871,7 @@ function routeFromForm() {
   route.id = text('id');
   if (checked('enabled')) delete route.enabled; else route.enabled = false;
   route.priority = integer('priority', 'Matching priority', { min: -2147483648, max: 2147483647 });
-  route.backends = lines('backends');
-  if (!route.backends.length || route.backends.length > 128) throw new Error(t('Backends must list 1–128 entries'));
+  route.backends = readBackendValues(route.backends);
   route.deny_cidrs = lines('deny_cidrs');
   if (route.deny_cidrs.length > 1024) throw new Error(t('At most 1,024 denied CIDRs are allowed'));
   for (const cidr of route.deny_cidrs) if (!/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr)) throw new Error(t('Denied CIDR must be address/prefix: {cidr}', { cidr }));
@@ -1774,7 +1901,7 @@ function routeFromForm() {
     if (tls.ca_file && tls.insecure_skip_verify) throw new Error(t('Upstream TLS CA file cannot be combined with skipped certificate verification'));
     tls.max_fragment_size = integer('tls_max_fragment_size', 'TLS maximum fragment size', { min: 128, max: 16389, optional: true });
     upstream.tls = tls;
-    if (type === 'http' && !route.backends.every((backend) => backend.startsWith('https://'))) throw new Error(t('Upstream TLS options require every backend to use https://'));
+    if (type === 'http' && !route.backends.every((backend) => backendAddress(backend).startsWith('https://'))) throw new Error(t('Upstream TLS options require every backend to use https://'));
   } else upstream.tls = null;
   route.upstream = upstream;
 
@@ -1806,8 +1933,13 @@ function routeFromForm() {
 
     const balance = isObject(route.balance) ? route.balance : {};
     balance.mode = raw('balance_mode');
-    balance.weights = parseWeights(text('balance_weights'));
-    if (balance.weights.length && balance.weights.length !== route.backends.length) throw new Error(t(route.backends.length === 1 ? 'Backend weights must list exactly {count} value, one per backend' : 'Backend weights must list exactly {count} values, one per backend', { count: route.backends.length }));
+    if ($('#route-form .backend-editor').dataset.mode === 'named') {
+      if (Array.isArray(balance.weights) && balance.weights.length) throw new Error(t('Named members cannot also use legacy backend weights'));
+      balance.weights = [];
+    } else {
+      balance.weights = parseWeights(text('balance_weights'));
+      if (balance.weights.length && balance.weights.length !== route.backends.length) throw new Error(t(route.backends.length === 1 ? 'Backend weights must list exactly {count} value, one per backend' : 'Backend weights must list exactly {count} values, one per backend', { count: route.backends.length }));
+    }
     const threshold = integer('health_failure_threshold', 'Failure threshold', { min: 1, max: 100, optional: true });
     const cooldown = integer('health_cooldown_ms', 'Cooldown', { min: 10, max: 300000, optional: true });
     if ((threshold === null) !== (cooldown === null)) throw new Error(t('Passive health needs both a failure threshold and a cooldown'));
@@ -1822,7 +1954,7 @@ function routeFromForm() {
       if (initial === 'checking') active.initial_state = 'checking';
       else if (initial === 'healthy') delete active.initial_state;
       else throw new Error(t('Select a valid initial probe state'));
-      if (initial === 'checking' && route.backends.some((backend) => backend.startsWith('docker://')))
+      if (initial === 'checking' && route.backends.some((backend) => backendAddress(backend).startsWith('docker://')))
         throw new Error(t('Checking startup does not support docker:// backends; use HTTP or HTTPS backends'));
       active.path = text('active_health_path');
       if (active.path.length > 256 || !/^\/[\x21-\x7e]*$/.test(active.path) || /[?#]/.test(active.path)) throw new Error(t('Probe path must be a printable absolute path without query or fragment'));
@@ -1964,12 +2096,23 @@ function routeFromForm() {
   }
   return route;
 }
-function syncRouteJsonFromForm() { try { $('#route-json').value = JSON.stringify(routeFromForm(), null, 2); delete $('#route-form').dataset.invalidNative; message($('#route-message')); } catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); } }
+function syncRouteJsonFromForm() {
+  try {
+    $('#route-json').value = JSON.stringify(routeFromForm(), null, 2);
+    // Subsequent edits use the newly serialized array as their preservation
+    // basis. After a removal its positions differ from the original document.
+    const editor = $('#route-form .backend-editor');
+    if (editor?.dataset.mode === 'named') for (const [index, row] of [...editor.querySelectorAll('.backend-member-row')].entries()) row.dataset.sourceIndex = String(index);
+    delete $('#route-form').dataset.invalidNative;
+    message($('#route-message'));
+  } catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); }
+}
 
 function syncRouteControlsFromJson() {
   let draft;
   try { draft = JSON.parse($('#route-json').value); } catch { return; }
   if (!isObject(draft)) return;
+  syncBackendControlsFromJson(draft);
   const form = $('#route-form');
   if (form.elements['tcp_health_enabled'] && (draft.health === null || draft.health === undefined || isObject(draft.health))) {
     const health = isObject(draft.health) ? draft.health : null;
@@ -2113,7 +2256,14 @@ async function resolveDocker(event) {
   try {
     const { data } = await api('/v1/docker/resolve', { method: 'POST', json: { container: values.get('container'), network: values.get('network'), port: Number(values.get('port')) } });
     const backend = state.editing.type === 'http' ? data.http_backend : data.tcp_backend;
-    const field = $('#route-form [name="backends"]'); const lines = nonemptyLines(field.value); if (backend && !lines.includes(backend)) lines.push(backend); field.value = lines.join('\n'); syncRouteJsonFromForm(); $('#docker-dialog').close(); toast(t('Docker backend added to the route.'));
+    const editor = $('#route-form .backend-editor');
+    if (editor.dataset.mode === 'named') {
+      const rows = editor.querySelector('.backend-member-list');
+      if (backend && ![...rows.querySelectorAll('.backend-member-address')].some((input) => input.value === backend)) rows.append(memberRow({ id: nextMemberId(rows), address: backend }));
+    } else {
+      const field = $('#route-form [name="backends"]'); const lines = nonemptyLines(field.value); if (backend && !lines.includes(backend)) lines.push(backend); field.value = lines.join('\n');
+    }
+    syncRouteJsonFromForm(); $('#docker-dialog').close(); toast(t('Docker backend added to the route.'));
   } catch (error) { message($('#docker-message'), error.status === 404 ? t('Docker integration is disabled on this proxy.') : error.message, 'error'); }
   finally { setBusy(button, false); }
 }
