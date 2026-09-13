@@ -162,13 +162,13 @@ async fn retirement_during_socks_handshake_releases_pending_without_forwarding()
     );
     release_tx.send(()).unwrap();
     let mut byte = [0_u8];
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
-            .await
-            .unwrap()
-            .unwrap(),
-        0,
-        "retired dial closes the downstream without forwarding buffered bytes"
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0))
+            || matches!(&closed, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "retired dial must close without response bytes: {closed:?}"
     );
     assert_eq!(
         socks_task.await.unwrap(),

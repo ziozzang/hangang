@@ -1,6 +1,9 @@
-//! Generation-local admission and activity count. Preparation starts closed;
+//! Generation-local admission and activity count with explicit prepared/serving states;
 //! retirement is irreversible. This primitive does not publish lifecycle intent.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const RETIRED: usize = 1 << (usize::BITS - 1);
 const PENDING: usize = 1 << (usize::BITS - 2);
@@ -8,6 +11,27 @@ const COUNT: usize = PENDING - 1;
 
 #[derive(Debug)]
 pub struct MemberAdmission(AtomicUsize);
+/// One generation admission, covering a pending dial and its eventual stream.
+/// Unlike an established-stream counter, ownership starts before outbound work.
+/// It is deliberately not Clone: transferring a connection transfers the lease.
+#[derive(Debug)]
+pub struct AdmissionLease(Arc<MemberAdmission>);
+
+impl AdmissionLease {
+    /// Recheck after asynchronous connection establishment. Retirement does
+    /// not destroy an existing owner, but it prevents forwarding a newly dialed
+    /// connection when the generation was retired during its handshake.
+    pub fn is_open(&self) -> bool {
+        self.0.is_open()
+    }
+}
+
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl Default for MemberAdmission {
     fn default() -> Self {
         Self::serving()
@@ -36,6 +60,12 @@ impl MemberAdmission {
     pub fn active(&self) -> usize {
         self.0.load(Ordering::Acquire) & COUNT
     }
+    /// Acquire an owned guard before starting asynchronous outbound work.
+    /// Dropping or cancelling that work releases the pending admission.
+    pub fn lease(self: &Arc<Self>) -> Option<AdmissionLease> {
+        self.acquire().then(|| AdmissionLease(Arc::clone(self)))
+    }
+
     /// Closure and count acquisition share one atomic linearization point.
     pub(crate) fn acquire(&self) -> bool {
         self.0
@@ -57,6 +87,43 @@ impl MemberAdmission {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[tokio::test]
+    async fn pending_dial_ownership_releases_on_cancellation_after_retirement() {
+        let gate = Arc::new(MemberAdmission::serving());
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (finish, pending) = tokio::sync::oneshot::channel::<()>();
+        let task_gate = gate.clone();
+        let task = tokio::spawn(async move {
+            let lease = task_gate.lease().unwrap();
+            started.send(()).unwrap();
+            let _ = pending.await;
+            assert!(
+                !lease.is_open(),
+                "retired dial must not become forwarding work"
+            );
+        });
+        observed.await.unwrap();
+        assert_eq!(gate.active(), 1);
+        gate.retire();
+        assert!(gate.lease().is_none());
+        finish.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(gate.active(), 0);
+
+        let gate = Arc::new(MemberAdmission::serving());
+        let lease = gate.lease().unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        observed.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(gate.active(), 0);
+    }
 
     #[test]
     fn prepared_and_retired_generations_never_admit_or_reopen() {

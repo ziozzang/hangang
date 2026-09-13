@@ -138,3 +138,41 @@ fn health_generation_resets_without_erasing_logical_stream_activity() {
         0
     );
 }
+
+#[test]
+fn tcp_admission_generation_mapping_is_stricter_than_logical_stream_identity() {
+    let first = Snapshot::new(config()).unwrap();
+    let gate = first.tcp_member_admissions["stream"][0].clone();
+    let lease = gate.lease().unwrap();
+    let mut reordered = first.config.clone();
+    reordered.tcp[0].backends.reverse();
+    let reordered = Snapshot::replace(reordered, &first).unwrap();
+    assert!(Arc::ptr_eq(
+        &gate,
+        &reordered.tcp_member_admissions["stream"][1]
+    ));
+    gate.retire();
+    assert!(!reordered.tcp_member_admissions["stream"][1].is_open());
+    assert_eq!(gate.active(), 1);
+    let mut changed = reordered.config.clone();
+    if let hangang::pool_member::Backend::Member(member) = &mut changed.tcp[0].backends[1] {
+        member.address = "127.0.0.1:18003".into();
+    }
+    let changed = Snapshot::replace(changed, &reordered).unwrap();
+    assert!(!Arc::ptr_eq(
+        &gate,
+        &changed.tcp_member_admissions["stream"][1]
+    ));
+    assert!(changed.tcp_member_admissions["stream"][1].is_open());
+    assert_eq!(changed.tcp_member_admissions["stream"][1].active(), 0);
+    assert!(!lease.is_open());
+    assert_eq!(gate.active(), 1);
+    drop(changed);
+    assert_eq!(
+        gate.active(),
+        1,
+        "candidate drop does not mutate old generation"
+    );
+    drop(lease);
+    assert_eq!(gate.active(), 0);
+}

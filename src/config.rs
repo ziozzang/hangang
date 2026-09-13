@@ -1051,6 +1051,10 @@ pub struct Snapshot {
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
     pub tcp_health: std::collections::HashMap<String, std::sync::Arc<crate::tcp_health::TcpHealth>>,
+    pub tcp_member_admissions: std::collections::HashMap<
+        String,
+        Vec<std::sync::Arc<crate::member_admission::MemberAdmission>>,
+    >,
     pub tcp_member_activity:
         std::collections::HashMap<String, std::sync::Arc<crate::tcp_member::TcpMemberActivity>>,
 }
@@ -1239,6 +1243,47 @@ impl Snapshot {
                 )
             })
             .collect();
+        let tcp_member_admissions = config
+            .tcp
+            .iter()
+            .map(|route| {
+                let compatible = previous_tcp_routes.get(route.id.as_str()).filter(|old| {
+                    old.enabled == route.enabled
+                        && old.upstream == route.upstream
+                        && old.health == route.health
+                        && previous.is_some_and(|snapshot| {
+                            snapshot.upstream_trust.get(&route.id) == upstream_trust.get(&route.id)
+                        })
+                });
+                let mapping = match compatible {
+                    Some(old)
+                        if named_backends(&route.backends) && named_backends(&old.backends) =>
+                    {
+                        stable_backend_mapping(&route.backends, &old.backends)
+                    }
+                    Some(old) if old.backends == route.backends => {
+                        (0..route.backends.len()).map(Some).collect()
+                    }
+                    _ => vec![None; route.backends.len()],
+                };
+                let old =
+                    previous.and_then(|snapshot| snapshot.tcp_member_admissions.get(&route.id));
+                let gates = mapping
+                    .into_iter()
+                    .map(|index| {
+                        index
+                            .and_then(|index| old.and_then(|gates| gates.get(index)))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                std::sync::Arc::new(
+                                    crate::member_admission::MemberAdmission::serving(),
+                                )
+                            })
+                    })
+                    .collect();
+                (route.id.clone(), gates)
+            })
+            .collect();
         let mut tcp_health = std::collections::HashMap::new();
         for route in &config.tcp {
             let Some(health) = &route.health else {
@@ -1329,6 +1374,7 @@ impl Snapshot {
             http,
             tcp_health,
             tcp_member_activity,
+            tcp_member_admissions,
             admissions,
         })
     }
