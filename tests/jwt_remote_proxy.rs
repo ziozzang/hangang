@@ -281,6 +281,7 @@ async fn remote_oidc_jwks_jwt_proxy_rotates_and_fails_closed_after_hard_expiry()
         request(front, Some(&disallowed), Method::GET).await,
         StatusCode::FORBIDDEN
     );
+    let before_injected = idp.requests.load(Ordering::SeqCst);
     let injected_url = signed(&old_signing, "old", "alice", &idp.issuer, true);
     assert_eq!(
         request(front, Some(&injected_url), Method::GET).await,
@@ -288,7 +289,7 @@ async fn remote_oidc_jwks_jwt_proxy_rotates_and_fails_closed_after_hard_expiry()
     );
     assert_eq!(
         idp.requests.load(Ordering::SeqCst),
-        2,
+        before_injected,
         "token-supplied jku must never fetch"
     );
     assert_eq!(seen.lock().unwrap().len(), 1);
