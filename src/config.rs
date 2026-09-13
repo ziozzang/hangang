@@ -357,12 +357,22 @@ fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+#[derive(Default)]
+struct PreparedUpstreamTls {
+    configs: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
+    trust: std::collections::HashMap<String, [u8; 32]>,
+}
+
 impl Config {
     pub fn prepare_upstream_tls(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>>
     {
-        let mut prepared = std::collections::HashMap::new();
+        Ok(self.prepare_upstream_tls_with_trust()?.configs)
+    }
+
+    fn prepare_upstream_tls_with_trust(&self) -> anyhow::Result<PreparedUpstreamTls> {
+        let mut prepared = PreparedUpstreamTls::default();
         for (id, options) in self
             .http
             .iter()
@@ -376,13 +386,16 @@ impl Config {
             )
         {
             if let Some(tls) = &options.tls {
-                prepared.insert(
-                    id.clone(),
-                    std::sync::Arc::new(crate::upstream::build_client_config(
-                        &crate::tls::client_config(None)?,
-                        tls,
-                    )?),
-                );
+                let (config, trust) = crate::upstream::build_client_config_with_trust(
+                    &crate::tls::client_config(None)?,
+                    tls,
+                )?;
+                prepared
+                    .configs
+                    .insert(id.clone(), std::sync::Arc::new(config));
+                if let Some(trust) = trust {
+                    prepared.trust.insert(id.clone(), trust);
+                }
             }
         }
         Ok(prepared)
@@ -1009,6 +1022,10 @@ pub struct Snapshot {
     pub http_match_headers: std::collections::HashSet<hyper::header::HeaderName>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
     pub upstream_tls: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
+    // Fingerprints of the exact custom CA certificates used by prepared TLS.
+    // Never re-read files to decide whether health observations may be reused.
+    #[doc(hidden)]
+    pub upstream_trust: std::collections::HashMap<String, [u8; 32]>,
     pub certificates: Option<std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
     pub cache: Option<std::sync::Arc<crate::cache::CacheRuntime>>,
     pub config: Config,
@@ -1047,7 +1064,10 @@ impl Snapshot {
                     .expect("validated HTTP match header")
             })
             .collect();
-        let upstream_tls = config.prepare_upstream_tls()?;
+        let PreparedUpstreamTls {
+            configs: upstream_tls,
+            trust: upstream_trust,
+        } = config.prepare_upstream_tls_with_trust()?;
         let mut regexes = config.prepare_host_regexes()?;
         let admissions: std::collections::HashMap<_, _> = config
             .http
@@ -1072,18 +1092,16 @@ impl Snapshot {
                     admission: admissions[&route.id].clone(),
                     balancer: previous
                         .and_then(|old| {
-                            let checking =
-                                route.balance.active_health.as_ref().is_some_and(|health| {
-                                    health.initial_state
-                                        == crate::balance::InitialHealthState::Checking
-                                });
+                            let active_health = route.balance.active_health.is_some();
                             old.http.iter().find(|runtime| {
                                 runtime.route.id == route.id
                                     && runtime.route.backends == route.backends
                                     && runtime.route.balance == route.balance
-                                    && (!checking
+                                    && (!active_health
                                         || (runtime.route.enabled == route.enabled
-                                            && runtime.route.upstream == route.upstream))
+                                            && runtime.route.upstream == route.upstream
+                                            && old.upstream_trust.get(&route.id)
+                                                == upstream_trust.get(&route.id)))
                             })
                         })
                         .map(|runtime| runtime.balancer.clone())
@@ -1132,6 +1150,9 @@ impl Snapshot {
                         && old.health == route.health
                         && old.upstream == route.upstream
                         && old.enabled == route.enabled
+                        && previous.is_some_and(|previous| {
+                            previous.upstream_trust.get(&route.id) == upstream_trust.get(&route.id)
+                        })
                 })
                 .and_then(|_| previous?.tcp_health.get(&route.id))
                 .cloned();
@@ -1188,6 +1209,7 @@ impl Snapshot {
             http_match_headers,
             sni_regex: regexes.sni,
             upstream_tls,
+            upstream_trust,
             certificates,
             cache,
             config,
@@ -1514,6 +1536,151 @@ mod tests {
             Some(true)
         );
     }
+    #[test]
+    fn healthy_default_never_reuses_observations_from_retired_transport() {
+        let config: Config = serde_json::from_value(serde_json::json!({"http":[{
+            "id":"pool", "backends":["http://127.0.0.1:8080"],
+            "balance":{"active_health":{
+                "path":"/ready", "interval_ms":100, "timeout_ms":100,
+                "healthy_statuses":[200], "unhealthy_statuses":[503],
+                "healthy_successes":1, "unhealthy_http_failures":1,
+                "unhealthy_tcp_failures":1, "unhealthy_timeouts":1
+            }}
+        }]}))
+        .unwrap();
+        let first = Snapshot::new(config.clone()).unwrap();
+        let retired = first.http[0].balancer.clone();
+        retired.record_active_status(0, 503);
+        assert!(!retired.available(0));
+
+        // A preview must neither mutate live state nor transfer observations
+        // from the old transport into the candidate's new transport.
+        let mut candidate = config.clone();
+        candidate.http[0].upstream.connect_address = Some("127.0.0.1:8081".into());
+        let prepared = Snapshot::replace(candidate, &first).unwrap();
+        let fresh = &prepared.http[0].balancer;
+        assert!(!std::sync::Arc::ptr_eq(&retired, fresh));
+        assert!(!retired.available(0));
+        assert!(
+            fresh.available(0),
+            "healthy default remains initially eligible"
+        );
+        assert_eq!(fresh.backend_state(0).unwrap().probe_observed, Some(false));
+        fresh.record_active_status(0, 503);
+        retired.record_active_status(0, 200);
+        assert!(
+            !fresh.available(0),
+            "late old success cannot recover new endpoint"
+        );
+        fresh.record_active_status(0, 200);
+        retired.record_active_timeout(0);
+        assert!(
+            fresh.available(0),
+            "late old timeout cannot quarantine new endpoint"
+        );
+
+        let mut disabled_config = config.clone();
+        disabled_config.http[0].enabled = false;
+        let disabled = Snapshot::replace(disabled_config, &first).unwrap();
+        let reenabled = Snapshot::replace(config, &disabled).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &retired,
+            &disabled.http[0].balancer
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &disabled.http[0].balancer,
+            &reenabled.http[0].balancer
+        ));
+        assert_eq!(
+            reenabled.http[0]
+                .balancer
+                .backend_state(0)
+                .unwrap()
+                .probe_observed,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn custom_ca_rotation_requalifies_http_and_tcp_using_prepared_trust() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ca.pem");
+        let original_ca =
+            rcgen::generate_simple_self_signed(vec!["original.local".into()]).unwrap();
+        let rotated_ca = rcgen::generate_simple_self_signed(vec!["rotated.local".into()]).unwrap();
+        for initial_state in ["healthy", "checking"] {
+            std::fs::write(&path, original_ca.cert.pem()).unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "http":[{"id":"web", "backends":["https://127.0.0.1:8080"],
+                    "upstream":{"tls":{"ca_file":path}},
+                    "balance":{"active_health":{
+                        "path":"/ready", "interval_ms":100, "timeout_ms":100,
+                        "healthy_statuses":[200], "unhealthy_statuses":[503],
+                        "healthy_successes":1, "unhealthy_http_failures":1,
+                        "unhealthy_tcp_failures":1, "unhealthy_timeouts":1,
+                        "initial_state":initial_state
+                    }}
+                }],
+                "tcp":[{"id":"stream", "listen":"127.0.0.1:19091",
+                    "backends":["127.0.0.1:8081"],
+                    "upstream":{"tls":{"ca_file":path,"server_name":"origin.local"}},
+                    "health":{"interval_ms":100,"timeout_ms":100,
+                        "healthy_successes":1,"unhealthy_failures":1,"initial_state":initial_state}
+                }]
+            }))
+            .unwrap();
+            let first = Snapshot::new(config.clone()).unwrap();
+            let web = &first.http[0].balancer;
+            let stream = &first.tcp_health["stream"];
+            web.record_active_status(0, 200);
+            stream.record_success(0);
+            assert!(web.available(0) && stream.available(0));
+
+            // PEM formatting does not change the trust used by rustls.
+            std::fs::write(&path, format!("\n{}\n", original_ca.cert.pem())).unwrap();
+            let identical = Snapshot::replace(config.clone(), &first).unwrap();
+            assert!(std::sync::Arc::ptr_eq(web, &identical.http[0].balancer));
+            assert!(std::sync::Arc::ptr_eq(
+                stream,
+                &identical.tcp_health["stream"]
+            ));
+
+            // Same path and unchanged JSON, but new trust: both protocols get
+            // fresh observations, without touching live state during preview.
+            std::fs::write(&path, rotated_ca.cert.pem()).unwrap();
+            let rotated = Snapshot::replace(config.clone(), &identical).unwrap();
+            assert!(!std::sync::Arc::ptr_eq(web, &rotated.http[0].balancer));
+            assert!(!std::sync::Arc::ptr_eq(
+                stream,
+                &rotated.tcp_health["stream"]
+            ));
+            assert_eq!(
+                rotated.http[0]
+                    .balancer
+                    .backend_state(0)
+                    .unwrap()
+                    .probe_observed,
+                Some(false)
+            );
+            assert_eq!(
+                rotated.http[0].balancer.available(0),
+                initial_state == "healthy"
+            );
+            assert_eq!(
+                rotated.tcp_health["stream"].available(0),
+                initial_state == "healthy"
+            );
+            assert!(web.available(0) && stream.available(0));
+
+            std::fs::write(&path, b"invalid CA").unwrap();
+            assert!(Snapshot::replace(config, &first).is_err());
+            assert!(
+                web.available(0) && stream.available(0),
+                "failed preparation preserves live health"
+            );
+        }
+    }
+
     #[test]
     fn checking_rejects_docker_backend_until_probe_resolution_is_supported() {
         let mut config = route();

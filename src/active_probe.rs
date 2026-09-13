@@ -22,46 +22,63 @@ pub fn spawn_monitor(
     shutdown: CancellationToken,
 ) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut current = Weak::<Snapshot>::new();
-            let mut probes = shutdown.child_token();
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = interval.tick() => {}
-                }
-                let snapshot = active.load_full();
-                if current
-                    .upgrade()
-                    .is_some_and(|previous| Arc::ptr_eq(&previous, &snapshot))
-                {
-                    continue;
-                }
-                probes.cancel();
-                probes = shutdown.child_token();
-                current = Arc::downgrade(&snapshot);
-                for runtime in &snapshot.http {
-                    if !runtime.route.enabled || runtime.route.balance.active_health.is_none() {
-                        continue;
-                    }
-                    let prepared = snapshot.upstream_tls.get(&runtime.route.id).cloned();
-                    for (index, backend) in runtime.route.backends.iter().enumerate() {
-                        tokio::spawn(run_backend(
-                            Arc::downgrade(runtime),
-                            index,
-                            backend.clone(),
-                            prepared.clone(),
-                            pools.clone(),
-                            probes.clone(),
-                        ));
-                    }
-                }
-            }
-            probes.cancel();
-        });
+        handle.spawn(run_monitor(active, pools, shutdown));
     }
+}
+
+async fn run_monitor(
+    active: Arc<ArcSwap<Snapshot>>,
+    pools: Arc<Pools>,
+    shutdown: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut current = Weak::<Snapshot>::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let snapshot = active.load_full();
+        if current
+            .upgrade()
+            .is_some_and(|previous| Arc::ptr_eq(&previous, &snapshot))
+        {
+            continue;
+        }
+        // Cancellation alone does not establish that old tasks have stopped
+        // touching a shared balancer. Reap every old task before starting the
+        // next generation, preserving the configured probe-task bound.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        if shutdown.is_cancelled() {
+            break;
+        }
+        // Joining yields: select the latest published generation again so
+        // a concurrent replacement is not delayed by a retired candidate.
+        let snapshot = active.load_full();
+        current = Arc::downgrade(&snapshot);
+        for runtime in &snapshot.http {
+            if !runtime.route.enabled || runtime.route.balance.active_health.is_none() {
+                continue;
+            }
+            let prepared = snapshot.upstream_tls.get(&runtime.route.id).cloned();
+            for (index, backend) in runtime.route.backends.iter().enumerate() {
+                tasks.spawn(run_backend(
+                    Arc::downgrade(runtime),
+                    index,
+                    backend.clone(),
+                    prepared.clone(),
+                    pools.clone(),
+                    shutdown.clone(),
+                ));
+            }
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 async fn run_backend(
@@ -250,6 +267,55 @@ mod tests {
         assert_eq!(new_hits.load(Ordering::Relaxed), new_stopped);
         old_server.abort();
         new_server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_a_stalled_probe_before_monitor_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = serde_json::json!({"http":[{
+            "id":"stalled", "backends":[format!("http://{address}")],
+            "balance":{"active_health":{
+                "path":"/ready", "interval_ms":60000, "timeout_ms":60000,
+                "healthy_statuses":[200], "unhealthy_statuses":[503],
+                "healthy_successes":1, "unhealthy_http_failures":1,
+                "unhealthy_tcp_failures":1, "unhealthy_timeouts":1,
+                "initial_state":"checking"
+            }}
+        }]});
+        let snapshot = Arc::new(Snapshot::new(serde_json::from_value(source).unwrap()).unwrap());
+        let runtime = Arc::downgrade(&snapshot.http[0]);
+        let active = Arc::new(ArcSwap::from(snapshot));
+        let pools = Arc::new(Pools::new(crate::tls::client_config(None).unwrap(), 1));
+        let shutdown = CancellationToken::new();
+        let monitor = tokio::spawn(run_monitor(active, pools, shutdown.clone()));
+        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = [0; 4096];
+        let bytes = tokio::time::timeout(Duration::from_secs(3), connection.read(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes > 0);
+        assert!(
+            runtime.upgrade().is_some(),
+            "the blocked probe retains its runtime"
+        );
+        // Keep the origin socket alive without responding. Cancellation must
+        // not wait for the 60-second request timeout, and returning from the
+        // monitor guarantees the old task has released its runtime.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            runtime.upgrade().is_none(),
+            "no probe task remains after shutdown"
+        );
+        drop(connection);
     }
 
     #[tokio::test]
