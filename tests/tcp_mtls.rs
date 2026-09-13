@@ -57,11 +57,41 @@ fn ca() -> CertifiedIssuer<'static, KeyPair> {
 
 fn client_certificate(issuer: &CertifiedIssuer<'_, KeyPair>, uri: &str) -> (String, String) {
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    if uri == GOOD_ID {
+        // A stable leaf serial lets the owned CRL fixture revoke exactly this
+        // certificate without relying on PEM parser representation details.
+        params.serial_number = Some(42u64.into());
+    }
     params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let key = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key, issuer).unwrap();
     (cert.pem(), key.serialize_pem())
+}
+
+fn crl_versions(material: &Material) -> (PathBuf, String, String, String) {
+    let path = material._directory.path().join("clients.crl");
+    let mut params = rcgen::CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2020, 1, 1),
+        next_update: rcgen::date_time_ymd(2035, 1, 1),
+        crl_number: 1u64.into(),
+        issuing_distribution_point: None,
+        revoked_certs: Vec::new(),
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let empty = params.signed_by(&material.issuer).unwrap().pem().unwrap();
+    params.revoked_certs.push(rcgen::RevokedCertParams {
+        serial_number: 42u64.into(),
+        revocation_time: rcgen::date_time_ymd(2021, 1, 1),
+        reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+        invalidity_date: None,
+    });
+    params.crl_number = 2u64.into();
+    let revoked = params.signed_by(&material.issuer).unwrap().pem().unwrap();
+    params.revoked_certs.clear();
+    params.crl_number = 3u64.into();
+    let restored = params.signed_by(&material.issuer).unwrap().pem().unwrap();
+    (path, empty, revoked, restored)
 }
 
 fn short_lived_client_certificate(
@@ -195,6 +225,24 @@ async fn wait_material(
     })
     .await
     .expect("TCP workload material did not reach the requested state")
+}
+
+async fn wait_new_generation(
+    active: &Arc<ArcSwap<Snapshot>>,
+    previous: &Arc<hangang::workload_tls::Prepared>,
+) -> Arc<hangang::workload_tls::Prepared> {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(current) = active.load().tcp_inbound_tls["workload"].load()
+                && !Arc::ptr_eq(&current, previous)
+            {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TCP CRL change did not publish a new material generation")
 }
 
 #[test]
@@ -432,6 +480,95 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     );
     assert!(!exchange(&wrong_uri, listen).await);
     assert_eq!(accepted.load(Ordering::SeqCst), 7);
+    watch_cancel.cancel();
+    watcher.await.unwrap();
+    manager.shutdown(Duration::from_secs(1)).await;
+    backend_task.abort();
+}
+
+#[tokio::test]
+async fn signed_crl_rotation_revokes_and_restores_tcp_identity_without_config_revision() {
+    let material = material();
+    let (crl_file, empty_crl, revoked_crl, restored_crl) = crl_versions(&material);
+    std::fs::write(&crl_file, empty_crl).unwrap();
+    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend_address = backend.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let backend_accepted = accepted.clone();
+    let backend_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = backend.accept().await {
+            backend_accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                while let Ok(count) = stream.read(&mut buffer).await {
+                    if count == 0 || stream.write_all(&buffer[..count]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let bound = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let listen = bound.local_addr().unwrap();
+    let mut document = config(listen, backend_address, &material, &[GOOD_ID]);
+    document.tcp[0]
+        .inbound_tls
+        .as_mut()
+        .unwrap()
+        .client_crl_file = Some(crl_file.clone());
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(document.clone()).unwrap(),
+    ));
+    let unchanged_snapshot = active.load_full();
+    let watch_cancel = CancellationToken::new();
+    let watcher = tokio::spawn(hangang::workload_material::watch(
+        active.clone(),
+        watch_cancel.clone(),
+    ));
+    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 16);
+    let prepared = manager
+        .prepare_with_inherited(&document, vec![(listen, OwnedFd::from(bound))])
+        .await
+        .unwrap();
+    manager.commit(prepared).await;
+    let initial = wait_material(&active, true).await.unwrap();
+
+    let good = connector(&material, Some((&material.good_cert, &material.good_key)));
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let mut held = good
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    held.write_all(b"ping").await.unwrap();
+    let mut reply = [0u8; 4];
+    held.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"ping");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    // The CRL remains valid and correctly signed, but now revokes the exact
+    // leaf serial. The watcher must replace Prepared without a CAS revision.
+    std::fs::write(&crl_file, revoked_crl).unwrap();
+    let revoked = wait_new_generation(&active, &initial).await;
+    assert!(Arc::ptr_eq(&unchanged_snapshot, &active.load_full()));
+    let mut byte = [0u8];
+    let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0) | Err(_))),
+        "revoked CRL left established stream active: {closed:?}"
+    );
+    assert!(
+        !exchange(&good, listen).await,
+        "revoked client reached the backend"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    // A newer empty CRL restores admission through the same watched path.
+    std::fs::write(&crl_file, restored_crl).unwrap();
+    let restored = wait_new_generation(&active, &revoked).await;
+    assert!(!Arc::ptr_eq(&initial, &restored));
+    assert!(Arc::ptr_eq(&unchanged_snapshot, &active.load_full()));
+    assert!(exchange(&good, listen).await);
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
     watch_cancel.cancel();
     watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
