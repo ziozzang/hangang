@@ -233,6 +233,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_skips_real_probes_while_draining_continues_and_serving_resumes() {
+        let (draining_address, draining_hits, draining_server) = counting_origin().await;
+        let (maintenance_address, maintenance_hits, maintenance_server) = counting_origin().await;
+        let config: Config = serde_json::from_value(serde_json::json!({"http":[{
+            "id":"member-probe-states",
+            "backends":[
+                {"id":"drain","address":format!("http://{draining_address}")},
+                {"id":"maint","address":format!("http://{maintenance_address}")}
+            ],
+            "balance":{"active_health":{
+                "path":"/ready","interval_ms":100,"timeout_ms":100,
+                "healthy_statuses":[200],"unhealthy_statuses":[503],
+                "healthy_successes":1,"unhealthy_http_failures":1,
+                "unhealthy_tcp_failures":1,"unhealthy_timeouts":1
+            }}
+        }]}))
+        .unwrap();
+        let mut initial = Snapshot::new(config.clone()).unwrap();
+        // Serving named members are valid in this isolated base. Model the
+        // prepared non-serving generation directly until Config publication
+        // accepts these states in the integration branch.
+        for (index, state) in [DesiredState::Draining, DesiredState::Maintenance]
+            .into_iter()
+            .enumerate()
+        {
+            let runtime = Arc::get_mut(&mut initial.http[0]).unwrap();
+            let Backend::Member(member) = &mut runtime.route.backends[index] else {
+                panic!("named fixture member expected");
+            };
+            member.desired_state = state;
+        }
+        let active = Arc::new(ArcSwap::from(Arc::new(initial)));
+        let pools = Arc::new(Pools::new(crate::tls::client_config(None).unwrap(), 1));
+        let shutdown = CancellationToken::new();
+        spawn_monitor(active.clone(), pools, shutdown.clone());
+        wait_for_hits(&draining_hits, 3).await;
+        assert_eq!(maintenance_hits.load(Ordering::Acquire), 0);
+
+        // A fresh serving snapshot starts the previously skipped probe.
+        active.store(Arc::new(Snapshot::new(config).unwrap()));
+        wait_for_hits(&maintenance_hits, 2).await;
+        shutdown.cancel();
+        draining_server.abort();
+        maintenance_server.abort();
+    }
+
+    #[tokio::test]
     async fn snapshot_replacement_stops_old_probes_and_shutdown_stops_new_probes() {
         let (old_address, old_hits, old_server) = counting_origin().await;
         let (new_address, new_hits, new_server) = counting_origin().await;

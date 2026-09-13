@@ -1080,6 +1080,73 @@ fn ensure_listening_socket(descriptor: &OwnedFd) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn counting_probe_endpoint() -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let hits = hits.clone();
+            async move {
+                while let Ok((_stream, _)) = listener.accept().await {
+                    hits.fetch_add(1, Ordering::Release);
+                }
+            }
+        });
+        (address, hits, server)
+    }
+
+    async fn wait_for_probe_hits(hits: &AtomicUsize, count: usize) {
+        timeout(Duration::from_secs(4), async {
+            while hits.load(Ordering::Acquire) < count {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("TCP active probe did not reach endpoint");
+    }
+
+    #[tokio::test]
+    async fn maintenance_skips_tcp_probes_while_draining_continues_and_serving_resumes() {
+        let (draining_address, draining_hits, draining_server) = counting_probe_endpoint().await;
+        let (maintenance_address, maintenance_hits, maintenance_server) =
+            counting_probe_endpoint().await;
+        let config: Config = serde_json::from_value(serde_json::json!({"tcp":[{
+            "id":"member-tcp-probe-states",
+            "listen":"127.0.0.1:18443",
+            "backends":[
+                {"id":"drain","address":draining_address.to_string()},
+                {"id":"maint","address":maintenance_address.to_string()}
+            ],
+            "health":{
+                "interval_ms":100,"timeout_ms":100,
+                "healthy_successes":1,"unhealthy_failures":1
+            }
+        }]}))
+        .unwrap();
+        let mut initial = Snapshot::new(config.clone()).unwrap();
+        for (index, state) in [DesiredState::Draining, DesiredState::Maintenance]
+            .into_iter()
+            .enumerate()
+        {
+            let Backend::Member(member) = &mut initial.config.tcp[0].backends[index] else {
+                panic!("named fixture member expected");
+            };
+            member.desired_state = state;
+        }
+        let active = Arc::new(ArcSwap::from(Arc::new(initial)));
+        let (_gate_sender, gate) = tokio::sync::watch::channel(true);
+        let monitor = tokio::spawn(monitor_tcp_health(active.clone(), None, gate));
+        wait_for_probe_hits(&draining_hits, 3).await;
+        assert_eq!(maintenance_hits.load(Ordering::Acquire), 0);
+
+        active.store(Arc::new(Snapshot::new(config).unwrap()));
+        wait_for_probe_hits(&maintenance_hits, 2).await;
+        monitor.abort();
+        let _ = monitor.await;
+        draining_server.abort();
+        maintenance_server.abort();
+    }
+
     #[tokio::test]
     async fn cancelled_publication_lock_wait_does_not_expose_candidate() {
         let active = Arc::new(ArcSwap::from_pointee(
