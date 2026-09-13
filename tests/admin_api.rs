@@ -2259,6 +2259,24 @@ async fn shared_store_transport_failures_are_tolerated_for_the_grace_window() {
     assert_eq!(report.reason, None);
     assert_eq!(report.last_confirmed_seconds_ago, Some(0));
 
+    // A reachable store containing a document this binary cannot decode is
+    // an authority disagreement, not a transient transport failure. Keeping
+    // readiness for the grace window would advertise stale routes during a
+    // mixed-version schema rollout.
+    std::fs::write(
+        &state_path,
+        br#"{"revision":6,"http":[{"id":"unsupported","backends":[42]}]}"#,
+    )
+    .unwrap();
+    assert!(manager.reload_file().await.is_err());
+    assert!(!manager.ready.load(Ordering::Acquire));
+    let report = manager.store_health.report();
+    assert_eq!(report.reason, Some("invalid"));
+    assert!(!report.degraded);
+    std::fs::write(&state_path, &bytes).unwrap();
+    assert!(!manager.reload_file().await.unwrap());
+    assert!(manager.ready.load(Ordering::Acquire));
+
     // Authority disagreements ignore the grace window.
     let mut older = config.clone();
     older.revision = 4;
