@@ -137,14 +137,33 @@ impl std::error::Error for RemoteKeyError {}
 
 struct Cache {
     keys: Option<Arc<PreparedKeys>>,
+    refresh_after: Instant,
     expires_at: Instant,
     next_refresh_at: Instant,
     last_refresh_failed: bool,
 }
 
+fn cached_key(cache: &Cache, request: &KeyRequest, now: Instant) -> Option<Arc<PreparedKey>> {
+    if now >= cache.expires_at {
+        return None;
+    }
+    cache
+        .keys
+        .as_ref()?
+        .get_for(&request.kid, request.algorithm)
+}
+
+fn cooled_down_error(cache: &Cache, now: Instant) -> RemoteKeyError {
+    if now < cache.expires_at && !cache.last_refresh_failed {
+        RemoteKeyError::UnknownKey
+    } else {
+        RemoteKeyError::Unavailable
+    }
+}
+
 /// Lazy, singleflight remote key source. There is no background task and no
-/// unbounded queue of waiters: while one request fetches, others receive 503
-/// unless their requested key remains within its hard TTL.
+/// unbounded queue of waiters: while one request fetches, others can use a
+/// known cached key until its hard TTL, but cold/unknown keys receive 503.
 pub struct RemoteJwksProvider {
     config: RemoteJwksConfig,
     issuer: String,
@@ -192,6 +211,7 @@ impl RemoteJwksProvider {
             client,
             cache: Mutex::new(Cache {
                 keys: None,
+                refresh_after: now,
                 expires_at: now,
                 next_refresh_at: now,
                 last_refresh_failed: false,
@@ -212,20 +232,13 @@ impl RemoteJwksProvider {
         let now = Instant::now();
         {
             let cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
-            if now < cache.expires_at
-                && let Some(key) = cache
-                    .keys
-                    .as_ref()
-                    .and_then(|keys| keys.get_for(&request.kid, request.algorithm))
+            if let Some(key) = cached_key(&cache, request, now)
+                && (now < cache.refresh_after || now < cache.next_refresh_at)
             {
                 return Ok(key);
             }
             if now < cache.next_refresh_at {
-                return Err(if now < cache.expires_at && !cache.last_refresh_failed {
-                    RemoteKeyError::UnknownKey
-                } else {
-                    RemoteKeyError::Unavailable
-                });
+                return Err(cooled_down_error(&cache, now));
             }
         }
         if self
@@ -235,12 +248,7 @@ impl RemoteJwksProvider {
         {
             // Recheck in case the winning fetch just completed.
             let cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
-            if Instant::now() < cache.expires_at
-                && let Some(key) = cache
-                    .keys
-                    .as_ref()
-                    .and_then(|keys| keys.get_for(&request.kid, request.algorithm))
-            {
+            if let Some(key) = cached_key(&cache, request, Instant::now()) {
                 return Ok(key);
             }
             return Err(RemoteKeyError::Unavailable);
@@ -250,20 +258,13 @@ impl RemoteJwksProvider {
         {
             let cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
             let now = Instant::now();
-            if now < cache.expires_at
-                && let Some(key) = cache
-                    .keys
-                    .as_ref()
-                    .and_then(|keys| keys.get_for(&request.kid, request.algorithm))
+            if let Some(key) = cached_key(&cache, request, now)
+                && (now < cache.refresh_after || now < cache.next_refresh_at)
             {
                 return Ok(key);
             }
             if now < cache.next_refresh_at {
-                return Err(if now < cache.expires_at && !cache.last_refresh_failed {
-                    RemoteKeyError::UnknownKey
-                } else {
-                    RemoteKeyError::Unavailable
-                });
+                return Err(cooled_down_error(&cache, now));
             }
         }
         // Reserve the cooldown before the first await. If the caller cancels
@@ -286,9 +287,14 @@ impl RemoteJwksProvider {
         let mut cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
         cache.next_refresh_at = now + Duration::from_secs(self.config.refresh_cooldown_seconds);
         match fetched {
-            Ok(Ok(keys)) if now < fetch_deadline => {
+            Ok(Ok(mut keys)) if now < fetch_deadline => {
+                if let Some(previous) = &cache.keys {
+                    keys.reuse_unchanged(previous);
+                }
+                cache.refresh_after = fetch_started
+                    + Duration::from_millis(self.config.cache_ttl_seconds * 1_000 / 2);
                 cache.expires_at = fetch_deadline;
-                cache.keys = Some(keys);
+                cache.keys = Some(Arc::new(keys));
                 cache.last_refresh_failed = false;
                 cache
                     .keys
@@ -298,7 +304,7 @@ impl RemoteJwksProvider {
             }
             _ => {
                 cache.last_refresh_failed = true;
-                Err(RemoteKeyError::Unavailable)
+                cached_key(&cache, request, now).ok_or(RemoteKeyError::Unavailable)
             }
         }
     }
@@ -318,7 +324,7 @@ impl RemoteJwksProvider {
                 .is_some_and(|current| Arc::ptr_eq(&current, key))
     }
 
-    async fn fetch_keys(&self) -> Result<Arc<PreparedKeys>> {
+    async fn fetch_keys(&self) -> Result<PreparedKeys> {
         let issuer = trusted_https_url(&self.issuer, "issuer")?;
         let uri = match &self.config.endpoint {
             RemoteJwksEndpoint::Jwks { url } => trusted_https_url(url, "JWKS URL")?,
@@ -339,7 +345,7 @@ impl RemoteJwksProvider {
         );
         let prepared = PreparedKeys::from_jwks_json(&body, &self.allowed_algorithms)?;
         ensure!(!prepared.is_empty(), "JWKS has no usable signing keys");
-        Ok(Arc::new(prepared))
+        Ok(prepared)
     }
 }
 
@@ -662,6 +668,10 @@ mod tests {
             !provider.is_current(&old, &old_key),
             "rotated key loses its admission fence"
         );
+        assert_eq!(
+            provider.key(&old).await.err().unwrap(),
+            RemoteKeyError::UnknownKey
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 4);
 
         // Cancel a cold lookup while the JWKS response is held. The cancelled
@@ -706,7 +716,70 @@ mod tests {
         );
         key_delay_ms.store(0, Ordering::SeqCst);
 
+        // Refresh a known key halfway through its hard lifetime. The winning
+        // caller waits for the held JWKS response; peers continue using the
+        // still-valid cached key without queuing behind the IdP.
+        let mut warm_spec = config(RemoteJwksEndpoint::Oidc);
+        warm_spec.ca_pem = Some(cert.cert.pem());
+        warm_spec.cache_ttl_seconds = 4;
+        warm_spec.refresh_cooldown_seconds = 1;
+        let warm =
+            Arc::new(RemoteJwksProvider::new(warm_spec, &issuer, &[JwtAlgorithm::EdDSA]).unwrap());
+        let first_warm_key = warm.key(&new).await.unwrap();
+        let baseline = requests.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        hold_keys.store(true, Ordering::SeqCst);
+        let refreshing = {
+            let warm = warm.clone();
+            let new = new.clone();
+            tokio::spawn(async move { warm.key(&new).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.load(Ordering::SeqCst) < baseline + 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let peer_key = warm.key(&new).await.unwrap();
+        assert!(Arc::ptr_eq(&first_warm_key, &peer_key));
+        assert!(warm.is_current(&new, &peer_key));
+        hold_keys.store(false, Ordering::SeqCst);
+        let refreshed_key = refreshing.await.unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&first_warm_key, &refreshed_key),
+            "unchanged public JWK preserves in-flight identity"
+        );
+        assert!(warm.is_current(&new, &refreshed_key));
+        assert!(warm.is_current(&new, &peer_key));
+
+        tokio::time::sleep(Duration::from_millis(2_050)).await;
         error.store(true, Ordering::SeqCst);
+        let fallback = warm.key(&new).await.unwrap();
+        assert!(
+            warm.is_current(&new, &fallback),
+            "failed early refresh may use valid old key"
+        );
+        assert_eq!(
+            warm.key(&KeyRequest {
+                kid: "unknown".into(),
+                algorithm: JwtAlgorithm::EdDSA
+            })
+            .await
+            .err()
+            .unwrap(),
+            RemoteKeyError::Unavailable
+        );
+        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        assert_eq!(
+            warm.key(&new).await.err().unwrap(),
+            RemoteKeyError::Unavailable
+        );
+        assert!(
+            !warm.is_current(&new, &fallback),
+            "hard expiry forbids outage fallback"
+        );
+
         tokio::time::sleep(Duration::from_millis(1_050)).await;
         assert_eq!(
             provider.key(&new).await.err().unwrap(),
