@@ -1367,7 +1367,7 @@ function routeSummaryTags(type, route) {
 function routeRow(type, route) {
   const row = document.createElement('tr'); row.className = 'route-row route-card'; row.dataset.routeId = route.id || '';
   const cell = (primary, secondary = '') => { const td = document.createElement('td'); const main = document.createElement('span'); main.className = 'route-cell-main'; main.textContent = primary; td.append(main); if (secondary) { const detail = document.createElement('small'); detail.className = 'route-cell-detail'; detail.textContent = secondary; td.append(detail); } return td; };
-  const identity = document.createElement('th'); identity.scope = 'row'; const title = document.createElement('h2'); title.className = 'route-cell-main'; title.textContent = route.id || t('(unnamed)'); const state = document.createElement('small'); state.className = 'route-cell-detail'; state.textContent = route.enabled === false ? t('Disabled') : t('Enabled'); identity.append(title, state);
+  const identity = document.createElement('th'); identity.scope = 'row'; const title = document.createElement('h2'); title.className = 'route-cell-main'; title.textContent = route.id || t('(unnamed)'); const stateLabel = document.createElement('small'); stateLabel.className = 'route-cell-detail'; stateLabel.textContent = route.enabled === false ? t('Disabled') : t('Enabled'); identity.append(title, stateLabel);
   if (type === 'tcp' && route.inbound_tls) {
     const material = document.createElement('small'); material.className = 'route-cell-detail workload-material-state';
     material.dataset.workloadMaterialKind = 'tcp'; material.dataset.workloadMaterialId = route.id;
@@ -1381,6 +1381,13 @@ function routeRow(type, route) {
   policy.append(...tags.slice(0, 3).map(tagNode)); if (tags.length > 3) policy.append(tagNode(`+${tags.length - 3}`)); if (!tags.length) policy.textContent = '—';
   const action = document.createElement('td'); const edit = document.createElement('button'); edit.className = 'button button-secondary'; edit.type = 'button'; edit.textContent = t('Edit'); edit.addEventListener('click', () => openRoute(type, route)); action.append(edit);
   if (isAdmin()) { const toggle = document.createElement('button'); toggle.className = 'button button-quiet route-toggle'; toggle.type = 'button'; toggle.textContent = t(route.enabled === false ? 'Activate' : 'Deactivate'); toggle.addEventListener('click', () => setRouteEnabled(type, route.id, route.enabled === false, toggle)); action.append(toggle); }
+  if (isAdmin()) {
+    const remove = document.createElement('button'); remove.type = 'button';
+    remove.className = 'button button-danger route-delete'; copy(remove, 'Delete');
+    const revision = state.routeEtags[type];
+    remove.addEventListener('click', () => deleteListedRoute(type, route.id, remove, revision));
+    action.append(remove);
+  }
   row.append(identity, cell(match, matchDetail), upstream, policy, cell(String(route.priority ?? 0)), action);
   return row;
 }
@@ -2791,6 +2798,37 @@ async function refreshRoutesKeepingDialog(type) {
   const draft = $('#route-json').value;
   try { const { data, etag } = await api(`/v1/routes/${type}`); state.routes[type] = data?.routes || []; state.routeEtags[type] = etag || (data?.revision !== undefined ? `"${data.revision}"` : null); if (data?.revision !== undefined) setRevision(data.revision); renderRoutes(type); } catch (_) { /* original error remains actionable */ }
   $('#route-json').value = draft;
+}
+
+async function deleteListedRoute(type, id, button, revision) {
+  if (!isAdmin() || !state.token || state.view !== type || button.disabled) return;
+  const token = state.token; const generation = state.authGeneration;
+  const current = () => token === state.token && generation === state.authGeneration && isAdmin() && state.view === type;
+  if (!revision) return showGlobalError(t('The current route revision is unavailable. Reload routes before changing it.'));
+  setBusy(button, true, t('Deleting…'));
+  try {
+    const accepted = await confirmDialog({ title: t('Delete route?'),
+      body: t('Route “{id}” will stop matching new traffic.', { id }), accept: t('Delete') });
+    if (!accepted || !current()) return;
+    const result = await api(`/v1/routes/${type}/${encodeURIComponent(id)}`, {
+      method: 'DELETE', headers: { 'If-Match': revision },
+    });
+    if (!current()) return;
+    if (result.etag) state.routeEtags[type] = result.etag;
+    if (result.data?.revision !== undefined) setRevision(result.data.revision);
+    toast(t('{id} deleted.', { id }));
+    await loadRoutes(type);
+  } catch (error) {
+    if (!current() || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    if (isRevisionConflict(error) || isIndeterminate(error)) {
+      try { await loadRoutes(type); } catch (_) { /* preserve the original deletion error */ }
+      if (!current()) return;
+    }
+    showGlobalError(isRevisionConflict(error)
+      ? t('The configuration changed on the server. Routes were refreshed; confirm deletion again.')
+      : error.message);
+  } finally { setBusy(button, false); }
 }
 
 async function deleteRoute() {
