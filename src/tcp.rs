@@ -525,7 +525,7 @@ type ListenerRoute = (
     Option<Arc<crate::tcp_health::TcpHealth>>,
     Option<Arc<crate::tcp_member::TcpMemberActivity>>,
     Arc<[Arc<crate::member_admission::MemberAdmission>]>,
-    Option<Arc<crate::workload_tls::Prepared>>,
+    Option<Arc<crate::workload_material::Slot>>,
 );
 
 struct ListenerRoutes {
@@ -975,7 +975,10 @@ fn spawn_accept_loop(
                 // never manufacture an authenticated workload identity.
                 let (client, identity_lease): (crate::upstream::BoxIo, Option<WorkloadLease>) =
                     if let Some(policy) = &route.inbound_tls {
-                        let Some(prepared) = inbound_tls else {
+                        // ListenerRoutes may be cached across file rotations.
+                        // Resolve the current slot generation for every new
+                        // handshake; a missing/invalid generation stays closed.
+                        let Some(prepared) = inbound_tls.and_then(|slot| slot.load()) else {
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -1203,7 +1206,8 @@ impl WorkloadLease {
         snapshot
             .tcp_inbound_tls
             .get(&self.route_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.prepared))
+            .and_then(|slot| slot.load())
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.prepared))
     }
     async fn revoked(&self) {
         let mut tick = tokio::time::interval(Duration::from_millis(250));

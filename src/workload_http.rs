@@ -77,7 +77,8 @@ impl Evidence {
             && snapshot
                 .http_workload_tls
                 .get(&self.0.listener_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.0.prepared))
+                .and_then(|slot| slot.load())
+                .is_some_and(|current| Arc::ptr_eq(&current, &self.0.prepared))
     }
 }
 
@@ -188,7 +189,13 @@ pub async fn serve(
         reject();
         return;
     };
-    let Some(prepared) = snapshot.http_workload_tls.get(&listener_id).cloned() else {
+    // A material watcher can withdraw an invalid generation without a config
+    // publication. Never allow that state to fall through to plaintext HTTP.
+    let Some(prepared) = snapshot
+        .http_workload_tls
+        .get(&listener_id)
+        .and_then(|slot| slot.load())
+    else {
         reject();
         return;
     };
