@@ -1,0 +1,53 @@
+{
+  "http": [
+    {
+      "id": "numbered-api",
+      "priority": 100,
+      "host_regex": "api[0-9]+[.]foo[.]com",
+      "backends": [
+        "https://origin.example"
+      ],
+      "upstream": {
+        "dns_servers": [
+          "192.0.2.53:53"
+        ]
+      }
+    },
+    {
+      "id": "other-foo",
+      "priority": 0,
+      "host": "*.foo.com",
+      "backends": [
+        "http://127.0.0.1:8080"
+      ]
+    }
+  ],
+  "tcp": [
+    {
+      "id": "short-bar",
+      "priority": 10,
+      "listen": "127.0.0.1:9443",
+      "sni": {
+        "hosts": [
+          "f??.bar.com"
+        ]
+      },
+      "backends": [
+        "127.0.0.1:10443"
+      ]
+    },
+    {
+      "id": "numbered-bar",
+      "priority": 0,
+      "listen": "127.0.0.1:9443",
+      "sni": {
+        "host_regexes": [
+          "node[0-9]+[.]bar[.]com"
+        ]
+      },
+      "backends": [
+        "127.0.0.1:11443"
+      ]
+    }
+  ]
+}

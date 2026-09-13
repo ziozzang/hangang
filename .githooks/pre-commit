@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks git --staged --no-banner --redact
+fi
+if [ -r "$HOME/env" ]; then
+    exec python3 tools/check_publish.py --secrets-file "$HOME/env"
+fi
+exec python3 tools/check_publish.py

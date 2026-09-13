@@ -1,0 +1,12 @@
+{
+  "revision": 0,
+  "http": [
+    {
+      "id": "api",
+      "path_prefix": "/",
+      "backends": ["http://127.0.0.1:8081"],
+      "lua": "if hangang.header('x-block') == 'yes' then hangang.reject(403) end"
+    }
+  ],
+  "tcp": []
+}

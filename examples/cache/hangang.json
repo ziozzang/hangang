@@ -1,0 +1,42 @@
+{
+  "revision": 0,
+  "cache": {
+    "memory": {
+      "max_bytes": 8388608,
+      "max_entries": 2000,
+      "eviction": "lru"
+    },
+    "disk": {
+      "directory": "/tmp/hangang-cache-example/instance-a",
+      "max_bytes": 67108864,
+      "max_entries": 20000,
+      "eviction": "lru"
+    },
+    "max_object_bytes": 262144,
+    "max_fills": 16,
+    "fill_timeout_ms": 3000
+  },
+  "http": [
+    {
+      "id": "cached-catalog",
+      "path_prefix": "/catalog",
+      "path_match": "exact",
+      "cache": {
+        "ttl_seconds": 30,
+        "max_ttl_seconds": 120
+      },
+      "backends": [
+        "http://127.0.0.1:18081"
+      ]
+    },
+    {
+      "id": "uncached-health",
+      "path_prefix": "/health",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ]
+    }
+  ],
+  "tcp": []
+}

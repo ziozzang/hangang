@@ -1,0 +1,43 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": { "namespace": "demo", "name": "api" },
+      "spec": {
+        "ports": [
+          { "name": "http", "port": 8080, "protocol": "TCP" }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": { "namespace": "demo", "name": "api" },
+      "spec": {
+        "ingressClassName": "hangang",
+        "rules": [
+          {
+            "host": "api.example.test",
+            "http": {
+              "paths": [
+                {
+                  "path": "/health",
+                  "pathType": "Exact",
+                  "backend": { "service": { "name": "api", "port": { "name": "http" } } }
+                },
+                {
+                  "path": "/",
+                  "pathType": "Prefix",
+                  "backend": { "service": { "name": "api", "port": { "name": "http" } } }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

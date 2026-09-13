@@ -1,0 +1,13 @@
+{
+  "http": [
+    {
+      "id": "foo-site",
+      "hosts": ["foo.com", "www.foo.com"],
+      "path_prefix": "/",
+      "backends": ["http://127.0.0.1:8081", "http://127.0.0.1:8082"],
+      "priority": 10,
+      "max_requests": 1024
+    }
+  ],
+  "tcp": []
+}

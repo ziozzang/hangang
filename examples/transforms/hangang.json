@@ -1,0 +1,213 @@
+{
+  "revision": 0,
+  "http": [
+    {
+      "id": "native-json",
+      "path_prefix": "/native-json",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "request_transform": {
+        "operations": [
+          {
+            "op": "json_set",
+            "pointer": "/source",
+            "value": "hangang"
+          },
+          {
+            "op": "json_remove",
+            "pointer": "/client_role"
+          }
+        ],
+        "set_headers": {
+          "x-native": "yes"
+        }
+      },
+      "response_transform": {
+        "operations": [
+          {
+            "op": "json_remove",
+            "pointer": "/secret"
+          }
+        ]
+      }
+    },
+    {
+      "id": "native-xml",
+      "path_prefix": "/native-xml",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "request_transform": {
+        "operations": [
+          {
+            "op": "xml_set_text",
+            "path": "/root/name",
+            "value": "Hangang & friends"
+          }
+        ]
+      },
+      "response_transform": {
+        "operations": [
+          {
+            "op": "xml_remove",
+            "path": "/root/secret"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lua-json",
+      "path_prefix": "/lua-json",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "request_transform": {
+        "mode": "buffered",
+        "lua": "-- Buffered request: preserve JSON types, remove a client-controlled identity,\n-- and add a field. Native headers are configured alongside this script.\nlocal document = hangang.json_decode(hangang.body())\ndocument.client_role = nil\ndocument.source = \"hangang\"\ndocument.tags = document.tags or hangang.array()\nreturn hangang.json_encode(document)\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      },
+      "response_transform": {
+        "mode": "buffered",
+        "lua": "-- Runs in a fresh isolated VM for this response or NDJSON record.\nlocal document = hangang.json_decode(hangang.body())\ndocument.secret = nil\ndocument.processed = true\ndocument.optional = hangang.null\nhangang.set_body(hangang.json_encode(document))\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      },
+      "lua": "-- Existing routing policy API, independent of request/response body scripts.\n-- A returned backend must be listed in this route's configured backends.\nif hangang.header(\"x-deny\") == \"yes\" then\n    hangang.reject(403)\nend\nhangang.set_header(\"x-policy\", \"checked\")\n"
+    },
+    {
+      "id": "native-lines",
+      "path_prefix": "/native-lines",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "lines",
+        "operations": [
+          {
+            "op": "replace",
+            "from": "internal",
+            "to": "public"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lua-lines",
+      "path_prefix": "/lua-lines",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "lines",
+        "lua": "-- A complete bounded line arrives here, even if its bytes crossed HTTP chunks.\n-- Lua patterns operate on bytes. Keep the output within max_output_bytes.\nlocal line = string.gsub(hangang.body(), \"token=[^%s]+\", \"token=[redacted]\")\nreturn line\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "native-ndjson",
+      "path_prefix": "/native-ndjson",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "ndjson",
+        "operations": [
+          {
+            "op": "json_remove",
+            "pointer": "/secret"
+          },
+          {
+            "op": "json_set",
+            "pointer": "/gateway",
+            "value": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "lua-ndjson",
+      "path_prefix": "/lua-ndjson",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "ndjson",
+        "lua": "-- Runs in a fresh isolated VM for this response or NDJSON record.\nlocal document = hangang.json_decode(hangang.body())\ndocument.secret = nil\ndocument.processed = true\ndocument.optional = hangang.null\nhangang.set_body(hangang.json_encode(document))\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "native-sse",
+      "path_prefix": "/native-sse",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "sse",
+        "operations": [
+          {
+            "op": "json_remove",
+            "pointer": "/secret"
+          }
+        ]
+      }
+    },
+    {
+      "id": "lua-sse",
+      "path_prefix": "/lua-sse",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "sse",
+        "lua": "-- The gateway preserves event/id/retry/comments and joins the data fields.\n-- Handle a common application sentinel before trying to decode JSON.\nif hangang.body() == \"[DONE]\" then\n    return \"[DONE]\"\nend\nlocal event = hangang.json_decode(hangang.body())\nevent.secret = nil\nevent.gateway = true\nreturn hangang.json_encode(event)\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "binary",
+      "path_prefix": "/binary",
+      "path_match": "exact",
+      "backends": [
+        "http://127.0.0.1:18081"
+      ],
+      "max_requests": 16,
+      "response_transform": {
+        "mode": "buffered",
+        "lua": "-- Binary-safe buffered transformation. This example writes a small envelope.\n-- Do not use text/JSON media types for arbitrary binary output.\nreturn \"HG\\0\" .. hangang.body()\n",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "timeout_ms": 5000
+      }
+    }
+  ],
+  "tcp": []
+}

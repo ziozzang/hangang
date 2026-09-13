@@ -1,0 +1,10 @@
+{
+  "certificates": [
+    {"id":"web","hosts":["web.example.test"],"cert_file":"/run/hangang/certs/web.pem","key_file":"/run/hangang/certs/web.key"}
+  ],
+  "http": [{"id":"web","host":"web.example.test","backends":["http://127.0.0.1:8080"]}],
+  "tcp": [
+    {"id":"app-a","listen":"127.0.0.1:9443","sni":{"hosts":["a.example.test"],"max_client_hello_bytes":65536,"hello_timeout_ms":3000},"backends":["127.0.0.1:10443"]},
+    {"id":"app-b","listen":"127.0.0.1:9443","sni":{"hosts":["*.example.test"],"max_client_hello_bytes":65536,"hello_timeout_ms":3000},"backends":["127.0.0.1:11443"]}
+  ]
+}

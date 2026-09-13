@@ -1,0 +1,21 @@
+{
+  "http": [{
+    "id": "checked-service",
+    "host": "app.example.test",
+    "backends": ["http://127.0.0.1:18080"],
+    "balance": {
+      "active_health": {
+        "initial_state": "checking",
+        "path": "/health",
+        "interval_ms": 1000,
+        "timeout_ms": 500,
+        "healthy_statuses": [200],
+        "unhealthy_statuses": [500, 502, 503, 504],
+        "healthy_successes": 2,
+        "unhealthy_http_failures": 2,
+        "unhealthy_tcp_failures": 2,
+        "unhealthy_timeouts": 2
+      }
+    }
+  }]
+}

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<meta content="light dark" name="color-scheme"/>
+<meta content="Hangang proxy management console" name="description"/>
+<title>Hangang Console</title>
+<link href="/ui/style.css" rel="stylesheet"/>
+<script src="/ui/app.js" type="module"></script>
+<link rel="stylesheet" href="/ui/lua-editor.css">
+</head>
+<body>
+<a class="skip-link" data-i18n="Skip to content" href="#main">Skip to content</a>
+<div class="app-shell">
+<header class="topbar">
+<a aria-label="Hangang console home" class="brand" data-i18n-aria-label="Hangang console home" href="#status">
+<span aria-hidden="true" class="brand-mark">H</span>
+<span><strong>HANGANG</strong><small data-i18n="PROXY CONTROL">PROXY CONTROL</small></span>
+</a>
+<div class="workspace-crumb"><span class="workspace-avatar">H</span><span data-i18n="Workspace">Workspace</span><span class="crumb-slash">/</span><strong data-i18n="This gateway" id="workspace-host">This gateway</strong></div>
+<div class="top-status">
+<button aria-label="Search console" class="command-trigger" data-i18n-aria-label="Search console" id="command-open" type="button"><span data-i18n="Search console…">Search console…</span><kbd>⌘ K</kbd></button>
+<select aria-label="Language" class="locale-select" data-i18n-aria-label="Language" data-i18n-title="Language" id="locale-select" title="Language"><option value="en">English</option><option value="ko">한국어</option></select><button aria-label="Switch to dark theme" class="theme-toggle" data-i18n-aria-label="Switch to dark theme" data-i18n-title="Switch theme" id="theme-toggle" title="Switch theme" type="button">◐</button>
+<span class="connection-pill is-offline" id="connection-state"><span class="pulse"></span><bdi data-i18n="Disconnected">Disconnected</bdi></span>
+<span class="revision" data-i18n="REV —" id="revision-badge">REV —</span>
+<span class="signed-in-user" hidden="" id="signed-in-user"></span>
+<button class="button button-quiet" data-i18n="Log out" hidden="" id="logout-button" type="button">Log out</button>
+</div>
+</header>
+<aside aria-label="Primary navigation" class="sidebar" data-i18n-aria-label="Primary navigation">
+<div class="workspace-card"><span class="workspace-avatar">H</span><div><strong data-i18n="Gateway workspace">Gateway workspace</strong><small data-i18n="This instance" id="sidebar-endpoint">This instance</small></div></div><nav><p class="nav-group-label" data-i18n="WORKSPACE">WORKSPACE</p>
+<a class="nav-link is-active" data-view="status" href="#status"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M3 13h4l3-7 4 12 3-7h4"></path></svg></span><bdi data-i18n="Status">Status</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="http" href="#http"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M4 7h15m-4-4 4 4-4 4 M20 17H5m4-4-4 4 4 4"></path></svg></span><bdi data-i18n="HTTP routes">HTTP routes</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="tcp" href="#tcp"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 5h14v5H5z M5 14h14v5H5z M8 7.5h.01 M8 16.5h.01"></path></svg></span><bdi data-i18n="TCP routes">TCP routes</bdi></a>
+<p class="nav-group-label" data-admin-only="" data-i18n="OPERATIONS">OPERATIONS</p><a class="nav-link" data-admin-only="" data-view="operations" href="#operations"><span aria-hidden="true">▣</span><bdi data-i18n="Operations">Operations</bdi></a><a class="nav-link" data-admin-only="" data-view="cache" href="#cache"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M4 6c0-4 16-4 16 0v12c0 4-16 4-16 0z M4 6c0 4 16 4 16 0 M4 12c0 4 16 4 16 0"></path></svg></span><bdi data-i18n="Cache">Cache</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="docker" href="#docker"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M3 15h18l-2 4H6z M5 9h4v4H5z M10 9h4v4h-4z M15 9h4v4h-4z M10 4h4v4h-4z"></path></svg></span><bdi data-i18n="Docker">Docker</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="security" href="#security"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z M8 12l3 3 5-6"></path></svg></span><bdi data-i18n="Security">Security</bdi></a><a class="nav-link" data-admin-only="" data-view="certificates" href="#certificates"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M7 11V8a5 5 0 0 1 10 0v3 M5 11h14v10H5z M12 15v3"></path></svg></span><bdi data-i18n="Certificates">Certificates</bdi></a>
+<p class="nav-group-label" data-admin-only="" data-i18n="MANAGE">MANAGE</p><a class="nav-link" data-admin-only="" data-view="config" href="#config"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 5h14 M5 12h14 M5 19h14 M9 2v6 M15 9v6 M9 16v6"></path></svg></span><bdi data-i18n="Configuration">Configuration</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="users" href="#users"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-3c0-6 14-6 14 0v3 M17 4c5 0 5 7 0 7 M19 14c3 1 3 4 3 7"></path></svg></span><bdi data-i18n="Users">Users</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="utilities" href="#utilities"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M14 4a6 6 0 0 0-7 7L3 15l6 6 4-4a6 6 0 0 0 7-7l-4 3-4-4z"></path></svg></span><bdi data-i18n="Utilities">Utilities</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="docs" href="#docs"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"></path></svg></span><bdi data-i18n="API reference">API reference</bdi></a>
+</nav>
+<div class="sidebar-foot">
+<span class="sidebar-system"><span class="small-dot"></span><bdi data-i18n="Hangang control plane">Hangang control plane</bdi></span>
+<span data-i18n="Awaiting sign in" id="uptime-small">Awaiting sign in</span>
+</div>
+</aside>
+<main id="main" tabindex="-1">
+<div class="alert" hidden="" id="global-alert" role="alert"></div>
+<section aria-labelledby="status-title" class="view is-active" id="view-status">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="Live overview">Live overview</p><h1 data-i18n="Proxy status" id="status-title">Proxy status</h1><p data-i18n="Your gateway at a glance. Live traffic, recent requests, and runtime health.">Your gateway at a glance. Live traffic, recent requests, and runtime health.</p></div>
+<div class="button-row"><button class="button button-secondary" data-i18n="Graceful restart" hidden="" id="restart-server" type="button">Graceful restart</button><button class="button button-secondary" data-i18n="Refresh" id="refresh-status" type="button">Refresh</button></div>
+</div>
+<div aria-live="polite" class="loading-panel" id="status-loading"><span class="spinner"></span><bdi data-i18n="Waiting for authentication">Waiting for authentication</bdi></div>
+<div hidden="" id="status-content">
+<div class="overview-banner"><div><span class="small-dot"></span><strong data-i18n="Connecting to gateway" id="overview-health">Connecting to gateway</strong><span data-i18n="Waiting for runtime telemetry" id="overview-detail">Waiting for runtime telemetry</span></div><span class="stream-badge" data-i18n="Connecting" id="stream-state">Connecting</span></div>
+<div class="metric-grid" id="metric-grid"></div>
+<div class="telemetry-grid">
+<section aria-labelledby="traffic-title" class="panel traffic-panel">
+<div class="section-heading"><div><h2 data-i18n="Traffic overview" id="traffic-title">Traffic overview</h2><p data-i18n="Requests per second · observed in this browser">Requests per second · observed in this browser</p></div><span class="period-label" data-i18n="Last 60 samples">Last 60 samples</span></div>
+<div class="chart-head"><strong id="traffic-rate">—</strong><span data-i18n="req / sec">req / sec</span><span class="chart-legend"><i></i><bdi data-i18n="Requests">Requests</bdi><i class="error-key"></i><bdi data-i18n="Errors">Errors</bdi></span></div>
+<div class="chart-container"><svg aria-label="Request and error rates over recent live samples" data-i18n-aria-label="Request and error rates over recent live samples" id="traffic-chart" role="img" viewbox="0 0 720 180"><g class="chart-grid"><path d="M40 20H700 M40 65H700 M40 110H700 M40 155H700"></path></g><text id="chart-max" x="2" y="24">—</text><text x="20" y="159">0</text><path class="chart-area" id="traffic-area"></path><path class="chart-line" id="traffic-line"></path><path class="chart-error-line" id="error-line"></path></svg><p class="chart-empty" data-i18n="Collecting live samples. No historical data is stored in this chart." id="chart-empty">Collecting live samples. No historical data is stored in this chart.</p></div>
+<div class="chart-footer"><span data-i18n="Waiting for samples" id="chart-start">Waiting for samples</span><span data-i18n="Now" id="chart-latest">Now</span></div>
+</section>
+<section aria-labelledby="flow-title" class="panel flow-panel">
+<div class="section-heading"><div><h2 data-i18n="Traffic flow" id="flow-title">Traffic flow</h2><p data-i18n="Activity from real request counters">Activity from real request counters</p></div><span class="neutral-badge" data-i18n="Waiting" id="flow-mode">Waiting</span></div>
+<svg aria-label="Aggregate flow from clients through Hangang to upstreams" data-i18n-aria-label="Aggregate flow from clients through Hangang to upstreams" id="traffic-flow" role="img" viewbox="0 0 410 180">
+<path class="flow-wire" d="M54 58C130 58 122 91 182 91 M54 130C130 130 122 91 182 91 M226 91C285 91 280 40 354 40 M226 91H354 M226 91C285 91 280 144 354 144"></path>
+<path class="flow-moving" d="M54 58C130 58 122 91 182 91 M54 130C130 130 122 91 182 91 M226 91C285 91 280 40 354 40 M226 91H354 M226 91C285 91 280 144 354 144"></path>
+<rect class="flow-endpoint" height="30" rx="7" width="32" x="24" y="43"></rect><path class="flow-symbol" d="M32 52h16v9H32z M36 65h8"></path>
+<rect class="flow-endpoint" height="30" rx="7" width="32" x="24" y="115"></rect><path class="flow-symbol" d="M32 124h16v9H32z M36 137h8"></path>
+<rect class="flow-gateway" height="54" rx="13" width="54" x="178" y="65"></rect><text class="flow-h" text-anchor="middle" x="205" y="99">H</text>
+<rect class="flow-endpoint" height="30" rx="7" width="32" x="354" y="25"></rect><path class="flow-symbol" d="M362 35h16 M362 44h16"></path>
+<rect class="flow-endpoint" height="30" rx="7" width="32" x="354" y="76"></rect><path class="flow-symbol" d="M362 86h16 M362 95h16"></path>
+<rect class="flow-endpoint" height="30" rx="7" width="32" x="354" y="129"></rect><path class="flow-symbol" d="M362 139h16 M362 148h16"></path>
+<text class="flow-label" data-i18n="Clients" text-anchor="middle" x="40" y="175">Clients</text><text class="flow-label" data-i18n="Hangang" text-anchor="middle" x="205" y="145">Hangang</text><text class="flow-label" data-i18n="Upstreams" text-anchor="middle" x="370" y="175">Upstreams</text>
+</svg>
+<div class="flow-stat"><span><strong id="flow-active">—</strong><bdi data-i18n="active connections">active connections</bdi></span><span><strong id="flow-errors">—</strong><bdi data-i18n="errors / sec">errors / sec</bdi></span></div><p class="flow-caption" data-i18n="This instance only. Active connections include management traffic. Aggregate activity is not a packet capture or upstream health check.">This instance only. Active connections include management traffic. Aggregate activity is not a packet capture or upstream health check.</p>
+</section>
+</div>
+<section aria-labelledby="activity-title" class="panel activity-panel" data-admin-only="" id="activity-panel">
+<div class="section-heading"><div><h2 data-i18n="Recent requests" id="activity-title">Recent requests</h2><p data-i18n="Client metadata in a bounded, in-memory buffer. Query values and payloads are excluded.">Client metadata in a bounded, in-memory buffer. Query values and payloads are excluded.</p></div><div class="activity-actions"><span class="neutral-badge" data-i18n="60s retention" id="activity-retention">60s retention</span><button aria-pressed="false" class="button button-secondary" data-i18n="Pause view" id="activity-pause" type="button">Pause view</button></div></div>
+<div class="activity-toolbar"><label class="activity-search"><span>⌕</span><input aria-label="Filter recent requests" data-i18n-aria-label="Filter recent requests" data-i18n-placeholder="Filter IP, method, path, route…" id="activity-search" placeholder="Filter IP, method, path, route…" type="search"/></label><span data-i18n="Waiting for request metadata" id="activity-count" role="status">Waiting for request metadata</span></div>
+<div class="activity-table-wrap"><table class="activity-table"><thead><tr><th data-i18n="Time" scope="col">Time</th><th data-i18n="Client / peer IP" scope="col">Client / peer IP</th><th data-i18n="Request" scope="col">Request</th><th data-i18n="Route" scope="col">Route</th><th data-i18n="Status" scope="col">Status</th><th data-i18n="Response headers" scope="col">Response headers</th></tr></thead><tbody id="activity-rows"></tbody></table><div class="activity-empty" data-i18n="Waiting for the live request stream." id="activity-empty">Waiting for the live request stream.</div></div>
+<div class="activity-footer"><span data-i18n="Only this instance. Buffered records expire automatically." id="activity-note">Only this instance. Buffered records expire automatically.</span><span id="activity-updated">—</span></div>
+</section>
+<details class="panel prometheus-panel" open=""><summary><span><strong data-i18n="Prometheus telemetry">Prometheus telemetry</strong><small data-i18n="Live counters and gauges from the same registry as /metrics">Live counters and gauges from the same registry as /metrics</small></span><span class="neutral-badge" data-i18n="1s stream">1s stream</span></summary><div class="prometheus-table-wrap"><table class="prometheus-table"><thead><tr><th data-i18n="Metric" scope="col">Metric</th><th data-i18n="Type" scope="col">Type</th><th data-i18n="Current value" scope="col">Current value</th><th data-i18n="Per second" scope="col">Per second</th></tr></thead><tbody id="prometheus-rows"></tbody></table></div><p class="telemetry-note" data-i18n="Rates use consecutive live samples. No historical Prometheus server is queried.">Rates use consecutive live samples. No historical Prometheus server is queried.</p></details>
+<div class="metric-grid secondary-metrics" id="secondary-metric-grid"></div><div class="section-heading runtime-heading"><div><h2 data-i18n="Runtime &amp; configuration">Runtime &amp; configuration</h2><p data-i18n="Details for the instance you are connected to.">Details for the instance you are connected to.</p></div><span class="neutral-badge" data-i18n="This instance">This instance</span></div>
+<div class="panel status-detail">
+<div><span class="eyebrow" data-i18n="Runtime state">Runtime state</span><strong id="runtime-state">—</strong></div>
+<div><span class="eyebrow" data-i18n="Configuration source">Configuration source</span><strong id="configuration-source">—</strong></div>
+<div><span class="eyebrow" data-i18n="Uptime">Uptime</span><strong id="uptime">—</strong></div>
+<div><span class="eyebrow" data-i18n="Last observed">Last observed</span><strong id="last-sync">—</strong></div>
+<div><span class="eyebrow" data-i18n="Version">Version</span><strong id="server-version">—</strong></div>
+<div><span class="eyebrow" data-i18n="Process ID">Process ID</span><strong id="process-id">—</strong></div>
+<div><span class="eyebrow" data-i18n="Instance">Instance</span><strong id="instance-id">—</strong><p class="field-help" data-i18n="Random per-process identifier; tells instances behind one address apart." id="instance-note">Random per-process identifier; tells instances behind one address apart.</p></div>
+<div><span class="eyebrow" data-i18n="Configuration digest">Configuration digest</span><strong id="instance-digest">—</strong><p class="field-help" data-i18n="Digest of the active document without its revision; fleet members at one revision must agree.">Digest of the active document without its revision; fleet members at one revision must agree.</p></div>
+</div>
+<div aria-labelledby="store-title" class="panel status-detail" hidden="" id="store-panel" role="region">
+<div><span class="eyebrow" data-i18n="Shared store" id="store-title">Shared store</span><strong id="store-state">—</strong><p class="field-help" id="store-state-detail"></p></div>
+<div><span class="eyebrow" data-i18n="Reason">Reason</span><strong id="store-reason">—</strong><p class="field-help" id="store-reason-help"></p></div>
+<div><span class="eyebrow" data-i18n="Last confirmed">Last confirmed</span><strong id="store-confirmed">—</strong><p class="field-help" id="store-grace"></p></div>
+<div><span class="eyebrow" data-i18n="Authority epoch">Authority epoch</span><strong id="store-epoch">—</strong><div class="button-row"><button class="button button-quiet" data-i18n="Copy epoch" id="copy-epoch" type="button">Copy epoch</button></div></div>
+<div><span class="eyebrow" data-i18n="Store revision">Store revision</span><strong id="store-revision">—</strong><p class="field-help" data-i18n="Revision this instance activated from the shared store.">Revision this instance activated from the shared store.</p></div>
+<div><span class="eyebrow" data-i18n="Detail">Detail</span><p class="field-help" id="store-detail"></p></div>
+</div>
+<div aria-labelledby="settings-status-title" class="panel status-detail" role="region">
+<div><span class="eyebrow" data-i18n="Fleet setting · trusted proxies" id="settings-status-title">Fleet setting · trusted proxies</span><strong id="setting-active-trusted_proxy_cidrs">—</strong><p class="field-help" data-i18n="settings.trusted_proxy_cidrs; otherwise --trusted-proxy-cidrs.">settings.trusted_proxy_cidrs; otherwise --trusted-proxy-cidrs.</p></div>
+<div><span class="eyebrow" data-i18n="Fleet setting · removed response headers">Fleet setting · removed response headers</span><strong id="setting-active-remove_response_headers">—</strong><p class="field-help" data-i18n="settings.remove_response_headers; otherwise --remove-response-headers.">settings.remove_response_headers; otherwise --remove-response-headers.</p></div>
+<div><span class="eyebrow" data-i18n="Fleet setting · HTTPS redirect code">Fleet setting · HTTPS redirect code</span><strong id="setting-active-https_redirect_code">—</strong><p class="field-help" data-i18n="settings.https_redirect_code; otherwise --https-redirect-code.">settings.https_redirect_code; otherwise --https-redirect-code.</p></div>
+<div><span class="eyebrow" data-i18n="Fleet setting · upstream timeout">Fleet setting · upstream timeout</span><strong id="setting-active-upstream_timeout_ms">—</strong><p class="field-help" data-i18n="settings.upstream_timeout_ms; otherwise --upstream-timeout-seconds.">settings.upstream_timeout_ms; otherwise --upstream-timeout-seconds.</p></div>
+<div><span class="eyebrow" data-i18n="Fleet setting · dot segments">Fleet setting · dot segments</span><strong id="setting-active-allow_dot_segments">—</strong><p class="field-help" data-i18n="settings.allow_dot_segments; otherwise --allow-dot-segments.">settings.allow_dot_segments; otherwise --allow-dot-segments.</p></div>
+<div><span class="eyebrow" data-i18n="Fleet setting · health path">Fleet setting · health path</span><strong id="setting-active-health_path">—</strong><p class="field-help" data-i18n="settings.health_path; otherwise --health-path.">settings.health_path; otherwise --health-path.</p></div>
+</div>
+<div class="panel status-detail"><div><span class="eyebrow" data-i18n="In-process certificate issuer">In-process certificate issuer</span><strong id="acme-state">—</strong><p id="acme-detail"></p></div></div>
+<div class="panel status-detail">
+<div><span class="eyebrow" data-i18n="Signed software updates">Signed software updates</span><strong data-i18n="Loading status" id="update-state">Loading status</strong><p id="update-detail"></p></div>
+<button class="button button-secondary" data-i18n="Check and apply update" hidden="" id="check-update" type="button">Check and apply update</button>
+</div>
+<div class="panel status-detail diagnostics">
+<div>
+<span class="eyebrow" data-i18n="Diagnostics">Diagnostics</span>
+<p class="field-help"><bdi data-i18n="The authenticated admin listener also answers">The authenticated admin listener also answers</bdi><code>GET /healthz</code><bdi data-i18n="(readiness) and">(readiness) and</bdi><code>GET /metrics</code><bdi data-i18n="(Prometheus text exposition).">(Prometheus text exposition).</bdi></p>
+<div aria-live="polite" class="inline-message" id="health-result"></div>
+<div class="button-row"><button class="button button-secondary" data-i18n="Check health" id="check-health" type="button">Check health</button><button class="button button-secondary" data-i18n="Load Prometheus metrics" id="load-metrics" type="button">Load Prometheus metrics</button><button class="button button-secondary" data-i18n="Verify my session" hidden="" id="verify-session" type="button">Verify my session</button></div>
+<div aria-live="polite" class="inline-message" id="session-result"></div>
+<pre class="metrics-output" hidden="" id="metrics-output"></pre>
+</div>
+</div>
+</div>
+</section>
+<section aria-labelledby="http-title" class="view" hidden="" id="view-http">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="Layer 7 routing">Layer 7 routing</p><h1 data-i18n="HTTP routes" id="http-title">HTTP routes</h1><p data-i18n="Ordered request matching, upstream pools, client policy, and Lua hooks.">Ordered request matching, upstream pools, client policy, and Lua hooks.</p></div>
+<button class="button button-primary" data-i18n="New HTTP route" data-new-route="http" type="button">New HTTP route</button>
+</div>
+<div class="route-list" id="http-routes"></div>
+</section>
+<section aria-labelledby="tcp-title" class="view" hidden="" id="view-tcp">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="Layer 4 routing">Layer 4 routing</p><h1 data-i18n="TCP routes" id="tcp-title">TCP routes</h1><p data-i18n="Listeners, backend targets, and source network policy.">Listeners, backend targets, and source network policy.</p></div>
+<button class="button button-primary" data-i18n="New TCP route" data-new-route="tcp" type="button">New TCP route</button>
+</div>
+<div class="route-list" id="tcp-routes"></div>
+</section>
+<section aria-labelledby="operations-title" class="view" hidden="" id="view-operations">
+  <div class="page-head"><div><p class="eyebrow" data-i18n="Instance operations">Instance operations</p><h1 id="operations-title" data-i18n="Operations">Operations</h1><p data-i18n="Configured load-balancer targets and capabilities of this instance.">Configured load-balancer targets and capabilities of this instance.</p></div><button id="operations-refresh" class="button button-secondary" type="button" data-i18n="Refresh">Refresh</button></div>
+  <div id="operations-message" class="inline-message" role="status" aria-live="polite"></div>
+  <div id="operations-capabilities" class="operations-capabilities"></div>
+  <div class="panel operations-panel">
+    <div class="section-heading"><div><h2 data-i18n="Backend targets">Backend targets</h2><p data-i18n="Configured addresses are shown literally; this page does not scan or control remote servers.">Configured addresses are shown literally; this page does not scan or control remote servers.</p></div><div class="operations-head-meta"><span id="operations-updated"></span><span id="operations-instance" class="neutral-badge"></span></div></div>
+    <p class="operations-caution" data-i18n="Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.">Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.</p>
+    <div class="operations-table-wrap"><table class="operations-table"><thead><tr><th scope="col" data-i18n="Route / match">Route / match</th><th scope="col" data-i18n="Configured target">Configured target</th><th scope="col" data-i18n="Selection">Selection</th><th scope="col" data-i18n="Health evidence">Health evidence</th><th scope="col" data-i18n="Observed load">Observed load</th></tr></thead><tbody id="operations-rows"></tbody></table></div>
+    <p id="operations-empty" class="operations-empty" data-i18n="No backend targets are configured.">No backend targets are configured.</p>
+    <div class="operations-pagination"><span id="operations-range" role="status"></span><button id="operations-prev" class="button button-secondary" type="button" data-i18n="Previous">Previous</button><button id="operations-next" class="button button-secondary" type="button" data-i18n="Next">Next</button></div>
+  </div>
+  <div class="operations-links"><a class="button button-secondary" href="#http" data-i18n="Edit HTTP routes">Edit HTTP routes</a><a class="button button-secondary" href="#tcp" data-i18n="Edit TCP routes">Edit TCP routes</a><a class="button button-secondary" href="#status" data-i18n="View runtime status">View runtime status</a></div>
+</section>
+<section aria-labelledby="docker-panel-title" class="view" hidden="" id="view-docker"><div id="docker-panel"></div></section>
+<section aria-labelledby="cache-title" class="view" hidden="" id="view-cache">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="Native HTTP cache">Native HTTP cache</p><h1 data-i18n="Cache" id="cache-title">Cache</h1><p data-i18n="Inspect storage use, change the global cache policy, and purge cached responses.">Inspect storage use, change the global cache policy, and purge cached responses.</p></div>
+<div class="button-row"><button class="button button-danger" data-i18n="Purge cache" id="purge-cache" type="button">Purge cache</button><button class="button button-secondary" data-i18n="Refresh" id="refresh-cache" type="button">Refresh</button></div>
+</div>
+<div aria-live="polite" class="loading-panel" id="cache-loading"><span class="spinner"></span><bdi data-i18n="Loading cache status">Loading cache status</bdi></div>
+<div hidden="" id="cache-content">
+<div class="metric-grid" id="cache-metric-grid"></div>
+<div class="panel status-detail">
+<div><span class="eyebrow" data-i18n="Runtime state">Runtime state</span><strong id="cache-state">—</strong></div>
+<div><span class="eyebrow" data-i18n="Memory policy">Memory policy</span><strong id="cache-memory-policy">—</strong></div>
+<div><span class="eyebrow" data-i18n="Disk policy">Disk policy</span><strong id="cache-disk-policy">—</strong></div>
+<div><span class="eyebrow" data-i18n="Active fills">Active fills</span><strong id="cache-active-fills">—</strong></div>
+<div><span class="eyebrow" data-i18n="Invalidation generation">Invalidation generation</span><strong id="cache-generation">—</strong><p class="field-help" data-i18n="Live value the runtime enforces; every cache key is namespaced by it.">Live value the runtime enforces; every cache key is namespaced by it.</p></div>
+<div><span class="eyebrow" data-i18n="Purge scope">Purge scope</span><strong id="cache-purge-scope">—</strong><p class="field-help" data-i18n="Fleet when a shared configuration store is the authority; otherwise only this instance.">Fleet when a shared configuration store is the authority; otherwise only this instance.</p></div>
+</div>
+<div class="panel editor-panel cache-policy-panel">
+<div class="panel-head"><label data-i18n="Global cache policy JSON" for="cache-policy-editor">Global cache policy JSON</label><span class="dirty-mark" data-i18n="Unsaved" hidden="" id="cache-policy-dirty">Unsaved</span></div>
+<textarea aria-describedby="cache-policy-help" class="code-editor code-editor-small" id="cache-policy-editor" spellcheck="false"></textarea>
+<p class="field-help" id="cache-policy-help"><bdi data-i18n="Object with">Object with</bdi><code>memory</code><bdi data-i18n="{max_bytes, max_entries, eviction lru|fifo}, optional">{max_bytes, max_entries, eviction lru|fifo}, optional</bdi><code>disk</code><bdi data-i18n="{directory, max_bytes 65536–8796093018112, max_entries, eviction},">{directory, max_bytes 65536–8796093018112, max_entries, eviction},</bdi><code>max_object_bytes</code> (1–16777216), <code>max_fills</code> (1–1024), <code>fill_timeout_ms</code><bdi data-i18n="(1–30000) and">(1–30000) and</bdi><code>generation</code><bdi data-i18n="(0–4294967295, default 0; mirrored by the field below). Use null to disable caching. The complete configuration remains authoritative.">(0–4294967295, default 0; mirrored by the field below). Use null to disable caching. The complete configuration remains authoritative.</bdi></p>
+<div class="form-grid">
+<div class="field">
+<label data-i18n="Invalidation generation" for="cache-generation-input">Invalidation generation</label>
+<input aria-describedby="cache-generation-help" id="cache-generation-input" inputmode="numeric" max="4294967295" min="0" name="generation" placeholder="0" step="1" type="number"/>
+<span class="field-help-inline" data-i18n="Read-mostly: changed by fleet purge; edit only to force invalidation. Any change makes every instance drop its cached entries when it activates the revision. Blank keeps the value in the JSON above." id="cache-generation-help">Read-mostly: changed by fleet purge; edit only to force invalidation. Any change makes every instance drop its cached entries when it activates the revision. Blank keeps the value in the JSON above.</span>
+</div>
+</div>
+<div aria-live="polite" class="inline-message" id="cache-message"></div>
+<p class="field-help" data-i18n="Use enabled: false to pause caching while retaining the policy. Removing the policy with null is a separate change.">Use enabled: false to pause caching while retaining the policy. Removing the policy with null is a separate change.</p>
+<div class="button-row"><button class="button button-quiet" data-i18n="Insert template" id="cache-policy-template" type="button">Insert template</button><button class="button button-quiet" data-i18n="Format JSON" id="format-cache-policy" type="button">Format JSON</button><button class="button button-secondary" disabled="" id="toggle-cache-policy" type="button">Activate cache</button><button class="button button-primary" data-i18n="Apply cache policy" id="apply-cache-policy" type="button">Apply cache policy</button></div>
+</div>
+</div>
+</section>
+<section aria-labelledby="certificates-title" class="view" hidden="" id="view-certificates">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="TLS inventory">TLS inventory</p><h1 data-i18n="Certificates" id="certificates-title">Certificates</h1><p data-i18n="Review certificate metadata and manage file-backed SNI coverage.">Review certificate metadata and manage file-backed SNI coverage.</p></div>
+<button class="button button-secondary" data-i18n="Reload from server" id="reload-certificates" type="button">Reload from server</button>
+</div>
+<div class="panel certificate-inventory-panel"><div class="panel-head"><strong data-i18n="Certificate inventory">Certificate inventory</strong><span id="certificate-inventory-count">—</span></div><p class="field-help" data-i18n="This inventory and its activation controls affect this instance only. A separate HTTPS gateway has its own configuration. Deactivation does not stop an external ACME issuer. A configured TLS binding does not prove this exact file is currently served or renewed.">This inventory and its activation controls affect this instance only. A separate HTTPS gateway has its own configuration. Deactivation does not stop an external ACME issuer. A configured TLS binding does not prove this exact file is currently served or renewed.</p><div id="certificate-acme-state"></div><div aria-live="polite" id="certificate-inventory"></div><nav aria-label="Certificate pages" data-i18n-aria-label="Certificate pages" id="certificate-inventory-pages"></nav></div>
+<div class="panel-head certificate-paths-title"><strong data-i18n="Configured file paths">Configured file paths</strong></div>
+<div aria-live="polite" class="route-list" id="certificate-list"></div>
+<div class="panel editor-panel certificate-editor-panel">
+<div class="panel-head"><label data-i18n="Certificate set JSON" for="certificate-editor">Certificate set JSON</label><span class="dirty-mark" data-i18n="Unsaved" hidden="" id="certificate-dirty">Unsaved</span></div>
+<textarea aria-describedby="certificate-help" class="code-editor code-editor-small" id="certificate-editor" spellcheck="false"></textarea>
+<p class="field-help" id="certificate-help"><bdi data-i18n="Each entry requires id, hosts, cert_file, and key_file. Paths must be absolute files readable by Hangang. Start Hangang with">Each entry requires id, hosts, cert_file, and key_file. Paths must be absolute files readable by Hangang. Start Hangang with</bdi><code>--config-tls</code><bdi data-i18n="to serve this set. Certificate and private-key PEM content is never stored in configuration.">to serve this set. Certificate and private-key PEM content is never stored in configuration.</bdi></p>
+<p class="field-help" data-i18n="Set enabled: false on an entry to exclude it from this instance's TLS selection while retaining its paths. Re-enabling validates the certificate files.">Set enabled: false on an entry to exclude it from this instance's TLS selection while retaining its paths. Re-enabling validates the certificate files.</p>
+<div aria-live="polite" class="inline-message" id="certificate-message"></div>
+<div class="button-row"><button class="button button-quiet" data-i18n="Add template" id="add-certificate-template" type="button">Add template</button><button class="button button-secondary" data-i18n="Format JSON" id="format-certificates" type="button">Format JSON</button><button class="button button-primary" data-i18n="Apply certificates" id="apply-certificates" type="button">Apply certificates</button></div>
+</div>
+</section>
+<section aria-labelledby="config-title" class="view" hidden="" id="view-config">
+<div class="page-head">
+<div><p class="eyebrow" data-i18n="Active document">Active document</p><h1 data-i18n="Configuration" id="config-title">Configuration</h1><p data-i18n="Validate and atomically publish the complete proxy configuration.">Validate and atomically publish the complete proxy configuration.</p></div>
+<button class="button button-secondary" data-i18n="Reload from server" id="reload-config" type="button">Reload from server</button>
+</div>
+<div class="editor-layout">
+<div class="panel editor-panel">
+<div class="panel-head"><label data-i18n="JSON document" for="config-editor">JSON document</label><span class="dirty-mark" data-i18n="Unsaved" hidden="" id="config-dirty">Unsaved</span></div>
+<textarea aria-describedby="config-help" class="code-editor" id="config-editor" spellcheck="false"></textarea>
+<p class="field-help" data-i18n="Changes remain in this browser until you press Apply configuration." id="config-help">Changes remain in this browser until you press Apply configuration.</p>
+<details class="form-section" id="settings-section" open="">
+<summary><span class="section-title" data-i18n="Fleet settings" id="settings-title">Fleet settings</span><span class="section-state" data-i18n="Configured" hidden="" id="settings-state">Configured</span></summary>
+<div aria-labelledby="settings-title" class="form-grid" id="settings-form" role="group">
+<p class="section-note" id="settings-help"><bdi data-i18n="Optional">Optional</bdi><code>settings</code><bdi data-i18n="block of the document. A set field overrides the command-line flag of the same name on every instance of the fleet; a blank field inherits the process default. Edits are mirrored into the JSON document above and published with Apply configuration.">block of the document. A set field overrides the command-line flag of the same name on every instance of the fleet; a blank field inherits the process default. Edits are mirrored into the JSON document above and published with Apply configuration.</bdi></p>
+<div class="field"><label data-i18n="Trusted proxy CIDRs" for="setting-trusted_proxy_cidrs">Trusted proxy CIDRs</label><textarea aria-describedby="setting-trusted_proxy_cidrs-help" id="setting-trusted_proxy_cidrs" name="trusted_proxy_cidrs" spellcheck="false"></textarea><span class="field-help-inline" data-i18n="One IPv4 or IPv6 network per line, at most 1,024; peers whose X-Forwarded-For/Proto/Host/Port are trusted. Blank inherits --trusted-proxy-cidrs." id="setting-trusted_proxy_cidrs-help">One IPv4 or IPv6 network per line, at most 1,024; peers whose X-Forwarded-For/Proto/Host/Port are trusted. Blank inherits --trusted-proxy-cidrs.</span></div>
+<div class="field"><label data-i18n="Removed response headers (fleet)" for="setting-remove_response_headers">Removed response headers (fleet)</label><textarea aria-describedby="setting-remove_response_headers-help" id="setting-remove_response_headers" name="remove_response_headers" spellcheck="false"></textarea><span class="field-help-inline" data-i18n="One header name per line, at most 64, removed from every upstream response; framing and hop-by-hop names are rejected. Blank inherits --remove-response-headers." id="setting-remove_response_headers-help">One header name per line, at most 64, removed from every upstream response; framing and hop-by-hop names are rejected. Blank inherits --remove-response-headers.</span></div>
+<div class="field"><label data-i18n="HTTPS redirect code" for="setting-https_redirect_code">HTTPS redirect code</label><select aria-describedby="setting-https_redirect_code-help" id="setting-https_redirect_code" name="https_redirect_code"><option value="">Inherit --https-redirect-code</option><option value="301">301 Moved Permanently</option><option value="302">302 Found</option><option value="307">307 Temporary Redirect</option><option value="308">308 Permanent Redirect</option><option value="426">426 Upgrade Required</option></select><span class="field-help-inline" data-i18n="Status answered to plaintext requests on routes that require TLS." id="setting-https_redirect_code-help">Status answered to plaintext requests on routes that require TLS.</span></div>
+<div class="field"><label data-i18n="Upstream timeout default (ms)" for="setting-upstream_timeout_ms">Upstream timeout default (ms)</label><input aria-describedby="setting-upstream_timeout_ms-help" id="setting-upstream_timeout_ms" inputmode="numeric" max="86400000" min="1" name="upstream_timeout_ms" step="1" type="number"/><span class="field-help-inline" data-i18n="1–86,400,000 ms for routes without their own upstream_timeout_ms. Blank inherits --upstream-timeout-seconds." id="setting-upstream_timeout_ms-help">1–86,400,000 ms for routes without their own upstream_timeout_ms. Blank inherits --upstream-timeout-seconds.</span></div>
+<div class="field"><label data-i18n="Dot segments in request paths" for="setting-allow_dot_segments">Dot segments in request paths</label><select aria-describedby="setting-allow_dot_segments-help" id="setting-allow_dot_segments" name="allow_dot_segments"><option value="">Inherit --allow-dot-segments</option><option value="true">Allowed</option><option value="false">Rejected</option></select><span class="field-help-inline" data-i18n="Whether paths containing . or .. segments are accepted." id="setting-allow_dot_segments-help">Whether paths containing . or .. segments are accepted.</span></div>
+<div class="field"><label data-i18n="Health path" for="setting-health_path">Health path</label><input aria-describedby="setting-health_path-help" autocapitalize="none" data-i18n-placeholder="/healthz" id="setting-health_path" maxlength="256" name="health_path" placeholder="/healthz" spellcheck="false" type="text"/><span class="field-help-inline" data-i18n="Absolute path (no query or fragment, at most 256 characters) of the unauthenticated readiness probe on the public listener. Blank inherits --health-path." id="setting-health_path-help">Absolute path (no query or fragment, at most 256 characters) of the unauthenticated readiness probe on the public listener. Blank inherits --health-path.</span></div>
+<div aria-live="polite" class="inline-message span-2" id="settings-message"></div>
+</div>
+</details>
+<div aria-live="polite" class="inline-message" id="config-message"></div>
+<div class="button-row">
+<button class="button button-quiet" data-i18n="Format JSON" id="format-config" type="button">Format JSON</button>
+<button class="button button-secondary" data-i18n="Validate" id="validate-config" type="button">Validate</button>
+<button class="button button-secondary" data-i18n="Preview changes" id="preview-config" type="button">Preview changes</button>
+<button class="button button-primary" data-i18n="Apply configuration" id="apply-config" type="button">Apply configuration</button>
+</div>
+</div>
+<aside aria-label="Configuration change preview" class="panel preview-panel" data-i18n-aria-label="Configuration change preview" id="config-preview">
+<div class="panel-head"><strong data-i18n="Change preview">Change preview</strong><span data-i18n="No changes" id="preview-count">No changes</span></div>
+<pre id="config-diff">Load the active configuration to compare changes.</pre>
+</aside>
+</div>
+</section>
+<section aria-labelledby="utilities-title" class="view" hidden="" id="view-utilities">
+<div class="page-head"><div><p class="eyebrow" data-i18n="Administrator utilities">Administrator utilities</p><h1 data-i18n="Utilities" id="utilities-title">Utilities</h1><p data-i18n="Generate a credential line for route Basic authentication without editing a route.">Generate a credential line for route Basic authentication without editing a route.</p></div></div>
+<div class="panel user-panel">
+<h2 data-i18n="Generate Basic credential">Generate Basic credential</h2>
+<p class="field-help" data-i18n="The proxy salts and hashes the password. This tool shows only the resulting credential line; paste it into an HTTP route’s Basic authentication settings and save that route to publish it.">The proxy salts and hashes the password. This tool shows only the resulting credential line; paste it into an HTTP route’s Basic authentication settings and save that route to publish it.</p>
+<form class="user-form" id="utility-hash-form">
+<label><bdi data-i18n="Username">Username</bdi><input autocomplete="off" maxlength="255" name="username" required="" type="text"/></label>
+<label><bdi data-i18n="Password">Password</bdi><input autocomplete="new-password" maxlength="1024" name="password" required="" type="password"/></label>
+<button class="button button-primary" data-i18n="Generate credential" type="submit">Generate credential</button>
+</form>
+<div aria-live="polite" class="inline-message" id="utility-hash-message"></div>
+<label class="field" for="utility-credential"><span data-i18n="Credential line">Credential line</span><textarea autocomplete="off" id="utility-credential" readonly="" rows="3" spellcheck="false"></textarea></label>
+<div class="button-row"><button class="button button-secondary" data-i18n="Copy credential" disabled="" id="utility-copy-credential" type="button">Copy credential</button><a class="button button-quiet" data-i18n="Open HTTP routes" href="#http">Open HTTP routes</a></div>
+</div>
+</section>
+<section aria-labelledby="docs-title" class="view" hidden="" id="view-docs">
+<div class="page-head"><div><p class="eyebrow">OpenAPI 3</p><h1 data-i18n="API reference" id="docs-title">API reference</h1><p data-i18n="Endpoints and schemas published by this proxy instance.">Endpoints and schemas published by this proxy instance.</p></div><button class="button button-secondary" data-i18n="Reload" id="reload-docs" type="button">Reload</button></div>
+<div class="docs-layout"><nav aria-label="API endpoints" class="panel docs-nav" data-i18n-aria-label="API endpoints" id="docs-nav"></nav><div class="docs-content" id="docs-content"></div></div>
+</section>
+<section aria-labelledby="security-title" class="view" hidden="" id="view-security"><div class="page-head"><div><p class="eyebrow" data-i18n="Identity &amp; access">Identity &amp; access</p><h1 data-i18n="Security posture" id="security-title">Security posture</h1><p data-i18n="Review route authentication, encrypted transport, and explicit trust boundaries.">Review route authentication, encrypted transport, and explicit trust boundaries.</p></div><button class="button button-secondary" data-i18n="Refresh" id="refresh-security" type="button">Refresh</button></div><div id="security-content"></div><div class="panel security-boundary"><h2 data-i18n="Zero Trust starts with explicit access">Zero Trust starts with explicit access</h2><p data-i18n="Enforce identity on each protected route, verify upstream certificates, and scope trusted proxies narrowly. Missing gateway authentication may be intentional when the application authenticates users itself.">Enforce identity on each protected route, verify upstream certificates, and scope trusted proxies narrowly. Missing gateway authentication may be intentional when the application authenticates users itself.</p><div class="security-links"><a class="button button-secondary" data-i18n="Manage route policies" href="#http">Manage route policies</a><a class="button button-secondary" data-i18n="Manage console users" href="#users">Manage console users</a><a class="button button-secondary" data-i18n="Review trusted proxies" href="#config">Review trusted proxies</a></div><p class="field-help" data-i18n="Gateway policies do not establish device posture or a complete Zero Trust architecture. External identity providers integrate through the route authorization service.">Gateway policies do not establish device posture or a complete Zero Trust architecture. External identity providers integrate through the route authorization service.</p></div></section>
+<section aria-labelledby="users-title" class="view" hidden="" id="view-users">
+<div class="page-head"><div><p class="eyebrow" data-i18n="Access control">Access control</p><h1 data-i18n="Users" id="users-title">Users</h1><p data-i18n="Accounts belong to this proxy instance. Configure each instance separately.">Accounts belong to this proxy instance. Configure each instance separately.</p></div><button class="button button-secondary" data-i18n="Refresh" id="refresh-users" type="button">Refresh</button></div>
+<div class="panel user-panel">
+<h2 data-i18n="Create user">Create user</h2>
+<form class="user-form" id="create-user-form">
+<label><bdi data-i18n="Username">Username</bdi><input autocomplete="off" maxlength="64" minlength="3" name="username" pattern="[A-Za-z0-9_.-]{3,64}" required="" type="text"/></label>
+<label><bdi data-i18n="Password">Password</bdi><input autocomplete="new-password" maxlength="1024" minlength="12" name="password" required="" type="password"/></label>
+<label><bdi data-i18n="Role">Role</bdi><select name="role"><option value="viewer">Viewer</option><option value="admin">Administrator</option></select></label>
+<button class="button button-primary" data-i18n="Create user" type="submit">Create user</button>
+</form>
+<div class="inline-message" id="users-message" role="status"></div>
+</div>
+<div aria-live="polite" class="user-list" id="user-list"></div>
+</section>
+</main>
+</div>
+<dialog aria-labelledby="login-title" class="login-dialog" id="login-dialog">
+<div aria-hidden="true" class="login-story"><div class="login-wordmark">HANGANG <span>CONSOLE</span></div><div class="login-art"><span class="orbit orbit-one"></span><span class="orbit orbit-two"></span><span class="orbit orbit-three"></span><strong>H</strong><i class="orbit-node node-one"></i><i class="orbit-node node-two"></i><i class="orbit-node node-three"></i></div><div><span class="login-overline" data-i18n="YOUR TRAFFIC. YOUR CONTROL.">YOUR TRAFFIC. YOUR CONTROL.</span><h2><bdi data-i18n="A clear view.">A clear view.</bdi><br/><bdi data-i18n="A powerful gateway.">A powerful gateway.</bdi></h2><p><bdi data-i18n="Routing, security, and live observability.">Routing, security, and live observability.</bdi><br/><bdi data-i18n="One place to keep things moving.">One place to keep things moving.</bdi></p></div><span class="login-story-foot" data-i18n="Built for the way you operate.">Built for the way you operate.</span></div>
+<form id="login-form" method="dialog">
+<select aria-label="Language" class="locale-select" data-i18n-aria-label="Language" data-i18n-title="Language" data-locale-select id="locale-select-login" title="Language"><option value="en">English</option><option value="ko">한국어</option></select>
+<div aria-hidden="true" class="login-mark">H</div>
+<p class="eyebrow" data-i18n="Hangang control plane">Hangang control plane</p>
+<h1 data-i18n="Connect to this proxy" id="login-title">Connect to this proxy</h1>
+<p data-i18n="Checking administrator access…" id="login-description">Checking administrator access…</p>
+<div class="login-fields" hidden="" id="token-login-fields">
+<label data-i18n="Administrator token" for="token-input">Administrator token</label>
+<div class="secret-input"><input autocapitalize="none" autocomplete="off" id="token-input" name="token" spellcheck="false" type="password"/><button aria-label="Show token" data-i18n="Show" data-i18n-aria-label="Show token" id="toggle-token" type="button">Show</button></div>
+</div>
+<div class="login-fields" hidden="" id="account-login-fields">
+<label data-i18n="Username" for="login-username">Username</label><input autocapitalize="none" autocomplete="username" id="login-username" maxlength="64" name="username" spellcheck="false" type="text"/>
+<label data-i18n="Password" for="login-password">Password</label><input autocomplete="current-password" id="login-password" maxlength="1024" name="password" type="password"/>
+</div>
+<div class="login-fields" hidden="" id="setup-login-fields">
+<label data-i18n="Bootstrap authorization token" for="setup-token">Bootstrap authorization token</label><input autocapitalize="none" autocomplete="off" id="setup-token" name="setup_token" spellcheck="false" type="password"/>
+<label data-i18n="New administrator username" for="setup-username">New administrator username</label><input autocapitalize="none" autocomplete="username" id="setup-username" maxlength="64" minlength="3" name="setup_username" pattern="[A-Za-z0-9_.-]{3,64}" spellcheck="false" type="text"/>
+<label data-i18n="New password" for="setup-password">New password</label><input autocomplete="new-password" id="setup-password" maxlength="1024" minlength="12" name="setup_password" type="password"/>
+<label data-i18n="Confirm password" for="setup-confirm">Confirm password</label><input autocomplete="new-password" id="setup-confirm" maxlength="1024" minlength="12" name="setup_confirm" type="password"/>
+</div>
+<div class="inline-message is-error" id="login-error" role="alert"></div>
+<button class="button button-primary button-wide" data-i18n="Connect" id="login-submit" type="submit">Connect</button>
+<button class="button button-quiet button-wide" data-i18n="Use administrator token" hidden="" id="switch-to-token" type="button">Use administrator token</button>
+<button class="button button-quiet button-wide" data-i18n="Use username and password" hidden="" id="switch-to-account" type="button">Use username and password</button>
+</form>
+</dialog>
+<dialog aria-labelledby="route-dialog-title" class="route-dialog" id="route-dialog">
+<form id="route-form" method="dialog">
+<div class="dialog-head"><div><p class="eyebrow" data-i18n="Route" id="route-dialog-eyebrow">Route</p><h2 data-i18n="New route" id="route-dialog-title">New route</h2></div><span class="dialog-head-actions"><select aria-label="Language" class="locale-select" data-i18n-aria-label="Language" data-i18n-title="Language" data-locale-select id="locale-select-route" title="Language"><option value="en">English</option><option value="ko">한국어</option></select><button aria-label="Close" class="icon-button" data-close-dialog="" data-i18n-aria-label="Close" type="button">×</button></span></div>
+<div id="route-form-fields"></div>
+<details class="advanced-editor"><summary data-i18n="Advanced JSON">Advanced JSON</summary><p data-i18n="The complete route document mirrored from the fields above. Edit it directly for anything the form does not expose; valid JSON here is authoritative when saved.">The complete route document mirrored from the fields above. Edit it directly for anything the form does not expose; valid JSON here is authoritative when saved.</p><textarea class="code-editor code-editor-small" id="route-json" spellcheck="false"></textarea></details>
+<div aria-live="polite" class="inline-message" id="route-message"></div>
+<div class="dialog-actions"><button class="button button-quiet" data-close-dialog="" data-i18n="Cancel" type="button">Cancel</button><button class="button button-danger" data-i18n="Delete route" hidden="" id="delete-route" type="button">Delete route</button><button class="button button-primary" data-i18n="Create route" id="save-route" type="submit">Create route</button></div>
+</form>
+</dialog>
+<dialog aria-labelledby="confirm-title" class="confirm-dialog" id="confirm-dialog">
+<form method="dialog"><h2 data-i18n="Delete route?" id="confirm-title">Delete route?</h2><p id="confirm-message"></p><div class="dialog-actions"><button class="button button-quiet" data-i18n="Cancel" type="submit" value="cancel">Cancel</button><button class="button button-danger" data-i18n="Delete" id="confirm-accept" type="submit" value="confirm">Delete</button></div></form>
+</dialog>
+<dialog aria-labelledby="docker-title" class="confirm-dialog" id="docker-dialog">
+<form id="docker-form" method="dialog"><h2 data-i18n="Resolve Docker backend" id="docker-title">Resolve Docker backend</h2><p data-i18n="Inspect a container address on a configured Docker network.">Inspect a container address on a configured Docker network.</p><label><bdi data-i18n="Container">Container</bdi><input name="container" required=""/></label><label><bdi data-i18n="Network">Network</bdi><input name="network" required="" value="bridge"/></label><label><bdi data-i18n="Container port">Container port</bdi><input max="65535" min="1" name="port" required="" type="number"/></label><div class="inline-message" id="docker-message"></div><div class="dialog-actions"><button class="button button-quiet" data-close-docker="" data-i18n="Cancel" type="button">Cancel</button><button class="button button-primary" data-i18n="Resolve" type="submit">Resolve</button></div></form>
+</dialog>
+<dialog aria-labelledby="command-title" class="command-dialog" id="command-dialog"><div class="command-head"><h2 data-i18n="Go to…" id="command-title">Go to…</h2><button aria-label="Close search" class="icon-button" data-i18n-aria-label="Close search" id="command-close" type="button">×</button></div><input aria-label="Search pages" autocomplete="off" data-i18n-aria-label="Search pages" data-i18n-placeholder="Search pages and actions…" id="command-search" placeholder="Search pages and actions…" type="search"/><div id="command-results"></div><p class="command-help" data-i18n="↑ ↓ to navigate · Enter to open · Esc to close">↑ ↓ to navigate · Enter to open · Esc to close</p></dialog>
+<div aria-atomic="true" aria-live="polite" class="toast-region" id="toast-region"></div>
+</body>
+</html>

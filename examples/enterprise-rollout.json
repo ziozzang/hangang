@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "max_parallel": 2,
+  "roles": {
+    "http": {
+      "min_ready": 1,
+      "allow_outage": false,
+      "required_capabilities": [
+        "http"
+      ]
+    },
+    "tls": {
+      "min_ready": 1,
+      "allow_outage": false,
+      "required_capabilities": [
+        "tls"
+      ]
+    }
+  },
+  "nodes": [
+    {
+      "id": "http-1",
+      "role": "http",
+      "failure_domain": "host-1",
+      "healthy": true,
+      "upgrade": true,
+      "revision": 7,
+      "capabilities": [
+        "http"
+      ]
+    },
+    {
+      "id": "http-2",
+      "role": "http",
+      "failure_domain": "host-2",
+      "healthy": true,
+      "upgrade": true,
+      "revision": 7,
+      "capabilities": [
+        "http"
+      ]
+    },
+    {
+      "id": "tls-1",
+      "role": "tls",
+      "failure_domain": "host-1",
+      "healthy": true,
+      "upgrade": true,
+      "revision": 7,
+      "capabilities": [
+        "tls"
+      ]
+    },
+    {
+      "id": "tls-2",
+      "role": "tls",
+      "failure_domain": "host-2",
+      "healthy": true,
+      "upgrade": true,
+      "revision": 7,
+      "capabilities": [
+        "tls"
+      ]
+    }
+  ]
+}

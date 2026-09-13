@@ -1,0 +1,30 @@
+{
+  "http": [
+    {
+      "id": "public-site",
+      "access_mode": "public",
+      "path_prefix": "/public/",
+      "backends": ["http://127.0.0.1:8081"]
+    },
+    {
+      "id": "application-login",
+      "access_mode": "application",
+      "path_prefix": "/app/",
+      "backends": ["http://127.0.0.1:8081"]
+    },
+    {
+      "id": "protected-api",
+      "access_mode": "protected",
+      "require_tls": true,
+      "path_prefix": "/api/",
+      "backends": ["http://127.0.0.1:8081"],
+      "auth": {
+        "url": "https://identity.example.test/check",
+        "request_headers": ["authorization"],
+        "response_headers": ["x-verified-subject"],
+        "timeout_ms": 1000
+      },
+      "lua": "hangang.set_header('x-application-policy', 'example')"
+    }
+  ]
+}

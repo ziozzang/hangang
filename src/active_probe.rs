@@ -1,0 +1,338 @@
+//! Per-snapshot, bounded upstream HTTP probes. Snapshot replacement cancels
+//! old probes; each task retains only a weak runtime reference between ticks.
+use crate::{
+    config::{HttpRuntime, Snapshot},
+    http_outbound::Pools,
+    proxy::{Body, BodyError},
+};
+use anyhow::{Context, Result, ensure};
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Uri};
+use std::{
+    sync::{Arc, Weak},
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+
+pub fn spawn_monitor(
+    active: Arc<ArcSwap<Snapshot>>,
+    pools: Arc<Pools>,
+    shutdown: CancellationToken,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut current = Weak::<Snapshot>::new();
+            let mut probes = shutdown.child_token();
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                let snapshot = active.load_full();
+                if current
+                    .upgrade()
+                    .is_some_and(|previous| Arc::ptr_eq(&previous, &snapshot))
+                {
+                    continue;
+                }
+                probes.cancel();
+                probes = shutdown.child_token();
+                current = Arc::downgrade(&snapshot);
+                for runtime in &snapshot.http {
+                    if !runtime.route.enabled || runtime.route.balance.active_health.is_none() {
+                        continue;
+                    }
+                    let prepared = snapshot.upstream_tls.get(&runtime.route.id).cloned();
+                    for (index, backend) in runtime.route.backends.iter().enumerate() {
+                        tokio::spawn(run_backend(
+                            Arc::downgrade(runtime),
+                            index,
+                            backend.clone(),
+                            prepared.clone(),
+                            pools.clone(),
+                            probes.clone(),
+                        ));
+                    }
+                }
+            }
+            probes.cancel();
+        });
+    }
+}
+
+async fn run_backend(
+    runtime: Weak<HttpRuntime>,
+    index: usize,
+    backend: String,
+    prepared: Option<Arc<rustls::ClientConfig>>,
+    pools: Arc<Pools>,
+    cancel: CancellationToken,
+) {
+    let Some(initial) = runtime.upgrade() else {
+        return;
+    };
+    let Some(policy) = initial.route.balance.active_health.as_ref() else {
+        return;
+    };
+    let interval_ms = policy.interval_ms;
+    drop(initial);
+    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        let Some(current) = runtime.upgrade() else {
+            break;
+        };
+        let policy = current
+            .route
+            .balance
+            .active_health
+            .as_ref()
+            .expect("route policy is immutable");
+        let probe = probe_once(&current, &backend, prepared.as_ref(), &pools);
+        let outcome = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = tokio::time::timeout(Duration::from_millis(policy.timeout_ms), probe) => result,
+        };
+        match outcome {
+            Ok(Ok(status)) => current.balancer.record_active_status(index, status),
+            Ok(Err(error)) => {
+                tracing::debug!(route = %current.route.id, backend = %backend, error = %error, "active upstream probe failed");
+                current.balancer.record_active_transport_failure(index);
+            }
+            Err(_) => current.balancer.record_active_timeout(index),
+        }
+        drop(current);
+    }
+}
+
+async fn probe_once(
+    runtime: &Arc<HttpRuntime>,
+    backend: &str,
+    prepared: Option<&Arc<rustls::ClientConfig>>,
+    pools: &Pools,
+) -> Result<u16> {
+    let policy = runtime
+        .route
+        .balance
+        .active_health
+        .as_ref()
+        .expect("probe route");
+    let upstream: Uri = backend.parse().context("parse active probe backend")?;
+    ensure!(
+        matches!(upstream.scheme_str(), Some("http" | "https")),
+        "active probe backend must be HTTP or HTTPS"
+    );
+    let authority = upstream
+        .authority()
+        .context("active probe backend has no authority")?;
+    let host = policy.host.as_deref().unwrap_or(authority.host());
+    let uri = Uri::builder()
+        .scheme(
+            upstream
+                .scheme()
+                .context("active probe backend has no scheme")?
+                .clone(),
+        )
+        // The connector dials the fixed backend. The URI authority carries
+        // the probe Host for HTTP/1 and :authority for HTTP/2, so neither
+        // protocol gets a duplicate regular Host field.
+        .authority(host)
+        .path_and_query(policy.path.as_str())
+        .build()
+        .context("build active probe URI")?;
+    let body: Body = Full::new(Bytes::new())
+        .map_err(BodyError::from_error)
+        .boxed_unsync();
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(body)
+        .context("build active probe request")?;
+    let client = pools.client(runtime, backend, prepared)?;
+    let response = client
+        .request(request)
+        .await
+        .context("active probe HTTP request")?;
+    Ok(response.status().as_u16())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    async fn counting_origin() -> (SocketAddr, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let hits = hits.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    let mut request = [0; 256];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+            }
+        });
+        (address, hits, server)
+    }
+
+    async fn wait_for_hits(hits: &AtomicUsize, threshold: usize) {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while hits.load(Ordering::Relaxed) < threshold {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("active probe did not reach endpoint");
+    }
+
+    #[tokio::test]
+    async fn snapshot_replacement_stops_old_probes_and_shutdown_stops_new_probes() {
+        let (old_address, old_hits, old_server) = counting_origin().await;
+        let (new_address, new_hits, new_server) = counting_origin().await;
+        let make_snapshot = |address| {
+            let value = serde_json::json!({"http":[{
+                "id":"swappable-probe", "backends":[format!("http://{address}")],
+                "balance":{"active_health":{
+                    "path":"/ready","interval_ms":100,"timeout_ms":100,
+                    "healthy_statuses":[200],"unhealthy_statuses":[503],
+                    "healthy_successes":1,"unhealthy_http_failures":2,
+                    "unhealthy_tcp_failures":2,"unhealthy_timeouts":2
+                }}
+            }]});
+            Arc::new(Snapshot::new(serde_json::from_value::<Config>(value).unwrap()).unwrap())
+        };
+        let active = Arc::new(ArcSwap::from(make_snapshot(old_address)));
+        let pools = Arc::new(Pools::new(crate::tls::client_config(None).unwrap(), 1));
+        let shutdown = CancellationToken::new();
+        spawn_monitor(active.clone(), pools, shutdown.clone());
+        wait_for_hits(&old_hits, 2).await;
+        let old = active.swap(make_snapshot(new_address));
+        let old_weak = Arc::downgrade(&old);
+        drop(old);
+        wait_for_hits(&new_hits, 2).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let old_stopped = old_hits.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(old_hits.load(Ordering::Relaxed), old_stopped);
+        assert!(
+            old_weak.upgrade().is_none(),
+            "old snapshot must be released"
+        );
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let new_stopped = new_hits.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(new_hits.load(Ordering::Relaxed), new_stopped);
+        old_server.abort();
+        new_server.abort();
+    }
+
+    #[tokio::test]
+    async fn monitor_probe_marks_unhealthy_then_recovers_on_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let seen_host = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let status = status.clone();
+            let seen_host = seen_host.clone();
+            let requests = requests.clone();
+            async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let mut bytes = Vec::with_capacity(1024);
+                    while bytes.len() < 4096 && !bytes.ends_with(b"\r\n\r\n") {
+                        let mut chunk = [0u8; 512];
+                        let Ok(size) = stream.read(&mut chunk).await else {
+                            break;
+                        };
+                        if size == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk[..size]);
+                    }
+                    if bytes
+                        .windows(b"Host: probe.local".len())
+                        .any(|part| part.eq_ignore_ascii_case(b"Host: probe.local"))
+                    {
+                        seen_host.store(true, Ordering::Release);
+                    }
+                    let answer = format!(
+                        "HTTP/1.1 {} PROBE\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        status.load(Ordering::Acquire)
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                }
+            }
+        });
+        let source = serde_json::json!({"http":[{
+            "id":"probe-route","host":"probe.local",
+            "backends":[format!("http://{address}")],
+            "balance":{"active_health":{
+                "path":"/health/readiness","host":"probe.local","interval_ms":100,"timeout_ms":100,
+                "healthy_statuses":[200],"unhealthy_statuses":[503],
+                "healthy_successes":1,"unhealthy_http_failures":2,"unhealthy_tcp_failures":2,"unhealthy_timeouts":2
+            }}
+        }]});
+        let snapshot =
+            Arc::new(Snapshot::new(serde_json::from_value::<Config>(source).unwrap()).unwrap());
+        let runtime = snapshot.http[0].clone();
+        let active = Arc::new(ArcSwap::from(snapshot));
+        let pools = Arc::new(Pools::new(crate::tls::client_config(None).unwrap(), 1));
+        let shutdown = CancellationToken::new();
+        spawn_monitor(active.clone(), pools, shutdown.clone());
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while runtime.balancer.available(0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(seen_host.load(Ordering::Acquire));
+        status.store(200, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !runtime.balancer.available(0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        // Allow an already-dispatched request to arrive, then assert the
+        // monitor does not schedule another interval after shutdown.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let stopped = requests.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(requests.load(Ordering::Relaxed), stopped);
+        server.abort();
+    }
+}
