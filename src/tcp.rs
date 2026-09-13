@@ -704,6 +704,12 @@ fn spawn_accept_loop(
             };
             let (client, peer) = match accepted {
                 Ok((client, peer)) => {
+                    // Avoid delayed-ACK/Nagle stalls when TLS or a proxied
+                    // request/response protocol emits a final short record.
+                    if client.set_nodelay(true).is_err() {
+                        metrics.errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     // Canonicalize IPv4-mapped IPv6 peers (from a dual-stack
                     // `[::]` listener) so `deny_cidrs` with IPv4 ranges match
                     // the real IPv4 address instead of silently failing open.

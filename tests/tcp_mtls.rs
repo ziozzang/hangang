@@ -423,6 +423,7 @@ async fn tcp_mtls_owned_echo_throughput() {
     let backend_task = tokio::spawn(async move {
         loop {
             let (mut stream, _) = backend.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 65536];
                 while let Ok(count) = stream.read(&mut buffer).await {

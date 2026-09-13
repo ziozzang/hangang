@@ -272,9 +272,9 @@ async fn connect_authority(
     dns_servers: &[SocketAddr],
 ) -> Result<TcpStream> {
     if dns_servers.is_empty() || authority.host.parse::<IpAddr>().is_ok() {
-        return TcpStream::connect(authority.original)
-            .await
-            .map_err(Into::into);
+        let stream = TcpStream::connect(authority.original).await?;
+        stream.set_nodelay(true)?;
+        return Ok(stream);
     }
     let addresses = crate::upstream_dns::resolve(authority.host, dns_servers)
         .await
@@ -282,7 +282,10 @@ async fn connect_authority(
     let mut last_error = None;
     for ip in addresses {
         match TcpStream::connect(SocketAddr::new(ip, authority.port)).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -646,6 +649,16 @@ impl ServerCertVerifier for InsecureCertificateVerifier {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn outbound_tcp_socket_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let stream = super::connect_authority(&super::parse_authority(&address).unwrap(), &[])
+            .await
+            .unwrap();
+        assert!(stream.nodelay().unwrap());
+    }
+
     use super::*;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
