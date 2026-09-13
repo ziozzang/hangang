@@ -679,10 +679,6 @@ impl Proxy {
         // A workload identity is only an extension created by the mandatory
         // mTLS listener. Client-supplied lookalike fields must not participate
         // in route predicates, external auth, Lua, or eventual forwarding.
-        let workload_evidence = request
-            .extensions()
-            .get::<crate::workload_http::Evidence>()
-            .cloned();
         for name in &snapshot.workload_identity_headers {
             request.headers_mut().remove(name);
         }
@@ -812,6 +808,10 @@ impl Proxy {
         mut traffic: Option<&mut TrafficContext>,
     ) -> Result<Response<Body>, Infallible> {
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
+        let workload_evidence = request
+            .extensions()
+            .get::<crate::workload_http::Evidence>()
+            .cloned();
         // Routes and the document's `settings` (which override the process
         // defaults when set) come from the snapshot captured by `handle`.
         let allow_dot_segments = snapshot
@@ -856,6 +856,12 @@ impl Proxy {
         // identity, route matching, cache policy, or authorization. Standard
         // hop headers stay until WebSocket validation and final forwarding.
         drop_client_connection_marked_headers(request.headers_mut());
+        if workload_evidence.is_some() {
+            // An authenticated workload is the direct TLS peer. No CIDR-only
+            // proxy delegation applies on this listener, and an external auth
+            // service must not see copied client-supplied Forwarded fields.
+            strip_forwarding_headers(request.headers_mut());
+        }
         // The terminal marker has meaning only on a response from the
         // configured authorization service, never as a client request field.
         request.headers_mut().remove("x-hangang-auth-terminal");
@@ -3002,6 +3008,7 @@ mod tests {
             access_mode: Default::default(),
             resource_policy: None,
             jwt_auth: None,
+            workload_auth: None,
             enabled: true,
             upstream: Default::default(),
             priority: 0,
