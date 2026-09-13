@@ -1,6 +1,7 @@
 use crate::{
     config::{Config, Snapshot, TcpRoute},
     metrics::Metrics,
+    pool_member::{Backend, DesiredState},
 };
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwap;
@@ -591,6 +592,10 @@ async fn monitor_tcp_health(
             let tls = snapshot.upstream_tls.get(&route.id).cloned();
             let route = Arc::new(route.clone());
             for index in 0..route.backends.len() {
+                if matches!(&route.backends[index], Backend::Member(member) if member.desired_state == DesiredState::Maintenance)
+                {
+                    continue;
+                }
                 tasks.spawn(run_tcp_probe(
                     route.clone(),
                     index,

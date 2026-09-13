@@ -3,6 +3,7 @@
 use crate::{
     config::{HttpRuntime, Snapshot},
     http_outbound::Pools,
+    pool_member::{Backend, DesiredState},
     proxy::{Body, BodyError},
 };
 use anyhow::{Context, Result, ensure};
@@ -66,6 +67,10 @@ async fn run_monitor(
             }
             let prepared = snapshot.upstream_tls.get(&runtime.route.id).cloned();
             for (index, backend) in runtime.route.backends.iter().enumerate() {
+                if matches!(backend, Backend::Member(member) if member.desired_state == DesiredState::Maintenance)
+                {
+                    continue;
+                }
                 tasks.spawn(run_backend(
                     Arc::downgrade(runtime),
                     index,

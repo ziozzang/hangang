@@ -1,4 +1,5 @@
 //! Weighted admission and optional passive health; requests are never replayed.
+use crate::pool_member::DesiredState;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
@@ -338,6 +339,51 @@ impl Balancer {
         next
     }
 
+    /// Build a candidate generation without changing any previously published
+    /// node. Non-serving members close only their fresh admission gates. A
+    /// compatible old node is shared only when its gate already has the
+    /// required openness; callers also exclude changed desired states from
+    /// `mapping` so transitions get fresh health and load state.
+    pub fn with_member_states(
+        config: BalanceConfig,
+        previous: Option<&Self>,
+        mapping: &[Option<usize>],
+        states: &[DesiredState],
+    ) -> Self {
+        if previous.is_some() {
+            assert_eq!(
+                mapping.len(),
+                states.len(),
+                "member mapping length mismatch"
+            );
+        }
+        let compatible = previous.is_some_and(|old| {
+            config.health == old.config.health
+                && config.active_health == old.config.active_health
+                && config.passive_health == old.config.passive_health
+        });
+        let mut next = Self::new(config, states.len());
+        for (index, state) in states.iter().enumerate() {
+            let wanted_open = *state == DesiredState::Serving;
+            let reusable = previous
+                .filter(|_| compatible)
+                .and_then(|old| {
+                    mapping
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .and_then(|i| old.nodes.get(i))
+                })
+                .filter(|node| node.active.is_open() == wanted_open);
+            if let Some(node) = reusable {
+                next.nodes[index] = Arc::clone(node);
+            } else if !wanted_open {
+                next.nodes[index].active.retire();
+            }
+        }
+        next
+    }
+
     /// Collect old nodes absent from the successor by pointer identity. This
     /// is preparation-only: the caller retires them after the publication
     /// boundary, never while validating or building a candidate snapshot.
@@ -353,7 +399,7 @@ impl Balancer {
     }
 
     pub fn available(&self, index: usize) -> bool {
-        self.nodes[index].active.is_open()
+        self.admission_open(index)
             && !self.nodes[index]
                 .initial_check_pending
                 .load(Ordering::Acquire)
@@ -361,6 +407,11 @@ impl Balancer {
             && !self.nodes[index].passive_unhealthy.load(Ordering::Acquire)
             && (self.config.health.is_none()
                 || self.nodes[index].unavailable_until.load(Ordering::Relaxed) <= now_ms())
+    }
+    pub fn admission_open(&self, index: usize) -> bool {
+        self.nodes
+            .get(index)
+            .is_some_and(|node| node.active.is_open())
     }
     pub fn backend_state(&self, index: usize) -> Option<BackendState> {
         let node = self.nodes.get(index)?;
@@ -777,6 +828,78 @@ mod tests {
         );
         drop(held);
         assert_eq!(old.backend_state(0).unwrap().active_requests, Some(0));
+    }
+
+    #[test]
+    fn nonserving_members_remain_closed_after_healthy_probes_in_all_selectors() {
+        for mode in [Mode::RoundRobin, Mode::LeastConnections] {
+            let balancer = Balancer::with_member_states(
+                BalanceConfig {
+                    mode,
+                    active_health: Some(active_policy()),
+                    ..Default::default()
+                },
+                None,
+                &[],
+                &[
+                    DesiredState::Serving,
+                    DesiredState::Draining,
+                    DesiredState::Maintenance,
+                ],
+            );
+            assert!(balancer.admission_open(0));
+            assert!(!balancer.admission_open(1));
+            assert!(!balancer.admission_open(2));
+            for index in [1, 2] {
+                balancer.record_active_status(index, 200);
+                assert!(!balancer.available(index));
+                assert!(balancer.acquire(index).is_none());
+            }
+            for _ in 0..12 {
+                assert_eq!(balancer.select(), Some(0));
+            }
+            assert!(balancer.acquire(0).is_some());
+            assert!(!balancer.admission_open(usize::MAX));
+        }
+    }
+
+    #[test]
+    fn state_transition_never_closes_shared_published_nodes() {
+        let original = Balancer::new(BalanceConfig::default(), 1);
+        let held = original.acquire(0).unwrap();
+        // Even a caller-supplied stale mapping cannot close a serving old
+        // generation while constructing a maintenance candidate.
+        let maintenance = Balancer::with_member_states(
+            BalanceConfig::default(),
+            Some(&original),
+            &[Some(0)],
+            &[DesiredState::Maintenance],
+        );
+        assert!(!Arc::ptr_eq(&original.nodes[0], &maintenance.nodes[0]));
+        assert!(original.available(0));
+        assert_eq!(original.backend_state(0).unwrap().active_requests, Some(1));
+        assert!(!maintenance.available(0));
+
+        // Unchanged non-serving state can reuse its already-closed node, but
+        // a transition back to serving requires a fresh open generation.
+        let same = Balancer::with_member_states(
+            BalanceConfig::default(),
+            Some(&maintenance),
+            &[Some(0)],
+            &[DesiredState::Maintenance],
+        );
+        assert!(Arc::ptr_eq(&same.nodes[0], &maintenance.nodes[0]));
+        let serving = Balancer::with_member_states(
+            BalanceConfig::default(),
+            Some(&same),
+            &[Some(0)],
+            &[DesiredState::Serving],
+        );
+        assert!(!Arc::ptr_eq(&same.nodes[0], &serving.nodes[0]));
+        assert!(serving.available(0));
+        assert!(!same.available(0));
+        drop(held);
+        assert_eq!(original.backend_state(0).unwrap().active_requests, Some(0));
     }
 
     #[test]
