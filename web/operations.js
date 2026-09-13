@@ -161,7 +161,7 @@ function renderRetired() {
   const start = total && rows.length ? retiredOffset + 1 : 0;
   renderRetiredRows(rows);
   $('#retired-range').textContent = t('{start}–{end} of {total} active retired generations', {
-    start: formatNumberLocale(start), end: formatNumberLocale(retiredOffset + rows.length),
+    start: formatNumberLocale(start), end: formatNumberLocale(rows.length ? retiredOffset + rows.length : 0),
     total: formatNumberLocale(total),
   });
   $('#retired-capacity').textContent = t('Registry capacity {count}', {
@@ -199,7 +199,7 @@ async function fetchRetiredPage(nextOffset, allowCorrection = true) {
       retiredLoading = false;
       return fetchRetiredPage(Math.floor((data.total - 1) / RETIRED_PAGE_SIZE) * RETIRED_PAGE_SIZE, false);
     }
-    retiredOffset = nextOffset;
+    retiredOffset = data.total === 0 ? 0 : nextOffset;
     retiredPage = data;
     $('#retired-message').textContent = '';
   } catch (error) {

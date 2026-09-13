@@ -235,6 +235,23 @@ test('empty retired inventory is instance-local and never presented as completed
   await expect(page.locator('#view-operations')).toContainText('An empty list does not prove that other instances are drained.');
 });
 
+test('a retired second page that drains to zero resets the range and previous control', async ({ page }) => {
+  const retiredRows = Array.from({ length: 65 }, (_, index) => ({
+    retirement_id: index + 1, protocol: 'tcp', route_id: 'socket', member_id: 'blue',
+    address: '192.0.2.10:443', active_admissions: 1,
+  }));
+  await fixture(page, false, [], retiredRows);
+  await page.locator('a[href="#operations"]').click();
+  await page.locator('#retired-next').click();
+  await expect(page.locator('#retired-range')).toContainText('65–65 of 65');
+  retiredRows.splice(0);
+  await page.locator('#retired-refresh').click();
+  await expect(page.locator('#retired-range')).toContainText('0–0 of 0');
+  await expect(page.locator('#retired-prev')).toBeDisabled();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(0);
+  await expect(page.locator('#retired-empty')).toBeVisible();
+});
+
 test('retired refresh failure keeps the last observation and reports the error', async ({ page }) => {
   await fixture(page, false, [], [{ retirement_id: 4, protocol: 'http', route_id: 'api',
     member_id: 'blue', address: 'http://192.0.2.4:80', active_admissions: 1 }]);
