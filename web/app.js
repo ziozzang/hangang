@@ -1248,6 +1248,7 @@ function routeSummaryTags(type, route) {
   if (route.max_requests) tags.push(t('Max {count} requests', { count: route.max_requests }));
   if (route.max_connections) tags.push(t('Max {count} connections', { count: route.max_connections }));
   if (route.upstream?.tls) tags.push(t('Upstream TLS'));
+  if (type === 'tcp' && route.inbound_tls) tags.push(t('Inbound mTLS'));
   if (route.upstream?.socks5) tags.push('SOCKS5');
   if ((route.deny_cidrs || []).length) tags.push(t(route.deny_cidrs.length === 1 ? '{count} denied CIDR' : '{count} denied CIDRs', { count: route.deny_cidrs.length }));
   return tags;
@@ -1279,7 +1280,7 @@ function routeDefaults(type) {
       auth: null, basic_auth: null, jwt_auth: null, balance: { mode: 'round_robin', weights: [], health: null }, response_set_headers: {}, response_remove_headers: [],
     };
   }
-  return { id: '', priority: 0, upstream: structuredClone(DEFAULT_UPSTREAM), sni: null, max_connections: null, listen: '0.0.0.0:9001', backends: ['127.0.0.1:8080'], deny_cidrs: [] };
+  return { id: '', priority: 0, upstream: structuredClone(DEFAULT_UPSTREAM), sni: null, inbound_tls: null, max_connections: null, listen: '0.0.0.0:9001', backends: ['127.0.0.1:8080'], deny_cidrs: [] };
 }
 
 async function setRouteEnabled(type, id, enabled, button) {
@@ -1769,6 +1770,7 @@ function httpSections(route) {
 function tcpSections(route) {
   const editing = Boolean(state.editing.originalId);
   const sni = isObject(route.sni) ? route.sni : null;
+  const inboundTls = isObject(route.inbound_tls) ? route.inbound_tls : null;
   const health = isObject(route.health) ? route.health : null;
   return [
     section({ title: 'Listener and matching', open: true, fields: [
@@ -1784,6 +1786,15 @@ function tcpSections(route) {
       field('SNI hostname regexes', 'sni_host_regexes', (sni?.host_regexes || []).join('\n'), { textarea: true, help: 'One whole-host regex per line; hostnames and regexes together may hold 1–128 patterns.' }),
       field('ClientHello size limit (bytes)', 'sni_max_client_hello_bytes', sni?.max_client_hello_bytes ?? '', { type: 'number', min: 1, max: 1048576, placeholder: '65536', help: '1–1,048,576; routes sharing a listener need identical limits.' }),
       field('ClientHello timeout (ms)', 'sni_hello_timeout_ms', sni?.hello_timeout_ms ?? '', { type: 'number', min: 1, max: 30000, placeholder: '3000', help: '1–30,000 ms to receive the ClientHello.' }),
+    ] }),
+    section({ title: 'Inbound mutual TLS', configured: Boolean(inboundTls), note: 'Terminate TLS on this TCP listener and require a client certificate with an exact allowed SPIFFE URI SAN before connecting upstream. Configure server certificate and trust files by absolute path; do not paste PEM or private keys. Cannot be combined with SNI passthrough.', fields: [
+      span2(field('Require inbound client certificate', 'inbound_tls_enabled', Boolean(inboundTls), { checkbox: true, toggles: 'inbound_tls', help: 'Enables TLS termination and client-certificate verification on this dedicated listener. Empty or disabled preserves TCP passthrough. Disable and save an active route before removing inbound mTLS from its listener.' })),
+      field('Server certificate file', 'inbound_tls_cert_file', inboundTls?.cert_file ?? '', { group: 'inbound_tls', placeholder: '/etc/hangang/server.crt', help: 'Absolute path to the public server certificate file.' }),
+      field('Server private key file', 'inbound_tls_key_file', inboundTls?.key_file ?? '', { group: 'inbound_tls', placeholder: '/etc/hangang/server.key', help: 'Absolute path to a private key file held by the runtime. Enter a path, never the key itself.' }),
+      field('Trusted client CA file', 'inbound_tls_client_ca_file', inboundTls?.client_ca_file ?? '', { group: 'inbound_tls', placeholder: '/etc/hangang/client-ca.crt', help: 'Absolute path to the CA bundle used to verify client certificates.' }),
+      field('Client revocation list file', 'inbound_tls_client_crl_file', inboundTls?.client_crl_file ?? '', { group: 'inbound_tls', placeholder: '/etc/hangang/client.crl', help: 'Optional absolute path to a client certificate revocation list.' }),
+      span2(field('Allowed client SPIFFE URI SANs', 'inbound_tls_allowed_uri_sans', (inboundTls?.allowed_uri_sans ?? []).join('\n'), { group: 'inbound_tls', textarea: true, placeholder: 'spiffe://example.test/ns/default/sa/service', help: 'One exact SPIFFE URI per line; 1–128 distinct values, at most 2,048 bytes each. Other URI SANs are denied.' })),
+      field('Inbound TLS handshake timeout (ms)', 'inbound_tls_handshake_timeout_ms', inboundTls?.handshake_timeout_ms ?? 5000, { group: 'inbound_tls', type: 'number', min: 1, max: 10000, help: '1–10,000 ms; default 5,000. The client certificate and URI SAN are checked before any upstream dial.' }),
     ] }),
     section({ title: 'Backends', open: true, fields: [
       backendFields('tcp', route),
@@ -2063,6 +2074,10 @@ function routeFromForm() {
   if (type === 'http' && route.jwt_auth !== undefined && route.jwt_auth !== null &&
       (!isObject(route.jwt_auth) || !isObject(route.jwt_auth.verification) || !isObject(route.jwt_auth.keys))) {
     throw new Error(t('Advanced JWT JSON must contain verification and keys objects'));
+  }
+  if (type === 'tcp' && route.inbound_tls !== undefined && route.inbound_tls !== null &&
+      (!isObject(route.inbound_tls) || !Array.isArray(route.inbound_tls.allowed_uri_sans))) {
+    throw new Error(t('Advanced inbound TLS JSON must contain an object with allowed_uri_sans array'));
   }
   const raw = (name) => form.elements[name].value;
   const text = (name) => raw(name).trim();
@@ -2362,6 +2377,29 @@ function routeFromForm() {
       if (hosts.length + regexes.length > 128) throw new Error(t('SNI hostnames and regexes together allow at most 128 patterns'));
       route.sni = { ...(isObject(route.sni) ? route.sni : {}), hosts, host_regexes: regexes, max_client_hello_bytes: helloBytes ?? 65536, hello_timeout_ms: helloTimeout ?? 3000 };
     }
+    if (checked('inbound_tls_enabled')) {
+      if (route.sni) throw new Error(t('Inbound mutual TLS cannot be combined with SNI passthrough'));
+      const filePath = (name, label, optional = false) => {
+        const value = text(name);
+        if (!value && optional) return null;
+        if (!value.startsWith('/') || value.includes('\0') || value.includes('\n') || value.includes('\r'))
+          throw new Error(t('{field} must be an absolute file path', { field: t(label) }));
+        return value;
+      };
+      const allowed = lines('inbound_tls_allowed_uri_sans');
+      if (!allowed.length || allowed.length > 128 || new Set(allowed).size !== allowed.length || allowed.some((uri) => {
+        if (new TextEncoder().encode(uri).length > 2048 || !uri.startsWith('spiffe://') || /[\s?#]/.test(uri)) return true;
+        try { const parsed = new URL(uri); return parsed.protocol !== 'spiffe:' || !parsed.hostname || parsed.pathname === '/'; }
+        catch { return true; }
+      })) throw new Error(t('Allowed client identities need 1–128 distinct exact SPIFFE URIs of at most 2,048 bytes'));
+      route.inbound_tls = { ...(isObject(route.inbound_tls) ? route.inbound_tls : {}),
+        cert_file: filePath('inbound_tls_cert_file', 'Server certificate file'),
+        key_file: filePath('inbound_tls_key_file', 'Server private key file'),
+        client_ca_file: filePath('inbound_tls_client_ca_file', 'Trusted client CA file'),
+        client_crl_file: filePath('inbound_tls_client_crl_file', 'Client revocation list file', true),
+        allowed_uri_sans: allowed,
+        handshake_timeout_ms: integer('inbound_tls_handshake_timeout_ms', 'Inbound TLS handshake timeout', { min: 1, max: 10000 }) };
+    } else if (Object.hasOwn(route, 'inbound_tls')) route.inbound_tls = null;
   }
   return route;
 }
@@ -2449,6 +2487,14 @@ function syncRouteControlsFromJson() {
     for (const name of ['interval_ms', 'timeout_ms', 'healthy_successes', 'unhealthy_failures'])
       form.elements[`tcp_health_${name}`].value = policy[name] === null || policy[name] === undefined ? '' : String(policy[name]);
     form.elements['tcp_health_initial_state'].value = policy.initial_state ?? 'healthy';
+  }
+  if (form.elements['inbound_tls_enabled'] && (draft.inbound_tls === null || draft.inbound_tls === undefined || isObject(draft.inbound_tls))) {
+    const tls = isObject(draft.inbound_tls) ? draft.inbound_tls : null;
+    form.elements['inbound_tls_enabled'].checked = Boolean(tls);
+    for (const name of ['cert_file', 'key_file', 'client_ca_file', 'client_crl_file'])
+      form.elements[`inbound_tls_${name}`].value = tls?.[name] ?? '';
+    form.elements['inbound_tls_allowed_uri_sans'].value = Array.isArray(tls?.allowed_uri_sans) ? tls.allowed_uri_sans.join('\n') : '';
+    form.elements['inbound_tls_handshake_timeout_ms'].value = tls?.handshake_timeout_ms ?? 5000;
   }
   if (form.elements['balance_mode'] && (draft.balance === null || draft.balance === undefined || isObject(draft.balance))) {
     const balance = isObject(draft.balance) ? draft.balance : {};
