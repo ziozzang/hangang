@@ -995,6 +995,10 @@ fn spawn_accept_loop(
                         return;
                     }
                 }
+                // Country is an admission decision only. Holding the slot for
+                // the forwarding lifetime would retain every replaced MMDB
+                // generation until its old TCP streams finish.
+                drop(geoip);
                 let _route_permit =
                     match crate::admission::acquire(&counter, route.max_connections) {
                         Ok(permit) => permit,

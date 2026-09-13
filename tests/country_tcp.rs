@@ -328,3 +328,90 @@ async fn shared_sni_listener_applies_only_selected_route_country_policy() {
     allowed_task.abort();
     denied_task.abort();
 }
+
+#[tokio::test]
+async fn source_switch_releases_old_geoip_slot_while_accepted_stream_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_path = dir.path().join("first.mmdb");
+    let second_path = dir.path().join("second.mmdb");
+    let database = current_fixture();
+    std::fs::write(&first_path, &database).unwrap();
+    std::fs::write(&second_path, &database).unwrap();
+    let (origin, accepted, origin_task) = echo_origin().await;
+    let held_listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let front = held_listener.local_addr().unwrap();
+    held_listener.set_nonblocking(true).unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(Config::default()).unwrap(),
+    ));
+    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 8);
+    let config: Config = serde_json::from_value(json!({
+        "geoip_database":source(&first_path),
+        "tcp":[route(front, origin, "allow")]
+    }))
+    .unwrap();
+    let prepared = manager
+        .prepare_with_inherited(&config, vec![(front, OwnedFd::from(held_listener))])
+        .await
+        .unwrap();
+    let snapshot = Arc::new(Snapshot::new(config).unwrap());
+    snapshot.activated();
+    active.store(snapshot);
+    manager.commit(prepared).await;
+    let (cancel, watcher) = start_watcher(&active);
+    wait_for(
+        || active.load().geoip.as_ref().unwrap().load().is_some(),
+        "first GeoIP generation",
+    )
+    .await;
+
+    let mut held = TcpStream::connect(front).await.unwrap();
+    held.write_all(b"held-through-switch").await.unwrap();
+    wait_for(
+        || accepted.load(Ordering::SeqCst) == 1,
+        "accepted origin connection",
+    )
+    .await;
+
+    let current = active.load_full();
+    let old_slot = current.geoip.as_ref().unwrap().clone();
+    let old_weak = Arc::downgrade(&old_slot);
+    let mut next_config = current.config.clone();
+    next_config.revision += 1;
+    next_config.geoip_database.as_mut().unwrap().file = second_path;
+    let prepared = manager.prepare(&next_config).await.unwrap();
+    let next = Arc::new(Snapshot::replace(next_config, &current).unwrap());
+    assert!(!Arc::ptr_eq(next.geoip.as_ref().unwrap(), &old_slot));
+    assert!(next.geoip.as_ref().unwrap().load().is_none());
+    manager
+        .commit_with_publication(prepared, || {
+            next.activated();
+            active.store(next);
+        })
+        .await
+        .unwrap();
+    cancel.cancel();
+    watcher.await.unwrap();
+    drop(current);
+    drop(old_slot);
+
+    // A new accept refreshes the listener route cache to the new pending
+    // source. Its refusal must not close the already admitted stream.
+    refused(front).await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    wait_for(
+        || old_weak.upgrade().is_none(),
+        "retired GeoIP slot release while TCP stream is still open",
+    )
+    .await;
+    held.shutdown().await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), held.read_to_end(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, b"held-through-switch");
+
+    manager.shutdown(Duration::from_secs(1)).await;
+    origin_task.abort();
+}
