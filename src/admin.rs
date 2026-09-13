@@ -2319,7 +2319,10 @@ fn geoip_lookup_query(query: Option<&str>) -> Option<std::net::IpAddr> {
     if key != "ip" || value.len() > 45 || pairs.next().is_some() {
         return None;
     }
-    value.parse().ok()
+    value
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical())
 }
 
 fn traffic_query(query: Option<&str>) -> Option<(Option<u64>, usize)> {

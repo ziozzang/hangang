@@ -201,7 +201,7 @@ async fn admin_geoip_status_and_lookup_are_bounded_path_free_and_fail_closed() {
     assert!(!status.to_string().contains(file.to_str().unwrap()));
     for (ip, canonical, country) in [
         ("81.2.69.160", "81.2.69.160", Some("GB")),
-        ("%3A%3Affff%3A81.2.69.160", "::ffff:81.2.69.160", Some("GB")),
+        ("%3A%3Affff%3A81.2.69.160", "81.2.69.160", Some("GB")),
         ("2001%3A220%3A%3A1", "2001:220::1", Some("KR")),
         ("127.0.0.1", "127.0.0.1", None),
     ] {
