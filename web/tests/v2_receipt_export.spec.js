@@ -190,7 +190,12 @@ test('a nonterminal 1,000th page rejects export beyond the page bound', async ({
   const { requests } = await fixture(page, { response: 'over-cap' });
   let downloads = 0;
   page.on('download', () => { downloads += 1; });
+  const lastPage = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === '/v1/config/commit-receipts-v2' && url.searchParams.get('after_seq') === '99900';
+  });
   await page.locator('#config-receipt-export-v2').click();
+  await lastPage;
   await expect(page.locator('#config-receipt-export-state')).toContainText('incomplete');
   expect(requests).toHaveLength(1000);
   expect(downloads).toBe(0);
