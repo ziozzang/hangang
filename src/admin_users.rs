@@ -5,7 +5,9 @@
 use anyhow::{Context, Result, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -66,6 +68,24 @@ pub enum Change {
     Conflict,
     Applied,
 }
+
+/// The account used for a management mutation. `Session` contains an opaque
+/// bearer secret, so this type deliberately has no Debug or Serialize impl.
+pub enum MutationAuthority {
+    System,
+    Session(String),
+}
+
+#[derive(Debug)]
+pub struct AuthorizationRevoked;
+
+impl std::fmt::Display for AuthorizationRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("administrator mutation authority is no longer valid")
+    }
+}
+
+impl std::error::Error for AuthorizationRevoked {}
 
 pub struct Store {
     path: PathBuf,
@@ -239,11 +259,7 @@ impl Store {
     }
 
     pub async fn session(&self, token: String) -> Result<Option<User>> {
-        if token.len() != 43
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        {
+        if !valid_session_token(&token) {
             return Ok(None);
         }
         let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
@@ -296,6 +312,7 @@ impl Store {
 
     pub async fn create(
         &self,
+        authority: MutationAuthority,
         username: String,
         password: String,
         role: Role,
@@ -313,6 +330,7 @@ impl Store {
             let (salt,hash)=hash_new_password(password.as_bytes())?;
             let mut connection=connection(&path)?;
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_mutation(&transaction, &authority)?;
             let count:i64=transaction.query_row("SELECT COUNT(*) FROM users",[],|row|row.get(0))?;
             if count==0 || count>=MAX_USERS {return Ok(None)}
             if transaction.query_row("SELECT 1 FROM users WHERE username=?1 COLLATE NOCASE",params![username],|row|row.get::<_,i64>(0)).optional()?.is_some(){return Ok(None)}
@@ -325,6 +343,7 @@ impl Store {
 
     pub async fn update(
         &self,
+        authority: MutationAuthority,
         id: i64,
         role: Option<Role>,
         enabled: Option<bool>,
@@ -349,6 +368,7 @@ impl Store {
             let new_password=password.map(|p|hash_new_password(p.as_bytes())).transpose()?;
             let mut connection=connection(&path)?;
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_mutation(&transaction, &authority)?;
             let existing:Option<User>=transaction.query_row("SELECT id,username,role,enabled FROM users WHERE id=?1",params![id],|row|Ok(User{id:row.get(0)?,username:row.get(1)?,role:Role::parse(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,enabled:row.get::<_,i64>(3)?==1})).optional()?;
             let Some(mut user)=existing else{return Ok((Change::NotFound,None))};
             let next_role=role.unwrap_or(user.role);let next_enabled=enabled.unwrap_or(user.enabled);
@@ -368,12 +388,13 @@ impl Store {
         }).await?
     }
 
-    pub async fn delete(&self, id: i64) -> Result<Change> {
+    pub async fn delete(&self, authority: MutationAuthority, id: i64) -> Result<Change> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = connection(&path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_mutation(&transaction, &authority)?;
             let existing: Option<(String, bool)> = transaction
                 .query_row(
                     "SELECT role,enabled FROM users WHERE id=?1",
@@ -400,6 +421,36 @@ impl Store {
         })
         .await?
     }
+}
+
+fn valid_session_token(token: &str) -> bool {
+    token.len() == 43
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn authorize_mutation(transaction: &Transaction<'_>, authority: &MutationAuthority) -> Result<()> {
+    let MutationAuthority::Session(token) = authority else {
+        return Ok(());
+    };
+    if !valid_session_token(token) {
+        return Err(AuthorizationRevoked.into());
+    }
+    let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let valid: Option<i64> = transaction
+        .query_row(
+            "SELECT users.id FROM sessions JOIN users ON users.id=sessions.user_id \
+             WHERE sessions.token_hash=?1 AND sessions.expires_at>?2 \
+             AND users.enabled=1 AND users.role='admin'",
+            params![token_hash.as_slice(), now()?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if valid.is_none() {
+        return Err(AuthorizationRevoked.into());
+    }
+    Ok(())
 }
 
 fn connection(path: &Path) -> Result<Connection> {
@@ -551,10 +602,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(store.delete(root.id).await.unwrap(), Change::Conflict);
         assert_eq!(
             store
-                .update(root.id, Some(Role::Viewer), None, None)
+                .delete(MutationAuthority::System, root.id)
+                .await
+                .unwrap(),
+            Change::Conflict
+        );
+        assert_eq!(
+            store
+                .update(
+                    MutationAuthority::System,
+                    root.id,
+                    Some(Role::Viewer),
+                    None,
+                    None
+                )
                 .await
                 .unwrap()
                 .0,
@@ -562,7 +625,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .update(root.id, None, Some(false), None)
+                .update(MutationAuthority::System, root.id, None, Some(false), None)
                 .await
                 .unwrap()
                 .0,
@@ -570,6 +633,7 @@ mod tests {
         );
         let second = store
             .create(
+                MutationAuthority::System,
                 "second".into(),
                 "second secure password".into(),
                 Role::Admin,
@@ -590,7 +654,13 @@ mod tests {
                 .is_some()
         );
         let updated = store
-            .update(second.id, Some(Role::Viewer), None, None)
+            .update(
+                MutationAuthority::System,
+                second.id,
+                Some(Role::Viewer),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(updated.0, Change::Applied);
@@ -602,7 +672,13 @@ mod tests {
             .unwrap();
         assert_eq!(session.user.role, Role::Viewer);
         store
-            .update(second.id, None, None, Some("new secure password".into()))
+            .update(
+                MutationAuthority::System,
+                second.id,
+                None,
+                None,
+                Some("new secure password".into()),
+            )
             .await
             .unwrap();
         assert!(store.session(session.token).await.unwrap().is_none());
@@ -620,8 +696,238 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(store.delete(root.id).await.unwrap(), Change::Conflict);
-        assert_eq!(store.delete(second.id).await.unwrap(), Change::Applied);
+        assert_eq!(
+            store
+                .delete(MutationAuthority::System, root.id)
+                .await
+                .unwrap(),
+            Change::Conflict
+        );
+        assert_eq!(
+            store
+                .delete(MutationAuthority::System, second.id)
+                .await
+                .unwrap(),
+            Change::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_authority_is_rechecked_inside_each_write_transaction() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let root_login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let viewer = store
+            .create(
+                MutationAuthority::Session(root_login.token.clone()),
+                "viewer".into(),
+                "viewer secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store.logout(root_login.token.clone()).await.unwrap();
+        let denied = store
+            .update(
+                MutationAuthority::Session(root_login.token.clone()),
+                viewer.id,
+                Some(Role::Admin),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.downcast_ref::<AuthorizationRevoked>().is_some());
+        assert_eq!(store.list().await.unwrap()[1].role, Role::Viewer);
+        assert!(
+            store
+                .delete(MutationAuthority::Session(root_login.token), viewer.id)
+                .await
+                .unwrap_err()
+                .downcast_ref::<AuthorizationRevoked>()
+                .is_some()
+        );
+
+        let viewer_login = store
+            .login("viewer".into(), "viewer secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .delete(MutationAuthority::Session(viewer_login.token), root.id)
+                .await
+                .unwrap_err()
+                .downcast_ref::<AuthorizationRevoked>()
+                .is_some(),
+            "a live viewer session cannot gain write authority"
+        );
+
+        let fresh = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let hash: [u8; 32] = Sha256::digest(fresh.token.as_bytes()).into();
+        connection(&directory.path().join("accounts.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET expires_at=0 WHERE token_hash=?1",
+                params![hash.as_slice()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .delete(MutationAuthority::Session(fresh.token), viewer.id)
+                .await
+                .unwrap_err()
+                .downcast_ref::<AuthorizationRevoked>()
+                .is_some(),
+            "expired sessions cannot mutate accounts"
+        );
+        assert_eq!(store.list().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn demotion_and_password_change_revoke_queued_mutation_authority() {
+        let (_directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .create(
+                MutationAuthority::System,
+                "second".into(),
+                "second secure password".into(),
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+        let root_login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .update(
+                MutationAuthority::System,
+                root.id,
+                Some(Role::Viewer),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .create(
+                    MutationAuthority::Session(root_login.token),
+                    "blocked".into(),
+                    "another secure password".into(),
+                    Role::Admin,
+                )
+                .await
+                .unwrap_err()
+                .downcast_ref::<AuthorizationRevoked>()
+                .is_some()
+        );
+        let second_login = store
+            .login("second".into(), "second secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "second")
+            .unwrap();
+        store
+            .update(
+                MutationAuthority::System,
+                second.id,
+                None,
+                None,
+                Some("new second password".into()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .delete(MutationAuthority::Session(second_login.token), root.id)
+                .await
+                .unwrap_err()
+                .downcast_ref::<AuthorizationRevoked>()
+                .is_some()
+        );
+        assert_eq!(store.list().await.unwrap().len(), 2);
+    }
+
+    /// Diagnostic only: SQLite FULL account writes with and without the
+    /// in-transaction session authority query. Password hashing, HTTP, and
+    /// data-plane throughput are outside this timed region.
+    /// Run with: cargo test --release --lib admin_mutation_authority_microbenchmark -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "explicit release-mode account write diagnostic"]
+    async fn admin_mutation_authority_microbenchmark() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let target = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "viewer secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        const ITERATIONS: usize = 100;
+        for account in [false, true] {
+            let started = std::time::Instant::now();
+            for index in 0..ITERATIONS {
+                let authority = if account {
+                    MutationAuthority::Session(login.token.clone())
+                } else {
+                    MutationAuthority::System
+                };
+                let (change, _) = store
+                    .update(authority, target.id, None, Some(index % 2 == 0), None)
+                    .await
+                    .unwrap();
+                assert_eq!(change, Change::Applied);
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "admin SQLite FULL no-password updates {}: {ITERATIONS} writes in {elapsed:?} ({:.0} ops/s); excludes Argon2, HTTP, and data plane",
+                if account {
+                    "session authority"
+                } else {
+                    "system authority"
+                },
+                ITERATIONS as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
