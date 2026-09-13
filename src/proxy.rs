@@ -211,40 +211,105 @@ impl WorkloadRouteLease {
                 .get(&self.route_id)
                 .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
     }
+}
 
-    async fn revoked(&self) {
+#[derive(Clone)]
+struct JwtRouteLease {
+    active: Arc<ArcSwap<Snapshot>>,
+    route_id: String,
+    route: Arc<HttpRoute>,
+    runtime: Arc<crate::jwt_runtime::Runtime>,
+    session: crate::jwt_runtime::Session,
+}
+
+impl JwtRouteLease {
+    fn current(&self) -> bool {
+        let snapshot = self.active.load();
+        snapshot
+            .jwt_routes
+            .get(&self.route_id)
+            .is_some_and(|route| Arc::ptr_eq(route, &self.route))
+            && self.runtime.session_current(&self.session)
+    }
+}
+
+#[derive(Clone, Default)]
+struct AuthRouteLease {
+    workload: Option<WorkloadRouteLease>,
+    jwt: Option<JwtRouteLease>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AuthRetirement {
+    workload: bool,
+    jwt: bool,
+}
+
+impl AuthRetirement {
+    fn any(self) -> bool {
+        self.workload || self.jwt
+    }
+
+    fn record(self, metrics: &Metrics) {
+        if self.workload {
+            metrics
+                .workload_route_terminations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.jwt {
+            metrics
+                .jwt_lease_terminations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl AuthRouteLease {
+    fn retirement(&self) -> AuthRetirement {
+        AuthRetirement {
+            workload: self.workload.as_ref().is_some_and(|lease| !lease.current()),
+            jwt: self.jwt.as_ref().is_some_and(|lease| !lease.current()),
+        }
+    }
+
+    fn current(&self) -> bool {
+        !self.retirement().any()
+    }
+
+    async fn revoked(&self) -> AuthRetirement {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            if !self.current() {
-                return;
+            let retired = self.retirement();
+            if retired.any() {
+                return retired;
             }
         }
     }
 }
 
-async fn workload_retired(lease: Option<&WorkloadRouteLease>) {
+async fn auth_retired(lease: Option<&AuthRouteLease>) -> AuthRetirement {
     if let Some(lease) = lease {
-        lease.revoked().await;
+        lease.revoked().await
     } else {
-        std::future::pending::<()>().await;
+        std::future::pending::<AuthRetirement>().await
     }
 }
 
 // The Hyper connection watcher handles listener-material retirement; this
-// body guard also retires a route whose workload rules changed while an SSE or
-// other streaming response remains open on an otherwise valid connection.
-struct WorkloadResponseBody {
+// body guard also retires a route whose workload or JWT rules changed while
+// an SSE or other streaming response remains open.
+struct AuthResponseBody {
     body: Body,
-    lease: WorkloadRouteLease,
+    lease: AuthRouteLease,
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
     metrics: Arc<Metrics>,
     terminated: bool,
 }
 
-impl WorkloadResponseBody {
-    fn new(body: Body, lease: WorkloadRouteLease, metrics: Arc<Metrics>) -> Self {
+impl AuthResponseBody {
+    fn new(body: Body, lease: AuthRouteLease, metrics: Arc<Metrics>) -> Self {
         Self {
             body,
             lease,
@@ -255,7 +320,7 @@ impl WorkloadResponseBody {
     }
 }
 
-impl hyper::body::Body for WorkloadResponseBody {
+impl hyper::body::Body for AuthResponseBody {
     type Data = Bytes;
     type Error = BodyError;
 
@@ -266,13 +331,12 @@ impl hyper::body::Body for WorkloadResponseBody {
         if self.terminated {
             return std::task::Poll::Ready(None);
         }
-        if !self.lease.current() {
+        let retired = self.lease.retirement();
+        if retired.any() {
             self.terminated = true;
-            self.metrics
-                .workload_route_terminations
-                .fetch_add(1, Ordering::Relaxed);
+            retired.record(&self.metrics);
             return std::task::Poll::Ready(Some(Err(BodyError::from_error(
-                std::io::Error::other("workload route authorization retired"),
+                std::io::Error::other("route authorization retired"),
             ))));
         }
         if self.timer.as_mut().poll(cx).is_ready() {
@@ -1063,6 +1127,10 @@ impl Proxy {
             } else {
                 (None, None)
             };
+        let mut auth_route_lease = workload_route_lease.map(|workload| AuthRouteLease {
+            workload: Some(workload),
+            jwt: None,
+        });
         // Enforce TLS for require_tls routes reached over plaintext.
         if runtime.route.require_tls && edge.proto != "https" {
             return Ok(self.https_redirect(
@@ -1233,15 +1301,15 @@ impl Proxy {
                 Some(token) => match &runtime.jwt_auth {
                     Some(prepared) => {
                         prepared
-                            .authenticate(token, self.jwt_verifications.clone())
+                            .authenticate_session(token, self.jwt_verifications.clone())
                             .await
                     }
                     None => Err(crate::jwt_runtime::AuthFailure::Unavailable),
                 },
                 None => Err(crate::jwt_runtime::AuthFailure::Invalid),
             };
-            let verified = match authenticated {
-                Ok(verified) => verified,
+            let session = match authenticated {
+                Ok(session) => session,
                 Err(error) => {
                     use crate::jwt_runtime::AuthFailure;
                     self.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -1291,6 +1359,7 @@ impl Proxy {
                     return Ok(denied);
                 }
             };
+            let verified = session.verified();
             if let Some(policy) = resource_policy
                 && matches!(
                     policy.principal,
@@ -1299,7 +1368,7 @@ impl Proxy {
             {
                 resource_allowed = policy.allows(
                     request.method().as_str(),
-                    crate::resource_policy::PrincipalEvidence::Jwt(&verified),
+                    crate::resource_policy::PrincipalEvidence::Jwt(verified),
                 );
             }
             if let Some(name) = &jwt.identity_header {
@@ -1310,6 +1379,25 @@ impl Proxy {
                 request.headers_mut().insert(name.clone(), value.clone());
                 established_identity.push((name, value));
             }
+            let prepared = runtime
+                .jwt_auth
+                .as_ref()
+                .expect("validated JWT route has a prepared verifier")
+                .clone();
+            let route = snapshot
+                .jwt_routes
+                .get(&runtime.route.id)
+                .expect("enabled JWT route has a generation")
+                .clone();
+            auth_route_lease
+                .get_or_insert_with(AuthRouteLease::default)
+                .jwt = Some(JwtRouteLease {
+                active: self.active.clone(),
+                route_id: runtime.route.id.clone(),
+                route,
+                runtime: prepared,
+                session,
+            });
         }
         if let Some(basic) = &runtime.route.basic_auth {
             let prepared = runtime
@@ -1416,13 +1504,19 @@ impl Proxy {
                     self.metrics.errors.fetch_add(1, Ordering::Relaxed);
                     return Ok(response(status, "authorization refused"));
                 }
-                AuthOutcome::Forward(forwarded) => {
+                AuthOutcome::Forward(mut forwarded) => {
                     self.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    if workload_route_lease
+                    if auth_route_lease
                         .as_ref()
                         .is_some_and(|lease| !lease.current())
                     {
-                        return Ok(response(503, "workload authorization retired"));
+                        return Ok(response(503, "route authorization retired"));
+                    }
+                    if let Some(lease) = &auth_route_lease {
+                        let body = std::mem::replace(forwarded.body_mut(), full_body(Bytes::new()));
+                        *forwarded.body_mut() =
+                            AuthResponseBody::new(body, lease.clone(), self.metrics.clone())
+                                .boxed_unsync();
                     }
                     return Ok(*forwarded);
                 }
@@ -1543,11 +1637,11 @@ impl Proxy {
             }
         }
 
-        if workload_route_lease
+        if auth_route_lease
             .as_ref()
             .is_some_and(|lease| !lease.current())
         {
-            return Ok(response(503, "workload authorization retired"));
+            return Ok(response(503, "route authorization retired"));
         }
 
         // Explicitly protected routes check gateway authentication and any
@@ -1808,11 +1902,11 @@ impl Proxy {
         let mut first_request = Some(Request::from_parts(parts, first_body));
         let mut attempt = 0usize;
         let upstream = loop {
-            if workload_route_lease
+            if auth_route_lease
                 .as_ref()
                 .is_some_and(|lease| !lease.current())
             {
-                return Ok(response(503, "workload authorization retired"));
+                return Ok(response(503, "route authorization retired"));
             }
             attempt += 1;
             let uri = match build_upstream_uri(&backend, &client_pq, host_override.as_deref()) {
@@ -1867,12 +1961,11 @@ impl Proxy {
                     request
                 }
             };
-            if let Some(lease) = &workload_route_lease
+            if let Some(lease) = &auth_route_lease
                 && !outgoing.body().is_end_stream()
             {
                 outgoing = outgoing.map(|body| {
-                    WorkloadResponseBody::new(body, lease.clone(), self.metrics.clone())
-                        .boxed_unsync()
+                    AuthResponseBody::new(body, lease.clone(), self.metrics.clone()).boxed_unsync()
                 });
             }
             if let Some((configured, target, discovery)) = &docker_target
@@ -1936,11 +2029,11 @@ impl Proxy {
             }
         };
         let mut upstream = upstream;
-        if workload_route_lease
+        if auth_route_lease
             .as_ref()
             .is_some_and(|lease| !lease.current())
         {
-            return Ok(response(503, "workload authorization retired"));
+            return Ok(response(503, "route authorization retired"));
         }
 
         let cache_header_ms = if cache_fill.is_some() {
@@ -2016,11 +2109,11 @@ impl Proxy {
         }
 
         if let (Some(downstream), Some(upstream)) = (downstream_upgrade, upstream_upgrade) {
-            if workload_route_lease
+            if auth_route_lease
                 .as_ref()
                 .is_some_and(|lease| !lease.current())
             {
-                return Ok(response(503, "workload authorization retired"));
+                return Ok(response(503, "route authorization retired"));
             }
             // Register admission before checking closed. Shutdown must either
             // see this token or prevent this new tunnel from being spawned.
@@ -2032,7 +2125,7 @@ impl Proxy {
             let tunnel_backend = backend_lease.clone();
             let tunnel_route = route_permit.clone();
             let tunnel_idle = self.tunnel_idle;
-            let tunnel_workload = workload_route_lease.clone();
+            let tunnel_auth = auth_route_lease.clone();
             let tunnel_metrics = self.metrics.clone();
             self.tunnels.spawn(async move {
                 let _backend_lease = tunnel_backend;
@@ -2042,8 +2135,8 @@ impl Proxy {
                 let upgraded = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    _ = workload_retired(tunnel_workload.as_ref()) => {
-                        tunnel_metrics.workload_route_terminations.fetch_add(1, Ordering::Relaxed);
+                    retired = auth_retired(tunnel_auth.as_ref()) => {
+                        retired.record(&tunnel_metrics);
                         return;
                     },
                     upgraded = async { tokio::try_join!(downstream, upstream) } => upgraded,
@@ -2058,8 +2151,8 @@ impl Proxy {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {}
-                        _ = workload_retired(tunnel_workload.as_ref()) => {
-                            tunnel_metrics.workload_route_terminations.fetch_add(1, Ordering::Relaxed);
+                        retired = auth_retired(tunnel_auth.as_ref()) => {
+                            retired.record(&tunnel_metrics);
                         }
                         _ = idle.expired() => {}
                         _ = copy_bidirectional(&mut downstream, &mut upstream) => {}
@@ -2130,9 +2223,9 @@ impl Proxy {
         if let Some(permit) = route_permit {
             response.extensions_mut().insert(permit);
         }
-        if let Some(lease) = workload_route_lease {
+        if let Some(lease) = auth_route_lease {
             response = response.map(|body| {
-                WorkloadResponseBody::new(body, lease, self.metrics.clone()).boxed_unsync()
+                AuthResponseBody::new(body, lease, self.metrics.clone()).boxed_unsync()
             });
         }
         Ok(response)
