@@ -930,12 +930,13 @@ impl Store {
             let actor_user_id=authorize_mutation(&transaction,&authority)?;
             let (authority_id,next_id,stored_records,history_revision,ids_digest):(String,i64,i64,i64,String)=transaction.query_row("SELECT authority_id,next_id,stored_records,history_revision,retained_ids_sha256 FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..MAX_SAFE_ID).contains(&history_revision) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
-            verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
+            let (_,mut verified_hasher)=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
             if stored_records>=CONFIG_OPERATION_CAPACITY || !(1..=MAX_SAFE_ID).contains(&next_id) {return Err(ConfigOperationCapacity.into());}
             let record=ConfigOperation{id:next_id,operation_id,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
             ensure!(valid_config_operation(&record),"invalid local config operation");
             transaction.execute("INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'accepted',NULL)",params![record.id,record.operation_id,record.authority_id,record.actor_kind.as_str(),record.actor_user_id,record.accepted_at_unix_ms,i64::try_from(record.expected_revision)?,record.candidate_sha256,record.store_kind.as_str(),record.authority_epoch])?;
-            let digest=retained_ids_sha256(&transaction)?;
+            verified_hasher.update(next_id.to_be_bytes());
+            let digest=hex_digest(verified_hasher);
             transaction.execute("UPDATE admin_config_operation_meta SET next_id=?1,stored_records=stored_records+1,history_revision=history_revision+1,retained_ids_sha256=?2 WHERE singleton=1",params![next_id+1,digest])?;
             transaction.commit()?;
             Ok(record)
@@ -985,7 +986,7 @@ impl Store {
             authorize_mutation(&transaction,&authority)?;
             let (authority_id,started_at,next_id,stored_records,history_revision,pruned_through,ids_digest):(String,i64,i64,i64,i64,i64,String)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records,history_revision,pruned_through,retained_ids_sha256 FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (0..=MAX_SAFE_ID).contains(&started_at) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..=MAX_SAFE_ID).contains(&history_revision) && (0..next_id).contains(&pruned_through) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
-            let oldest_id=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
+            let (oldest_id,_)=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
             let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
@@ -1100,13 +1101,14 @@ fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOper
     Ok(record)
 }
 
-fn retained_ids_sha256(transaction: &Transaction<'_>) -> Result<String> {
+fn scan_config_ids(transaction: &Transaction<'_>) -> Result<(Option<i64>, i64, i64, Sha256)> {
     let mut hasher = Sha256::new();
     let mut statement =
-        transaction.prepare("SELECT id FROM admin_config_operations ORDER BY id")?;
-    let mut rows = statement.query([])?;
+        transaction.prepare("SELECT id FROM admin_config_operations ORDER BY id LIMIT ?1")?;
+    let mut rows = statement.query(params![CONFIG_OPERATION_CAPACITY + 1])?;
     let mut previous = 0_i64;
     let mut count = 0_i64;
+    let mut oldest = None;
     while let Some(row) = rows.next()? {
         count += 1;
         ensure!(
@@ -1118,14 +1120,23 @@ fn retained_ids_sha256(transaction: &Transaction<'_>) -> Result<String> {
             (1..=MAX_SAFE_ID).contains(&id) && id > previous,
             "invalid local config operation ID ordering"
         );
+        oldest.get_or_insert(id);
         hasher.update(id.to_be_bytes());
         previous = id;
     }
-    Ok(hasher
+    Ok((oldest, count, previous, hasher))
+}
+
+fn hex_digest(hasher: Sha256) -> String {
+    hasher
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
+}
+
+fn retained_ids_sha256(transaction: &Transaction<'_>) -> Result<String> {
+    Ok(hex_digest(scan_config_ids(transaction)?.3))
 }
 
 fn migrate_config_retention_v4(transaction: &Transaction<'_>) -> Result<()> {
@@ -1188,28 +1199,24 @@ fn migrate_config_retention_v4(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Bounded control-plane aggregate plus retained-ID digest detects missing rows.
+/// One bounded ordered ID scan checks count/range and retained-ID digest.
 /// Sparse IDs are expected after explicit, audited pruning.
 fn verify_config_history(
     transaction: &Transaction<'_>,
     next_id: i64,
     stored_records: i64,
     expected_digest: &str,
-) -> Result<Option<i64>> {
-    let (actual_count, oldest_id, actual_max): (i64, Option<i64>, i64) = transaction.query_row(
-        "SELECT COUNT(*),MIN(id),COALESCE(MAX(id),0) FROM admin_config_operations",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+) -> Result<(Option<i64>, Sha256)> {
+    let (oldest_id, actual_count, actual_max, hasher) = scan_config_ids(transaction)?;
     ensure!(
         actual_count == stored_records
             && (0..=CONFIG_OPERATION_CAPACITY).contains(&actual_count)
             && actual_max < next_id
             && oldest_id.is_none_or(|id| (1..next_id).contains(&id))
-            && retained_ids_sha256(transaction)? == expected_digest,
+            && hex_digest(hasher.clone()) == expected_digest,
         "local config operation history inconsistent"
     );
-    Ok(oldest_id)
+    Ok((oldest_id, hasher))
 }
 
 fn authorize_mutation(
@@ -1792,6 +1799,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.id, 4);
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        let stored_digest: String = transaction
+            .query_row(
+                "SELECT retained_ids_sha256 FROM admin_config_operation_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_digest, retained_ids_sha256(&transaction).unwrap());
+        drop(transaction);
+        assert!(Store::open(path).is_ok());
     }
 
     #[tokio::test]
