@@ -30,7 +30,11 @@
           "required_scopes": [
             "orders:read"
           ],
-          "required_groups": []
+          "required_groups": [],
+          "revocation": {
+            "issued_before": 0,
+            "token_ids": ["example-withdrawn-token-id"]
+          }
         },
         "keys": {
           "source": "remote",

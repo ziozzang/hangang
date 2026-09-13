@@ -119,3 +119,17 @@ fn published_oidc_example_validates_without_network_access() {
     config.validate().unwrap();
     Snapshot::new(config).unwrap();
 }
+
+#[test]
+fn shared_resource_aliases_cannot_drop_revocation_conditions() {
+    let mut value = document();
+    value["http"][0]["jwt_auth"]["verification"]["revocation"] =
+        json!({"issued_before": 1700000000u64, "token_ids": ["withdrawn"]});
+    let mut alias = value["http"][0].clone();
+    alias["id"] = json!("alias");
+    alias["host"] = json!("www.jwt.test");
+    value["http"].as_array_mut().unwrap().push(alias);
+    Snapshot::new(parse(value.clone())).unwrap();
+    value["http"][1]["jwt_auth"]["verification"]["revocation"] = Value::Null;
+    assert!(parse(value).validate().is_err());
+}

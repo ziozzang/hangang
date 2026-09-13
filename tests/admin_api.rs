@@ -3237,3 +3237,83 @@ async fn operations_do_not_reuse_old_http_probe_evidence_when_docker_resolution_
     manager.tcp.shutdown(std::time::Duration::ZERO).await;
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn jwt_revocation_publication_is_revisioned_validated_and_persistent() {
+    let (address, manager, _dir) = server().await;
+    let example: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/jwt-auth.json")).unwrap();
+    let mut route = example["http"][0].clone();
+    route["jwt_auth"]["verification"]["revocation"] = serde_json::Value::Null;
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/routes/http",
+            Some(&route.to_string()),
+            Some(0)
+        )
+        .await
+        .0,
+        201
+    );
+    let initial = manager.active.load_full();
+    route["jwt_auth"]["verification"]["revocation"] = serde_json::json!({"issued_before": 1700000000u64, "token_ids": ["withdrawn", "withdrawn"]});
+    let (status, _, body) = request(
+        address,
+        "PUT",
+        "/v1/routes/http/orders-api",
+        Some(&route.to_string()),
+        Some(1),
+    )
+    .await;
+    assert_eq!(status, 422);
+    assert!(!String::from_utf8_lossy(&body).contains("withdrawn"));
+    assert!(Arc::ptr_eq(&initial, &manager.active.load_full()));
+    route["jwt_auth"]["verification"]["revocation"]["token_ids"] = serde_json::json!(["withdrawn"]);
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            "/v1/routes/http/orders-api",
+            Some(&route.to_string()),
+            Some(0)
+        )
+        .await
+        .0,
+        409
+    );
+    assert!(Arc::ptr_eq(&initial, &manager.active.load_full()));
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            "/v1/routes/http/orders-api",
+            Some(&route.to_string()),
+            Some(1)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(manager.active.load().config.revision, 2);
+    assert!(!Arc::ptr_eq(
+        initial.jwt_routes.get("orders-api").unwrap(),
+        manager.active.load().jwt_routes.get("orders-api").unwrap()
+    ));
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 2);
+    assert_eq!(
+        serde_json::to_value(&persisted.http[0]).unwrap()["jwt_auth"]["verification"]["revocation"],
+        route["jwt_auth"]["verification"]["revocation"]
+    );
+    // A new process prepares the durable revoked policy, not admission defaults.
+    Snapshot::new(persisted).unwrap();
+    let (status, _, body) = request(address, "GET", "/v1/routes/http/orders-api", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json(&body)["jwt_auth"]["verification"]["revocation"],
+        route["jwt_auth"]["verification"]["revocation"]
+    );
+}

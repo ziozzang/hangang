@@ -841,6 +841,7 @@ mod tests {
                 groups_claim: "groups".into(),
                 required_scopes: vec![],
                 required_groups: vec![],
+                revocation: None,
             },
             keys: crate::jwt_runtime::KeySource::Remote { config: live_spec },
             hide_credentials: true,
