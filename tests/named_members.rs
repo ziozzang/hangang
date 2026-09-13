@@ -182,6 +182,18 @@ async fn reorder_and_weight_change_preserve_held_stream_and_passive_health_by_id
     assert_eq!(current.backend_state(1).unwrap().active_requests, Some(1));
     active.store(Arc::new(reordered));
 
+    // Removing stable identities altogether is a new generation even when
+    // the literal endpoint strings are unchanged. The old held response must
+    // remain on its old node, without appearing in the legacy view.
+    let mut legacy = serde_json::to_value(&active.load().config).unwrap();
+    legacy["http"][0]["backends"] = serde_json::json!([b, a]);
+    let legacy: Config = serde_json::from_value(legacy).unwrap();
+    let anonymous = Snapshot::replace(legacy, &active.load_full()).unwrap();
+    let anonymous = &anonymous.http[0].balancer;
+    assert!(anonymous.available(0));
+    assert_eq!(anonymous.backend_state(1).unwrap().active_requests, Some(0));
+    assert_eq!(current.backend_state(1).unwrap().active_requests, Some(1));
+
     // Renaming B at the same address creates a fresh identity. A remains
     // shared, including its held request, across this second publication.
     let renamed = Snapshot::replace(named_config(&a, &b, "b-new", true), &active.load_full())
