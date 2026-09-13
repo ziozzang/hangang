@@ -599,6 +599,7 @@ async fn resource_policy_rejects_native_identity_transform_and_defensively_reass
     route.request_transform = Some(transform.clone());
     let runtime = hangang::config::HttpRuntime {
         language_policy: None,
+        country_policy: None,
         auth_reserved: Vec::new(),
         jwt_auth: None,
         workload_auth: None,

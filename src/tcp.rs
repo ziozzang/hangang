@@ -526,7 +526,7 @@ type ListenerRoute = (
     Option<Arc<crate::tcp_member::TcpMemberActivity>>,
     Arc<[Arc<crate::member_admission::MemberAdmission>]>,
     Option<Arc<crate::workload_material::Slot>>,
-    Option<crate::country_policy::CompiledCountryPolicy>,
+    Option<Arc<crate::country_policy::CompiledCountryPolicy>>,
 );
 
 struct ListenerRoutes {
@@ -568,7 +568,8 @@ impl ListenerRoutes {
                 .as_ref()
                 .map(crate::country_policy::Policy::compile)
                 .transpose()
-                .ok()?;
+                .ok()?
+                .map(Arc::new);
             routes.push((
                 route.clone(),
                 snapshot.admissions[&route.id].clone(),

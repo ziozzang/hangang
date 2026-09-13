@@ -2154,8 +2154,10 @@ mod tests {
 
     #[test]
     fn geoip_source_invalid_structure_rejected_even_without_file_read() {
-        let mut config = Config::default();
-        config.geoip_database = Some(geoip_source("relative.mmdb"));
+        let mut config = Config {
+            geoip_database: Some(geoip_source("relative.mmdb")),
+            ..Config::default()
+        };
         assert!(config.validate().is_err());
         config.geoip_database = Some(geoip_source("/valid-shape.mmdb"));
         config.geoip_database.as_mut().unwrap().max_file_bytes = 0;

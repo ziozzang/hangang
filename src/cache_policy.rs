@@ -54,6 +54,10 @@ impl RouteCache {
 /// Returns whether a route can produce one deterministic, shareable representation.
 pub fn route_eligible(route: &crate::config::HttpRoute) -> bool {
     route.cache.is_some()
+        && route
+            .country_policy
+            .as_ref()
+            .is_none_or(|policy| !policy.enforce)
         && route.resource_policy.is_none()
         && route.workload_auth.is_none()
         && route.jwt_auth.is_none()

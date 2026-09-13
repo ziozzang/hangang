@@ -28,6 +28,7 @@ fn reserve_address() -> SocketAddr {
 
 fn route(id: &str, listen: SocketAddr, backend: SocketAddr) -> TcpRoute {
     TcpRoute {
+        country_policy: None,
         enabled: true,
         upstream: Default::default(),
         health: None,
@@ -44,6 +45,7 @@ fn route(id: &str, listen: SocketAddr, backend: SocketAddr) -> TcpRoute {
 
 fn config(routes: Vec<TcpRoute>) -> Config {
     Config {
+        geoip_database: None,
         cache: None,
         certificates: Vec::new(),
         revision: 0,

@@ -1,0 +1,32 @@
+{
+  "revision": 0,
+  "geoip_database": {
+    "file": "/var/lib/hangang/GeoLite2-Country.mmdb",
+    "max_file_bytes": 33554432,
+    "max_age_days": 14,
+    "reload_interval_seconds": 30
+  },
+  "http": [
+    {
+      "id": "country-http",
+      "host": "country.example.test",
+      "access_mode": "public",
+      "backends": ["http://127.0.0.1:8081"],
+      "country_policy": {
+        "allow": ["KR", "US"],
+        "on_unknown": "deny"
+      }
+    }
+  ],
+  "tcp": [
+    {
+      "id": "country-tcp",
+      "listen": "127.0.0.1:19001",
+      "backends": ["127.0.0.1:19002"],
+      "country_policy": {
+        "deny": ["GB"],
+        "on_unknown": "allow"
+      }
+    }
+  ]
+}

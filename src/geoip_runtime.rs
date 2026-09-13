@@ -7,8 +7,8 @@
 use std::{
     path::{Component, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,7 +19,7 @@ use tokio::{sync::Semaphore, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::geoip::{
-    Database, DatabaseStatus, GeoIpError, DEFAULT_MAX_AGE, DEFAULT_MAX_FILE_BYTES, MAX_AGE,
+    DEFAULT_MAX_AGE, DEFAULT_MAX_FILE_BYTES, Database, DatabaseStatus, GeoIpError, MAX_AGE,
     MAX_FILE_BYTES,
 };
 

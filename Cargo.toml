@@ -25,6 +25,7 @@ jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust
 rsa = "0.9"
 quick-xml = "0.41"
 memchr = "2"
+maxminddb = { version = "0.32.0", default-features = false }
 tokio = { version = "1", features = ["full"] }
 regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }

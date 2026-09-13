@@ -83,6 +83,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     // Exact serialized size of the generated document: the empty envelope plus
     // every route plus one separating comma per additional route.
     let base_bytes = serialized_len(&Config {
+        geoip_database: None,
         certificates: vec![],
         cache: None,
         revision: 0,
@@ -182,6 +183,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     }
     routes.extend(defaults);
     let config = Config {
+        geoip_database: None,
         certificates: vec![],
         cache: None,
         revision: 0,

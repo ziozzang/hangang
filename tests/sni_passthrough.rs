@@ -50,6 +50,7 @@ fn route(
     timeout_ms: u64,
 ) -> TcpRoute {
     TcpRoute {
+        country_policy: None,
         enabled: true,
         upstream: Default::default(),
         health: None,
@@ -87,6 +88,7 @@ fn regex_route(
 
 fn config(routes: Vec<TcpRoute>) -> Config {
     Config {
+        geoip_database: None,
         revision: 0,
         cache: None,
         certificates: Vec::new(),
@@ -612,6 +614,7 @@ async fn listener_wide_cidr_denial_precedes_hello_and_global_admission() {
     );
     denied_wildcard.deny_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
     let allowed = TcpRoute {
+        country_policy: None,
         enabled: true,
         upstream: Default::default(),
         health: None,

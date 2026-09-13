@@ -3617,6 +3617,7 @@ mod tests {
         let state_path = directory.path().join("state.json");
         let edited = Config {
             tcp: vec![crate::config::TcpRoute {
+                country_policy: None,
                 enabled: true,
                 upstream: Default::default(),
                 health: None,

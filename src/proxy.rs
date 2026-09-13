@@ -1174,6 +1174,24 @@ impl Proxy {
             ));
         }
 
+        // Acquire one immutable country generation at admission. Missing or
+        // unhealthy data is an availability failure, never an unknown country.
+        // `peer` already contains the trusted-proxy effective client address.
+        if let Some(policy) = &runtime.country_policy
+            && policy.enforced()
+        {
+            let Some(database) = snapshot.geoip.as_ref().and_then(|slot| slot.load()) else {
+                return Ok(response(503, "country database unavailable"));
+            };
+            let country = match database.lookup(peer.ip()) {
+                Ok(country) => country,
+                Err(_) => return Ok(response(503, "country database unavailable")),
+            };
+            if !policy.evaluate(country) {
+                return Ok(response(403, "client country denied"));
+            }
+        }
+
         // Native language preference filtering is an access decision on the
         // already selected route, never a route predicate or Lua override.
         if let Some(policy) = &runtime.language_policy
@@ -3201,6 +3219,7 @@ mod tests {
             access_mode: Default::default(),
             resource_policy: None,
             language_policy: None,
+            country_policy: None,
             jwt_auth: None,
             workload_auth: None,
             enabled: true,

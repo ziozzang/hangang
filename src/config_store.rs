@@ -3453,6 +3453,7 @@ mod tests {
             CasResult::Conflict { .. }
         ));
         let different = Config {
+            geoip_database: None,
             revision: 6,
             certificates: vec![],
             http: vec![],

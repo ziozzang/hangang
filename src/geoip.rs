@@ -12,13 +12,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     sync::{
-        atomic::{AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use maxminddb::{path, Reader};
+use maxminddb::{Reader, path};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -464,6 +464,22 @@ mod tests {
     }
 
     #[test]
+    fn structurally_valid_malformed_country_is_a_lookup_error() {
+        let (_dir, path, now) = fixture();
+        let mut bytes = FAKE_DB.to_vec();
+        // This synthetic fixture's GB country value (not registered_country).
+        // Keep the MMDB structure valid while violating the country schema.
+        assert_eq!(&bytes[12097..12099], b"GB");
+        bytes[12097] = b'g';
+        fs::write(&path, bytes).unwrap();
+        let database = Database::load_at(&path, MAX_FILE_BYTES, MAX_AGE, now).unwrap();
+        assert_eq!(
+            database.lookup_at("81.2.69.160".parse().unwrap(), now),
+            Err(GeoIpError::InvalidRecord)
+        );
+    }
+
+    #[test]
     fn private_special_and_unrepresented_addresses_are_unknown() {
         let (_dir, database, now) = load_fixture();
         for address in [
@@ -505,9 +521,11 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(directory_error, GeoIpError::NotRegularFile);
-        assert!(!directory_error
-            .to_string()
-            .contains(dir.path().to_str().unwrap()));
+        assert!(
+            !directory_error
+                .to_string()
+                .contains(dir.path().to_str().unwrap())
+        );
         let bad = dir.path().join("bad.mmdb");
         fs::write(&bad, b"not an MMDB").unwrap();
         assert_eq!(

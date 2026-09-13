@@ -258,6 +258,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         access_mode: Default::default(),
         resource_policy: None,
         language_policy: None,
+        country_policy: None,
         jwt_auth: None,
         workload_auth: None,
         enabled: true,
@@ -303,6 +304,7 @@ fn proxy_with_settings(
     settings: hangang::config::Settings,
 ) -> ((Proxy, Arc<PolicyPool>), Arc<ArcSwap<Snapshot>>) {
     let config = Config {
+        geoip_database: None,
         certificates: vec![],
         cache: None,
         revision: 1,
@@ -1602,6 +1604,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
 
     // A new document without settings restores the process defaults at once.
     let plain = Config {
+        geoip_database: None,
         certificates: vec![],
         cache: None,
         revision: 2,
@@ -1737,6 +1740,7 @@ async fn one_streaming_route_cannot_consume_another_routes_capacity() {
     second.max_requests = Some(1);
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config {
+            geoip_database: None,
             certificates: vec![],
             cache: None,
             revision: 0,
@@ -3813,6 +3817,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
     .unwrap();
     let runtime = hangang::config::HttpRuntime {
         language_policy: None,
+        country_policy: None,
         auth_reserved: Vec::new(),
         jwt_auth: None,
         workload_auth: None,

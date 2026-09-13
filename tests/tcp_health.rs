@@ -35,6 +35,7 @@ fn config(route: TcpRoute) -> Config {
 
 fn route(listen: SocketAddr, backends: Vec<String>) -> TcpRoute {
     TcpRoute {
+        country_policy: None,
         id: "checked-stream".into(),
         enabled: true,
         priority: 0,
