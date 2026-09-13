@@ -1392,11 +1392,13 @@ impl Proxy {
                 .as_ref()
                 .expect("validated JWT route has a prepared verifier")
                 .clone();
-            let route = snapshot
-                .jwt_routes
-                .get(&runtime.route.id)
-                .expect("enabled JWT route has a generation")
-                .clone();
+            let Some(route) = snapshot.jwt_routes.get(&runtime.route.id).cloned() else {
+                self.metrics
+                    .jwt_auth_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                return Ok(response(503, "JWT route generation unavailable"));
+            };
             auth_route_lease
                 .get_or_insert_with(AuthRouteLease::default)
                 .jwt = Some(JwtRouteLease {

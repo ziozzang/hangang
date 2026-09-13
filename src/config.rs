@@ -1320,6 +1320,9 @@ pub struct Snapshot {
     pub workload_identity_headers: Vec<hyper::header::HeaderName>,
     pub workload_routes:
         std::collections::HashMap<String, std::sync::Arc<crate::workload_auth::Runtime>>,
+    /// Whole-route generations for admitted JWT streams; unchanged unrelated
+    /// publications preserve their leases without scanning all routes per frame.
+    pub jwt_routes: std::collections::HashMap<String, std::sync::Arc<HttpRoute>>,
     pub http_workload_tls:
         std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
@@ -1575,6 +1578,21 @@ impl Snapshot {
                 });
             }
         }
+        let jwt_routes = config
+            .http
+            .iter()
+            .filter(|route| route.enabled && route.jwt_auth.is_some())
+            .map(|route| {
+                let old = previous
+                    .and_then(|snapshot| snapshot.jwt_routes.get(&route.id))
+                    .filter(|old| old.as_ref() == route);
+                (
+                    route.id.clone(),
+                    old.cloned()
+                        .unwrap_or_else(|| std::sync::Arc::new(route.clone())),
+                )
+            })
+            .collect();
         let mut workload_routes = std::collections::HashMap::new();
         for route in config
             .http
@@ -1890,6 +1908,7 @@ impl Snapshot {
             http_match_headers,
             workload_identity_headers,
             workload_routes,
+            jwt_routes,
             http_workload_tls,
             sni_regex: regexes.sni,
             upstream_tls,

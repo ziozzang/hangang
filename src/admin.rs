@@ -773,6 +773,7 @@ impl Admin {
                 "tcp_mtls_rejections_total": metrics.tcp_mtls_rejections.load(Ordering::Relaxed),
                 "tcp_mtls_lease_terminations_total": metrics.tcp_mtls_lease_terminations.load(Ordering::Relaxed),
                 "jwt_auth_unavailable_total": metrics.jwt_auth_unavailable.load(Ordering::Relaxed),
+                "jwt_lease_terminations_total": metrics.jwt_lease_terminations.load(Ordering::Relaxed),
                 "jwt_auth_capacity_rejections_total": metrics.jwt_auth_capacity_rejections.load(Ordering::Relaxed),
                 "active_connections": metrics.active_connections.load(Ordering::Relaxed),
                 "rejected_connections_total": metrics.rejected_connections.load(Ordering::Relaxed),

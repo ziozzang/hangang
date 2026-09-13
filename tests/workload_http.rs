@@ -859,3 +859,111 @@ async fn release_workload_http_mtls_throughput_diagnostic() {
     running.shutdown().await;
     backend_task.abort();
 }
+
+#[tokio::test]
+async fn jwt_expiry_retires_sse_even_while_workload_identity_is_current() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let material = material();
+    let (backend, backend_task) = streaming_origin().await;
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let key = SigningKey::from_bytes(&[63; 32]);
+    let mut document = serde_json::to_value(config(listen, backend, &material)).unwrap();
+    document["http"][0]["jwt_auth"] = json!({
+        "verification":{"issuer":"https://issuer.example.test/", "audiences":["workload-api"],
+            "profile":"rfc9068", "algorithms":["EdDSA"], "leeway_seconds":0},
+        "keys":{"source":"local", "jwks":{"keys":[{"kty":"OKP", "crv":"Ed25519", "alg":"EdDSA",
+            "use":"sig", "kid":"lease-fixture", "x":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())}]}}
+    });
+    let running = start(serde_json::from_value(document).unwrap(), bound).await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let header = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({"typ":"at+jwt","alg":"EdDSA","kid":"lease-fixture"})).unwrap(),
+    );
+    let claims = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(
+            &json!({"iss":"https://issuer.example.test/","aud":"workload-api",
+        "sub":"alice","client_id":"owned","iat":now,"exp":now+4,"jti":"owned-lease"}),
+        )
+        .unwrap(),
+    );
+    let input = format!("{header}.{claims}");
+    let token = format!(
+        "{input}.{}",
+        URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
+    );
+    let good = connector(&material, Some(&material.good));
+    assert_eq!(request_h1(&good, listen, "").await.unwrap().0, 401);
+    let without_certificate = connector(&material, None);
+    assert!(
+        request_h1(
+            &without_certificate,
+            listen,
+            &format!("Authorization: Bearer {token}\r\n")
+        )
+        .await
+        .is_none()
+    );
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let mut tls = good
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    tls.write_all(
+        format!(
+            "GET /private HTTP/1.1\r\nHost: private.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        while !response.windows(7).any(|bytes| bytes == b"data:x\n") {
+            let count = tls.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "combined auth stream ended before admission");
+            response.extend_from_slice(&chunk[..count]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(7), async {
+        let mut chunk = [0; 1024];
+        while let Ok(count) = tls.read(&mut chunk).await {
+            if count == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("JWT expiry did not retire the workload-authenticated SSE stream");
+    assert!(
+        running.active.load().http_workload_tls["private-edge"]
+            .load()
+            .is_some()
+    );
+    assert!(
+        running
+            .metrics
+            .jwt_lease_terminations
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    );
+    assert_eq!(
+        running
+            .metrics
+            .workload_route_terminations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    running.shutdown().await;
+    backend_task.abort();
+}

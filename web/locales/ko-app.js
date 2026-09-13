@@ -1,6 +1,8 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  'JWT stream terminations': 'JWT 스트림 종료',
+  'Token time, signing key or route policy invalidated': '토큰 시간·서명 키·경로 정책 무효화',
   'The proxy could not be reached.': '프록시에 연결할 수 없습니다.',
   'Connected': '연결됨', 'Disconnected': '연결 끊김', 'Confirm': '확인',
   'Connect to this proxy': '이 프록시에 연결',
@@ -644,7 +646,7 @@ export default {
   'Verified identity header': '검증된 신원 헤더',
   'Hide Bearer token from the upstream': '업스트림에 Bearer 토큰 숨기기',
   'Verified JWT subject': '검증된 JWT 주체',
-  'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access.': '모든 요청에서 서명된 RFC 9068 OAuth 접근 토큰을 검증합니다. 브라우저 로그인이나 OpenID Connect ID 토큰 수락 기능은 아닙니다. 보호된 접근에서 JWT와 외부 인가를 함께 사용할 수 있지만 Basic과 JWT는 Authorization 헤더를 공유하므로 병용할 수 없습니다. 원격 키 조회 실패 시 접근을 거부합니다.',
+  'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access. Long uploads, SSE and WebSocket streams end when the token expires (including leeway), its signing key is withdrawn, or this route changes. This does not provide per-token online revocation.': '모든 요청에서 서명된 RFC 9068 OAuth 접근 토큰을 검증합니다. 브라우저 로그인이나 OpenID Connect ID 토큰 수락 기능은 아닙니다. 보호된 접근에서 JWT와 외부 인가를 함께 사용할 수 있지만 Basic과 JWT는 Authorization 헤더를 공유하므로 병용할 수 없습니다. 원격 키 조회 실패 시 접근을 거부합니다. 긴 업로드·SSE·WebSocket 스트림은 허용 시간 오차를 포함한 토큰 만료, 서명 키 철회 또는 해당 경로 변경 시 종료됩니다. 개별 토큰의 온라인 폐기 기능은 아닙니다.',
   'When off, the existing route remains unchanged until saved. A configured JWT policy disables route response caching.': '끄더라도 저장 전에는 기존 경로가 바뀌지 않습니다. JWT 정책이 설정된 경로는 응답 캐시를 사용하지 않습니다.',
   'Exact HTTPS issuer including its path and trailing slash; must equal the signed iss claim.': '경로와 끝 슬래시를 포함한 정확한 HTTPS 발급자 값이며 서명된 iss 클레임과 같아야 합니다.',
   'One expected resource audience per line, 1–8 distinct values. The signed aud claim must contain one.': '예상하는 리소스 대상 값을 줄마다 하나씩, 서로 다른 값 1~8개 입력합니다. 서명된 aud 클레임에 그중 하나가 있어야 합니다.',

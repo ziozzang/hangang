@@ -613,6 +613,7 @@ function renderStatus(data, record = true) {
     [t('Body transform errors'), metrics.body_transform_errors_total, t('Buffer or stream failures'), Number(metrics.body_transform_errors_total) ? 'is-error' : ''],
     [t('Policy errors'), metrics.policy_errors_total, t('Lua policy failures, including capacity rejections'), Number(metrics.policy_errors_total) ? 'is-error' : ''],
     [t('Lua capacity rejections'), Number.isFinite(metrics.policy_capacity_rejections_total) ? metrics.policy_capacity_rejections_total : null, t('Worker busy or restarting; counted in policy errors'), Number(metrics.policy_capacity_rejections_total) ? 'is-error' : ''],
+    [t('JWT stream terminations'), Number.isFinite(metrics.jwt_lease_terminations_total) ? metrics.jwt_lease_terminations_total : null, t('Token time, signing key or route policy invalidated'), Number(metrics.jwt_lease_terminations_total) ? 'is-error' : ''],
     [t('Config updates'), metrics.config_updates_total, t('Published revisions'), ''],
   ];
   const grid = $('#metric-grid');
@@ -1655,7 +1656,7 @@ function jwtSection(route) {
   keySource.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
   endpointKind.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
   return section({ title: 'JWT access token', configured: Boolean(jwt),
-    note: 'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access.', fields: [
+    note: 'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access. Long uploads, SSE and WebSocket streams end when the token expires (including leeway), its signing key is withdrawn, or this route changes. This does not provide per-token online revocation.', fields: [
       span2(field('Enable JWT authentication', 'jwt_auth_enabled', Boolean(jwt), { checkbox: true, toggles: 'jwt_auth', help: 'When off, the existing route remains unchanged until saved. A configured JWT policy disables route response caching.' })),
       span2(field('Issuer', 'jwt_issuer', verification.issuer ?? '', { group: 'jwt_auth', maxlength: 512, placeholder: 'https://issuer.example.test/', help: 'Exact HTTPS issuer including its path and trailing slash; must equal the signed iss claim.' })),
       span2(field('Audiences', 'jwt_audiences', Array.isArray(verification.audiences) ? verification.audiences.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One expected resource audience per line, 1–8 distinct values. The signed aud claim must contain one.' })),

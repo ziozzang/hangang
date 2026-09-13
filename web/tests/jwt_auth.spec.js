@@ -17,12 +17,13 @@ async function fixture(page, initial = baseRoute, locale = 'en') {
   const routes = new Map([[initial.id, structuredClone(initial)]]);
   const writes = [];
   let revision = 7;
+  let terminations;
   if (locale === 'ko') await page.addInitScript(() => localStorage.setItem('hangang-locale', 'ko'));
   await page.route('**/*', async (handled) => {
     const request = handled.request(); const path = new URL(request.url()).pathname;
     if (path.startsWith('/ui/')) return handled.continue();
     if (path === '/v1/auth/setup') return handled.fulfill({ status: 404, body: 'not found' });
-    if (path === '/v1/status') return handled.fulfill({ json: { revision, http_routes: routes.size, tcp_routes: 0, uptime_seconds: 1, metrics: {}, state: { ready: true } } });
+    if (path === '/v1/status') return handled.fulfill({ json: { revision, http_routes: routes.size, tcp_routes: 0, uptime_seconds: 1, metrics: { jwt_lease_terminations_total: terminations }, state: { ready: true } } });
     if (path === '/v1/update/status') return handled.fulfill({ json: { enabled: false, phase: 'idle' } });
     if (path === '/v1/traffic') return handled.fulfill({ json: { records: [] } });
     if (path === '/v1/events') return handled.fulfill({ status: 503, body: 'no stream' });
@@ -50,7 +51,7 @@ async function fixture(page, initial = baseRoute, locale = 'en') {
   await page.locator('#login-dialog').getByRole('button', { name: locale === 'ko' ? '연결' : 'Connect' }).click();
   await expect(page.locator('#login-dialog')).toBeHidden();
   await page.locator('[data-view="http"]').click();
-  return { writes, routes };
+  return { writes, routes, setTerminations(value) { terminations = value; } };
 }
 
 async function edit(page) {
@@ -175,3 +176,17 @@ test('Korean JWT controls and raw public JWKS remain readable', async ({ page })
   await expect(page.locator('label[for="route-field-jwt_issuer"]')).toContainText('발급자');
   await expect(page.locator('#route-field-jwt_local_jwks')).toHaveValue(/"kid": "fixture"/);
 });
+
+for (const locale of ['en', 'ko']) {
+  test(`JWT lease counter exposes unavailable and refreshed evidence in ${locale}`, async ({ page }) => {
+    const control = await fixture(page, baseRoute, locale);
+    await page.locator('[data-view="status"]').click();
+    const label = locale === 'ko' ? 'JWT 스트림 종료' : 'JWT stream terminations';
+    const card = page.locator('.metric').filter({ has: page.getByText(label, { exact: true }) });
+    await expect(card.locator('.metric-value')).toHaveText('—');
+    control.setTerminations(3);
+    await page.locator('#refresh-status').click();
+    await expect(card.locator('.metric-value')).toHaveText('3');
+    await expect(card).toHaveClass(/is-error/);
+  });
+}
