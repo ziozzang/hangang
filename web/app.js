@@ -37,6 +37,11 @@ const state = {
   accountAuthAvailable: false,
   view: 'status',
   statusTimer: null,
+  workloadMaterialTimer: null,
+  workloadMaterialAbort: null,
+  workloadMaterials: null,
+  workloadMaterialsRevision: null,
+  tcpRoutesRevision: null,
   revision: null,
   config: null,
   configEtag: null,
@@ -85,6 +90,7 @@ function refreshAppCopy() {
   for (const el of $$('[data-app-i18n-placeholder]')) el.placeholder = t(el.dataset.appI18nPlaceholder);
   for (const { editor, label } of luaEditors.values()) { editor.setLabel(t(label)); editor.setTranslateInfo?.(t); }
   if (state.lastStatus) renderStatus(state.lastStatus, false);
+  refreshWorkloadMaterialBadges();
   if (state.lastUpdateStatus) renderUpdateStatus(state.lastUpdateStatus);
   if (state.cacheRuntime) renderCache(state.cacheRuntime);
   refreshCacheToggle(state.config?.cache ?? null);
@@ -386,6 +392,7 @@ function scrubRenderedData() {
 
 function logout(reason = '') {
   stopCertificatePolling();
+  stopWorkloadMaterialPolling();
   const token = state.token;
   const revoke = state.accountAuthAvailable && token && state.authMode !== 'token';
   forgetAccountToken();
@@ -410,6 +417,9 @@ function logout(reason = '') {
   state.certificateLoadSequence++;
   state.lastStatus = null;
   state.lastUpdateStatus = null;
+  state.workloadMaterials = null;
+  state.workloadMaterialsRevision = null;
+  state.tcpRoutesRevision = null;
   scrubRenderedData();
   $('#token-input').value = '';
   for (const id of ['login-username', 'login-password', 'setup-token', 'setup-username', 'setup-password', 'setup-confirm']) $(`#${id}`).value = '';
@@ -521,6 +531,7 @@ async function switchView() {
   });
   $$('.nav-link').forEach((link) => link.classList.toggle('is-active', link.dataset.view === name));
   if (name === 'status' && state.token) startStatusPolling(); else stopStatusPolling();
+  if (name !== 'config' && name !== 'tcp') stopWorkloadMaterialPolling();
   if (name === 'certificates' && state.token && !document.hidden) startCertificatePolling(); else stopCertificatePolling();
   if (state.token) await loadView(name);
   $('#main').focus({ preventScroll: true });
@@ -533,6 +544,10 @@ async function loadView(name, quiet = false) {
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
     if (name === 'config') await loadConfig(false);
+    if (name === 'config' || name === 'tcp') {
+      await refreshWorkloadMaterialStatus();
+      startWorkloadMaterialPolling();
+    }
     if (name === 'users' && isAdmin()) await loadUsers();
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
@@ -577,6 +592,9 @@ function renderUpdateStatus(update) {
 
 function renderStatus(data, record = true) {
   state.lastStatus = data;
+  // Locale-only rerenders may carry an older status snapshot than a recent
+  // Configuration/TCP material poll; keep the newer local slot observation.
+  if (record) acceptWorkloadMaterials(data);
   if (record) recordStatus(data);
   setRevision(data.revision);
   setConnection(true);
@@ -1077,6 +1095,66 @@ function startStatusPolling() {
 }
 function stopStatusPolling() { stopLive(); if (state.statusTimer) clearInterval(state.statusTimer); state.statusTimer = null; }
 
+function acceptWorkloadMaterials(status) {
+  state.workloadMaterials = Array.isArray(status?.workload_materials)
+    ? status.workload_materials.filter((item) => item && ['http', 'tcp'].includes(item.kind) && typeof item.id === 'string' && typeof item.ready === 'boolean')
+    : null;
+  state.workloadMaterialsRevision = status?.revision ?? null;
+  refreshWorkloadMaterialBadges();
+}
+
+function materialState(kind, id) {
+  const revision = kind === 'http' ? state.config?.revision : state.tcpRoutesRevision;
+  const active = kind === 'http'
+    ? state.config?.workload_http?.find((item) => item.id === id)
+    : state.routes.tcp.find((item) => item.id === id);
+  if (!active) return 'unknown';
+  if (active.enabled === false) return 'inactive';
+  if (revision === undefined || revision === null || revision !== state.workloadMaterialsRevision || !state.workloadMaterials) return 'unknown';
+  const slot = state.workloadMaterials.find((item) => item.kind === kind && item.id === id);
+  return slot ? (slot.ready ? 'ready' : 'blocked') : 'unknown';
+}
+
+function refreshWorkloadMaterialBadges() {
+  for (const badge of $$('[data-workload-material-kind]')) {
+    const condition = materialState(badge.dataset.workloadMaterialKind, badge.dataset.workloadMaterialId);
+    badge.textContent = t({ ready: 'Current runtime: ready', blocked: 'Current runtime: blocked', inactive: 'Current runtime: inactive', unknown: 'Current runtime: unknown' }[condition]);
+    badge.dataset.materialState = condition;
+  }
+}
+
+async function refreshWorkloadMaterialStatus() {
+  if (!state.token || document.hidden || !['config', 'tcp'].includes(state.view)) return;
+  state.workloadMaterialAbort?.abort();
+  const controller = new AbortController();
+  state.workloadMaterialAbort = controller;
+  try {
+    const { data } = await api('/v1/status', { signal: controller.signal });
+    if (controller.signal.aborted) return;
+    acceptWorkloadMaterials(data);
+  } catch (error) {
+    if (controller.signal.aborted || error instanceof StaleSessionError || !state.token) return;
+    if (error.status === 401) return logout(t('Your session is no longer authorized.'));
+    state.workloadMaterials = null;
+    refreshWorkloadMaterialBadges();
+  } finally {
+    if (state.workloadMaterialAbort === controller) state.workloadMaterialAbort = null;
+  }
+}
+
+function startWorkloadMaterialPolling() {
+  stopWorkloadMaterialPolling();
+  if (!state.token || document.hidden || !['config', 'tcp'].includes(state.view)) return;
+  state.workloadMaterialTimer = setInterval(refreshWorkloadMaterialStatus, 5000);
+}
+
+function stopWorkloadMaterialPolling() {
+  if (state.workloadMaterialTimer) clearInterval(state.workloadMaterialTimer);
+  state.workloadMaterialTimer = null;
+  state.workloadMaterialAbort?.abort();
+  state.workloadMaterialAbort = null;
+}
+
 async function loadRoutes(type) {
   const root = $(`#${type}-routes`);
   root.replaceChildren(loadingNode('Loading routes…'));
@@ -1084,6 +1162,7 @@ async function loadRoutes(type) {
     const { data, etag } = await api(`/v1/routes/${type}`);
     state.routes[type] = Array.isArray(data) ? data : (data?.routes || []);
     state.routeEtags[type] = etag || (data?.revision !== undefined ? `"${data.revision}"` : null);
+    if (type === 'tcp') state.tcpRoutesRevision = data?.revision ?? null;
     if (data?.revision !== undefined) setRevision(data.revision);
     renderRoutes(type);
   } catch (error) {
@@ -1225,6 +1304,7 @@ function updateRouteInventory(type, content, pagination, count) {
     next.addEventListener('click', () => { settings.page += 1; updateRouteInventory(type, content, pagination, count); });
     pagination.append(range, previous, next);
   }
+  if (type === 'tcp') refreshWorkloadMaterialBadges();
 }
 
 function rootForRoute(type) { return $(`#${type}-routes`); }
@@ -1260,6 +1340,11 @@ function routeRow(type, route) {
   const row = document.createElement('tr'); row.className = 'route-row route-card'; row.dataset.routeId = route.id || '';
   const cell = (primary, secondary = '') => { const td = document.createElement('td'); const main = document.createElement('span'); main.className = 'route-cell-main'; main.textContent = primary; td.append(main); if (secondary) { const detail = document.createElement('small'); detail.className = 'route-cell-detail'; detail.textContent = secondary; td.append(detail); } return td; };
   const identity = document.createElement('th'); identity.scope = 'row'; const title = document.createElement('h2'); title.className = 'route-cell-main'; title.textContent = route.id || t('(unnamed)'); const state = document.createElement('small'); state.className = 'route-cell-detail'; state.textContent = route.enabled === false ? t('Disabled') : t('Enabled'); identity.append(title, state);
+  if (type === 'tcp' && route.inbound_tls) {
+    const material = document.createElement('small'); material.className = 'route-cell-detail workload-material-state';
+    material.dataset.workloadMaterialKind = 'tcp'; material.dataset.workloadMaterialId = route.id;
+    identity.append(material);
+  }
   const match = routeMatch(type, route);
   const matchDetail = type === 'http' ? `${route.path_match === 'exact' ? t('Exact ') : ''}${route.path_prefix || '/'}` : (route.sni ? t('Listen {address}', { address: route.listen || '—' }) : t('Any TCP connection'));
   const backends = route.backends || [];
@@ -3024,6 +3109,7 @@ function ensureWorkloadListenersPanel() {
   const panel = document.createElement('details'); panel.className = 'form-section'; panel.id = 'workload-http-panel';
   const summary = document.createElement('summary'); const title = document.createElement('span'); title.className = 'section-title'; copy(title, 'Dedicated HTTP workload mTLS listeners'); summary.append(title);
   const note = document.createElement('p'); note.className = 'section-note'; copy(note, 'These listeners require a verified client certificate before serving HTTP/1 or HTTP/2. Paths refer to files on this instance. Changes are only staged in the JSON draft until Apply configuration publishes the full document. Ordinary HTTP/HTTPS and ACME listeners remain separate.');
+  const runtimeNote = document.createElement('p'); runtimeNote.className = 'workload-runtime-note'; copy(runtimeNote, 'Current runtime material is local to this instance. Ready means verified material is loaded; client and route authorization still apply. Blocked means current material is not verified. Unknown means status is unavailable, a binding is unpublished, or revisions differ. File metadata is checked every 500 ms and full contents every 5 s. An invalid client CA or CRL closes admission and existing streams; new bindings remain pending until verification after publication.');
   const list = document.createElement('div'); list.id = 'workload-http-list';
   const add = document.createElement('button'); add.type = 'button'; add.id = 'workload-http-add'; add.className = 'button button-secondary'; copy(add, 'Add workload listener'); add.addEventListener('click', () => openWorkloadListener(-1));
   const messageBox = document.createElement('div'); messageBox.id = 'workload-http-message'; messageBox.className = 'inline-message'; messageBox.setAttribute('aria-live', 'polite');
@@ -3053,7 +3139,7 @@ function ensureWorkloadListenersPanel() {
       message(messageBox, t('Listener staged. Apply configuration to publish it.'), 'success');
     } catch (error) { message(messageBox, error.message, 'error'); }
   });
-  panel.append(summary, note, list, add, form, messageBox);
+  panel.append(summary, note, runtimeNote, list, add, form, messageBox);
   $('#settings-section').after(panel);
 }
 
@@ -3119,13 +3205,16 @@ function renderWorkloadListeners(draft) {
     const row = document.createElement('div'); row.className = 'button-row workload-http-row'; row.dataset.workloadId = typeof item?.id === 'string' ? item.id : '';
     const title = document.createElement('strong'); title.textContent = `${item?.id ?? '?'} · ${item?.listen ?? '?'}`;
     const state = document.createElement('span'); copy(state, item?.enabled === false ? 'Inactive' : 'Enabled');
+    const material = document.createElement('span'); material.className = 'workload-material-state';
+    material.dataset.workloadMaterialKind = 'http'; material.dataset.workloadMaterialId = typeof item?.id === 'string' ? item.id : '';
     const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button button-secondary'; copy(edit, 'Edit'); edit.addEventListener('click', () => openWorkloadListener(index));
     const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'button button-quiet'; copy(toggle, item?.enabled === false ? 'Activate' : 'Deactivate');
     toggle.addEventListener('click', () => { try { mutateWorkloadListeners((items) => { if (items[index]?.enabled === false) delete items[index].enabled; else items[index].enabled = false; }); message($('#workload-http-message'), t('Listener activation staged. Apply configuration to publish it.'), 'success'); } catch (error) { message($('#workload-http-message'), error.message, 'error'); } });
     const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove');
     remove.addEventListener('click', () => { try { mutateWorkloadListeners((items) => items.splice(index, 1)); message($('#workload-http-message'), t('Listener removal staged. Apply configuration to publish it.'), 'success'); } catch (error) { message($('#workload-http-message'), error.message, 'error'); } });
-    row.append(title, state, edit, toggle, remove); list.append(row);
+    row.append(title, state, material, edit, toggle, remove); list.append(row);
   });
+  refreshWorkloadMaterialBadges();
 }
 
 async function loadConfig(force) {
@@ -3519,11 +3608,12 @@ $('#docker-form').addEventListener('submit', resolveDocker);
 window.addEventListener('hashchange', switchView);
 window.addEventListener('hangang:localechange', refreshAppCopy);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { stopStatusPolling(); stopCertificatePolling(); }
+  if (document.hidden) { stopStatusPolling(); stopCertificatePolling(); stopWorkloadMaterialPolling(); }
   else if (state.token && state.view === 'status') { loadStatus().catch(() => {}); startStatusPolling(); }
   else if (state.token && state.view === 'certificates') { loadCertificateInventory(state.certificateInventoryOffset, true).catch(() => {}); startCertificatePolling(); }
+  else if (state.token && ['config', 'tcp'].includes(state.view)) { refreshWorkloadMaterialStatus(); startWorkloadMaterialPolling(); }
 });
-window.addEventListener('beforeunload', () => { state.token = ''; stopStatusPolling(); });
+window.addEventListener('beforeunload', () => { state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
 state.view = normalizeView(location.hash);

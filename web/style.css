@@ -90,6 +90,7 @@ main { width: 100%; max-width: 1580px; padding: 40px clamp(24px, 4vw, 64px) 80px
 .preview-panel pre { max-height: 570px; margin: 0; overflow: auto; color: var(--muted); white-space: pre-wrap; word-break: break-word; font: 11px/1.65 var(--mono); }
 .diff-add { color: var(--green); }.diff-remove { color: var(--red); }
 .inline-message { min-height: 20px; margin-top: 8px; color: var(--muted); font-size: 12px; }.inline-message.is-error { color: var(--red); }.inline-message.is-success { color: var(--green); }.inline-message.is-warning { color: var(--amber); }
+.workload-material-state { color: var(--muted); font-size: 11px; }.workload-material-state[data-material-state="ready"] { color: var(--green); }.workload-material-state[data-material-state="blocked"] { color: var(--red); }
 .alert { margin-bottom: 18px; padding: 11px 14px; color: var(--red); border: 1px solid rgba(255,113,133,.35); border-radius: 5px; background: rgba(255,113,133,.1); }
 .docs-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 14px; }.docs-nav { position: sticky; top: 88px; align-self: start; max-height: calc(100vh - 110px); overflow: auto; padding: 10px; }
 .docs-nav a { display: flex; gap: 8px; align-items: center; padding: 8px; color: var(--muted); border-radius: 4px; text-decoration: none; font-size: 11px; }.docs-nav a:hover { color: var(--text); background: var(--surface-3); }
@@ -114,7 +115,7 @@ input, textarea:not(.code-editor), select { width: 100%; min-height: 38px; paddi
 .section-title { flex: 1; }
 .section-state { padding: 2px 6px; color: var(--green); border: 1px solid rgba(97,214,154,.3); border-radius: 3px; font: 650 9px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
 .form-section > .form-grid { padding: 4px 14px 14px; }
-.section-note { grid-column: 1 / -1; margin: 0 0 2px; color: var(--faint); font-size: 11px; line-height: 1.5; }
+.section-note, .workload-runtime-note { grid-column: 1 / -1; margin: 0 0 2px; color: var(--faint); font-size: 11px; line-height: 1.5; }
 .form-grid textarea { min-height: 84px; resize: vertical; font: 12px/1.6 var(--mono); }
 .form-grid select { appearance: auto; }
 .form-grid .field.check-field { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; }
