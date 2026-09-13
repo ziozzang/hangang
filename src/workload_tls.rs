@@ -56,11 +56,12 @@ impl Policy {
         .flatten()
         {
             ensure!(path.is_absolute(), "mTLS material path must be absolute");
+            let spelling = path.to_str().context("mTLS material path must be UTF-8")?;
             ensure!(
-                path.components().all(|component| matches!(
-                    component,
-                    std::path::Component::RootDir | std::path::Component::Normal(_)
-                )),
+                spelling.starts_with('/')
+                    && spelling[1..]
+                        .split('/')
+                        .all(|segment| !segment.is_empty() && segment != "." && segment != ".."),
                 "mTLS material path must be normalized"
             );
         }
@@ -400,6 +401,16 @@ mod tests {
         policy.allowed_uri_sans = vec![ID.into()];
         policy.handshake_timeout_ms = 10_001;
         assert!(policy.validate().is_err());
+        policy.handshake_timeout_ms = 5_000;
+        for invalid_path in [
+            "/etc/./server.pem",
+            "/etc//server.pem",
+            "/etc/../server.pem",
+            "/etc/server.pem/",
+        ] {
+            policy.cert_file = invalid_path.into();
+            assert!(policy.validate().is_err(), "accepted path {invalid_path}");
+        }
         assert!(
             serde_json::from_value::<Policy>(serde_json::json!({
                 "cert_file":"/a", "key_file":"/b", "client_ca_file":"/c",
