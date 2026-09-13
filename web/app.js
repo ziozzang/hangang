@@ -369,6 +369,7 @@ function scrubRenderedData() {
   $('#utility-hash-form').reset();
   $('#update-state').textContent = t('Loading status');
   for (const id of ['config-editor', 'cache-policy-editor', 'certificate-editor', 'route-json']) { const editor = $(`#${id}`); editor.value = ''; editor.setAttribute('aria-invalid', 'false'); }
+  if ($('#workload-http-panel')) { $('#workload-http-list').replaceChildren(); $('#workload-http-form').reset(); $('#workload-http-form').hidden = true; message($('#workload-http-message')); }
   $('#cache-generation-input').value = '';
   $('#cache-generation-input').setAttribute('aria-invalid', 'false');
   showSettings(undefined);
@@ -1168,7 +1169,7 @@ function routeHasPolicy(type, route, policy) {
   if (type === 'http') {
     if (policy === 'domains') return Boolean(route.hosts?.length);
     if (policy === 'tls') return Boolean(route.require_tls);
-    if (policy === 'auth') return Boolean(route.auth || route.basic_auth || route.jwt_auth);
+    if (policy === 'auth') return Boolean(route.auth || route.basic_auth || route.jwt_auth || route.workload_auth);
     if (policy === 'cache') return Boolean(route.cache);
     if (policy === 'advanced') return Boolean(route.lua || route.request_transform || route.response_transform);
   } else {
@@ -1238,6 +1239,7 @@ function routeSummaryTags(type, route) {
     if (route.auth) tags.push(t('External auth'));
     if (route.basic_auth) tags.push(t('Basic auth'));
     if (route.jwt_auth) tags.push(t('JWT access token'));
+    if (route.workload_auth) tags.push(t('Workload mTLS'));
     if (route.cache) tags.push(t('Cache {seconds}s', { seconds: route.cache.ttl_seconds ?? '?' }));
     if (route.retries) tags.push(t('Retries {count}', { count: route.retries }));
     if (route.upstream_timeout_ms) tags.push(t('Timeout {milliseconds} ms', { milliseconds: route.upstream_timeout_ms }));
@@ -1277,7 +1279,7 @@ function routeDefaults(type) {
       id: '', priority: 0, host: null, host_regex: null, upstream: structuredClone(DEFAULT_UPSTREAM), upstream_host: null, preserve_host: false,
       max_requests: null, upstream_timeout_ms: null, retries: 0, require_tls: false, cache: null, path_prefix: '/', path_match: 'prefix',
       headers: {}, json: {}, backends: ['http://127.0.0.1:8080'], deny_cidrs: [], lua: null, request_transform: null, response_transform: null,
-      auth: null, basic_auth: null, jwt_auth: null, balance: { mode: 'round_robin', weights: [], health: null }, response_set_headers: {}, response_remove_headers: [],
+      auth: null, basic_auth: null, jwt_auth: null, workload_auth: null, balance: { mode: 'round_robin', weights: [], health: null }, response_set_headers: {}, response_remove_headers: [],
     };
   }
   return { id: '', priority: 0, upstream: structuredClone(DEFAULT_UPSTREAM), sni: null, inbound_tls: null, max_connections: null, listen: '0.0.0.0:9001', backends: ['127.0.0.1:8080'], deny_cidrs: [] };
@@ -1501,7 +1503,7 @@ function resourceRuleRow(rule = {}) {
   if (!isObject(rule)) rule = {};
   const row = document.createElement('div'); row.className = 'resource-rule-row';
   const number = ++resourceRuleSequence;
-  const subjects = field('Allowed subjects', `resource_subjects_${number}`, Array.isArray(rule.subjects) ? rule.subjects.join('\n') : '', { textarea: true, help: 'Exact principal subjects, one per line (1–32). No wildcard or whitespace trimming.' });
+  const subjects = field('Allowed subjects', `resource_subjects_${number}`, Array.isArray(rule.subjects) ? rule.subjects.join('\n') : '', { textarea: true, help: 'Exact principal subjects, one per line (1–32). Workload subjects must be canonical SPIFFE URIs; no wildcard or whitespace trimming.' });
   const methods = field('Allowed methods', `resource_methods_${number}`, Array.isArray(rule.methods) ? rule.methods.join('\n') : '', { textarea: true, help: 'Uppercase HTTP methods, one per line (1–16), or * alone for every method.' });
   subjects.querySelector('textarea').classList.add('resource-rule-subjects');
   methods.querySelector('textarea').classList.add('resource-rule-methods');
@@ -1536,11 +1538,11 @@ function resourcePolicySection(route) {
   rules.append(note, list, add);
   action.querySelector('select').addEventListener('change', () => updateResourcePolicyControls($('#route-form')));
   return section({ title: 'Resource authorization', configured: Boolean(policy),
-    note: 'Protect one resource namespace using a Basic username, verified JWT subject or copied external identity header. Matching is exact and deny-by-default. Moving an enforced host/path scope requires preserving its old scope or first saving enforcement Off. This is an instance route policy, not device identity or a fleet authorization result.', fields: [
+    note: 'Protect one resource namespace using a Basic username, verified JWT subject, verified workload SPIFFE URI, or copied external identity header. Matching is exact and deny-by-default. Moving an enforced host/path scope requires preserving its old scope or first saving enforcement Off. This is an instance route policy, not a fleet authorization result.', fields: [
       span2(action),
       field('Resource ID', 'resource_policy_id', policy?.resource_id ?? '', { group: 'resource_policy', maxlength: 128, help: 'Opaque ASCII ID, 1–128 characters. Routes sharing it must keep the same policy and authenticator.' }),
       field('Enforce resource policy', 'resource_policy_enforce', policy?.enforce !== false, { group: 'resource_policy', checkbox: true, help: 'Off keeps the policy configured without namespace or subject enforcement; gateway authentication still runs. Save Off before removing a previously enforced policy.' }),
-      field('Principal source', 'resource_policy_source', principal.source ?? (route.jwt_auth ? 'jwt' : route.auth && !route.basic_auth ? 'external' : 'basic'), { group: 'resource_policy', select: [['basic', 'Basic username'], ['external', 'External identity header'], ['jwt', 'Verified JWT subject']], help: 'Requires Protected access and the matching gateway authenticator.' }),
+      field('Principal source', 'resource_policy_source', principal.source ?? (route.workload_auth ? 'workload' : route.jwt_auth ? 'jwt' : route.auth && !route.basic_auth ? 'external' : 'basic'), { group: 'resource_policy', select: [['basic', 'Basic username'], ['external', 'External identity header'], ['jwt', 'Verified JWT subject'], ['workload', 'Verified workload SPIFFE URI']], help: 'Requires Protected access and the matching gateway authenticator.' }),
       field('External subject header', 'resource_policy_subject_header', principal.subject_header ?? '', { group: 'resource_policy', maxlength: 128, placeholder: 'x-forwarded-user', help: 'For External only: exact header copied from a successful authorization response onto the upstream request. It must be configured in Identity response headers.' }),
       rules,
     ] });
@@ -1590,6 +1592,17 @@ function jwtSection(route) {
       span2(field('Additional public CA PEM', 'jwt_ca_pem', remote.ca_pem ?? '', { group: 'jwt_remote', textarea: true, help: 'Optional public trust anchor for a private issuer. No private keys; at most 128 KiB.' })),
       field('Verified identity header', 'jwt_identity_header', jwt?.identity_header ?? '', { group: 'jwt_auth', maxlength: 128, placeholder: 'x-verified-user', help: 'Optional upstream request header containing the verified sub. Client and Lua writes cannot replace it.' }),
       span2(field('Hide Bearer token from the upstream', 'jwt_hide_credentials', jwt?.hide_credentials !== false, { group: 'jwt_auth', checkbox: true, help: 'Checked by default. The external authorization service can still inspect the verified request before the token is removed.' })),
+    ] });
+}
+
+function workloadAuthSection(route) {
+  const auth = isObject(route.workload_auth) ? route.workload_auth : null;
+  return section({ title: 'HTTP workload mTLS', configured: Boolean(auth),
+    note: 'Require a verified SPIFFE client certificate from one of the selected dedicated HTTP mTLS listeners, then match an exact URI allowlist. This setting requires Protected access and resource authorization. Other gateway authenticators still run; ordinary public HTTP and HTTPS listeners cannot supply this identity.', fields: [
+      span2(field('Require workload identity', 'workload_auth_enabled', Boolean(auth), { checkbox: true, toggles: 'workload_auth', help: 'Listener registrations are managed in Configuration. Enabling this does not turn an ordinary HTTP listener into mTLS.' })),
+      span2(field('Workload listener IDs', 'workload_listener_ids', (auth?.listener_ids ?? []).join('\n'), { group: 'workload_auth', textarea: true, help: 'One configured listener ID per line, 1–64 distinct IDs. Only these dedicated HTTP mTLS listeners may enter this route.' })),
+      span2(field('Allowed workload SPIFFE URI SANs', 'workload_allowed_uri_sans', (auth?.allowed_uri_sans ?? []).join('\n'), { group: 'workload_auth', textarea: true, help: 'One exact SPIFFE URI per line, 1–128 distinct identities. They must also satisfy the resource allow rules.' })),
+      field('Verified workload identity header', 'workload_identity_header', auth?.identity_header ?? '', { group: 'workload_auth', placeholder: 'x-workload-identity', maxlength: 128, help: 'Optional trusted upstream request header containing the verified SPIFFE URI. Client and Lua writes cannot establish this identity.' }),
     ] });
 }
 
@@ -1729,10 +1742,10 @@ function httpSections(route) {
     ] }),
     upstreamSection('http', route),
     section({ title: 'Access policy', configured: Boolean(route.access_mode && route.access_mode !== 'legacy'),
-      note: 'Declare who owns access control. Legacy preserves existing behavior without declaring the route protected. Public is intentionally anonymous at the gateway; Application delegates login to the application; Protected requires Basic, JWT or external authorization on every request. This label is not a complete Zero Trust assessment.', fields: [
+      note: 'Declare who owns access control. Legacy preserves existing behavior without declaring the route protected. Public is intentionally anonymous at the gateway; Application delegates login to the application; Protected requires Basic, JWT, workload mTLS or external authorization on every request. This label is not a complete Zero Trust assessment.', fields: [
         span2(field('Access mode', 'access_mode', route.access_mode || 'legacy', {
           select: [['legacy', 'Legacy — existing behavior'], ['public', 'Public — anonymous at gateway'], ['application', 'Application — app owns login'], ['protected', 'Protected — gateway auth required']],
-          help: 'Public and Application cannot configure gateway Basic, JWT or external auth. Protected needs at least one. JWT can combine with external authorization but not Basic. An existing Protected route cannot return to Legacy; choose Public or Application and clear auth explicitly. Lua transforms remain available in every mode.',
+          help: 'Public and Application cannot configure gateway Basic, JWT, workload mTLS or external auth. Protected needs at least one. Workload mTLS also requires resource authorization. JWT can combine with external authorization but not Basic. An existing Protected route cannot return to Legacy; choose Public or Application and clear auth explicitly. Lua transforms remain available in every mode.',
         })),
       ] }),
     section({ title: 'External authorization', configured: Boolean(auth), note: 'Every request is first sent to an authorization service. A 2xx answer allows the request; a denial answers the client without contacting the backend. The service always receives the generated request context from the trusted-proxy resolution: x-forwarded-method, x-forwarded-uri, x-forwarded-proto, x-forwarded-host, x-forwarded-port, x-forwarded-for, x-real-ip, x-original-url and the x-original-method/uri/client-ip compatibility names. These names cannot be listed below; the identity names x-forwarded-user, x-forwarded-email, x-forwarded-groups, x-forwarded-preferred-username and x-forwarded-access-token may be copied from the response only. On a 2xx answer with “Forward denial responses” enabled, the service’s Set-Cookie headers reach the client.', fields: [
@@ -1750,6 +1763,7 @@ function httpSections(route) {
       span2(field('Hide credentials from the upstream', 'basic_auth_hide_credentials', Boolean(basic?.hide_credentials), { checkbox: true, help: 'Removes the Authorization header before forwarding.' })),
     ] }),
     jwtSection(route),
+    workloadAuthSection(route),
     resourcePolicySection(route),
     section({ title: 'Response headers', configured: Boolean(Object.keys(route.response_set_headers || {}).length || (route.response_remove_headers || []).length), note: 'Streaming-safe header edits applied to every upstream response head; framing and hop-by-hop names are rejected.', fields: [
       field('Set response headers', 'response_set_headers', pairsToLines(route.response_set_headers), { textarea: true, help: 'One name: value per line; replaces an existing header of the same name.' }),
@@ -2081,7 +2095,7 @@ function routeFromForm() {
       || !isObject(policy.principal) || typeof policy.principal.source !== 'string' || !Array.isArray(policy.allow)
       || policy.allow.length > 32
       || !policy.allow.every((rule) => isObject(rule) && Array.isArray(rule.subjects) && rule.subjects.length <= 32
-        && rule.subjects.every((value) => typeof value === 'string' && value.length <= 255)
+        && rule.subjects.every((value) => typeof value === 'string' && new TextEncoder().encode(value).length <= (policy.principal.source === 'workload' ? 2048 : 255))
         && Array.isArray(rule.methods) && rule.methods.length <= 16
         && rule.methods.every((value) => typeof value === 'string' && value.length <= 32))) {
       throw new Error(t('Advanced resource policy JSON must contain an ID, principal and allow-rule arrays'));
@@ -2090,6 +2104,10 @@ function routeFromForm() {
   if (type === 'http' && route.jwt_auth !== undefined && route.jwt_auth !== null &&
       (!isObject(route.jwt_auth) || !isObject(route.jwt_auth.verification) || !isObject(route.jwt_auth.keys))) {
     throw new Error(t('Advanced JWT JSON must contain verification and keys objects'));
+  }
+  if (type === 'http' && route.workload_auth !== undefined && route.workload_auth !== null &&
+      (!isObject(route.workload_auth) || !Array.isArray(route.workload_auth.listener_ids) || !Array.isArray(route.workload_auth.allowed_uri_sans))) {
+    throw new Error(t('Advanced workload authentication JSON needs listener_ids and allowed_uri_sans arrays'));
   }
   if (type === 'tcp' && route.inbound_tls !== undefined && route.inbound_tls !== null &&
       (!isObject(route.inbound_tls) || !Array.isArray(route.inbound_tls.allowed_uri_sans))) {
@@ -2254,6 +2272,19 @@ function routeFromForm() {
     if (route.jwt_auth && route.basic_auth) throw new Error(t('JWT and Basic authentication cannot share Authorization'));
     if (route.jwt_auth?.identity_header && authResponse.some((name) => name.toLowerCase() === route.jwt_auth.identity_header.toLowerCase()))
       throw new Error(t('JWT identity header conflicts with an external authorization response header'));
+    if (checked('workload_auth_enabled')) {
+      const listenerIds = lines('workload_listener_ids');
+      const allowed = lines('workload_allowed_uri_sans');
+      const identity = optionalText('workload_identity_header');
+      if (!listenerIds.length || listenerIds.length > 64 || new Set(listenerIds).size !== listenerIds.length || listenerIds.some((id) => !/^[A-Za-z0-9._:-]{1,128}$/.test(id)))
+        throw new Error(t('Workload authentication needs 1–64 distinct configured listener IDs'));
+      if (!allowed.length || allowed.length > 128 || new Set(allowed).size !== allowed.length || allowed.some((uri) => !validSpiffeIdentity(uri)))
+        throw new Error(t('Workload authentication needs 1–128 distinct canonical SPIFFE URIs'));
+      if (identity && !jwtIdentityHeader(identity)) throw new Error(t('Workload identity header is reserved or invalid'));
+      if (identity && [route.basic_auth?.identity_header, route.jwt_auth?.identity_header, ...authResponse].some((header) => header?.toLowerCase() === identity.toLowerCase()))
+        throw new Error(t('Workload identity header conflicts with another verified identity header'));
+      route.workload_auth = { ...(isObject(route.workload_auth) ? route.workload_auth : {}), listener_ids: listenerIds, allowed_uri_sans: allowed, identity_header: identity };
+    } else if (Object.hasOwn(route, 'workload_auth')) route.workload_auth = null;
 
     const accessMode = raw('access_mode');
     if (state.editing.originalId && state.editing.value.access_mode === 'protected' && accessMode === 'legacy') {
@@ -2263,9 +2294,9 @@ function routeFromForm() {
       if (route.access_mode !== 'legacy') delete route.access_mode;
     } else if (['public', 'application', 'protected'].includes(accessMode)) route.access_mode = accessMode;
     else throw new Error(t('Select a valid access mode'));
-    if (accessMode === 'protected' && !route.auth && !route.basic_auth && !route.jwt_auth) throw new Error(t('Protected access requires Basic, JWT or external authorization'));
-    if ((accessMode === 'public' || accessMode === 'application') && (route.auth || route.basic_auth || route.jwt_auth)) {
-      throw new Error(t('{mode} access cannot configure gateway Basic, JWT or external authorization', { mode: t(accessMode) }));
+    if (accessMode === 'protected' && !route.auth && !route.basic_auth && !route.jwt_auth && !route.workload_auth) throw new Error(t('Protected access requires Basic, JWT, workload mTLS or external authorization'));
+    if ((accessMode === 'public' || accessMode === 'application') && (route.auth || route.basic_auth || route.jwt_auth || route.workload_auth)) {
+      throw new Error(t('{mode} access cannot configure gateway Basic, JWT, workload mTLS or external authorization', { mode: t(accessMode) }));
     }
 
     const policyAction = raw('resource_policy_action');
@@ -2297,6 +2328,10 @@ function routeFromForm() {
         if (!route.jwt_auth) throw new Error(t('JWT principal source requires JWT authentication'));
         if (subjectHeader) throw new Error(t('Clear the external subject header when using a JWT principal'));
         principal = { source: 'jwt' };
+      } else if (source === 'workload') {
+        if (!route.workload_auth) throw new Error(t('Workload principal source requires workload authentication'));
+        if (subjectHeader) throw new Error(t('Clear the external subject header when using a workload principal'));
+        principal = { source: 'workload' };
       } else throw new Error(t('Choose a valid principal source'));
       const ruleRows = [...form.querySelectorAll('.resource-rule-row')];
       if (ruleRows.length > 32) throw new Error(t('At most 32 resource allow rules are allowed'));
@@ -2310,7 +2345,9 @@ function routeFromForm() {
         if (new Set(methods).size !== methods.length) throw new Error(t('Methods must be unique within each allow rule'));
         for (const subject of subjects) {
           const bytes = new TextEncoder().encode(subject).length;
-          if (subject !== subject.trim() || /\p{Cc}/u.test(subject) || bytes < 1 || bytes > 255) throw new Error(t('Subjects must be exact 1–255 byte UTF-8 strings without surrounding whitespace or controls'));
+          if (source === 'workload') {
+            if (!validSpiffeIdentity(subject)) throw new Error(t('Workload subjects must be exact canonical SPIFFE URIs of at most 2,048 bytes'));
+          } else if (subject !== subject.trim() || /\p{Cc}/u.test(subject) || bytes < 1 || bytes > 255) throw new Error(t('Subjects must be exact 1–255 byte UTF-8 strings without surrounding whitespace or controls'));
           if (source === 'external' && subject.includes(',')) throw new Error(t('External subjects cannot contain commas'));
           textBytes += bytes;
         }
@@ -2330,6 +2367,7 @@ function routeFromForm() {
       else delete policy.enforce;
       route.resource_policy = policy;
     } else throw new Error(t('Choose a valid resource policy action'));
+    if (route.workload_auth && !route.resource_policy) throw new Error(t('Workload authentication requires resource authorization'));
 
     route.response_set_headers = parseHeaderLines(raw('response_set_headers'), 'Response header');
     route.response_remove_headers = headerNames(lines('response_remove_headers'), 'Removed response header');
@@ -2482,13 +2520,20 @@ function syncRouteControlsFromJson() {
     set('jwt_identity_header', jwt?.identity_header);
     form.elements['jwt_hide_credentials'].checked = jwt?.hide_credentials !== false;
   }
+  if (form.elements['workload_auth_enabled'] && (draft.workload_auth === null || draft.workload_auth === undefined || isObject(draft.workload_auth))) {
+    const auth = isObject(draft.workload_auth) ? draft.workload_auth : null;
+    form.elements['workload_auth_enabled'].checked = Boolean(auth);
+    form.elements['workload_listener_ids'].value = Array.isArray(auth?.listener_ids) ? auth.listener_ids.join('\n') : '';
+    form.elements['workload_allowed_uri_sans'].value = Array.isArray(auth?.allowed_uri_sans) ? auth.allowed_uri_sans.join('\n') : '';
+    form.elements['workload_identity_header'].value = auth?.identity_header ?? '';
+  }
   if (form.elements['resource_policy_action'] && (draft.resource_policy === null || draft.resource_policy === undefined || isObject(draft.resource_policy))) {
     const policy = isObject(draft.resource_policy) ? draft.resource_policy : null;
     const principal = isObject(policy?.principal) ? policy.principal : {};
     form.elements['resource_policy_action'].value = policy ? 'configured' : 'none';
     form.elements['resource_policy_id'].value = policy?.resource_id ?? '';
     form.elements['resource_policy_enforce'].checked = policy?.enforce !== false;
-    form.elements['resource_policy_source'].value = principal.source ?? (draft.jwt_auth ? 'jwt' : draft.auth && !draft.basic_auth ? 'external' : 'basic');
+    form.elements['resource_policy_source'].value = principal.source ?? (draft.workload_auth ? 'workload' : draft.jwt_auth ? 'jwt' : draft.auth && !draft.basic_auth ? 'external' : 'basic');
     form.elements['resource_policy_subject_header'].value = principal.subject_header ?? '';
     const allow = Array.isArray(policy?.allow) ? policy.allow : [];
     form.querySelector('.resource-rule-list').replaceChildren(...allow.slice(0, 33).map(resourceRuleRow));
@@ -2961,6 +3006,128 @@ async function rebaseCertificateDraft(draft) {
   } catch (error) { message($('#certificate-message'), error.message, 'error'); }
 }
 
+function workloadListenerControl(form, label, name, { textarea = false, checkbox = false, placeholder = '', help = '' } = {}) {
+  const wrapper = document.createElement('div'); wrapper.className = 'field';
+  const title = document.createElement('label'); title.htmlFor = `workload-http-${name}`; copy(title, label);
+  const control = document.createElement(textarea ? 'textarea' : 'input');
+  control.id = title.htmlFor; control.name = name;
+  if (!textarea) control.type = checkbox ? 'checkbox' : 'text';
+  if (placeholder) { control.placeholder = placeholder; control.dataset.appI18nPlaceholder = placeholder; }
+  wrapper.append(title, control);
+  if (help) { const note = document.createElement('span'); note.className = 'field-help-inline'; copy(note, help); wrapper.append(note); }
+  form.append(wrapper);
+  return control;
+}
+
+function ensureWorkloadListenersPanel() {
+  if ($('#workload-http-panel')) return;
+  const panel = document.createElement('details'); panel.className = 'form-section'; panel.id = 'workload-http-panel';
+  const summary = document.createElement('summary'); const title = document.createElement('span'); title.className = 'section-title'; copy(title, 'Dedicated HTTP workload mTLS listeners'); summary.append(title);
+  const note = document.createElement('p'); note.className = 'section-note'; copy(note, 'These listeners require a verified client certificate before serving HTTP/1 or HTTP/2. Paths refer to files on this instance. Changes are only staged in the JSON draft until Apply configuration publishes the full document. Ordinary HTTP/HTTPS and ACME listeners remain separate.');
+  const list = document.createElement('div'); list.id = 'workload-http-list';
+  const add = document.createElement('button'); add.type = 'button'; add.id = 'workload-http-add'; add.className = 'button button-secondary'; copy(add, 'Add workload listener'); add.addEventListener('click', () => openWorkloadListener(-1));
+  const messageBox = document.createElement('div'); messageBox.id = 'workload-http-message'; messageBox.className = 'inline-message'; messageBox.setAttribute('aria-live', 'polite');
+  const form = document.createElement('form'); form.id = 'workload-http-form'; form.className = 'form-grid'; form.hidden = true;
+  workloadListenerControl(form, 'Listener ID', 'id', { help: 'Stable ASCII ID, 1–128 letters, digits, dots, underscores, colons or dashes. Routes refer to this ID.' });
+  workloadListenerControl(form, 'Workload listen address', 'listen', { placeholder: '0.0.0.0:9443', help: 'Dedicated IP:port socket; not the ordinary public HTTP or HTTPS listener.' });
+  workloadListenerControl(form, 'Listener enabled', 'enabled', { checkbox: true, help: 'Disabled retains the listener policy but does not bind or accept new connections.' });
+  workloadListenerControl(form, 'Server certificate file', 'cert_file', { placeholder: '/etc/hangang/workload/server.pem', help: 'Absolute normalized path to a public server certificate file. No PEM content in the browser.' });
+  workloadListenerControl(form, 'Server private key file', 'key_file', { placeholder: '/etc/hangang/workload/server-key.pem', help: 'Absolute normalized path to the runtime-owned private key file; never paste the key.' });
+  workloadListenerControl(form, 'Trusted client CA file', 'client_ca_file', { placeholder: '/etc/hangang/workload/client-ca.pem', help: 'Absolute normalized path to the mandatory client trust roots.' });
+  workloadListenerControl(form, 'Client revocation list file', 'client_crl_file', { placeholder: '/etc/hangang/workload/client.crl.pem', help: 'Optional absolute normalized path to a client CRL.' });
+  workloadListenerControl(form, 'Allowed client SPIFFE URI SANs', 'allowed_uri_sans', { textarea: true, placeholder: 'spiffe://example.test/services/orders', help: 'One exact canonical SPIFFE URI per line, 1–128 distinct identities.' });
+  workloadListenerControl(form, 'Inbound TLS handshake timeout (ms)', 'handshake_timeout_ms', { help: '1–10,000 ms; default 5,000.' });
+  const actions = document.createElement('div'); actions.className = 'button-row span-2';
+  const stage = document.createElement('button'); stage.type = 'submit'; stage.className = 'button button-primary'; copy(stage, 'Stage listener in document');
+  const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button button-secondary'; copy(cancel, 'Cancel listener edit'); cancel.addEventListener('click', () => { form.hidden = true; message(messageBox); });
+  actions.append(stage, cancel); form.append(actions);
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    try {
+      const index = Number(form.dataset.editIndex);
+      const listener = workloadListenerFromForm(form);
+      mutateWorkloadListeners((items) => {
+        if (items.some((item, position) => position !== index && item?.id === listener.id)) throw new Error(t('Workload listener ID already exists'));
+        if (index < 0) items.push(listener); else items[index] = { ...(isObject(items[index]) ? items[index] : {}), ...listener };
+      });
+      message(messageBox, t('Listener staged. Apply configuration to publish it.'), 'success');
+    } catch (error) { message(messageBox, error.message, 'error'); }
+  });
+  panel.append(summary, note, list, add, form, messageBox);
+  $('#settings-section').after(panel);
+}
+
+function workloadListenerFromForm(form) {
+  const value = (name) => form.elements[name].value.trim();
+  const id = value('id');
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) throw new Error(t('Workload listener ID must be 1–128 ASCII letters, digits, dots, underscores, colons or dashes'));
+  const listen = value('listen');
+  const socket = /^(?:\[[0-9a-fA-F:.]+\]|[0-9.]+):(\d{1,5})$/.exec(listen);
+  if (!socket || Number(socket[1]) < 1 || Number(socket[1]) > 65535) throw new Error(t('Workload listen address must be ip:port with a nonzero port'));
+  const file = (name, optional = false) => {
+    const path = value(name);
+    if (!path && optional) return null;
+    if (!validInboundTlsPath(path)) throw new Error(t('{field} must be an absolute normalized file path', { field: t(form.elements[name].previousElementSibling?.dataset.appI18n ?? name) }));
+    return path;
+  };
+  const identities = nonemptyLines(form.elements.allowed_uri_sans.value);
+  if (!identities.length || identities.length > 128 || new Set(identities).size !== identities.length || identities.some((uri) => !validSpiffeIdentity(uri)))
+    throw new Error(t('Workload listener needs 1–128 distinct canonical SPIFFE URIs'));
+  const timeout = Number(value('handshake_timeout_ms'));
+  if (!/^[0-9]+$/.test(value('handshake_timeout_ms')) || timeout < 1 || timeout > 10000)
+    throw new Error(t('Inbound TLS handshake timeout must be 1–10,000 ms'));
+  return { id, listen, ...(form.elements.enabled.checked ? {} : { enabled: false }), tls: {
+    cert_file: file('cert_file'), key_file: file('key_file'), client_ca_file: file('client_ca_file'),
+    client_crl_file: file('client_crl_file', true), allowed_uri_sans: identities, handshake_timeout_ms: timeout,
+  } };
+}
+
+function mutateWorkloadListeners(change) {
+  const draft = parseConfigEditor();
+  if (!isObject(draft) || (draft.workload_http !== undefined && !Array.isArray(draft.workload_http))) throw new Error(t('Document workload_http must be an array'));
+  const items = structuredClone(draft.workload_http ?? []);
+  change(items);
+  draft.workload_http = items;
+  $('#config-editor').value = JSON.stringify(draft, null, 2);
+  configInput(); updateConfigPreview(); renderWorkloadListeners(draft);
+}
+
+function openWorkloadListener(index) {
+  try {
+    const draft = parseConfigEditor();
+    const items = Array.isArray(draft?.workload_http) ? draft.workload_http : [];
+    const item = index < 0 ? null : items[index];
+    if (index >= 0 && !isObject(item)) throw new Error(t('Reload the workload listener list before editing'));
+    const form = $('#workload-http-form'); form.dataset.editIndex = String(index); form.hidden = false;
+    form.elements.id.value = item?.id ?? '';
+    form.elements.listen.value = item?.listen ?? '';
+    form.elements.enabled.checked = item?.enabled !== false;
+    for (const name of ['cert_file', 'key_file', 'client_ca_file', 'client_crl_file']) form.elements[name].value = item?.tls?.[name] ?? '';
+    form.elements.allowed_uri_sans.value = Array.isArray(item?.tls?.allowed_uri_sans) ? item.tls.allowed_uri_sans.join('\n') : '';
+    form.elements.handshake_timeout_ms.value = item?.tls?.handshake_timeout_ms ?? 5000;
+    form.elements.id.focus();
+  } catch (error) { message($('#workload-http-message'), error.message, 'error'); }
+}
+
+function renderWorkloadListeners(draft) {
+  ensureWorkloadListenersPanel();
+  const list = $('#workload-http-list'); list.replaceChildren(); $('#workload-http-form').hidden = true;
+  if (!isObject(draft) || !Array.isArray(draft.workload_http) || !draft.workload_http.length) {
+    const empty = document.createElement('p'); copy(empty, 'No dedicated HTTP workload listeners in this document.'); list.append(empty); return;
+  }
+  draft.workload_http.forEach((item, index) => {
+    const row = document.createElement('div'); row.className = 'button-row workload-http-row'; row.dataset.workloadId = typeof item?.id === 'string' ? item.id : '';
+    const title = document.createElement('strong'); title.textContent = `${item?.id ?? '?'} · ${item?.listen ?? '?'}`;
+    const state = document.createElement('span'); copy(state, item?.enabled === false ? 'Inactive' : 'Enabled');
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button button-secondary'; copy(edit, 'Edit'); edit.addEventListener('click', () => openWorkloadListener(index));
+    const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'button button-quiet'; copy(toggle, item?.enabled === false ? 'Activate' : 'Deactivate');
+    toggle.addEventListener('click', () => { try { mutateWorkloadListeners((items) => { if (items[index]?.enabled === false) delete items[index].enabled; else items[index].enabled = false; }); message($('#workload-http-message'), t('Listener activation staged. Apply configuration to publish it.'), 'success'); } catch (error) { message($('#workload-http-message'), error.message, 'error'); } });
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove');
+    remove.addEventListener('click', () => { try { mutateWorkloadListeners((items) => items.splice(index, 1)); message($('#workload-http-message'), t('Listener removal staged. Apply configuration to publish it.'), 'success'); } catch (error) { message($('#workload-http-message'), error.message, 'error'); } });
+    row.append(title, state, edit, toggle, remove); list.append(row);
+  });
+}
+
 async function loadConfig(force) {
   if (state.configDirty && !force && state.config) return;
   const editor = $('#config-editor'); editor.disabled = true; message($('#config-message'), t('Loading active configuration…'));
@@ -2977,6 +3144,7 @@ function showConfigDocument(data) {
   editor.value = JSON.stringify(data, null, 2);
   editor.setAttribute('aria-invalid', 'false');
   showSettings(isObject(data) ? data.settings : undefined);
+  renderWorkloadListeners(data);
 }
 
 function parseConfigEditor() {
@@ -2988,7 +3156,7 @@ function configInput() { state.configDirty = true; $('#config-dirty').hidden = f
 /** A hand-edited document drives the fleet-settings controls (the reverse direction is syncSettingsToDocument). */
 function configEditorInput() {
   configInput();
-  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) showSettings(value.settings); } catch (_) { /* mid-edit; the controls keep their values */ }
+  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) { showSettings(value.settings); renderWorkloadListeners(value); } } catch (_) { /* mid-edit; the controls keep their values */ }
 }
 
 const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path'];
