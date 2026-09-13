@@ -10,6 +10,7 @@ use http_body_util::Full;
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     sync::{
@@ -126,19 +127,81 @@ fn fresh_fixture() -> Vec<u8> {
 }
 
 async fn status(fixture: &Fixture, ip: &str) -> u16 {
-    let response = reqwest::Client::builder()
+    request_status(fixture, "/", ip, &[]).await
+}
+
+async fn request_status(fixture: &Fixture, path: &str, ip: &str, headers: &[(&str, &str)]) -> u16 {
+    let mut request = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap()
-        .get(&fixture.front)
-        .header("x-forwarded-for", ip)
-        .send()
-        .await
-        .unwrap();
+        .get(format!("{}{path}", fixture.front))
+        .header("x-forwarded-for", ip);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await.unwrap();
     let code = response.status().as_u16();
     response.bytes().await.unwrap();
     code
+}
+
+fn start_watcher(
+    fixture: &Fixture,
+    slot: Arc<hangang::geoip_runtime::Slot>,
+) -> (tokio_util::sync::CancellationToken, JoinHandle<()>) {
+    let active = fixture.active.clone();
+    let published: Arc<hangang::geoip_runtime::Published> = Arc::new(move |candidate| {
+        active
+            .load()
+            .geoip
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, candidate))
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(hangang::geoip_runtime::watch(
+        slot,
+        published,
+        cancel.clone(),
+    ));
+    (cancel, task)
+}
+
+async fn wait_ready(slot: &hangang::geoip_runtime::Slot) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !slot.status().ready {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("GeoIP slot should become ready");
+}
+
+fn basic_credential() -> String {
+    let salt = b"0123456789abcdef";
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(b"secret");
+    let hex = |value: &[u8]| {
+        value
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    format!("alice:{}:{}", hex(salt), hex(&digest.finalize()))
+}
+
+fn protected_route(origin: std::net::SocketAddr, allow: &str) -> Value {
+    json!({
+        "id":"protected", "host":"foo.test", "path_prefix":"/secure",
+        "path_match":"segment_prefix", "access_mode":"protected",
+        "backends":[format!("http://{origin}")],
+        "basic_auth":{"credentials":[basic_credential()]},
+        "resource_policy":{"resource_id":"records", "principal":{"source":"basic"},
+            "allow":[{"subjects":["alice"],"methods":["GET"]}]},
+        "country_policy":{"allow":[allow],"on_unknown":"deny"}
+    })
 }
 
 #[tokio::test]
@@ -232,4 +295,138 @@ async fn country_admission_uses_trusted_ip_and_fails_closed_on_database_damage()
         fixture.close().await;
         std::fs::write(&file, fresh_fixture()).unwrap();
     }
+}
+
+#[tokio::test]
+async fn protected_resource_shadow_cannot_skip_country_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("country.mmdb");
+    std::fs::write(&file, fresh_fixture()).unwrap();
+    let fixture = fixture(
+        |origin| {
+            json!([
+                protected_route(origin, "GB"),
+                {"id":"public-shadow", "host":"foo.test", "path_prefix":"/secure",
+                 "path_match":"segment_prefix", "priority":100, "access_mode":"public",
+                 "headers":{"x-mode":"public"}, "backends":[format!("http://{origin}")]}
+            ])
+        },
+        &file,
+        true,
+    )
+    .await;
+    let slot = fixture.active.load().geoip.clone().unwrap();
+    let (cancel, watcher) = start_watcher(&fixture, slot.clone());
+    wait_ready(&slot).await;
+
+    // The public route would otherwise win priority and ignore country rules.
+    assert_eq!(
+        request_status(
+            &fixture,
+            "/secure/records",
+            "81.2.69.160",
+            &[("host", "foo.test"), ("x-mode", "public")],
+        )
+        .await,
+        403
+    );
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 0);
+
+    // Two routes claiming one resource ID cannot publish different country
+    // policies, even when their authentication and resource rules agree.
+    let current = fixture.active.load_full();
+    let mut mismatch = current.config.clone();
+    let mut second = mismatch.http[0].clone();
+    second.id = "other-protected".into();
+    second.country_policy.as_mut().unwrap().allow = vec!["KR".into()];
+    mismatch.http.push(second);
+    assert!(mismatch.validate().is_err());
+
+    cancel.cancel();
+    watcher.await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn changed_country_source_is_pending_until_its_own_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_file = dir.path().join("first.mmdb");
+    let next_file = dir.path().join("next.mmdb");
+    let bytes = fresh_fixture();
+    std::fs::write(&first_file, &bytes).unwrap();
+    std::fs::write(&next_file, &bytes).unwrap();
+    let fixture = fixture(
+        |origin| {
+            json!([{"id":"country", "access_mode":"public",
+                "backends":[format!("http://{origin}")],
+                "country_policy":{"allow":["GB"],"on_unknown":"deny"}}])
+        },
+        &first_file,
+        true,
+    )
+    .await;
+    let old_slot = fixture.active.load().geoip.clone().unwrap();
+    let (old_cancel, old_watcher) = start_watcher(&fixture, old_slot.clone());
+    wait_ready(&old_slot).await;
+    assert_eq!(status(&fixture, "81.2.69.160").await, 200);
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 1);
+
+    let current = fixture.active.load_full();
+    let mut config = current.config.clone();
+    config.revision += 1;
+    config.geoip_database.as_mut().unwrap().file = next_file;
+    let next = Arc::new(Snapshot::replace(config, &current).unwrap());
+    let next_slot = next.geoip.clone().unwrap();
+    assert!(!Arc::ptr_eq(&old_slot, &next_slot));
+    assert!(next_slot.load().is_none());
+    next.activated();
+    fixture.active.store(next);
+    assert_eq!(status(&fixture, "81.2.69.160").await, 503);
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 1);
+
+    let (next_cancel, next_watcher) = start_watcher(&fixture, next_slot.clone());
+    wait_ready(&next_slot).await;
+    assert_eq!(status(&fixture, "81.2.69.160").await, 200);
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 2);
+    old_cancel.cancel();
+    next_cancel.cancel();
+    old_watcher.await.unwrap();
+    next_watcher.await.unwrap();
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn country_denial_precedes_only_if_cached_shortcut() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("country.mmdb");
+    std::fs::write(&file, fresh_fixture()).unwrap();
+    let fixture = fixture(
+        |origin| {
+            json!([{"id":"country", "access_mode":"public",
+                "backends":[format!("http://{origin}")],
+                "cache":{"ttl_seconds":30,"max_ttl_seconds":60},
+                "country_policy":{"allow":["GB"],"on_unknown":"deny"}}])
+        },
+        &file,
+        true,
+    )
+    .await;
+    let slot = fixture.active.load().geoip.clone().unwrap();
+    let (cancel, watcher) = start_watcher(&fixture, slot.clone());
+    wait_ready(&slot).await;
+    assert_eq!(
+        request_status(
+            &fixture,
+            "/",
+            "2001:220::1",
+            &[("cache-control", "only-if-cached")],
+        )
+        .await,
+        403
+    );
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 0);
+
+    cancel.cancel();
+    watcher.await.unwrap();
+    fixture.close().await;
 }
