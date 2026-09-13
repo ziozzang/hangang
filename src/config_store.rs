@@ -616,7 +616,7 @@ fn validate_sequenced_export_request(
         || (after_seq != 0 && snapshot.is_none())
         || snapshot.is_some_and(|snapshot| {
             snapshot.high_water > MAX_ACCEPTANCE_SEQUENCE
-                || snapshot.retention_generation > i64::MAX as u64
+                || snapshot.retention_generation > MAX_ACCEPTANCE_SEQUENCE
                 || after_seq > snapshot.high_water
         })
     {
@@ -645,9 +645,9 @@ fn sequenced_export_snapshot(
         .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export high water")))?;
     let retention_generation = u64::try_from(retention_generation)
         .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt export generation")))?;
-    if high_water > MAX_ACCEPTANCE_SEQUENCE {
+    if high_water > MAX_ACCEPTANCE_SEQUENCE || retention_generation > MAX_ACCEPTANCE_SEQUENCE {
         return Err(StoreError::Invalid(anyhow!(
-            "invalid receipt export high water"
+            "invalid receipt export boundary"
         )));
     }
     if let Some(requested) = requested {
@@ -1741,7 +1741,7 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
                 authority_id TEXT PRIMARY KEY,
                 high_water INTEGER NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991),
-                retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)
+                retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0 AND retention_generation <= 9007199254740991)
             ) STRICT;",
         )
         .map_err(sqlite_error)?;
@@ -1793,7 +1793,7 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
     }
     if !sqlite_sequenced_authorities_has_column(connection, "retention_generation")?
         && let Err(error) = connection.execute_batch(
-            "ALTER TABLE hangang_sequenced_authorities ADD COLUMN retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)",
+            "ALTER TABLE hangang_sequenced_authorities ADD COLUMN retention_generation INTEGER NOT NULL DEFAULT 0 CHECK(retention_generation >= 0 AND retention_generation <= 9007199254740991)",
         )
         && !sqlite_sequenced_authorities_has_column(connection, "retention_generation")?
     {
@@ -2355,7 +2355,8 @@ impl PostgresConfigStore {
                             WHERE authority_id=$1 AND acceptance_seq>$2
                               AND acceptance_seq<=COALESCE($3::BIGINT,a.high_water,0)
                             ORDER BY acceptance_seq LIMIT $4
-                         ) r ON TRUE",
+                         ) r ON TRUE
+                         ORDER BY r.acceptance_seq ASC NULLS LAST",
                         parameters,
                     )
                     .await
@@ -2543,9 +2544,9 @@ impl PostgresConfigStore {
             CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
                 authority_id TEXT PRIMARY KEY,
                 high_water BIGINT NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991),
-                retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0)
+                retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0 AND retention_generation <= 9007199254740991)
             );
-            ALTER TABLE hangang_sequenced_authorities ADD COLUMN IF NOT EXISTS retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0);
+            ALTER TABLE hangang_sequenced_authorities ADD COLUMN IF NOT EXISTS retention_generation BIGINT NOT NULL DEFAULT 0 CHECK(retention_generation >= 0 AND retention_generation <= 9007199254740991);
             INSERT INTO hangang_commit_receipt_meta(singleton,stored_records)
             VALUES(1,0) ON CONFLICT(singleton) DO NOTHING;
             CREATE OR REPLACE FUNCTION hangang_stamped_generation_guard() RETURNS trigger
