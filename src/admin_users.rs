@@ -645,7 +645,7 @@ impl Store {
         limit: usize,
     ) -> Result<AuditPage> {
         ensure!(
-            after >= 0 && (1..=100).contains(&limit),
+            (0..=MAX_SAFE_ID).contains(&after) && (1..=100).contains(&limit),
             "invalid audit page bounds"
         );
         let path = self.path.clone();
@@ -994,6 +994,61 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_v1_migration_leaves_version_and_accounts_unchanged() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1; CREATE TABLE admin_audit_meta(dummy INTEGER);").unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        let connection = connection(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            connection
+                .query_row("SELECT 1 FROM admin_audit", [], |row| row.get::<_, i64>(0))
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        connection
+            .execute_batch("DROP TABLE admin_audit_meta")
+            .unwrap();
+        drop(connection);
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(
+            migrated.session(login.token).await.unwrap().unwrap().id,
+            root.id
+        );
+        assert_eq!(
+            migrated
+                .audit_page(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .records
+                .len(),
+            1
         );
     }
 
