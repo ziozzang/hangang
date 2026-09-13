@@ -127,6 +127,7 @@ test('desired state, admission gate and live leases remain distinct for HTTP and
     { ...first, route_id: 'http-drain', member_id: 'blue', desired_state: 'draining', admission_open: false, active_admissions: 2, active_requests: 2 },
     { ...last, route_id: 'tcp-maint', member_id: 'green', desired_state: 'maintenance', admission_open: false, active_admissions: 3, member_active_streams: 2, health_mode: 'active_tcp', probe_observed: true },
     { ...last, route_id: 'unprobed', member_id: 'white', desired_state: 'maintenance', admission_open: false, active_admissions: 0 },
+    { ...first, route_id: 'cooldown-maint', member_id: 'black', desired_state: 'maintenance', admission_open: false, active_admissions: 1, health_mode: 'cooldown' },
     { ...first, route_id: 'http-serving', member_id: 'orange', desired_state: 'serving', admission_open: true, active_admissions: 0, available: true },
   ]);
   await page.locator('a[href="#operations"]').click();
@@ -134,18 +135,26 @@ test('desired state, admission gate and live leases remain distinct for HTTP and
   await expect(row('http-drain')).toContainText('Desired: Draining');
   await expect(row('http-drain')).toContainText('Admission closed');
   await expect(row('http-drain')).toContainText('2 active admission leases');
+  await expect(row('http-drain')).toContainText('Draining closes new admissions; configured probes continue');
+  await expect(row('http-drain')).not.toContainText('Excluded after observed health evidence');
   await expect(row('tcp-maint')).toContainText('Desired: Maintenance');
   await expect(row('tcp-maint')).toContainText('3 active admission leases');
   await expect(row('tcp-maint')).toContainText('2 established member streams');
   await expect(row('tcp-maint')).toContainText('Probes suspended for maintenance');
-  await expect(row('unprobed')).toContainText('No probes configured');
+  await expect(row('unprobed')).toContainText('No active probes configured');
+  await expect(row('cooldown-maint')).toContainText('Failure cooldown');
+  await expect(row('cooldown-maint')).toContainText('No active probes configured');
+  await expect(row('cooldown-maint')).not.toContainText('Probes suspended');
   await expect(row('tcp-maint')).toContainText('TCP member leases include pending dials');
   await expect(row('http-serving')).toContainText('Member gate open');
   await expect(row('http-serving')).toContainText('0 active admission leases');
   await expect(row('http-serving')).toContainText('Zero does not prove drain completion');
   await page.locator('#locale-select').selectOption('ko');
   await expect(row('http-drain')).toContainText('설정 상태: 드레이닝');
+  await expect(row('http-drain')).toContainText('설정된 프로브는 계속합니다');
   await expect(row('tcp-maint')).toContainText('설정 상태: 유지보수');
+  await expect(row('tcp-maint')).toContainText('프로브 중단');
+  await expect(row('cooldown-maint')).toContainText('설정된 능동 프로브가 없습니다');
   await expect(row('tcp-maint')).toContainText('진행 중인 admission lease 3개');
   await expect(row('http-serving')).toContainText('멤버 요청 게이트 열림');
 });

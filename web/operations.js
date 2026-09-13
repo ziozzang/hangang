@@ -96,12 +96,14 @@ function renderRows(rows) {
     selection.append(node('span', 'operations-secondary',
       t('{mode} · weight {weight}', { mode: modeLabel(row.balance_mode), weight: formatNumberLocale(row.weight) })));
     const health = node('td');
-    const suspended = row.desired_state === 'maintenance' && row.health_mode !== 'unmonitored';
+    const suspended = row.desired_state === 'maintenance' && ['active', 'active_passive', 'active_tcp'].includes(row.health_mode);
     health.append(node('span', 'operations-primary', inactive ? t('Route inactive')
       : suspended ? t('Probes suspended') : healthLabel(row)));
     health.append(node('span', 'operations-secondary', inactive ? t('No health checks while inactive')
       : suspended ? t('Probes suspended for maintenance; existing work continues')
-        : row.desired_state === 'maintenance' ? t('No probes configured; maintenance blocks new admissions')
+        : row.desired_state === 'maintenance' ? t('No active probes configured; maintenance blocks new admissions')
+          : row.desired_state === 'draining' ? t('Draining closes new admissions; configured probes continue')
+            : admissionOpen === false ? t('Member gate closed; this does not imply a probe failure')
         : row.initial_check_pending === true ? t(row.protocol === 'tcp' ? 'Checking — waiting for successful connection probes' : 'Checking — waiting for healthy probes')
         : row.initial_check_pending === false && row.probe_observed === true && !row.available
           ? t(row.protocol === 'tcp' ? 'Excluded after observed connection failures' : 'Excluded after observed health evidence')
