@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
-        Arc, Mutex as StdMutex, Weak,
+        Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -63,6 +63,37 @@ pub struct TcpManager {
     /// its snapshot against the shared configuration authority, so L4 traffic
     /// never runs on an unreconciled snapshot. Default: open.
     gate: tokio::sync::watch::Sender<bool>,
+    /// Installed before opening the accept gate. A missing handler rejects
+    /// workload HTTP connections rather than treating them as raw TCP.
+    workload_http: Arc<OnceLock<WorkloadHttpHandler>>,
+}
+
+struct WorkloadHttpHandler {
+    proxy: Arc<crate::proxy::Proxy>,
+    header_bytes: usize,
+}
+
+fn is_workload_http(config: &Config, address: SocketAddr) -> bool {
+    config
+        .workload_http
+        .iter()
+        .any(|listener| listener.enabled && listener.listen == address)
+}
+
+fn desired_listens(config: &Config) -> HashSet<SocketAddr> {
+    config
+        .tcp
+        .iter()
+        .filter(|route| route.enabled)
+        .map(|route| route.listen)
+        .chain(
+            config
+                .workload_http
+                .iter()
+                .filter(|listener| listener.enabled)
+                .map(|listener| listener.listen),
+        )
+        .collect()
 }
 
 impl TcpManager {
@@ -90,6 +121,7 @@ impl TcpManager {
             discovery: None,
             idle_timeout,
             gate: tokio::sync::watch::Sender::new(true),
+            workload_http: Arc::new(OnceLock::new()),
         }
     }
 
@@ -113,6 +145,34 @@ impl TcpManager {
         self
     }
 
+    /// Install the authenticated HTTP handler before the accept gate opens.
+    /// This is deliberately one-shot: a replacement proxy requires a new
+    /// process generation and must not silently redirect existing TLS peers.
+    pub fn set_workload_http(
+        &self,
+        proxy: Arc<crate::proxy::Proxy>,
+        header_bytes: usize,
+    ) -> Result<()> {
+        ensure!(
+            !self.gate_open(),
+            "install workload HTTP handler before opening the accept gate"
+        );
+        ensure!(
+            header_bytes > 0,
+            "workload HTTP header limit must be positive"
+        );
+        ensure!(
+            self.workload_http
+                .set(WorkloadHttpHandler {
+                    proxy,
+                    header_bytes
+                })
+                .is_ok(),
+            "workload HTTP handler already installed"
+        );
+        Ok(())
+    }
+
     /// Resolve the same discovery view used by this instance's data plane.
     pub fn discovered_target(
         &self,
@@ -134,12 +194,14 @@ impl TcpManager {
             state.listeners.keys().copied().collect::<HashSet<_>>()
         };
 
-        let desired = config
-            .tcp
-            .iter()
-            .filter(|route| route.enabled)
-            .map(|route| route.listen)
-            .collect::<HashSet<_>>();
+        let desired = desired_listens(config);
+        let previous = self.active.load();
+        for address in current.intersection(&desired) {
+            ensure!(
+                is_workload_http(&previous.config, *address) == is_workload_http(config, *address),
+                "TCP and workload HTTP cannot exchange an active listener; remove it in a prior revision"
+            );
+        }
         let mut added = Vec::new();
         // Keep configuration order so a later bind failure deterministically
         // drops every socket already prepared in this transaction.
@@ -156,6 +218,28 @@ impl TcpManager {
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("bind TCP listener {address}"))?;
+            let (listener, export) = retain_export_listener(listener)?;
+            added.push((address, listener, export));
+        }
+        for address in config
+            .workload_http
+            .iter()
+            .filter(|listener| listener.enabled)
+            .map(|listener| listener.listen)
+        {
+            ensure!(
+                !config
+                    .tcp
+                    .iter()
+                    .any(|route| route.enabled && route.listen == address),
+                "workload HTTP listener overlaps a TCP route"
+            );
+            if !accounted.insert(address) {
+                continue;
+            }
+            let listener = TcpListener::bind(address)
+                .await
+                .with_context(|| format!("bind workload HTTP listener {address}"))?;
             let (listener, export) = retain_export_listener(listener)?;
             added.push((address, listener, export));
         }
@@ -208,6 +292,22 @@ impl TcpManager {
                     .with_context(|| format!("bind TCP listener {address}"))?,
             );
         }
+        for address in config
+            .workload_http
+            .iter()
+            .filter(|listener| listener.enabled)
+            .map(|listener| listener.listen)
+        {
+            ensure!(
+                !process.contains(&address) && routes.insert(address),
+                "workload HTTP listener {address} collides with another listener"
+            );
+            held.push(
+                TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("bind workload HTTP listener {address}"))?,
+            );
+        }
         drop(held);
         Ok(())
     }
@@ -230,12 +330,7 @@ impl TcpManager {
                 "TCP manager already owns listeners"
             );
         }
-        let desired = config
-            .tcp
-            .iter()
-            .filter(|route| route.enabled)
-            .map(|route| route.listen)
-            .collect::<HashSet<_>>();
+        let desired = desired_listens(config);
         ensure!(
             inherited.len() == desired.len(),
             "inherited TCP listener count does not match configuration"
@@ -326,6 +421,7 @@ impl TcpManager {
                     self.discovery.clone(),
                     self.idle_timeout,
                     self.gate.subscribe(),
+                    self.workload_http.clone(),
                 );
                 state.listeners.insert(
                     address,
@@ -680,6 +776,7 @@ fn spawn_accept_loop(
     discovery: Option<Arc<crate::discovery::Discovery>>,
     idle_timeout: Duration,
     mut gate: tokio::sync::watch::Receiver<bool>,
+    workload_http: Arc<OnceLock<WorkloadHttpHandler>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let next_backend = Arc::new(StdMutex::new(HashMap::<String, usize>::new()));
@@ -730,6 +827,58 @@ fn spawn_accept_loop(
             };
 
             let snapshot = active.load_full();
+            if let Some(configured) = snapshot
+                .config
+                .workload_http
+                .iter()
+                .find(|configured| configured.enabled && configured.listen == address)
+            {
+                // A malformed cross-role snapshot must never reinterpret a
+                // raw TCP stream as authenticated HTTP (or vice versa).
+                if snapshot
+                    .config
+                    .tcp
+                    .iter()
+                    .any(|route| route.enabled && route.listen == address)
+                {
+                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Some(handler) = workload_http.get() else {
+                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let permit = match permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let proxy = handler.proxy.clone();
+                let header_bytes = handler.header_bytes;
+                let listener_id = configured.id.clone();
+                let task_active = active.clone();
+                let task_cancel = connection_cancel.clone();
+                let task_metrics = metrics.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _active = ActiveConnection::new(task_metrics.clone());
+                    crate::workload_http::serve(
+                        client,
+                        peer,
+                        task_active,
+                        listener_id,
+                        proxy,
+                        header_bytes,
+                        idle_timeout,
+                        task_cancel,
+                        task_metrics,
+                    )
+                    .await;
+                });
+                continue;
+            }
             if routing_cache
                 .as_ref()
                 .is_none_or(|routes| !Weak::ptr_eq(&routes.source, &Arc::downgrade(&snapshot)))
