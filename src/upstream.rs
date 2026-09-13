@@ -505,9 +505,21 @@ fn validate_host(host: &str) -> Result<()> {
 /// Clone a process-wide base client configuration and apply route-specific
 /// trust and TLS record settings. A custom CA augments the public WebPKI roots.
 pub fn build_client_config(base: &ClientConfig, options: &UpstreamTls) -> Result<ClientConfig> {
+    Ok(build_client_config_with_trust(base, options)?.0)
+}
+
+/// Build the client configuration and fingerprint the exact custom CA DER
+/// certificates used by its verifier. The CA file is opened and parsed once;
+/// a length prefix per certificate makes order and boundaries unambiguous.
+/// No custom CA returns `None`, including an explicit insecure verifier.
+pub fn build_client_config_with_trust(
+    base: &ClientConfig,
+    options: &UpstreamTls,
+) -> Result<(ClientConfig, Option<[u8; 32]>)> {
     options.validate()?;
     let mut config = base.clone();
     config.max_fragment_size = options.max_fragment_size;
+    let mut trust_fingerprint = None;
     if options.insecure_skip_verify {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         config
@@ -515,6 +527,13 @@ pub fn build_client_config(base: &ClientConfig, options: &UpstreamTls) -> Result
             .set_certificate_verifier(Arc::new(InsecureCertificateVerifier::new(provider)));
     } else if let Some(path) = &options.ca_file {
         let certs = read_ca_file(path)?;
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        for cert in &certs {
+            let der = cert.as_ref();
+            digest.update((der.len() as u64).to_be_bytes());
+            digest.update(der);
+        }
         let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for cert in certs {
             roots
@@ -527,8 +546,9 @@ pub fn build_client_config(base: &ClientConfig, options: &UpstreamTls) -> Result
                 .build()
                 .context("build upstream certificate verifier")?;
         config.dangerous().set_certificate_verifier(verifier);
+        trust_fingerprint = Some(digest.finalize().into());
     }
-    Ok(config)
+    Ok((config, trust_fingerprint))
 }
 
 fn read_ca_file(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -1096,6 +1116,48 @@ mod tests {
                 .to_string()
                 .contains("no certificates")
         );
+    }
+
+    #[test]
+    fn custom_ca_fingerprint_tracks_exact_parsed_trust_without_a_second_read() {
+        let base = crate::tls::client_config(None).unwrap();
+        let first = rcgen::generate_simple_self_signed(vec!["first.example".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["second.example".into()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roots.pem");
+        let options = UpstreamTls {
+            ca_file: Some(path.clone()),
+            ..Default::default()
+        };
+
+        std::fs::write(&path, first.cert.pem()).unwrap();
+        let (_, initial) = build_client_config_with_trust(&base, &options).unwrap();
+        let initial = initial.expect("custom trust must have a fingerprint");
+        let (_, same) = build_client_config_with_trust(&base, &options).unwrap();
+        assert_eq!(same, Some(initial));
+        // The fingerprint describes parsed DER, not irrelevant PEM spacing.
+        std::fs::write(&path, format!("\n{}\n", first.cert.pem())).unwrap();
+        let (_, reformatted) = build_client_config_with_trust(&base, &options).unwrap();
+        assert_eq!(reformatted, Some(initial));
+
+        std::fs::write(&path, second.cert.pem()).unwrap();
+        let (_, replaced) = build_client_config_with_trust(&base, &options).unwrap();
+        assert_ne!(replaced, Some(initial));
+        assert_eq!(
+            build_client_config(&base, &options)
+                .unwrap()
+                .max_fragment_size,
+            None,
+            "the existing builder remains source-compatible"
+        );
+
+        std::fs::write(&path, "not a certificate").unwrap();
+        assert!(build_client_config_with_trust(&base, &options).is_err());
+        assert!(build_client_config(&base, &options).is_err());
+
+        let (_, no_custom_ca) =
+            build_client_config_with_trust(&base, &UpstreamTls::default()).unwrap();
+        assert_eq!(no_custom_ca, None);
     }
 
     #[tokio::test]
