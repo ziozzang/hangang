@@ -36,6 +36,7 @@ struct Idp {
     issuer: String,
     ca_pem: String,
     current: Arc<Mutex<(String, String)>>,
+    empty_keys: Arc<AtomicBool>,
     unavailable: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -56,11 +57,13 @@ async fn idp(signing: &SigningKey) -> Idp {
         listener.local_addr().unwrap().port()
     );
     let current = Arc::new(Mutex::new(("old".into(), public_x(signing))));
+    let empty_keys = Arc::new(AtomicBool::new(false));
     let unavailable = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(AtomicUsize::new(0));
     let task = {
         let issuer = issuer.clone();
         let current = current.clone();
+        let empty_keys = empty_keys.clone();
         let unavailable = unavailable.clone();
         let requests = requests.clone();
         tokio::spawn(async move {
@@ -87,6 +90,8 @@ async fn idp(signing: &SigningKey) -> Idp {
                 let (kid, x) = current.lock().unwrap().clone();
                 let body = if discovery {
                     format!(r#"{{"issuer":"{issuer}","jwks_uri":"{issuer}/keys"}}"#)
+                } else if empty_keys.load(Ordering::SeqCst) {
+                    r#"{"keys":[]}"#.to_owned()
                 } else {
                     format!(
                         r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","kid":"{kid}","alg":"EdDSA","use":"sig","x":"{x}"}}]}}"#
@@ -110,6 +115,7 @@ async fn idp(signing: &SigningKey) -> Idp {
         issuer,
         ca_pem: certificate.cert.pem(),
         current,
+        empty_keys,
         unavailable,
         requests,
         task,
@@ -187,6 +193,65 @@ async fn origin() -> (
         })
     };
     (addr, seen, task)
+}
+
+async fn streaming_origin() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0u8; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() < 8192);
+                }
+                if request.starts_with(b"GET /events ") {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n7\r\ndata:x\n\r\n").await.unwrap();
+                    std::future::pending::<()>().await;
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\norigin").await.unwrap();
+                }
+            });
+        }
+    });
+    (address, task)
+}
+
+async fn held_event(front: SocketAddr, bearer: &str) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(front).await.unwrap();
+    stream.write_all(format!("GET /events HTTP/1.1\r\nHost: jwt.test\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !response.windows(7).any(|part| part == b"data:x\n") {
+            let mut buffer = [0u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "held response ended before first SSE event");
+            response.extend_from_slice(&buffer[..count]);
+            assert!(response.len() < 8192);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    stream
+}
+
+async fn assert_held_event_closes(stream: &mut tokio::net::TcpStream, reason: &str) {
+    let mut buffer = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{reason} left the held SSE stream open"));
 }
 
 async fn frontend(proxy: Proxy) -> (SocketAddr, JoinHandle<()>) {
@@ -331,6 +396,84 @@ async fn remote_oidc_jwks_jwt_proxy_rotates_and_fails_closed_after_hard_expiry()
         StatusCode::OK
     );
     assert_eq!(seen.lock().unwrap().len(), 3);
+    front_task.abort();
+    origin_task.abort();
+    idp.task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_key_withdrawal_and_hard_expiry_close_existing_event_streams() {
+    let old_signing = SigningKey::from_bytes(&[41; 32]);
+    let new_signing = SigningKey::from_bytes(&[42; 32]);
+    let idp = idp(&old_signing).await;
+    let (origin_address, origin_task) = streaming_origin().await;
+    let document: Value = json!({"http":[{
+        "id":"jwt-events", "host":"jwt.test", "access_mode":"protected",
+        "backends":[format!("http://{origin_address}")],
+        "jwt_auth": {
+            "verification":{"issuer":idp.issuer,"audiences":["api://gateway"],"profile":"rfc9068","algorithms":["EdDSA"]},
+            "keys":{"source":"remote","config":{"endpoint":{"kind":"oidc"},"cache_ttl_seconds":2,"refresh_cooldown_seconds":1,"timeout_ms":3000,"ca_pem":idp.ca_pem}}
+        },
+        "resource_policy":{"resource_id":"events","principal":{"source":"jwt"},"allow":[{"subjects":["alice"],"methods":["GET"]}]}
+    }]});
+    let config: Config = serde_json::from_value(document).unwrap();
+    config.validate().unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
+    let policy = Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1));
+    let proxy = Proxy::new(active, policy.clone(), Arc::new(Metrics::default()));
+    let (front, front_task) = frontend(proxy).await;
+
+    let old = signed(&old_signing, "old", "alice", &idp.issuer, false);
+    let mut old_stream = held_event(front, &old).await;
+    // The same public key refreshes after the midpoint without revoking a valid session.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        request(front, Some(&old), Method::GET).await,
+        StatusCode::OK
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), old_stream.read_u8())
+            .await
+            .is_err(),
+        "unchanged JWKS refresh ended a valid held session"
+    );
+
+    *idp.current.lock().unwrap() = ("new".into(), public_x(&new_signing));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let new = signed(&new_signing, "new", "alice", &idp.issuer, false);
+    assert_eq!(
+        request(front, Some(&new), Method::GET).await,
+        StatusCode::OK
+    );
+    assert_held_event_closes(&mut old_stream, "removed signing key").await;
+
+    let mut new_stream = held_event(front, &new).await;
+    idp.empty_keys.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        request(front, Some(&new), Method::GET).await,
+        StatusCode::UNAUTHORIZED,
+        "a valid empty JWKS must withdraw the final signing key"
+    );
+    assert_held_event_closes(&mut new_stream, "empty JWKS key withdrawal").await;
+
+    idp.empty_keys.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        request(front, Some(&new), Method::GET).await,
+        StatusCode::OK
+    );
+    let mut restored_stream = held_event(front, &new).await;
+    idp.unavailable.store(true, Ordering::SeqCst);
+    // Once the last successfully fetched keys pass their hard TTL, outage must not
+    // let the already admitted SSE response continue indefinitely.
+    assert_held_event_closes(&mut restored_stream, "expired JWKS during IdP outage").await;
+    assert_eq!(
+        request(front, Some(&new), Method::GET).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
     front_task.abort();
     origin_task.abort();
     idp.task.abort();
