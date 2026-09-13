@@ -1168,7 +1168,7 @@ function routeHasPolicy(type, route, policy) {
   if (type === 'http') {
     if (policy === 'domains') return Boolean(route.hosts?.length);
     if (policy === 'tls') return Boolean(route.require_tls);
-    if (policy === 'auth') return Boolean(route.auth || route.basic_auth);
+    if (policy === 'auth') return Boolean(route.auth || route.basic_auth || route.jwt_auth);
     if (policy === 'cache') return Boolean(route.cache);
     if (policy === 'advanced') return Boolean(route.lua || route.request_transform || route.response_transform);
   } else {
@@ -1237,6 +1237,7 @@ function routeSummaryTags(type, route) {
     if (route.path_match && route.path_match !== 'prefix') tags.push(t('Path {mode}', { mode: route.path_match }));
     if (route.auth) tags.push(t('External auth'));
     if (route.basic_auth) tags.push(t('Basic auth'));
+    if (route.jwt_auth) tags.push(t('JWT access token'));
     if (route.cache) tags.push(t('Cache {seconds}s', { seconds: route.cache.ttl_seconds ?? '?' }));
     if (route.retries) tags.push(t('Retries {count}', { count: route.retries }));
     if (route.upstream_timeout_ms) tags.push(t('Timeout {milliseconds} ms', { milliseconds: route.upstream_timeout_ms }));
@@ -1275,7 +1276,7 @@ function routeDefaults(type) {
       id: '', priority: 0, host: null, host_regex: null, upstream: structuredClone(DEFAULT_UPSTREAM), upstream_host: null, preserve_host: false,
       max_requests: null, upstream_timeout_ms: null, retries: 0, require_tls: false, cache: null, path_prefix: '/', path_match: 'prefix',
       headers: {}, json: {}, backends: ['http://127.0.0.1:8080'], deny_cidrs: [], lua: null, request_transform: null, response_transform: null,
-      auth: null, basic_auth: null, balance: { mode: 'round_robin', weights: [], health: null }, response_set_headers: {}, response_remove_headers: [],
+      auth: null, basic_auth: null, jwt_auth: null, balance: { mode: 'round_robin', weights: [], health: null }, response_set_headers: {}, response_remove_headers: [],
     };
   }
   return { id: '', priority: 0, upstream: structuredClone(DEFAULT_UPSTREAM), sni: null, max_connections: null, listen: '0.0.0.0:9001', backends: ['127.0.0.1:8080'], deny_cidrs: [] };
@@ -1534,13 +1535,60 @@ function resourcePolicySection(route) {
   rules.append(note, list, add);
   action.querySelector('select').addEventListener('change', () => updateResourcePolicyControls($('#route-form')));
   return section({ title: 'Resource authorization', configured: Boolean(policy),
-    note: 'Protect one resource namespace using a Basic username or one copied external identity header. Matching is exact and deny-by-default. Moving an enforced host/path scope requires preserving its old scope or first saving enforcement Off. This is an instance route policy, not device identity or a fleet authorization result.', fields: [
+    note: 'Protect one resource namespace using a Basic username, verified JWT subject or copied external identity header. Matching is exact and deny-by-default. Moving an enforced host/path scope requires preserving its old scope or first saving enforcement Off. This is an instance route policy, not device identity or a fleet authorization result.', fields: [
       span2(action),
       field('Resource ID', 'resource_policy_id', policy?.resource_id ?? '', { group: 'resource_policy', maxlength: 128, help: 'Opaque ASCII ID, 1–128 characters. Routes sharing it must keep the same policy and authenticator.' }),
       field('Enforce resource policy', 'resource_policy_enforce', policy?.enforce !== false, { group: 'resource_policy', checkbox: true, help: 'Off keeps the policy configured without namespace or subject enforcement; gateway authentication still runs. Save Off before removing a previously enforced policy.' }),
-      field('Principal source', 'resource_policy_source', principal.source ?? 'basic', { group: 'resource_policy', select: [['basic', 'Basic username'], ['external', 'External identity header']], help: 'Requires Protected access and the matching gateway authenticator.' }),
+      field('Principal source', 'resource_policy_source', principal.source ?? (route.jwt_auth ? 'jwt' : route.auth && !route.basic_auth ? 'external' : 'basic'), { group: 'resource_policy', select: [['basic', 'Basic username'], ['external', 'External identity header'], ['jwt', 'Verified JWT subject']], help: 'Requires Protected access and the matching gateway authenticator.' }),
       field('External subject header', 'resource_policy_subject_header', principal.subject_header ?? '', { group: 'resource_policy', maxlength: 128, placeholder: 'x-forwarded-user', help: 'For External only: exact header copied from a successful authorization response onto the upstream request. It must be configured in Identity response headers.' }),
       rules,
+    ] });
+}
+
+function updateJwtControls(form) {
+  const enabled = form.elements['jwt_auth_enabled']?.checked;
+  const source = form.elements['jwt_key_source']?.value;
+  for (const group of ['jwt_local', 'jwt_remote', 'jwt_remote_jwks']) {
+    const active = enabled && (group === 'jwt_local' ? source === 'local' : source === 'remote')
+      && (group !== 'jwt_remote_jwks' || form.elements['jwt_endpoint_kind']?.value === 'jwks');
+    for (const control of form.querySelectorAll(`[data-group="${group}"]`)) control.disabled = !active;
+  }
+}
+
+function jwtSection(route) {
+  const jwt = isObject(route.jwt_auth) ? route.jwt_auth : null;
+  const verification = isObject(jwt?.verification) ? jwt.verification : {};
+  const keys = isObject(jwt?.keys) ? jwt.keys : {};
+  const remote = isObject(keys.config) ? keys.config : {};
+  const endpoint = isObject(remote.endpoint) ? remote.endpoint : {};
+  const source = keys.source || 'local';
+  const keySource = field('Key source', 'jwt_key_source', source, { group: 'jwt_auth', select: [['local', 'Local public JWKS'], ['remote', 'Remote HTTPS JWKS']], help: 'Keys are public. Never paste signing keys or bearer tokens.' });
+  const endpointKind = field('Remote endpoint', 'jwt_endpoint_kind', endpoint.kind || 'oidc', { group: 'jwt_remote', select: [['oidc', 'OIDC discovery from issuer'], ['jwks', 'Explicit JWKS URL']], help: 'Only operator-configured HTTPS endpoints are contacted. Token headers cannot select a URL.' });
+  keySource.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
+  endpointKind.querySelector('select').addEventListener('change', () => updateJwtControls($('#route-form')));
+  return section({ title: 'JWT access token', configured: Boolean(jwt),
+    note: 'Verify signed RFC 9068 OAuth access tokens on every request. This is not browser login or OpenID Connect ID-token acceptance. Protected access can combine JWT with external authorization; Basic and JWT share Authorization and cannot be combined. Remote key failures deny access.', fields: [
+      span2(field('Enable JWT authentication', 'jwt_auth_enabled', Boolean(jwt), { checkbox: true, toggles: 'jwt_auth', help: 'When off, the existing route remains unchanged until saved. A configured JWT policy disables route response caching.' })),
+      span2(field('Issuer', 'jwt_issuer', verification.issuer ?? '', { group: 'jwt_auth', maxlength: 512, placeholder: 'https://issuer.example.test/', help: 'Exact HTTPS issuer including its path and trailing slash; must equal the signed iss claim.' })),
+      span2(field('Audiences', 'jwt_audiences', Array.isArray(verification.audiences) ? verification.audiences.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One expected resource audience per line, 1–8 distinct values. The signed aud claim must contain one.' })),
+      field('Token profile', 'jwt_profile', verification.profile ?? 'rfc9068', { group: 'jwt_auth', select: [['rfc9068', 'RFC 9068 access token']], help: 'Requires at+jwt type and issuer, audience, subject, expiry, client ID, issue time and token ID.' }),
+      field('Allowed algorithms', 'jwt_algorithms', Array.isArray(verification.algorithms) ? verification.algorithms.join('\n') : 'RS256', { group: 'jwt_auth', textarea: true, help: 'One asymmetric algorithm per line: RS256, PS256, ES256 or EdDSA. No HS or none.' }),
+      field('Clock leeway (seconds)', 'jwt_leeway_seconds', verification.leeway_seconds ?? 0, { group: 'jwt_auth', type: 'number', min: 0, max: 60, help: '0–60 seconds; default 0.' }),
+      field('Maximum token lifetime (seconds)', 'jwt_max_lifetime_seconds', verification.max_lifetime_seconds ?? 3600, { group: 'jwt_auth', type: 'number', min: 1, max: 86400, help: 'Reject exp − iat above this limit (1–86,400 seconds).' }),
+      field('Scope claim', 'jwt_scope_claim', verification.scope_claim ?? 'scope', { group: 'jwt_auth', maxlength: 64, help: 'Claim name containing space-delimited OAuth scopes.' }),
+      field('Groups claim', 'jwt_groups_claim', verification.groups_claim ?? 'groups', { group: 'jwt_auth', maxlength: 64, help: 'Claim name containing a group array.' }),
+      field('Required scopes', 'jwt_required_scopes', Array.isArray(verification.required_scopes) ? verification.required_scopes.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One exact scope per line. All listed scopes are required; blank adds no scope condition.' }),
+      field('Required groups', 'jwt_required_groups', Array.isArray(verification.required_groups) ? verification.required_groups.join('\n') : '', { group: 'jwt_auth', textarea: true, help: 'One exact group per line. All listed groups are required; blank adds no group condition.' }),
+      keySource,
+      span2(field('Local public JWKS JSON', 'jwt_local_jwks', keys.source === 'local' && isObject(keys.jwks) ? JSON.stringify(keys.jwks, null, 2) : '', { group: 'jwt_local', textarea: true, help: 'A public {"keys":[...]} document; at most 32 signing keys and 128 KiB. Private JWK fields are rejected by the server.' })),
+      endpointKind,
+      span2(field('Explicit JWKS URL', 'jwt_jwks_url', endpoint.kind === 'jwks' ? endpoint.url ?? '' : '', { group: 'jwt_remote_jwks', placeholder: 'https://issuer.example.test/keys', help: 'HTTPS URL without credentials, query or fragment. Used only for the Explicit JWKS URL mode.' })),
+      field('Key cache TTL (seconds)', 'jwt_cache_ttl_seconds', remote.cache_ttl_seconds ?? 300, { group: 'jwt_remote', type: 'number', min: 1, max: 3600, help: '1–3,600 seconds; keys fail closed at expiry.' }),
+      field('Refresh cooldown (seconds)', 'jwt_refresh_cooldown_seconds', remote.refresh_cooldown_seconds ?? 10, { group: 'jwt_remote', type: 'number', min: 1, max: 60, help: '1–60 seconds, no longer than key cache TTL.' }),
+      field('Key fetch timeout (ms)', 'jwt_timeout_ms', remote.timeout_ms ?? 3000, { group: 'jwt_remote', type: 'number', min: 1, max: 5000, help: '1–5,000 ms for OIDC discovery and JWKS requests.' }),
+      span2(field('Additional public CA PEM', 'jwt_ca_pem', remote.ca_pem ?? '', { group: 'jwt_remote', textarea: true, help: 'Optional public trust anchor for a private issuer. No private keys; at most 128 KiB.' })),
+      field('Verified identity header', 'jwt_identity_header', jwt?.identity_header ?? '', { group: 'jwt_auth', maxlength: 128, placeholder: 'x-verified-user', help: 'Optional upstream request header containing the verified sub. Client and Lua writes cannot replace it.' }),
+      span2(field('Hide Bearer token from the upstream', 'jwt_hide_credentials', jwt?.hide_credentials !== false, { group: 'jwt_auth', checkbox: true, help: 'Checked by default. The external authorization service can still inspect the verified request before the token is removed.' })),
     ] });
 }
 
@@ -1680,10 +1728,10 @@ function httpSections(route) {
     ] }),
     upstreamSection('http', route),
     section({ title: 'Access policy', configured: Boolean(route.access_mode && route.access_mode !== 'legacy'),
-      note: 'Declare who owns access control. Legacy preserves existing behavior without declaring the route protected. Public is intentionally anonymous at the gateway; Application delegates login to the application; Protected requires Basic or external authorization on every request. This label is not a complete Zero Trust assessment.', fields: [
+      note: 'Declare who owns access control. Legacy preserves existing behavior without declaring the route protected. Public is intentionally anonymous at the gateway; Application delegates login to the application; Protected requires Basic, JWT or external authorization on every request. This label is not a complete Zero Trust assessment.', fields: [
         span2(field('Access mode', 'access_mode', route.access_mode || 'legacy', {
           select: [['legacy', 'Legacy — existing behavior'], ['public', 'Public — anonymous at gateway'], ['application', 'Application — app owns login'], ['protected', 'Protected — gateway auth required']],
-          help: 'Public and Application cannot configure gateway Basic or external auth. Protected needs at least one; both may be configured. An existing Protected route cannot return to Legacy; choose Public or Application and clear auth explicitly. Lua transforms remain available in every mode.',
+          help: 'Public and Application cannot configure gateway Basic, JWT or external auth. Protected needs at least one. JWT can combine with external authorization but not Basic. An existing Protected route cannot return to Legacy; choose Public or Application and clear auth explicitly. Lua transforms remain available in every mode.',
         })),
       ] }),
     section({ title: 'External authorization', configured: Boolean(auth), note: 'Every request is first sent to an authorization service. A 2xx answer allows the request; a denial answers the client without contacting the backend. The service always receives the generated request context from the trusted-proxy resolution: x-forwarded-method, x-forwarded-uri, x-forwarded-proto, x-forwarded-host, x-forwarded-port, x-forwarded-for, x-real-ip, x-original-url and the x-original-method/uri/client-ip compatibility names. These names cannot be listed below; the identity names x-forwarded-user, x-forwarded-email, x-forwarded-groups, x-forwarded-preferred-username and x-forwarded-access-token may be copied from the response only. On a 2xx answer with “Forward denial responses” enabled, the service’s Set-Cookie headers reach the client.', fields: [
@@ -1700,6 +1748,7 @@ function httpSections(route) {
       field('Identity header', 'basic_auth_identity_header', basic?.identity_header || '', { placeholder: 'x-authenticated-user', help: 'Optional request header set to the authenticated username for the upstream.' }),
       span2(field('Hide credentials from the upstream', 'basic_auth_hide_credentials', Boolean(basic?.hide_credentials), { checkbox: true, help: 'Removes the Authorization header before forwarding.' })),
     ] }),
+    jwtSection(route),
     resourcePolicySection(route),
     section({ title: 'Response headers', configured: Boolean(Object.keys(route.response_set_headers || {}).length || (route.response_remove_headers || []).length), note: 'Streaming-safe header edits applied to every upstream response head; framing and hop-by-hop names are rejected.', fields: [
       field('Set response headers', 'response_set_headers', pairsToLines(route.response_set_headers), { textarea: true, help: 'One name: value per line; replaces an existing header of the same name.' }),
@@ -1858,6 +1907,7 @@ function applyGroupToggles(form) {
     }
   }
   updateResourcePolicyControls(form);
+  updateJwtControls(form);
 }
 
 function nonemptyLines(value) { return value.split('\n').map((v) => v.trim()).filter(Boolean); }
@@ -1911,6 +1961,86 @@ function ensureDisjointStatuses(healthy, unhealthy, healthyLabel, unhealthyLabel
   }
 }
 
+function jwtIdentityHeader(name) {
+  if (!HEADER_NAME.test(name) || new TextEncoder().encode(name).length > 128) return false;
+  const lower = name.toLowerCase();
+  return !['host', 'authorization', 'proxy-authorization', 'proxy-authenticate', 'proxy-connection',
+    'cookie', 'set-cookie', 'forwarded', 'x-real-ip', 'x-hangang-auth-terminal'].includes(lower)
+    && !lower.startsWith('x-forwarded-') && !lower.startsWith('x-original-') && !lower.startsWith('sec-websocket-')
+    && !AUTH_RESERVED_HEADERS.includes(lower);
+}
+
+function jwtFromForm(form, previous) {
+  if (!form.elements['jwt_auth_enabled'].checked) return null;
+  const value = (name) => form.elements[name].value.trim();
+  const list = (name) => nonemptyLines(form.elements[name].value);
+  const issuer = value('jwt_issuer');
+  let issuerUrl;
+  try { issuerUrl = new URL(issuer); } catch { throw new Error(t('JWT issuer must be an HTTPS URL without credentials, query or fragment')); }
+  if (issuer.length > 512 || issuerUrl.protocol !== 'https:' || issuerUrl.username || issuerUrl.password || issuer.includes('?') || issuer.includes('#'))
+    throw new Error(t('JWT issuer must be an HTTPS URL without credentials, query or fragment'));
+  const audiences = list('jwt_audiences');
+  if (!audiences.length || audiences.length > 8 || new Set(audiences).size !== audiences.length || audiences.some((item) => new TextEncoder().encode(item).length > 255))
+    throw new Error(t('JWT audiences need 1–8 distinct values of at most 255 bytes'));
+  const algorithms = list('jwt_algorithms');
+  if (!algorithms.length || algorithms.length > 4 || new Set(algorithms).size !== algorithms.length || algorithms.some((item) => !['RS256', 'PS256', 'ES256', 'EdDSA'].includes(item)))
+    throw new Error(t('JWT algorithms must list 1–4 distinct asymmetric choices'));
+  const profile = value('jwt_profile');
+  if (profile !== 'rfc9068') throw new Error(t('Only the RFC 9068 access-token profile is supported'));
+  const scopeClaim = value('jwt_scope_claim');
+  const groupsClaim = value('jwt_groups_claim');
+  const claimName = /^[A-Za-z0-9_.-]{1,64}$/;
+  if (!claimName.test(scopeClaim) || !claimName.test(groupsClaim) || scopeClaim === groupsClaim ||
+      ['iss', 'aud', 'exp', 'sub', 'iat', 'nbf', 'jti', 'client_id'].includes(scopeClaim) ||
+      ['iss', 'aud', 'exp', 'sub', 'iat', 'nbf', 'jti', 'client_id'].includes(groupsClaim))
+    throw new Error(t('JWT scope and group claim names must be distinct, bounded nonstandard names'));
+  const requiredScopes = list('jwt_required_scopes');
+  const requiredGroups = list('jwt_required_groups');
+  if ([requiredScopes, requiredGroups].some((items) => items.length > 32 || new Set(items).size !== items.length || items.some((item) => new TextEncoder().encode(item).length > 128)))
+    throw new Error(t('JWT required scopes and groups allow at most 32 distinct values of 128 bytes each'));
+  const verification = { ...(isObject(previous?.verification) ? previous.verification : {}),
+    issuer, audiences, profile, algorithms,
+    leeway_seconds: readInteger(form, 'jwt_leeway_seconds', 'Clock leeway', { min: 0, max: 60 }),
+    max_lifetime_seconds: readInteger(form, 'jwt_max_lifetime_seconds', 'Maximum token lifetime', { min: 1, max: 86400 }),
+    scope_claim: scopeClaim, groups_claim: groupsClaim,
+    required_scopes: requiredScopes, required_groups: requiredGroups };
+  const source = value('jwt_key_source');
+  let keys;
+  if (source === 'local') {
+    const jwks = parseJsonField(form.elements['jwt_local_jwks'].value, 'Local public JWKS JSON');
+    if (!isObject(jwks) || !Array.isArray(jwks.keys) || !jwks.keys.length || jwks.keys.length > 32 ||
+      new TextEncoder().encode(form.elements['jwt_local_jwks'].value).length > 131072)
+      throw new Error(t('Local public JWKS needs 1–32 keys within 128 KiB'));
+    keys = { ...(previous?.keys?.source === 'local' ? previous.keys : {}), source, jwks };
+  } else if (source === 'remote') {
+    const kind = value('jwt_endpoint_kind');
+    let endpoint;
+    if (kind === 'oidc') endpoint = { ...(previous?.keys?.source === 'remote' && previous.keys.config?.endpoint?.kind === 'oidc' ? previous.keys.config.endpoint : {}), kind };
+    else if (kind === 'jwks') {
+      const url = value('jwt_jwks_url');
+      let parsed;
+      try { parsed = new URL(url); } catch { throw new Error(t('Explicit JWKS URL must be HTTPS without credentials, query or fragment')); }
+      if (url.length > 2048 || parsed.protocol !== 'https:' || parsed.username || parsed.password || url.includes('?') || url.includes('#'))
+        throw new Error(t('Explicit JWKS URL must be HTTPS without credentials, query or fragment'));
+      endpoint = { ...(previous?.keys?.source === 'remote' && previous.keys.config?.endpoint?.kind === 'jwks' ? previous.keys.config.endpoint : {}), kind, url };
+    } else throw new Error(t('Choose a valid JWT key source'));
+    const ttl = readInteger(form, 'jwt_cache_ttl_seconds', 'Key cache TTL', { min: 1, max: 3600 });
+    const cooldown = readInteger(form, 'jwt_refresh_cooldown_seconds', 'Refresh cooldown', { min: 1, max: 60 });
+    if (cooldown > ttl) throw new Error(t('JWT refresh cooldown cannot exceed cache TTL'));
+    const caPem = form.elements['jwt_ca_pem'].value.trim() || null;
+    if (caPem && (new TextEncoder().encode(caPem).length > 131072 || caPem.includes('PRIVATE KEY')))
+      throw new Error(t('JWT public CA PEM cannot contain a private key or exceed 128 KiB'));
+    const config = { ...(previous?.keys?.source === 'remote' && isObject(previous.keys.config) ? previous.keys.config : {}),
+      endpoint, cache_ttl_seconds: ttl, refresh_cooldown_seconds: cooldown,
+      timeout_ms: readInteger(form, 'jwt_timeout_ms', 'Key fetch timeout', { min: 1, max: 5000 }), ca_pem: caPem };
+    keys = { ...(previous?.keys?.source === 'remote' ? previous.keys : {}), source, config };
+  } else throw new Error(t('Choose a valid JWT key source'));
+  const identity = value('jwt_identity_header') || null;
+  if (identity && !jwtIdentityHeader(identity)) throw new Error(t('JWT verified identity header is reserved or invalid'));
+  return { ...(isObject(previous) ? previous : {}), verification, keys,
+    hide_credentials: form.elements['jwt_hide_credentials'].checked, identity_header: identity };
+}
+
 function routeFromForm() {
   const form = $('#route-form'); const type = state.editing.type;
   let route = structuredClone(state.editing.value);
@@ -1929,6 +2059,10 @@ function routeFromForm() {
         && rule.methods.every((value) => typeof value === 'string' && value.length <= 32))) {
       throw new Error(t('Advanced resource policy JSON must contain an ID, principal and allow-rule arrays'));
     }
+  }
+  if (type === 'http' && route.jwt_auth !== undefined && route.jwt_auth !== null &&
+      (!isObject(route.jwt_auth) || !isObject(route.jwt_auth.verification) || !isObject(route.jwt_auth.keys))) {
+    throw new Error(t('Advanced JWT JSON must contain verification and keys objects'));
   }
   const raw = (name) => form.elements[name].value;
   const text = (name) => raw(name).trim();
@@ -2085,6 +2219,11 @@ function routeFromForm() {
       route.basic_auth = { ...(isObject(route.basic_auth) ? route.basic_auth : {}), realm: realm || 'restricted', credentials, hide_credentials: hide, identity_header: identity };
     }
 
+    route.jwt_auth = jwtFromForm(form, route.jwt_auth);
+    if (route.jwt_auth && route.basic_auth) throw new Error(t('JWT and Basic authentication cannot share Authorization'));
+    if (route.jwt_auth?.identity_header && authResponse.some((name) => name.toLowerCase() === route.jwt_auth.identity_header.toLowerCase()))
+      throw new Error(t('JWT identity header conflicts with an external authorization response header'));
+
     const accessMode = raw('access_mode');
     if (state.editing.originalId && state.editing.value.access_mode === 'protected' && accessMode === 'legacy') {
       throw new Error(t('A protected route cannot return to Legacy. Choose Public or Application and clear gateway auth explicitly.'));
@@ -2093,9 +2232,9 @@ function routeFromForm() {
       if (route.access_mode !== 'legacy') delete route.access_mode;
     } else if (['public', 'application', 'protected'].includes(accessMode)) route.access_mode = accessMode;
     else throw new Error(t('Select a valid access mode'));
-    if (accessMode === 'protected' && !route.auth && !route.basic_auth) throw new Error(t('Protected access requires Basic or external authorization'));
-    if ((accessMode === 'public' || accessMode === 'application') && (route.auth || route.basic_auth)) {
-      throw new Error(t('{mode} access cannot configure gateway Basic or external authorization', { mode: t(accessMode) }));
+    if (accessMode === 'protected' && !route.auth && !route.basic_auth && !route.jwt_auth) throw new Error(t('Protected access requires Basic, JWT or external authorization'));
+    if ((accessMode === 'public' || accessMode === 'application') && (route.auth || route.basic_auth || route.jwt_auth)) {
+      throw new Error(t('{mode} access cannot configure gateway Basic, JWT or external authorization', { mode: t(accessMode) }));
     }
 
     const policyAction = raw('resource_policy_action');
@@ -2123,6 +2262,10 @@ function routeFromForm() {
         if (!HEADER_NAME.test(subjectHeader) || new TextEncoder().encode(subjectHeader).length > 128) throw new Error(t('External subject header must be a valid header name of at most 128 bytes'));
         if (!authResponse.some((name) => name.toLowerCase() === subjectHeader.toLowerCase())) throw new Error(t('External subject header must be in Identity response headers'));
         principal = { source: 'external', subject_header: subjectHeader };
+      } else if (source === 'jwt') {
+        if (!route.jwt_auth) throw new Error(t('JWT principal source requires JWT authentication'));
+        if (subjectHeader) throw new Error(t('Clear the external subject header when using a JWT principal'));
+        principal = { source: 'jwt' };
       } else throw new Error(t('Choose a valid principal source'));
       const ruleRows = [...form.querySelectorAll('.resource-rule-row')];
       if (ruleRows.length > 32) throw new Error(t('At most 32 resource allow rules are allowed'));
@@ -2240,13 +2383,61 @@ function syncRouteControlsFromJson() {
   if (!isObject(draft)) return;
   syncBackendControlsFromJson(draft);
   const form = $('#route-form');
+  if (form.elements['access_mode'] && (draft.access_mode === undefined || typeof draft.access_mode === 'string'))
+    form.elements['access_mode'].value = draft.access_mode || 'legacy';
+  // Authorization is a single native editing unit. A JSON switch from Basic
+  // to JWT (or a JWT plus external auth) must survive the next native edit.
+  if (form.elements['basic_auth_credentials'] && (draft.basic_auth === null || draft.basic_auth === undefined || isObject(draft.basic_auth))) {
+    const basic = isObject(draft.basic_auth) ? draft.basic_auth : null;
+    form.elements['basic_auth_credentials'].value = Array.isArray(basic?.credentials) ? basic.credentials.join('\n') : '';
+    form.elements['basic_auth_realm'].value = basic?.realm ?? '';
+    form.elements['basic_auth_identity_header'].value = basic?.identity_header ?? '';
+    form.elements['basic_auth_hide_credentials'].checked = Boolean(basic?.hide_credentials);
+  }
+  if (form.elements['auth_url'] && (draft.auth === null || draft.auth === undefined || isObject(draft.auth))) {
+    const auth = isObject(draft.auth) ? draft.auth : null;
+    form.elements['auth_url'].value = auth?.url ?? '';
+    form.elements['auth_request_headers'].value = Array.isArray(auth?.request_headers) ? auth.request_headers.join('\n') : '';
+    form.elements['auth_response_headers'].value = Array.isArray(auth?.response_headers) ? auth.response_headers.join('\n') : '';
+    form.elements['auth_timeout_ms'].value = auth?.timeout_ms ?? '';
+    form.elements['auth_forward_response'].checked = Boolean(auth?.forward_response);
+  }
+  if (form.elements['jwt_auth_enabled'] && (draft.jwt_auth === null || draft.jwt_auth === undefined || isObject(draft.jwt_auth))) {
+    const jwt = isObject(draft.jwt_auth) ? draft.jwt_auth : null;
+    const verification = isObject(jwt?.verification) ? jwt.verification : {};
+    const keys = isObject(jwt?.keys) ? jwt.keys : {};
+    const remote = isObject(keys.config) ? keys.config : {};
+    const endpoint = isObject(remote.endpoint) ? remote.endpoint : {};
+    const set = (name, value) => { form.elements[name].value = value === null || value === undefined ? '' : String(value); };
+    form.elements['jwt_auth_enabled'].checked = Boolean(jwt);
+    set('jwt_issuer', verification.issuer);
+    set('jwt_audiences', Array.isArray(verification.audiences) ? verification.audiences.join('\n') : verification.audiences);
+    set('jwt_profile', verification.profile ?? 'rfc9068');
+    set('jwt_algorithms', Array.isArray(verification.algorithms) ? verification.algorithms.join('\n') : verification.algorithms ?? 'RS256');
+    set('jwt_leeway_seconds', verification.leeway_seconds ?? 0);
+    set('jwt_max_lifetime_seconds', verification.max_lifetime_seconds ?? 3600);
+    set('jwt_scope_claim', verification.scope_claim ?? 'scope');
+    set('jwt_groups_claim', verification.groups_claim ?? 'groups');
+    set('jwt_required_scopes', Array.isArray(verification.required_scopes) ? verification.required_scopes.join('\n') : verification.required_scopes);
+    set('jwt_required_groups', Array.isArray(verification.required_groups) ? verification.required_groups.join('\n') : verification.required_groups);
+    set('jwt_key_source', keys.source ?? 'local');
+    set('jwt_local_jwks', keys.jwks === undefined ? '' : JSON.stringify(keys.jwks, null, 2));
+    set('jwt_endpoint_kind', endpoint.kind ?? 'oidc');
+    set('jwt_jwks_url', endpoint.url);
+    set('jwt_cache_ttl_seconds', remote.cache_ttl_seconds ?? 300);
+    set('jwt_refresh_cooldown_seconds', remote.refresh_cooldown_seconds ?? 10);
+    set('jwt_timeout_ms', remote.timeout_ms ?? 3000);
+    set('jwt_ca_pem', remote.ca_pem);
+    set('jwt_identity_header', jwt?.identity_header);
+    form.elements['jwt_hide_credentials'].checked = jwt?.hide_credentials !== false;
+  }
   if (form.elements['resource_policy_action'] && (draft.resource_policy === null || draft.resource_policy === undefined || isObject(draft.resource_policy))) {
     const policy = isObject(draft.resource_policy) ? draft.resource_policy : null;
     const principal = isObject(policy?.principal) ? policy.principal : {};
     form.elements['resource_policy_action'].value = policy ? 'configured' : 'none';
     form.elements['resource_policy_id'].value = policy?.resource_id ?? '';
     form.elements['resource_policy_enforce'].checked = policy?.enforce !== false;
-    form.elements['resource_policy_source'].value = principal.source ?? 'basic';
+    form.elements['resource_policy_source'].value = principal.source ?? (draft.jwt_auth ? 'jwt' : draft.auth && !draft.basic_auth ? 'external' : 'basic');
     form.elements['resource_policy_subject_header'].value = principal.subject_header ?? '';
     const allow = Array.isArray(policy?.allow) ? policy.allow : [];
     form.querySelector('.resource-rule-list').replaceChildren(...allow.slice(0, 33).map(resourceRuleRow));
