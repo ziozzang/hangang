@@ -21,6 +21,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 fn credential(username: &str, password: &str) -> String {
@@ -80,7 +81,11 @@ async fn origin(label: &'static str) -> (SocketAddr, Arc<AtomicUsize>, JoinHandl
 }
 
 async fn gateway(routes: Vec<Value>) -> (SocketAddr, Arc<PolicyPool>, JoinHandle<()>) {
-    let config: Config = serde_json::from_value(json!({"http":routes})).unwrap();
+    gateway_document(json!({"http":routes})).await
+}
+
+async fn gateway_document(document: Value) -> (SocketAddr, Arc<PolicyPool>, JoinHandle<()>) {
+    let config: Config = serde_json::from_value(document).unwrap();
     let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
     let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 2));
     let proxy = Proxy::new(active, policy.clone(), Arc::new(Metrics::default()));
@@ -101,6 +106,22 @@ async fn gateway(routes: Vec<Value>) -> (SocketAddr, Arc<PolicyPool>, JoinHandle
         }
     });
     (address, policy, task)
+}
+
+async fn raw_status(front: SocketAddr, request: &str) -> u16 {
+    let mut stream = tokio::net::TcpStream::connect(front).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&response)
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 async fn request(
@@ -173,12 +194,13 @@ async fn priority_header_and_json_shadow_routes_cannot_escape_resource_guard() {
     let (public, public_hits, public_task) = origin("public").await;
     let header_shadow = json!({
         "id":"header-shadow", "access_mode":"public", "priority":100,
-        "host_regex":".*", "path_prefix":"/secure", "headers":{"x-mode":"public"},
+        "host_regex":"[a-z.]+", "path_prefix":"/secure", "headers":{"x-mode":"public"},
         "backends":[format!("http://{public}")]
     });
     let json_shadow = json!({
         "id":"json-shadow", "access_mode":"public", "priority":200,
-        "host":"foo.test", "path_prefix":"/secure", "json":{"/bypass":true},
+        "host":"foo.test", "path_prefix":"/secure", "headers":{"content-type":"application/json"},
+        "json":{"/bypass":true},
         "backends":[format!("http://{public}")]
     });
     let mut protected = protected_route(private);
@@ -259,6 +281,7 @@ async fn guarded_host_uses_canonical_path_and_rejects_ambiguous_escapes() {
         200
     );
     let permitted_hits = hits.load(Ordering::SeqCst);
+    let credential = base64::engine::general_purpose::STANDARD.encode("alice:secret");
     for path in [
         "/secure%2fhidden",
         "/secure%5chidden",
@@ -267,13 +290,188 @@ async fn guarded_host_uses_canonical_path_and_rejects_ambiguous_escapes() {
         "/secure/%3fprivate",
         "/secure/%3bprivate",
     ] {
-        assert_eq!(
-            request(front, "GET", path, Some("alice"), &[], None).await,
-            400,
-            "{path}"
+        let wire = format!(
+            "GET {path} HTTP/1.1\r\nHost: foo.test\r\nAuthorization: Basic {credential}\r\nConnection: close\r\n\r\n"
         );
+        assert_eq!(raw_status(front, &wire).await, 400, "{path}");
     }
     assert_eq!(hits.load(Ordering::SeqCst), permitted_hits);
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn external_subject_must_be_single_verified_response_value() {
+    let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_address = auth_listener.local_addr().unwrap();
+    let auth_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = auth_listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| async move {
+                    let case = request
+                        .headers()
+                        .get("x-case")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("good");
+                    let mut reply = Response::new(Full::new(Bytes::new()));
+                    match case {
+                        "missing" => {}
+                        "duplicate" => {
+                            reply
+                                .headers_mut()
+                                .append("x-auth-subject", "alice".parse().unwrap());
+                            reply
+                                .headers_mut()
+                                .append("x-auth-subject", "bob".parse().unwrap());
+                        }
+                        "comma" => {
+                            reply
+                                .headers_mut()
+                                .insert("x-auth-subject", "alice,bob".parse().unwrap());
+                        }
+                        "blank" => {
+                            reply
+                                .headers_mut()
+                                .insert("x-auth-subject", "".parse().unwrap());
+                        }
+                        "hop" => {
+                            reply
+                                .headers_mut()
+                                .insert("connection", "x-auth-subject".parse().unwrap());
+                            reply
+                                .headers_mut()
+                                .insert("x-auth-subject", "alice".parse().unwrap());
+                        }
+                        _ => {
+                            reply
+                                .headers_mut()
+                                .insert("x-auth-subject", "alice".parse().unwrap());
+                        }
+                    }
+                    Ok::<_, Infallible>(reply)
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let (upstream, hits, upstream_task) = origin("private").await;
+    let route = json!({
+        "id":"external", "access_mode":"protected", "host":"foo.test",
+        "path_prefix":"/secure", "path_match":"segment_prefix",
+        "backends":[format!("http://{upstream}")],
+        "auth":{"url":format!("http://{auth_address}/verify"),
+            "request_headers":["x-case"], "response_headers":["x-auth-subject"]},
+        "resource_policy":{"resource_id":"records",
+            "principal":{"source":"external","subject_header":"x-auth-subject"},
+            "allow":[{"subjects":["alice"],"methods":["GET"]}]}
+    });
+    let (front, policy, front_task) = gateway(vec![route]).await;
+    for case in ["missing", "duplicate", "comma", "blank", "hop"] {
+        assert_eq!(
+            request(
+                front,
+                "GET",
+                "/secure/records",
+                None,
+                &[("x-case", case), ("x-auth-subject", "alice")],
+                None
+            )
+            .await,
+            403,
+            "{case}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        request(
+            front,
+            "GET",
+            "/secure/records",
+            None,
+            &[("x-case", "good"), ("x-auth-subject", "client-forged")],
+            None
+        )
+        .await,
+        200
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    front_task.abort();
+    upstream_task.abort();
+    auth_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn guarded_host_rejects_forwarded_absolute_and_trailing_dot_mismatch() {
+    let (upstream, hits, upstream_task) = origin("private").await;
+    let (front, policy, front_task) = gateway_document(json!({
+        "settings":{"trusted_proxy_cidrs":["127.0.0.0/8"]},
+        "http":[protected_route(upstream)]
+    }))
+    .await;
+    assert_eq!(
+        request(
+            front,
+            "GET",
+            "/secure",
+            None,
+            &[("x-forwarded-host", "evil.test")],
+            None
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        raw_status(
+            front,
+            "GET http://evil.test/secure HTTP/1.1\r\nHost: foo.test\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        raw_status(
+            front,
+            "GET /secure HTTP/1.1\r\nHost: foo.test.\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        400
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_guard_and_overlapping_resource_ids_fail_closed() {
+    let (upstream, hits, upstream_task) = origin("private").await;
+    let mut disabled = protected_route(upstream);
+    disabled["enabled"] = json!(false);
+    let public = json!({"id":"public", "access_mode":"public", "priority":100,
+        "host":"foo.test", "path_prefix":"/secure", "backends":[format!("http://{upstream}")]});
+    let (front, policy, front_task) = gateway(vec![disabled, public]).await;
+    assert_eq!(
+        request(front, "GET", "/secure/records", Some("alice"), &[], None).await,
+        403
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    front_task.abort();
+    policy.shutdown().await;
+
+    let mut other = protected_route(upstream);
+    other["id"] = json!("other");
+    other["priority"] = json!(100);
+    other["resource_policy"]["resource_id"] = json!("other-records");
+    let (front, policy, front_task) = gateway(vec![protected_route(upstream), other]).await;
+    assert_eq!(
+        request(front, "GET", "/secure/records", Some("alice"), &[], None).await,
+        403
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
     front_task.abort();
     upstream_task.abort();
     policy.shutdown().await;
