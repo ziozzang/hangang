@@ -57,3 +57,5 @@ pub mod http_outbound;
 pub mod upstream_dns;
 
 pub mod member_admission;
+
+pub mod retired_members;

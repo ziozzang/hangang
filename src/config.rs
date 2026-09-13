@@ -1032,14 +1032,14 @@ pub struct HttpRuntime {
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
 }
-#[derive(Default)]
 struct PublicationRetirements {
-    http: Vec<crate::balance::BackendRetirement>,
-    tcp: Vec<std::sync::Arc<crate::member_admission::MemberAdmission>>,
+    reservation: crate::retired_members::Reservation,
+    records: Vec<crate::retired_members::Record>,
 }
 
 pub struct Snapshot {
-    retirements: std::sync::Mutex<PublicationRetirements>,
+    retirements: std::sync::Mutex<Option<PublicationRetirements>>,
+    pub retired_members: std::sync::Arc<crate::retired_members::Registry>,
     pub settings: std::sync::Arc<PreparedSettings>,
     /// Header names used by any declarative HTTP route predicate. Incoming
     /// duplicates for these names are rejected before routing so the selected
@@ -1156,35 +1156,63 @@ impl Snapshot {
     pub fn replace_fresh(config: Config, previous: &Self) -> anyhow::Result<Self> {
         config.validate_transition_from(&previous.config)?;
         let mut next = Self::new(config)?;
-        next.retirements = std::sync::Mutex::new(next.retirements_from(previous));
+        next.retired_members = previous.retired_members.clone();
+        next.retirements = std::sync::Mutex::new(Some(next.retirements_from(previous)?));
         Ok(next)
     }
 
-    fn retirements_from(&self, previous: &Self) -> PublicationRetirements {
-        let mut plan = PublicationRetirements::default();
+    fn retirements_from(&self, previous: &Self) -> anyhow::Result<PublicationRetirements> {
+        use crate::retired_members::{Counter, Record};
+        let mut records = Vec::new();
         let successors: std::collections::HashMap<_, _> = self
             .http
             .iter()
             .map(|next| (next.route.id.as_str(), next.balancer.as_ref()))
             .collect();
         for old in &previous.http {
-            let successor = successors.get(old.route.id.as_str()).copied();
-            plan.http.extend(old.balancer.retirements(successor));
+            for counter in old
+                .balancer
+                .retirements(successors.get(old.route.id.as_str()).copied())
+            {
+                let backend = &old.route.backends[counter.index()];
+                records.push(Record {
+                    protocol: "http",
+                    route_id: old.route.id.clone(),
+                    member_id: backend.id().map(str::to_owned),
+                    address: backend.address().to_owned(),
+                    counter: Counter::Http(counter),
+                });
+            }
         }
+        let old_routes: std::collections::HashMap<_, _> = previous
+            .config
+            .tcp
+            .iter()
+            .map(|route| (route.id.as_str(), route))
+            .collect();
         for (route, gates) in &previous.tcp_member_admissions {
             let successor = self.tcp_member_admissions.get(route);
-            plan.tcp.extend(
-                gates
-                    .iter()
-                    .filter(|old| {
-                        !successor.is_some_and(|gates| {
-                            gates.iter().any(|next| std::sync::Arc::ptr_eq(old, next))
-                        })
-                    })
-                    .cloned(),
-            );
+            for (index, old) in gates.iter().enumerate() {
+                if successor
+                    .is_some_and(|gates| gates.iter().any(|next| std::sync::Arc::ptr_eq(old, next)))
+                {
+                    continue;
+                }
+                let backend = &old_routes[route.as_str()].backends[index];
+                records.push(Record {
+                    protocol: "tcp",
+                    route_id: route.clone(),
+                    member_id: backend.id().map(str::to_owned),
+                    address: backend.address().to_owned(),
+                    counter: Counter::Tcp(old.clone()),
+                });
+            }
         }
-        plan
+        let reservation = self.retired_members.reserve(records.len())?;
+        Ok(PublicationRetirements {
+            reservation,
+            records,
+        })
     }
 
     /// Side effects that belong to publication, not preparation: call once
@@ -1196,11 +1224,8 @@ impl Snapshot {
             .retirements
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for old in retirements.http.drain(..) {
-            old.retire();
-        }
-        for old in retirements.tcp.drain(..) {
-            old.retire();
+        if let Some(plan) = retirements.take() {
+            plan.reservation.commit(plan.records);
         }
         if let (Some(runtime), Some(settings)) = (&self.cache, &self.config.cache) {
             runtime.adopt_generation(settings.generation);
@@ -1419,6 +1444,9 @@ impl Snapshot {
         };
         let mut next = Self {
             retirements: Default::default(),
+            retired_members: previous
+                .map(|old| old.retired_members.clone())
+                .unwrap_or_default(),
             settings,
             http_match_headers,
             sni_regex: regexes.sni,
@@ -1434,7 +1462,8 @@ impl Snapshot {
             admissions,
         };
         if let Some(previous) = previous {
-            next.retirements = std::sync::Mutex::new(next.retirements_from(previous));
+            next.retired_members = previous.retired_members.clone();
+            next.retirements = std::sync::Mutex::new(Some(next.retirements_from(previous)?));
         }
         Ok(next)
     }

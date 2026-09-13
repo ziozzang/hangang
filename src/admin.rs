@@ -1290,6 +1290,30 @@ impl Admin {
                 Some(revision),
             ));
         }
+        if path == "/v1/retired-members" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let Some((offset, limit)) = operations_query(req.uri().query()) else {
+                return Ok(problem(
+                    400,
+                    "Bad Request",
+                    "invalid retired member offset or limit",
+                ));
+            };
+            let snapshot = self.manager.active.load();
+            let all = snapshot.retired_members.snapshot();
+            let total = all.len();
+            let rows: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            return Ok(json_value(
+                200,
+                &serde_json::json!({
+                    "total": total, "offset": offset, "limit": limit,
+                    "capacity": crate::retired_members::CAPACITY, "rows": rows,
+                }),
+                Some(snapshot.config.revision),
+            ));
+        }
         if path == "/v1/operations" {
             if req.method() != hyper::Method::GET {
                 return Ok(problem(405, "Method Not Allowed", "GET required"));

@@ -185,9 +185,15 @@ pub struct Balancer {
 }
 /// An old generation selected for retirement after durable publication.
 /// Constructing or dropping this handle never changes admission state.
-pub(crate) struct BackendRetirement(Arc<Node>);
+pub(crate) struct BackendRetirement(Arc<Node>, usize);
 
 impl BackendRetirement {
+    pub(crate) fn active(&self) -> usize {
+        self.0.active.active()
+    }
+    pub(crate) fn index(&self) -> usize {
+        self.1
+    }
     pub(crate) fn retire(&self) {
         self.0.active.retire();
     }
@@ -338,11 +344,11 @@ impl Balancer {
     pub(crate) fn retirements(&self, successor: Option<&Self>) -> Vec<BackendRetirement> {
         self.nodes
             .iter()
-            .filter(|old| {
+            .enumerate()
+            .filter(|(_, old)| {
                 successor.is_none_or(|next| !next.nodes.iter().any(|node| Arc::ptr_eq(old, node)))
             })
-            .cloned()
-            .map(BackendRetirement)
+            .map(|(index, node)| BackendRetirement(node.clone(), index))
             .collect()
     }
 
