@@ -63,7 +63,7 @@ impl JwtAuth {
         Ok(())
     }
 }
-fn validate_identity_header(name: &str) -> Result<HeaderName> {
+pub(crate) fn validate_identity_header(name: &str) -> Result<HeaderName> {
     let name: HeaderName = name.parse()?;
     ensure!(
         name.as_str().len() <= 128

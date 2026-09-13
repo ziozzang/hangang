@@ -27,6 +27,8 @@ pub struct Config {
     pub http: Vec<HttpRoute>,
     #[serde(default)]
     pub tcp: Vec<TcpRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_http: Vec<crate::workload_http::Listener>,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -187,6 +189,8 @@ pub struct HttpRoute {
     pub resource_policy: Option<crate::resource_policy::ResourcePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_auth: Option<crate::jwt_runtime::JwtAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_auth: Option<crate::workload_auth::Policy>,
     /// Persist policy while excluding this route from new traffic.
     #[serde(default = "enabled_default", skip_serializing_if = "is_enabled")]
     pub enabled: bool,
@@ -608,9 +612,112 @@ impl Config {
             );
             ensure!(ids.insert(id), "duplicate route id: {id}");
         }
+        ensure!(
+            self.workload_http.len() <= 64,
+            "at most 64 workload HTTP listeners"
+        );
+        let mut workload_ids = HashSet::new();
+        let mut workload_addresses = HashSet::new();
+        for listener in &self.workload_http {
+            listener.validate()?;
+            ensure!(
+                workload_ids.insert(&listener.id),
+                "duplicate workload HTTP listener id"
+            );
+            if listener.enabled {
+                ensure!(
+                    workload_addresses.insert(listener.listen),
+                    "duplicate workload HTTP listener address"
+                );
+                ensure!(
+                    !self
+                        .tcp
+                        .iter()
+                        .any(|route| route.enabled && route.listen == listener.listen),
+                    "workload HTTP listener conflicts with TCP listener"
+                );
+            }
+        }
+        let workload_identity_headers: HashSet<String> = self
+            .http
+            .iter()
+            .filter_map(|route| route.workload_auth.as_ref()?.identity_header.as_ref())
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        for route in &self.http {
+            let mut other_identity = Vec::new();
+            if let Some(jwt) = &route.jwt_auth {
+                other_identity.extend(
+                    jwt.identity_header
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase()),
+                );
+            }
+            if let Some(auth) = &route.auth {
+                other_identity.extend(
+                    auth.response_headers
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase()),
+                );
+            }
+            if let Some(basic) = &route.basic_auth {
+                other_identity.extend(
+                    crate::basic_auth::prepare(basic)?
+                        .reserved_headers()
+                        .iter()
+                        .map(|name| name.as_str().to_owned()),
+                );
+            }
+            ensure!(
+                !other_identity
+                    .iter()
+                    .any(|name| workload_identity_headers.contains(name)),
+                "workload identity header conflicts with another authenticator"
+            );
+            ensure!(
+                !route
+                    .headers
+                    .keys()
+                    .any(|name| workload_identity_headers.contains(&name.to_ascii_lowercase())),
+                "verified workload identity cannot be a request-header predicate"
+            );
+        }
         let mut resources: std::collections::HashMap<&str, &HttpRoute> = Default::default();
         let mut jwt_policies = std::collections::HashSet::new();
         for r in &self.http {
+            if let Some(workload) = &r.workload_auth {
+                workload.validate()?;
+                ensure!(
+                    r.access_mode == AccessMode::Protected && r.resource_policy.is_some(),
+                    "workload_auth requires protected access and resource_policy"
+                );
+                if let Some(name) = &workload.identity_header {
+                    ensure!(
+                        !r.auth.as_ref().is_some_and(|auth| auth
+                            .response_headers
+                            .iter()
+                            .any(|other| other.eq_ignore_ascii_case(name))),
+                        "workload identity header conflicts with external authorization"
+                    );
+                    ensure!(
+                        !r.jwt_auth
+                            .as_ref()
+                            .and_then(|jwt| jwt.identity_header.as_ref())
+                            .is_some_and(|other| other.eq_ignore_ascii_case(name)),
+                        "workload identity header conflicts with JWT"
+                    );
+                    if let Some(basic) = &r.basic_auth {
+                        let prepared = crate::basic_auth::prepare(basic)?;
+                        ensure!(
+                            !prepared
+                                .reserved_headers()
+                                .iter()
+                                .any(|other| other.as_str().eq_ignore_ascii_case(name)),
+                            "workload identity header conflicts with Basic authentication"
+                        );
+                    }
+                }
+            }
             if let Some(jwt) = &r.jwt_auth {
                 if jwt_policies.insert(serde_json::to_vec(jwt)?) {
                     ensure!(
@@ -642,10 +749,11 @@ impl Config {
                     r.access_mode == AccessMode::Protected,
                     "resource policy requires access_mode protected"
                 );
-                policy.validate_binding_with_jwt(
+                policy.validate_binding_with_workload(
                     r.basic_auth.as_ref(),
                     r.auth.as_ref(),
                     r.jwt_auth.as_ref(),
+                    r.workload_auth.as_ref(),
                 )?;
                 if let Some(path) = &r.path_prefix {
                     ensure!(
@@ -658,7 +766,8 @@ impl Config {
                         prior.resource_policy == r.resource_policy
                             && prior.basic_auth == r.basic_auth
                             && prior.auth == r.auth
-                            && prior.jwt_auth == r.jwt_auth,
+                            && prior.jwt_auth == r.jwt_auth
+                            && prior.workload_auth == r.workload_auth,
                         "routes sharing a resource_id must share policy and authenticators"
                     );
                 }
@@ -666,12 +775,18 @@ impl Config {
             match r.access_mode {
                 AccessMode::Legacy => {}
                 AccessMode::Protected => ensure!(
-                    r.basic_auth.is_some() || r.auth.is_some() || r.jwt_auth.is_some(),
+                    r.basic_auth.is_some()
+                        || r.auth.is_some()
+                        || r.jwt_auth.is_some()
+                        || r.workload_auth.is_some(),
                     "route {} access_mode protected requires basic_auth or auth or jwt_auth",
                     r.id
                 ),
                 AccessMode::Public | AccessMode::Application => ensure!(
-                    r.basic_auth.is_none() && r.auth.is_none() && r.jwt_auth.is_none(),
+                    r.basic_auth.is_none()
+                        && r.auth.is_none()
+                        && r.jwt_auth.is_none()
+                        && r.workload_auth.is_none(),
                     "route {} access_mode public/application conflicts with basic_auth or auth or jwt_auth",
                     r.id
                 ),
@@ -755,6 +870,12 @@ impl Config {
                         r.jwt_auth
                             .iter()
                             .filter_map(|jwt| jwt.identity_header.as_deref()),
+                    )
+                    .chain(workload_identity_headers.iter().map(String::as_str))
+                    .chain(
+                        r.workload_auth
+                            .iter()
+                            .filter_map(|auth| auth.identity_header.as_deref()),
                     )
                     .map(str::to_owned)
                     .chain(r.basic_auth.iter().flat_map(|basic| {
@@ -1071,6 +1192,28 @@ impl Config {
                 "active TCP mTLS listener must be disabled or removed in a prior revision before removing authentication"
             );
         }
+        for old in previous
+            .workload_http
+            .iter()
+            .filter(|listener| listener.enabled)
+        {
+            ensure!(
+                !self
+                    .tcp
+                    .iter()
+                    .any(|route| route.enabled && route.listen == old.listen),
+                "workload HTTP listener must be removed in a prior revision before changing socket role"
+            );
+        }
+        for old in previous.tcp.iter().filter(|route| route.enabled) {
+            ensure!(
+                !self
+                    .workload_http
+                    .iter()
+                    .any(|listener| listener.enabled && listener.listen == old.listen),
+                "TCP listener must be removed in a prior revision before changing socket role"
+            );
+        }
         let protected: std::collections::HashSet<&str> = previous
             .http
             .iter()
@@ -1158,6 +1301,8 @@ pub struct HttpRuntime {
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
     pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
+    pub workload_auth: Option<std::sync::Arc<crate::workload_auth::Runtime>>,
+    pub auth_reserved: Vec<hyper::header::HeaderName>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -1172,6 +1317,11 @@ pub struct Snapshot {
     /// duplicates for these names are rejected before routing so the selected
     /// route and an upstream cannot interpret different values.
     pub http_match_headers: std::collections::HashSet<hyper::header::HeaderName>,
+    pub workload_identity_headers: Vec<hyper::header::HeaderName>,
+    pub workload_routes:
+        std::collections::HashMap<String, std::sync::Arc<crate::workload_auth::Runtime>>,
+    pub http_workload_tls:
+        std::collections::HashMap<String, std::sync::Arc<crate::workload_tls::Prepared>>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
     pub upstream_tls: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
     // Fingerprints of the exact custom CA certificates used by prepared TLS.
@@ -1425,27 +1575,73 @@ impl Snapshot {
                 });
             }
         }
+        let mut workload_routes = std::collections::HashMap::new();
+        for route in config
+            .http
+            .iter()
+            .filter(|route| route.enabled && route.workload_auth.is_some())
+        {
+            let old = previous
+                .and_then(|snapshot| snapshot.workload_routes.get(&route.id))
+                .filter(|runtime| runtime.matches_route(route));
+            let runtime = match old {
+                Some(runtime) => runtime.clone(),
+                None => std::sync::Arc::new(crate::workload_auth::Runtime::new(route)?),
+            };
+            workload_routes.insert(route.id.clone(), runtime);
+        }
+        let workload_identity_headers: Vec<hyper::header::HeaderName> = config
+            .http
+            .iter()
+            .filter_map(|route| route.workload_auth.as_ref()?.identity_header.as_ref())
+            .map(|name| {
+                name.parse::<hyper::header::HeaderName>()
+                    .expect("validated workload identity header")
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
             .cloned()
             .map(|route| {
+                let basic_auth = route
+                    .basic_auth
+                    .as_ref()
+                    .map(crate::basic_auth::prepare)
+                    .transpose()
+                    .expect("validated basic-auth credentials");
+                let jwt_auth = route.jwt_auth.as_ref().map(|jwt| {
+                    jwt_runtimes[&serde_json::to_vec(jwt).expect("serializable JWT policy")].clone()
+                });
+                let workload_auth = workload_routes.get(&route.id).cloned();
+                let auth_reserved = basic_auth
+                    .iter()
+                    .flat_map(|auth| auth.reserved_headers().iter())
+                    .chain(
+                        jwt_auth
+                            .iter()
+                            .flat_map(|auth| auth.reserved_headers().iter()),
+                    )
+                    .chain(workload_identity_headers.iter())
+                    .chain(
+                        workload_auth
+                            .iter()
+                            .flat_map(|auth| auth.reserved_headers().iter()),
+                    )
+                    .cloned()
+                    .collect();
                 std::sync::Arc::new(HttpRuntime {
                     host_regex: regexes.http.remove(&route.id),
-                    jwt_auth: route.jwt_auth.as_ref().map(|jwt| {
-                        jwt_runtimes[&serde_json::to_vec(jwt).expect("serializable JWT policy")]
-                            .clone()
-                    }),
+                    jwt_auth,
+                    workload_auth,
+                    auth_reserved,
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
                     response_transform: route.response_transform.clone().map(std::sync::Arc::new),
-                    basic_auth: route
-                        .basic_auth
-                        .as_ref()
-                        .map(crate::basic_auth::prepare)
-                        .transpose()
-                        .expect("validated basic-auth credentials"),
+                    basic_auth,
                     cache_fingerprint: {
                         use sha2::Digest;
                         format!(
@@ -1630,6 +1826,31 @@ impl Snapshot {
                 tcp_inbound_tls.insert(route.id.clone(), prepared);
             }
         }
+        let mut http_workload_tls = std::collections::HashMap::new();
+        for listener in config
+            .workload_http
+            .iter()
+            .filter(|listener| listener.enabled)
+        {
+            let mut prepared = crate::workload_tls::Prepared::load(&listener.tls)?;
+            std::sync::Arc::make_mut(&mut prepared.server_config).alpn_protocols =
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let old = previous
+                .filter(|old| {
+                    old.config.workload_http.iter().any(|prior| {
+                        prior.enabled && prior.id == listener.id && prior.listen == listener.listen
+                    })
+                })
+                .and_then(|old| old.http_workload_tls.get(&listener.id))
+                .filter(|old| old.fingerprint() == prepared.fingerprint());
+            http_workload_tls.insert(
+                listener.id.clone(),
+                match old {
+                    Some(old) => old.clone(),
+                    None => std::sync::Arc::new(prepared),
+                },
+            );
+        }
         let certificates = if config.certificates.is_empty() {
             None
         } else {
@@ -1653,6 +1874,9 @@ impl Snapshot {
                 .unwrap_or_default(),
             settings,
             http_match_headers,
+            workload_identity_headers,
+            workload_routes,
+            http_workload_tls,
             sni_regex: regexes.sni,
             upstream_tls,
             upstream_trust,
@@ -1735,7 +1959,7 @@ pub fn is_protected_response_header(name: &str) -> bool {
 /// A response header a route rule may set/remove: a valid lowercase-insensitive
 /// header token that is not a framing or hop-by-hop header (those would corrupt
 /// message framing or connection semantics if rewritten streaming).
-fn valid_response_header_name(name: &str) -> bool {
+pub(crate) fn valid_response_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|b| {

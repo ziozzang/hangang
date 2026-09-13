@@ -92,6 +92,7 @@ fn config(routes: Vec<TcpRoute>) -> Config {
         certificates: Vec::new(),
         http: Vec::new(),
         tcp: routes,
+        workload_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,
     }

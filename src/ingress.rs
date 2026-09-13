@@ -88,6 +88,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
         revision: 0,
         http: Vec::new(),
         tcp: Vec::new(),
+        workload_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,
     });
@@ -186,6 +187,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
         revision: 0,
         http: routes,
         tcp: Vec::new(),
+        workload_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,
     };

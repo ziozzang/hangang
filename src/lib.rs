@@ -67,3 +67,6 @@ pub mod resource_policy;
 pub mod jwks_remote;
 pub mod jwt_auth;
 pub mod jwt_runtime;
+
+pub mod workload_auth;
+pub mod workload_http;

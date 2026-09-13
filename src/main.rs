@@ -411,6 +411,7 @@ async fn run(args: Args) -> Result<()> {
     let mut inherited_docker_lock = None;
     let mut inherited_config = None;
     let mut inherited_tcp = Vec::new();
+    let mut inherited_workload_addresses = std::collections::HashSet::new();
     if let Some(channel) = &channel {
         let channel = channel.clone();
         let descriptors = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -443,6 +444,10 @@ async fn run(args: Args) -> Result<()> {
                         inherited_admin = Some(descriptor.fd);
                     }
                     DescriptorRole::Tcp(address) => inherited_tcp.push((address, descriptor.fd)),
+                    DescriptorRole::WorkloadHttp(address) => {
+                        inherited_workload_addresses.insert(address);
+                        inherited_tcp.push((address, descriptor.fd));
+                    }
                     DescriptorRole::ConfigLock => {
                         inherited_lock = Some(std::fs::File::from(descriptor.fd))
                     }
@@ -473,6 +478,24 @@ async fn run(args: Args) -> Result<()> {
                     }
                 }
             }
+        }
+    }
+    if let Some(inherited) = &inherited_config {
+        for (address, _) in &inherited_tcp {
+            let workload = inherited
+                .config
+                .workload_http
+                .iter()
+                .any(|listener| listener.enabled && listener.listen == *address);
+            let tcp = inherited
+                .config
+                .tcp
+                .iter()
+                .any(|route| route.enabled && route.listen == *address);
+            anyhow::ensure!(
+                workload != tcp && workload == inherited_workload_addresses.contains(address),
+                "inherited listener role disagrees with frozen configuration"
+            );
         }
     }
     let replacing = inherited_config.is_some();
@@ -773,11 +796,7 @@ async fn run(args: Args) -> Result<()> {
     // before its authority confirms the initial snapshot. This also covers
     // a replacement that inherited a snapshot from the previous process.
     // The gate opens only after await_readiness succeeds below.
-    let tcp = Arc::new(if shared_store || args.kubernetes_controller {
-        tcp.with_gate_closed()
-    } else {
-        tcp
-    });
+    let tcp = Arc::new(tcp.with_gate_closed());
     let public_listener = if let Some(fd) = inherited_public {
         adopt_listener(fd, args.listen)?
     } else {
@@ -883,6 +902,7 @@ async fn run(args: Args) -> Result<()> {
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
+    tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
     let manager = Arc::new(Manager {
         active: active.clone(),
         tcp: tcp.clone(),
@@ -1397,7 +1417,17 @@ async fn lifecycle_wait(
                     )?;
                 }
                 for (address, fd) in tcp.export_listeners().await? {
-                    channel.send_descriptor(DescriptorRole::Tcp(address), fd.as_fd())?;
+                    let role = if snapshot
+                        .config
+                        .workload_http
+                        .iter()
+                        .any(|listener| listener.enabled && listener.listen == address)
+                    {
+                        DescriptorRole::WorkloadHttp(address)
+                    } else {
+                        DescriptorRole::Tcp(address)
+                    };
+                    channel.send_descriptor(role, fd.as_fd())?;
                 }
                 channel.send_control(Control::ExportDone)?;
             }

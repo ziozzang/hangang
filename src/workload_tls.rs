@@ -301,7 +301,7 @@ fn unix_now() -> Result<u64> {
 
 /// Validate a canonical SPIFFE URI without normalization that could collapse
 /// two distinct certificate byte strings into one identity.
-fn validate_spiffe_id(uri: &str) -> Result<()> {
+pub(crate) fn validate_spiffe_id(uri: &str) -> Result<()> {
     ensure!(
         uri.len() <= MAX_SPIFFE_ID_BYTES && uri.is_ascii(),
         "SPIFFE URI must be ASCII and at most 2048 bytes"

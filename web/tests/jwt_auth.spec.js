@@ -162,7 +162,7 @@ test('Basic and JWT cannot combine, while Protected cannot lose its only authent
   await page.locator('#route-field-basic_auth_credentials').fill('');
   await reveal(page, 'jwt_auth_enabled');
   await page.locator('#route-field-jwt_auth_enabled').uncheck();
-  await expect(page.locator('#route-message')).toContainText('Protected access requires Basic, JWT or external authorization');
+  await expect(page.locator('#route-message')).toContainText('Protected access requires Basic, JWT, workload mTLS or external authorization');
   await page.locator('#save-route').click();
   expect(writes).toHaveLength(0);
 });

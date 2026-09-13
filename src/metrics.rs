@@ -8,6 +8,10 @@ pub struct Metrics {
     pub errors: AtomicU64,
     pub jwt_auth_rejections: AtomicU64,
     pub jwt_auth_unavailable: AtomicU64,
+    pub http_mtls_rejections: AtomicU64,
+    pub http_mtls_lease_terminations: AtomicU64,
+    pub workload_auth_rejections: AtomicU64,
+    pub workload_route_terminations: AtomicU64,
     pub tcp_mtls_rejections: AtomicU64,
     pub tcp_mtls_lease_terminations: AtomicU64,
     pub jwt_auth_capacity_rejections: AtomicU64,
@@ -25,6 +29,26 @@ impl Metrics {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for (name, kind, value) in [
+            (
+                "http_mtls_rejections_total",
+                "counter",
+                &self.http_mtls_rejections,
+            ),
+            (
+                "http_mtls_lease_terminations_total",
+                "counter",
+                &self.http_mtls_lease_terminations,
+            ),
+            (
+                "workload_auth_rejections_total",
+                "counter",
+                &self.workload_auth_rejections,
+            ),
+            (
+                "workload_route_terminations_total",
+                "counter",
+                &self.workload_route_terminations,
+            ),
             ("requests_total", "counter", &self.requests),
             ("cache_hits_total", "counter", &self.cache_hits),
             ("cache_misses_total", "counter", &self.cache_misses),

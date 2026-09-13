@@ -19,6 +19,7 @@ fn config(revision: u64, id: &str) -> Config {
             access_mode: Default::default(),
             resource_policy: None,
             jwt_auth: None,
+            workload_auth: None,
             enabled: true,
             upstream: Default::default(),
             priority: 0,
@@ -50,6 +51,7 @@ fn config(revision: u64, id: &str) -> Config {
             response_remove_headers: Vec::new(),
         }],
         tcp: Vec::new(),
+        workload_http: Vec::new(),
     }
 }
 

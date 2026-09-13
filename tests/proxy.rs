@@ -258,6 +258,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         access_mode: Default::default(),
         resource_policy: None,
         jwt_auth: None,
+        workload_auth: None,
         enabled: true,
         upstream: Default::default(),
         priority: 0,
@@ -306,6 +307,7 @@ fn proxy_with_settings(
         revision: 1,
         http: routes,
         tcp: Vec::new(),
+        workload_http: Vec::new(),
         settings,
         cache_generation_floor: 0,
     };
@@ -1604,6 +1606,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
         revision: 2,
         http: vec![secured, open],
         tcp: Vec::new(),
+        workload_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,
     };
@@ -1738,6 +1741,7 @@ async fn one_streaming_route_cannot_consume_another_routes_capacity() {
             revision: 0,
             http: vec![first, second],
             tcp: Vec::new(),
+            workload_http: Vec::new(),
             settings: Default::default(),
             cache_generation_floor: 0,
         })
@@ -3807,7 +3811,9 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
     })
     .unwrap();
     let runtime = hangang::config::HttpRuntime {
+        auth_reserved: Vec::new(),
         jwt_auth: None,
+        workload_auth: None,
         host_regex: None,
         admission: valid.admissions["route"].clone(),
         balancer: std::sync::Arc::new(hangang::balance::Balancer::new(Default::default(), 1)),
