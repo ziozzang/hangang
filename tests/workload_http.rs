@@ -229,6 +229,26 @@ async fn origin() -> (
     (address, seen, task)
 }
 
+async fn payload_origin(payload: Bytes) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |_request: Request<Incoming>| {
+                    let payload = payload.clone();
+                    async move { Ok::<_, Infallible>(Response::new(Full::new(payload))) }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (address, task)
+}
+
 async fn streaming_origin() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -665,4 +685,83 @@ async fn http2_stream_retirement_does_not_close_an_unrelated_workload_route() {
     running.policy.shutdown().await;
     stream_task.abort();
     other_task.abort();
+}
+
+/// Diagnostic only: localhost origin, one mTLS listener, 8 keep-alive clients,
+/// 8 requests each, 1 MiB response per request. TLS handshakes are timed;
+/// certificate generation and server startup are not. This is not a claim
+/// about production or competing proxies' throughput.
+#[tokio::test]
+#[ignore = "run explicitly in release mode to measure loopback mTLS throughput"]
+async fn release_workload_http_mtls_throughput_diagnostic() {
+    const CLIENTS: usize = 8;
+    const REQUESTS_PER_CLIENT: usize = 8;
+    const PAYLOAD_BYTES: usize = 1024 * 1024;
+    let payload = Bytes::from(
+        (0..PAYLOAD_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let material = material();
+    let (backend, backend_task) = payload_origin(payload.clone()).await;
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let running = start(config(listen, backend, &material), bound).await;
+    let connector = connector(&material, Some(&material.good));
+
+    let started = tokio::time::Instant::now();
+    let clients = (0..CLIENTS)
+        .map(|_| {
+            let connector = connector.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                let socket = TcpStream::connect(listen).await.unwrap();
+                let tls = connector
+                    .connect("localhost".try_into().unwrap(), socket)
+                    .await
+                    .unwrap();
+                let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+                    .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+                    .await
+                    .unwrap();
+                let connection_task = tokio::spawn(async move { connection.await.unwrap() });
+                for _ in 0..REQUESTS_PER_CLIENT {
+                    let response = sender
+                        .send_request(
+                            Request::builder()
+                                .uri("https://private.test/private")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    assert_eq!(body.len(), PAYLOAD_BYTES);
+                    assert_eq!(body, payload, "mTLS response payload was corrupted");
+                }
+                drop(sender);
+                connection_task.await.unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for client in clients {
+            client.await.unwrap();
+        }
+    })
+    .await
+    .expect("mTLS throughput diagnostic exceeded 60 seconds");
+    let elapsed = started.elapsed();
+    let mebibytes = (CLIENTS * REQUESTS_PER_CLIENT * PAYLOAD_BYTES) as f64 / 1_048_576.0;
+    eprintln!(
+        "workload HTTP mTLS loopback diagnostic: {mebibytes:.0} MiB verified in {:.3} s = {:.1} MiB/s payload; {CLIENTS} concurrent keep-alive clients, {} requests, TLS handshakes included, setup excluded",
+        elapsed.as_secs_f64(),
+        mebibytes / elapsed.as_secs_f64(),
+        CLIENTS * REQUESTS_PER_CLIENT
+    );
+    running.manager.shutdown(Duration::ZERO).await;
+    running.proxy.shutdown(Duration::ZERO).await;
+    running.policy.shutdown().await;
+    backend_task.abort();
 }
