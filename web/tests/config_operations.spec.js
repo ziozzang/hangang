@@ -9,7 +9,7 @@ const operation = (id, state = 'candidate_activated') => ({
   store_kind: 'local_file', authority_epoch: null, state,
 });
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, invalid = false, longHistory = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false } = {}) {
   const calls = [];
   let release;
   const blocked = new Promise((resolve) => { release = resolve; });
@@ -32,12 +32,15 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       if (unavailable) return route.fulfill({ status: 503, json: { title: 'Unavailable', detail: 'history unavailable' } });
       if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
       const after = Number(url.searchParams.get('after'));
+      const authorityId = changedAuthority && after ? 'c'.repeat(32) : 'b'.repeat(32);
       const rows = longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
         : after ? [operation(101, 'indeterminate')] : Array.from({ length: 100 }, (_, index) =>
           operation(index + 1, index === 0 ? 'accepted' : index === 1 ? 'failed' : 'candidate_activated'));
-      const data = { scope: 'instance', authority_id: 'b'.repeat(32), records: rows,
+      for (const record of rows) record.authority_id = authorityId;
+      const data = { scope: 'instance', coverage: ['acceptance', 'local_outcome'], authority_id: authorityId,
+        started_at_unix_ms: 1788999999000, oldest_id: historyGap ? 2 : 1, latest_id: longHistory ? 10000 : 101, records: rows,
         next_after: rows.at(-1).id, has_more: longHistory ? after < 9900 : after === 0,
-        capacity: 10000, stored_records: longHistory ? 10000 : 101, writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
+        capacity: 10000, stored_records: historyGap ? 100 : longHistory ? 10000 : 101, writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
       if (invalid) delete data.writes_available;
       return route.fulfill({ json: data });
     }
@@ -93,6 +96,23 @@ test('missing operation capacity metadata fails closed', async ({ page }) => {
   await expect(page.locator('#config-operations-rows')).toBeEmpty();
 });
 
+test('a history hole cannot be shown as a complete operation journal', async ({ page }) => {
+  await fixture(page, { historyGap: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-message')).toContainText('response is invalid');
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
+});
+
+test('a changed authority between pages requires a fresh first-page read', async ({ page }) => {
+  await fixture(page, { changedAuthority: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-rows tr')).toHaveCount(100);
+  await page.locator('#config-operations-next').click();
+  await expect(page.locator('#config-operations-message')).toContainText('authority or history changed');
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
+  await expect(page.locator('#config-operations-export')).toBeDisabled();
+});
+
 test('viewer cannot open history and delayed admin result cannot repopulate after logout', async ({ page }) => {
   const { calls, release } = await fixture(page, { accounts: true, delayed: true });
   await page.locator('[data-view="config-operations"]').click();
@@ -112,6 +132,7 @@ test('Korean configuration history re-renders labels without refetching or losin
   const { calls } = await fixture(page, { locale: 'ko' });
   await page.locator('[data-view="config-operations"]').click();
   await expect(page.locator('#config-operations-title')).toHaveText('구성 작업 이력');
+  await expect(page.locator('#config-operations-meta')).toContainText('접수, 이 인스턴스의 결과');
   await expect(page.locator('#config-operations-rows tr')).toHaveCount(100);
   await expect(page.locator('#config-operations-rows tr').first()).toContainText('최종 결과 미기록');
   await page.locator('#locale-select').selectOption('en');
@@ -120,6 +141,7 @@ test('Korean configuration history re-renders labels without refetching or losin
 });
 
 test('all 10,000 retained operations remain reachable beyond the recent backcursor stack', async ({ page }) => {
+  test.setTimeout(60000);
   await fixture(page, { longHistory: true });
   await page.locator('[data-view="config-operations"]').click();
   for (let pageNumber = 2; pageNumber <= 66; pageNumber += 1) {

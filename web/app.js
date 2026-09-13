@@ -3691,14 +3691,21 @@ function validConfigOperationsPage(data, after) {
   const safe = (value) => Number.isSafeInteger(value) && value >= 0;
   const idValue = (value) => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
   if (!isObject(data) || data.scope !== 'instance' || !idValue(data.authority_id) ||
+    !Array.isArray(data.coverage) || data.coverage.length !== 2 ||
+    !['acceptance', 'local_outcome'].every((name) => data.coverage.includes(name)) ||
+    !safe(data.started_at_unix_ms) || !safe(data.latest_id) ||
     !Array.isArray(data.records) || data.records.length > 100 || !safe(data.next_after) ||
     typeof data.has_more !== 'boolean' || data.capacity !== 10000 ||
     !safe(data.stored_records) || data.stored_records > data.capacity ||
     typeof data.writes_available !== 'boolean' || !safe(data.server_time_unix_ms)) return false;
+  // This journal has no pruning. A hole cannot be represented as complete history.
+  if (data.latest_id !== data.stored_records ||
+    data.oldest_id !== (data.stored_records ? 1 : null) ||
+    (data.writes_available && data.stored_records === data.capacity)) return false;
   if (data.has_more && !data.records.length) return false;
   if (data.next_after !== (data.records.at(-1)?.id ?? after)) return false;
   return data.records.every((record, index) => isObject(record) && safe(record.id) &&
-    record.id > (index ? data.records[index - 1].id : after) &&
+    record.id > (index ? data.records[index - 1].id : after) && record.id <= data.latest_id &&
     idValue(record.operation_id) && record.authority_id === data.authority_id &&
     ['system', 'account'].includes(record.actor_kind) &&
     (record.actor_kind === 'system' ? record.actor_user_id == null : safe(record.actor_user_id) && record.actor_user_id > 0) &&
@@ -3729,8 +3736,11 @@ function renderConfigOperations() {
     $('#config-operations-page-state').textContent = '';
     message($('#config-operations-message'), history.error || '', 'error');
   } else {
-    $('#config-operations-meta').textContent = t('This instance only · Authority: {authority} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
+    $('#config-operations-meta').textContent = t('This instance only · Authority: {authority} · Covers: {coverage} · Began: {started} · Sequences: {oldest}–{latest} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
       authority: page.authority_id, stored: formatNumber(page.stored_records), capacity: formatNumber(page.capacity),
+      coverage: page.coverage.map((name) => t(name === 'acceptance' ? 'Acceptance' : 'Local outcome')).join(', '),
+      started: auditDate(page.started_at_unix_ms),
+      oldest: page.oldest_id ?? '—', latest: page.latest_id,
       observed: auditDate(page.server_time_unix_ms), writes: page.writes_available ? t('available') : t('blocked'),
     });
     const notices = [];
@@ -3765,6 +3775,7 @@ function renderConfigOperations() {
 
 async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
   if (!isAdmin() || !state.token) { resetConfigOperations(); return; }
+  const priorPage = after ? state.configOperations.page : null;
   const sequence = ++state.configOperations.sequence;
   state.configOperations.page = null;
   state.configOperations.error = null;
@@ -3773,6 +3784,9 @@ async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
     const { data } = await api(`/v1/config/operations?after=${after}&limit=100`);
     if (sequence !== state.configOperations.sequence || state.view !== 'config-operations' || !isAdmin()) return;
     if (!validConfigOperationsPage(data, after)) throw new Error(t('Configuration operation response is invalid.'));
+    if (priorPage && (data.authority_id !== priorPage.authority_id ||
+      data.started_at_unix_ms !== priorPage.started_at_unix_ms || data.latest_id < priorPage.latest_id))
+      throw new Error(t('Configuration operation authority or history changed. Refresh from the first page.'));
     state.configOperations.page = data;
     state.configOperations.after = after;
     state.configOperations.previous = previous;
