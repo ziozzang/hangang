@@ -279,6 +279,138 @@ async fn finish_user_mutation(stream: &mut tokio::net::TcpStream, body: &str) ->
         .unwrap()
 }
 
+async fn account_admin_token(address: std::net::SocketAddr) -> String {
+    let credentials = r#"{"username":"operator","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/auth/bootstrap",
+            Some(credentials),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(credentials),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    json(&body)["token"].as_str().unwrap().to_owned()
+}
+
+async fn admitted_config_mutation_waiting_for_body(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let headers = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nIf-Match: \"0\"\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    let interim = read_raw_response_headers(&mut stream).await;
+    assert!(
+        interim.starts_with(b"HTTP/1.1 100 Continue"),
+        "configuration body was not polled: {interim:?}"
+    );
+    stream
+}
+
+async fn revoke_account_session(address: std::net::SocketAddr, token: &str) {
+    assert_eq!(
+        request_with_token(address, "POST", "/v1/auth/logout", None, None, Some(token))
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/auth/me", None, None, Some(token))
+            .await
+            .0,
+        401
+    );
+}
+
+async fn config_operation_records(address: std::net::SocketAddr) -> Vec<serde_json::Value> {
+    let (status, _, body) = request(address, "GET", "/v1/config/operations", None, None).await;
+    assert_eq!(status, 200);
+    let page = json(&body);
+    assert_eq!(page["scope"], "instance");
+    page["records"].as_array().unwrap().clone()
+}
+
+struct HeldCasStore {
+    inner: FileConfigStore,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl hangang::config_store::ConfigStore for HeldCasStore {
+    async fn load_latest(
+        &self,
+    ) -> hangang::config_store::StoreResult<Option<hangang::config_store::Stored>> {
+        hangang::config_store::ConfigStore::load_latest(&self.inner).await
+    }
+
+    async fn bootstrap(
+        &self,
+        initial: Config,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::Stored> {
+        hangang::config_store::ConfigStore::bootstrap(&self.inner, initial).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        epoch: &str,
+        expected: u64,
+        next: Config,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::CasResult> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        hangang::config_store::ConfigStore::compare_and_swap(&self.inner, epoch, expected, next)
+            .await
+    }
+
+    async fn publish_challenge(
+        &self,
+        token: &str,
+        key_authorization: &str,
+        ttl: std::time::Duration,
+    ) -> hangang::config_store::StoreResult<()> {
+        hangang::config_store::ConfigStore::publish_challenge(
+            &self.inner,
+            token,
+            key_authorization,
+            ttl,
+        )
+        .await
+    }
+
+    async fn lookup_challenge(
+        &self,
+        token: &str,
+    ) -> hangang::config_store::StoreResult<Option<String>> {
+        hangang::config_store::ConfigStore::lookup_challenge(&self.inner, token).await
+    }
+
+    async fn withdraw_challenge(&self, token: &str) -> hangang::config_store::StoreResult<()> {
+        hangang::config_store::ConfigStore::withdraw_challenge(&self.inner, token).await
+    }
+}
+
 async fn event_fixture(
     event_limit: usize,
 ) -> (
@@ -1568,6 +1700,212 @@ async fn http_route_crud_enforces_revisions_and_not_found() {
             .0,
         404
     );
+}
+
+#[tokio::test]
+async fn revoked_account_cannot_publish_route_after_body_admission() {
+    let (address, manager, _directory) = server().await;
+    let token = account_admin_token(address).await;
+    let body = r#"{"id":"late-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    let mut pending =
+        admitted_config_mutation_waiting_for_body(address, "POST", "/v1/routes/http", &token, body)
+            .await;
+    revoke_account_session(address, &token).await;
+    assert_eq!(finish_user_mutation(&mut pending, body).await, 403);
+    assert_eq!(manager.active.load().config.revision, 0);
+    assert!(manager.active.load().config.http.is_empty());
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 0);
+    assert!(persisted.http.is_empty());
+    assert!(config_operation_records(address).await.is_empty());
+
+    // Static break-glass authority remains a valid, explicit system writer.
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(body), Some(0))
+            .await
+            .0,
+        201
+    );
+    assert_eq!(manager.active.load().config.revision, 1);
+    let operations = config_operation_records(address).await;
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["actor_kind"], "system");
+    assert_eq!(operations[0]["state"], "candidate_activated");
+}
+
+#[tokio::test]
+async fn revoked_account_cannot_publish_whole_config_after_body_admission() {
+    let (address, manager, _directory) = server().await;
+    let token = account_admin_token(address).await;
+    let body = serde_json::to_string(&Config::default()).unwrap();
+    let mut pending =
+        admitted_config_mutation_waiting_for_body(address, "PUT", "/v1/config", &token, &body)
+            .await;
+    revoke_account_session(address, &token).await;
+    assert_eq!(finish_user_mutation(&mut pending, &body).await, 403);
+    assert_eq!(manager.active.load().config.revision, 0);
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 0);
+    assert!(config_operation_records(address).await.is_empty());
+}
+
+#[tokio::test]
+async fn revoked_account_cannot_publish_after_writer_queue_wait() {
+    let (address, manager, _directory) = server().await;
+    let token = account_admin_token(address).await;
+    let body = r#"{"id":"queued-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    let writer = manager.writes.lock().await;
+    let request = tokio::spawn({
+        let token = token.clone();
+        async move {
+            request_with_token(
+                address,
+                "POST",
+                "/v1/routes/http",
+                Some(body),
+                Some(0),
+                Some(&token),
+            )
+            .await
+            .0
+        }
+    });
+    // Acquiring the detached transaction permit proves the request has passed
+    // header/body admission and is queued on the held configuration writer.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while manager.transactions.available_permits() == 32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("configuration mutation did not reach writer queue");
+    revoke_account_session(address, &token).await;
+    drop(writer);
+    assert_eq!(request.await.unwrap(), 403);
+    assert_eq!(manager.active.load().config.revision, 0);
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 0);
+    assert!(persisted.http.is_empty());
+    assert!(config_operation_records(address).await.is_empty());
+}
+
+#[tokio::test]
+async fn accepted_configuration_intent_can_finish_after_session_logout() {
+    use hangang::config_store::ConfigStore;
+
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("shared.json");
+    let initial = Config::default();
+    let inner = FileConfigStore::new(state_path.clone());
+    inner.bootstrap(initial.clone()).await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(HeldCasStore {
+        inner,
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let (address, manager) = server_on(state_path, initial, Some(store), false, 64, 16).await;
+    manager.reload_file().await.unwrap();
+    let token = account_admin_token(address).await;
+    let body = r#"{"id":"accepted-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    let mutation = tokio::spawn({
+        let token = token.clone();
+        async move {
+            request_with_token(
+                address,
+                "POST",
+                "/v1/routes/http",
+                Some(body),
+                Some(0),
+                Some(&token),
+            )
+            .await
+            .0
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .expect("accepted mutation did not reach configuration CAS");
+    let accepted = config_operation_records(address).await;
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0]["actor_kind"], "account");
+    assert_eq!(accepted[0]["state"], "accepted");
+    revoke_account_session(address, &token).await;
+    release.notify_one();
+    assert_eq!(mutation.await.unwrap(), 201);
+    assert_eq!(manager.active.load().config.revision, 1);
+    let completed = config_operation_records(address).await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["operation_id"], accepted[0]["operation_id"]);
+    assert_eq!(completed[0]["state"], "candidate_activated");
+}
+
+#[tokio::test]
+async fn failed_intent_insert_prevents_configuration_persistence() {
+    let (address, manager, _directory) = server().await;
+    let db = manager.state_path.with_extension("admin-users.sqlite3");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_config_accept BEFORE INSERT ON admin_config_operations \
+             BEGIN SELECT RAISE(ABORT, 'fixture rejects acceptance'); END;",
+        )
+        .unwrap();
+    let body = r#"{"id":"blocked-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(body), Some(0))
+            .await
+            .0,
+        503
+    );
+    assert_eq!(manager.active.load().config.revision, 0);
+    assert!(manager.active.load().config.http.is_empty());
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 0);
+    assert!(persisted.http.is_empty());
+    assert!(config_operation_records(address).await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_intent_completion_reports_unknown_outcome_without_erasing_acceptance() {
+    let (address, manager, _directory) = server().await;
+    let db = manager.state_path.with_extension("admin-users.sqlite3");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_config_finish BEFORE UPDATE ON admin_config_operations \
+             WHEN NEW.state!='accepted' \
+             BEGIN SELECT RAISE(ABORT, 'fixture rejects completion'); END;",
+        )
+        .unwrap();
+    let body = r#"{"id":"applied-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(body), Some(0))
+            .await
+            .0,
+        503
+    );
+    assert_eq!(manager.active.load().config.revision, 1);
+    assert!(
+        manager
+            .active
+            .load()
+            .config
+            .http
+            .iter()
+            .any(|route| route.id == "applied-route")
+    );
+    let persisted: Config =
+        serde_json::from_slice(&std::fs::read(&manager.state_path).unwrap()).unwrap();
+    assert_eq!(persisted.revision, 1);
+    let operations = config_operation_records(address).await;
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["state"], "accepted");
 }
 
 #[tokio::test]
