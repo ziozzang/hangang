@@ -21,7 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -44,6 +44,7 @@ struct Material {
     other_key: String,
     wrong_cert: String,
     wrong_key: String,
+    issuer: CertifiedIssuer<'static, KeyPair>,
 }
 
 fn ca() -> CertifiedIssuer<'static, KeyPair> {
@@ -57,6 +58,20 @@ fn client_certificate(issuer: &CertifiedIssuer<'_, KeyPair>, uri: &str) -> (Stri
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let key = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key, issuer).unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+fn short_lived_client_certificate(
+    issuer: &CertifiedIssuer<'_, KeyPair>,
+    uri: &str,
+) -> (String, String) {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.not_before = (SystemTime::now() - Duration::from_secs(5)).into();
+    params.not_after = (SystemTime::now() + Duration::from_secs(5)).into();
     let key = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key, issuer).unwrap();
     (cert.pem(), key.serialize_pem())
@@ -100,6 +115,7 @@ fn material() -> Material {
         other_key,
         wrong_cert,
         wrong_key,
+        issuer: trusted_ca,
     }
 }
 
@@ -268,6 +284,25 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     assert!(exchange(&good, listen).await);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
+    let (short_cert, short_key) = short_lived_client_certificate(&material.issuer, GOOD_ID);
+    let short = connector(&material, Some((&short_cert, &short_key)));
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let mut expiring = short
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    expiring.write_all(b"ping").await.unwrap();
+    let mut reply = [0; 4];
+    expiring.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"ping");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(8), expiring.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0) | Err(_))),
+        "expired identity stream remained active: {closed:?}"
+    );
+
     // Keep a verified stream open across publication. It must not continue
     // forwarding under an allowlist that no longer admits its SAN URI.
     let socket = TcpStream::connect(listen).await.unwrap();
@@ -276,10 +311,9 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         .await
         .unwrap();
     held.write_all(b"ping").await.unwrap();
-    let mut reply = [0; 4];
     held.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"ping");
-    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
 
     // A no-op publication preserves the exact prepared verifier and a live
     // authenticated stream. Replacing CA bytes at the same path must fence
@@ -298,7 +332,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     held.write_all(b"ping").await.unwrap();
     held.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"ping");
-    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
 
     std::fs::write(&material.ca_file, ca().pem()).unwrap();
     let prepared = manager.prepare(&same).await.unwrap();
@@ -310,14 +344,13 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         &prepared_before,
         &active.load_full().tcp_inbound_tls["workload"]
     ));
-    let mut byte = [0];
     let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte)).await;
     assert!(
         matches!(closed, Ok(Ok(0) | Err(_))),
         "old CA stream stayed active: {closed:?}"
     );
     assert!(!exchange(&good, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
 
     std::fs::write(&material.ca_file, &material.ca_pem).unwrap();
     let prepared = manager.prepare(&same).await.unwrap();
@@ -326,7 +359,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     ));
     manager.commit(prepared).await;
     assert!(exchange(&good, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
 
     let socket = TcpStream::connect(listen).await.unwrap();
     let mut held = good
@@ -336,7 +369,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     held.write_all(b"ping").await.unwrap();
     held.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"ping");
-    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    assert_eq!(accepted.load(Ordering::SeqCst), 5);
 
     let next = config(listen, backend_address, &material, &[OTHER_ID]);
     let prepared = manager.prepare(&next).await.unwrap();
@@ -350,9 +383,9 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         "old identity stream remained active: {closed:?}"
     );
     assert!(!exchange(&good, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 4);
-    assert!(exchange(&wrong_uri, listen).await);
     assert_eq!(accepted.load(Ordering::SeqCst), 5);
+    assert!(exchange(&wrong_uri, listen).await);
+    assert_eq!(accepted.load(Ordering::SeqCst), 6);
 
     let socket = TcpStream::connect(listen).await.unwrap();
     let mut remaining = wrong_uri
@@ -362,7 +395,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
     remaining.write_all(b"ping").await.unwrap();
     remaining.read_exact(&mut reply).await.unwrap();
     assert_eq!(&reply, b"ping");
-    assert_eq!(accepted.load(Ordering::SeqCst), 6);
+    assert_eq!(accepted.load(Ordering::SeqCst), 7);
 
     let empty = Config::default();
     let prepared = manager.prepare(&empty).await.unwrap();
@@ -376,7 +409,7 @@ async fn tcp_mtls_verifies_certificate_identity_before_backend_and_fences_reload
         "removed route kept authenticated stream active: {closed:?}"
     );
     assert!(!exchange(&wrong_uri, listen).await);
-    assert_eq!(accepted.load(Ordering::SeqCst), 6);
+    assert_eq!(accepted.load(Ordering::SeqCst), 7);
     manager.shutdown(Duration::from_secs(1)).await;
     backend_task.abort();
 }
