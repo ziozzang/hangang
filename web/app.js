@@ -69,7 +69,7 @@ const state = {
   lastStatus: null,
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
-  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null },
+  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -3559,7 +3559,9 @@ function auditChange(record) {
   if (record.password_changed) parts.push(t(record.action === 'bootstrap' || record.action === 'create' ? 'Password set' : 'Password changed'));
   if (record.action === 'baseline' && Number.isSafeInteger(record.affected_count)) parts.push(t('Existing accounts at audit start: {count}', { count: formatNumber(record.affected_count) }));
   if (record.action === 'prune' && Number.isSafeInteger(record.affected_count)) parts.push(t('{count} records pruned', { count: formatNumber(record.affected_count) }));
+  if (record.action === 'config_operations_prune' && Number.isSafeInteger(record.affected_count)) parts.push(t('{count} terminal configuration operations pruned', { count: formatNumber(record.affected_count) }));
   if (record.action === 'prune' && Number.isSafeInteger(record.through_id)) parts.push(t('Through #{id}', { id: record.through_id }));
+  if (record.action === 'config_operations_prune' && Number.isSafeInteger(record.through_id)) parts.push(t('Configuration operation through #{id}', { id: record.through_id }));
   return parts.join(' · ') || t('No role or enabled-state change');
 }
 
@@ -3586,7 +3588,8 @@ function renderAudit() {
     if (notices.length) message($('#audit-message'), notices.join(' '), page.writes_available && !audit.notice ? 'warning' : 'error');
     for (const record of page.records) {
       const tr = document.createElement('tr');
-      const values = [record.id, auditDate(record.time_unix_ms), t(`Audit ${record.action}`), auditActor(record),
+      const values = [record.id, auditDate(record.time_unix_ms),
+        t(record.action === 'config_operations_prune' ? 'Configuration operation history pruned' : `Audit ${record.action}`), auditActor(record),
         Number.isSafeInteger(record.target_user_id) ? `#${record.target_user_id}` : '—', auditChange(record)];
       for (const value of values) { const td = document.createElement('td'); td.textContent = String(value); tr.append(td); }
       rows.append(tr);
@@ -3611,7 +3614,7 @@ async function loadAudit(after = 0, previous = [], pageNumber = 1) {
     const { data } = await api(`/v1/audit/users?after=${after}&limit=100`);
     if (sequence !== state.audit.sequence || state.view !== 'audit' || !isAdmin()) return;
     if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
-      !['bootstrap', 'create', 'update', 'delete', 'prune'].every((action) => data.coverage.includes(action)) ||
+      !['bootstrap', 'create', 'update', 'delete', 'prune', 'config_operations_prune'].every((action) => data.coverage.includes(action)) ||
       !Array.isArray(data.records) || data.records.length > 100 ||
       !Number.isSafeInteger(data.latest_id) || data.latest_id < 0 || !Number.isSafeInteger(data.next_after) ||
       !Number.isSafeInteger(data.pruned_through) || data.pruned_through < 0 || typeof data.truncated !== 'boolean' ||
@@ -3680,11 +3683,12 @@ function resetConfigOperations() {
   state.configOperations.previous = [];
   state.configOperations.pageNumber = 1;
   state.configOperations.error = null;
+  state.configOperations.notice = null;
   $('#config-operations-rows').replaceChildren();
   $('#config-operations-meta').textContent = '';
   $('#config-operations-page-state').textContent = '';
   message($('#config-operations-message'));
-  for (const id of ['config-operations-export', 'config-operations-previous', 'config-operations-next']) $(`#${id}`).disabled = true;
+  for (const id of ['config-operations-export', 'config-operations-prune', 'config-operations-previous', 'config-operations-next']) $(`#${id}`).disabled = true;
 }
 
 function validConfigOperationsPage(data, after) {
@@ -3694,13 +3698,16 @@ function validConfigOperationsPage(data, after) {
     !Array.isArray(data.coverage) || data.coverage.length !== 2 ||
     !['acceptance', 'local_outcome'].every((name) => data.coverage.includes(name)) ||
     !safe(data.started_at_unix_ms) || !safe(data.latest_id) ||
+    !safe(data.history_revision) || !safe(data.pruned_through) || data.pruned_through > data.latest_id ||
+    typeof data.truncated !== 'boolean' ||
+    !(data.oldest_id == null || (safe(data.oldest_id) && data.oldest_id > 0 && data.oldest_id <= data.latest_id)) ||
     !Array.isArray(data.records) || data.records.length > 100 || !safe(data.next_after) ||
     typeof data.has_more !== 'boolean' || data.capacity !== 10000 ||
     !safe(data.stored_records) || data.stored_records > data.capacity ||
     typeof data.writes_available !== 'boolean' || !safe(data.server_time_unix_ms)) return false;
-  // This journal has no pruning. A hole cannot be represented as complete history.
-  if (data.latest_id !== data.stored_records ||
-    data.oldest_id !== (data.stored_records ? 1 : null) ||
+  if (data.records.length > data.stored_records ||
+    (data.records.length && data.oldest_id == null) ||
+    (data.stored_records === 0 && data.oldest_id != null) ||
     (data.writes_available && data.stored_records === data.capacity)) return false;
   if (data.has_more && !data.records.length) return false;
   if (data.next_after !== (data.records.at(-1)?.id ?? after)) return false;
@@ -3736,14 +3743,16 @@ function renderConfigOperations() {
     $('#config-operations-page-state').textContent = '';
     message($('#config-operations-message'), history.error || '', 'error');
   } else {
-    $('#config-operations-meta').textContent = t('This instance only · Authority: {authority} · Covers: {coverage} · Began: {started} · Sequences: {oldest}–{latest} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
+    $('#config-operations-meta').textContent = t('This instance only · Authority: {authority} · Covers: {coverage} · Began: {started} · Sequences: {oldest}–{latest} · History revision: {revision} · Pruned through: {pruned} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
       authority: page.authority_id, stored: formatNumber(page.stored_records), capacity: formatNumber(page.capacity),
       coverage: page.coverage.map((name) => t(name === 'acceptance' ? 'Acceptance' : 'Local outcome')).join(', '),
       started: auditDate(page.started_at_unix_ms),
-      oldest: page.oldest_id ?? '—', latest: page.latest_id,
+      oldest: page.oldest_id ?? '—', latest: page.latest_id, revision: page.history_revision, pruned: page.pruned_through,
       observed: auditDate(page.server_time_unix_ms), writes: page.writes_available ? t('available') : t('blocked'),
     });
     const notices = [];
+    if (history.notice) notices.push(history.notice);
+    if (page.truncated || page.pruned_through > 0) notices.push(t('Earlier terminal configuration operations were pruned; unresolved records were retained. This is not complete history.'));
     if (!page.writes_available) notices.push(t('New governed configuration writes are blocked while operation history is full or unavailable.'));
     if (page.records.some((record) => record.state === 'accepted' || record.state === 'indeterminate'))
       notices.push(t('Accepted or indeterminate operations have no proven final outcome here. Do not infer fleet activation.'));
@@ -3769,6 +3778,7 @@ function renderConfigOperations() {
     $('#config-operations-page-state').textContent = t('Page {page} · cursor #{cursor}', { page: history.pageNumber, cursor: page.next_after });
   }
   $('#config-operations-export').disabled = !page?.records?.length;
+  $('#config-operations-prune').disabled = !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state));
   $('#config-operations-previous').disabled = !page || !history.previous.length;
   $('#config-operations-next').disabled = !page?.has_more || !page.records.length;
 }
@@ -3779,13 +3789,15 @@ async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
   const sequence = ++state.configOperations.sequence;
   state.configOperations.page = null;
   state.configOperations.error = null;
+  state.configOperations.notice = null;
   renderConfigOperations();
   try {
     const { data } = await api(`/v1/config/operations?after=${after}&limit=100`);
     if (sequence !== state.configOperations.sequence || state.view !== 'config-operations' || !isAdmin()) return;
     if (!validConfigOperationsPage(data, after)) throw new Error(t('Configuration operation response is invalid.'));
     if (priorPage && (data.authority_id !== priorPage.authority_id ||
-      data.started_at_unix_ms !== priorPage.started_at_unix_ms || data.latest_id < priorPage.latest_id))
+      data.started_at_unix_ms !== priorPage.started_at_unix_ms || data.latest_id < priorPage.latest_id ||
+      data.history_revision !== priorPage.history_revision))
       throw new Error(t('Configuration operation authority or history changed. Refresh from the first page.'));
     state.configOperations.page = data;
     state.configOperations.after = after;
@@ -3810,6 +3822,36 @@ function exportConfigOperationsPage() {
     link.href = url; link.download = `hangang-config-operations-page-${state.configOperations.after}.json`;
     document.body.append(link); link.click(); link.remove();
   } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
+
+async function pruneConfigOperationsPage() {
+  const page = state.configOperations.page;
+  if (!isAdmin() || !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state))) return;
+  const throughId = page.records.at(-1).id;
+  const sequence = state.configOperations.sequence;
+  const accepted = await confirmDialog({
+    title: t('Permanently prune terminal configuration operations?'),
+    body: t('Archive all terminal configuration operations through #{id}, including earlier pages, before proceeding. This page export is not a complete archive. Accepted and indeterminate operations are retained. This deletion is irreversible and affects this instance only.', { id: throughId }),
+    accept: t('Permanently prune terminal records'),
+  });
+  if (!accepted || sequence !== state.configOperations.sequence || page !== state.configOperations.page || !isAdmin() || !state.token) return;
+  const button = $('#config-operations-prune'); setBusy(button, true, t('Pruning…'));
+  try {
+    const { data } = await api('/v1/config/operations/prune', { method: 'POST', json: {
+      through_id: throughId, expected_latest_id: page.latest_id, expected_history_revision: page.history_revision,
+    } });
+    if (!isObject(data) || !Number.isSafeInteger(data.pruned_records) || data.pruned_records < 0 ||
+      !Number.isSafeInteger(data.retained_unresolved) || data.retained_unresolved < 0 ||
+      !isObject(data.record) || data.record.action !== 'config_operations_prune' ||
+      data.record.through_id !== throughId)
+      throw new Error(t('Configuration operation prune response is invalid.'));
+    await loadConfigOperations(0, []);
+    toast(t('{pruned} terminal records pruned; {retained} unresolved retained.', { pruned: formatNumber(data.pruned_records), retained: formatNumber(data.retained_unresolved) }));
+  } catch (error) {
+    if (error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    state.configOperations.notice = error.status === 409 ? t('Operation history changed; refresh before deciding whether to prune. No automatic retry was made.') : error.message;
+  } finally { setBusy(button, false); renderConfigOperations(); }
 }
 
 async function createUser(event) {
@@ -3908,6 +3950,7 @@ $('#config-operations-next').addEventListener('click', () => {
   loadConfigOperations(page.next_after, previous, state.configOperations.pageNumber + 1);
 });
 $('#config-operations-export').addEventListener('click', exportConfigOperationsPage);
+$('#config-operations-prune').addEventListener('click', pruneConfigOperationsPage);
 $('#toggle-token').addEventListener('click', () => { const input = $('#token-input'); input.type = input.type === 'password' ? 'text' : 'password'; refreshTokenToggle(); });
 $('#logout-button').addEventListener('click', () => logout());
 $('#refresh-security').addEventListener('click', () => loadView('security'));

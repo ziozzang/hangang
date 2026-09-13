@@ -9,15 +9,16 @@ const operation = (id, state = 'candidate_activated') => ({
   store_kind: 'local_file', authority_epoch: null, state,
 });
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false } = {}) {
   const calls = [];
+  let pruned = false;
   let release;
   const blocked = new Promise((resolve) => { release = resolve; });
   if (locale === 'ko') await page.addInitScript(() => localStorage.setItem('hangang-locale', 'ko'));
   await page.route('**/*', async (route) => {
     const request = route.request(); const url = new URL(request.url());
     if (url.pathname.startsWith('/ui/')) return route.continue();
-    calls.push({ path: url.pathname, search: url.search, authorization: request.headers().authorization });
+    calls.push({ path: url.pathname, search: url.search, method: request.method(), body: request.postDataJSON?.(), authorization: request.headers().authorization });
     if (url.pathname === '/v1/auth/setup') return route.fulfill(accounts ? { json: { bootstrap_required: false } } : { status: 404, body: 'not found' });
     if (url.pathname === '/v1/auth/login') {
       const username = request.postDataJSON().username;
@@ -33,16 +34,29 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
       const after = Number(url.searchParams.get('after'));
       const authorityId = changedAuthority && after ? 'c'.repeat(32) : 'b'.repeat(32);
-      const rows = longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
+      const rows = pruned ? [operation(1, 'accepted'), operation(101, 'indeterminate')].filter((record) => record.id > after)
+        : longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
         : after ? [operation(101, 'indeterminate')] : Array.from({ length: 100 }, (_, index) =>
-          operation(index + 1, index === 0 ? 'accepted' : index === 1 ? 'failed' : 'candidate_activated'));
+          operation(index + 1, noTerminal ? 'accepted' : index === 0 ? 'accepted' : index === 1 ? 'failed' : 'candidate_activated'));
+      if (historyGap && !after) rows.shift();
       for (const record of rows) record.authority_id = authorityId;
       const data = { scope: 'instance', coverage: ['acceptance', 'local_outcome'], authority_id: authorityId,
         started_at_unix_ms: 1788999999000, oldest_id: historyGap ? 2 : 1, latest_id: longHistory ? 10000 : 101, records: rows,
-        next_after: rows.at(-1).id, has_more: longHistory ? after < 9900 : after === 0,
-        capacity: 10000, stored_records: historyGap ? 100 : longHistory ? 10000 : 101, writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
+        next_after: rows.at(-1)?.id ?? after, has_more: pruned ? false : longHistory ? after < 9900 : after === 0,
+        history_revision: pruned ? 203 : 202, pruned_through: pruned ? 100 : historyGap ? 1 : 0,
+        truncated: pruned || historyGap,
+        capacity: 10000, stored_records: pruned ? 2 : historyGap ? 100 : longHistory ? 10000 : 101,
+        writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
       if (invalid) delete data.writes_available;
       return route.fulfill({ json: data });
+    }
+    if (url.pathname === '/v1/config/operations/prune') {
+      if (delayedPrune) await blocked;
+      if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
+      if (pruneConflict) return route.fulfill({ status: 409, json: { title: 'Conflict', detail: 'history changed' } });
+      pruned = true;
+      return route.fulfill({ json: { pruned_records: 99, retained_unresolved: 2,
+        record: { id: 102, action: 'config_operations_prune', through_id: 100 } } });
     }
     return route.fulfill({ status: 404, body: 'fixture missing' });
   });
@@ -96,11 +110,69 @@ test('missing operation capacity metadata fails closed', async ({ page }) => {
   await expect(page.locator('#config-operations-rows')).toBeEmpty();
 });
 
-test('a history hole cannot be shown as a complete operation journal', async ({ page }) => {
+test('sparse retained history discloses pruning and remains pageable', async ({ page }) => {
   await fixture(page, { historyGap: true });
   await page.locator('[data-view="config-operations"]').click();
-  await expect(page.locator('#config-operations-message')).toContainText('response is invalid');
+  await expect(page.locator('#config-operations-message')).toContainText('not complete history');
+  await expect(page.locator('#config-operations-rows tr')).toHaveCount(99);
+  await expect(page.locator('#config-operations-meta')).toContainText('Pruned through: 1');
+});
+
+test('terminal pruning requires confirmation, exact history CAS, and never retries a conflict', async ({ page }) => {
+  const { calls } = await fixture(page, { pruneConflict: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-prune')).toBeEnabled();
+  await page.locator('#config-operations-prune').click();
+  await expect(page.locator('#confirm-message')).toContainText('including earlier pages');
+  await expect(page.locator('#confirm-message')).toContainText('Accepted and indeterminate operations are retained');
+  await page.locator('#confirm-dialog [value="cancel"]').click();
+  expect(calls.filter((call) => call.path.endsWith('/prune'))).toHaveLength(0);
+  await page.locator('#config-operations-prune').click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-message')).toContainText('No automatic retry');
+  const prunes = calls.filter((call) => call.path.endsWith('/prune'));
+  expect(prunes).toHaveLength(1);
+  expect(prunes[0].body).toEqual({ through_id: 100, expected_latest_id: 101, expected_history_revision: 202 });
+  expect(prunes[0].authorization).toBe('Bearer fixture-admin-token');
+});
+
+test('successful pruning keeps unresolved records visible and discloses a sparse history', async ({ page }) => {
+  const { calls } = await fixture(page);
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-prune').click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-rows tr')).toHaveCount(2);
+  await expect(page.locator('#config-operations-rows')).toContainText('outcome not yet recorded');
+  await expect(page.locator('#config-operations-rows')).toContainText('outcome unknown');
+  await expect(page.locator('#config-operations-message')).toContainText('not complete history');
+  await expect(page.locator('#config-operations-prune')).toBeDisabled();
+  expect(calls.filter((call) => call.path.endsWith('/prune'))).toHaveLength(1);
+});
+
+test('full history still permits explicit terminal pruning but unresolved-only pages do not', async ({ page }) => {
+  await fixture(page, { longHistory: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-meta')).toContainText('10,000/10,000');
+  await expect(page.locator('#config-operations-prune')).toBeEnabled();
+});
+
+test('unresolved-only page does not offer terminal pruning', async ({ page }) => {
+  await fixture(page, { noTerminal: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-prune')).toBeDisabled();
+});
+
+test('a pruning response arriving after logout cannot restore privileged history', async ({ page }) => {
+  const { calls, release } = await fixture(page, { delayedPrune: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-prune').click();
+  await page.locator('#confirm-accept').click();
+  await expect.poll(() => calls.some((call) => call.path === '/v1/config/operations/prune')).toBe(true);
+  await page.locator('#logout-button').click();
+  release();
   await expect(page.locator('#config-operations-rows')).toBeEmpty();
+  await expect(page.locator('#config-operations-export')).toBeDisabled();
+  await expect(page.locator('#config-operations-prune')).toBeDisabled();
 });
 
 test('a changed authority between pages requires a fresh first-page read', async ({ page }) => {

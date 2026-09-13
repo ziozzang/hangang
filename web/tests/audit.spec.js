@@ -8,7 +8,7 @@ const events = Array.from({ length: 101 }, (_, index) => ({
   password_changed: false, affected_count: 1, through_id: null,
 }));
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, pruneConflict = false, longHistory = false, missingRetention = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, pruneConflict = false, longHistory = false, missingRetention = false, configReceipt = false } = {}) {
   const calls = [];
   let release;
   const blocked = new Promise((resolve) => { release = resolve; });
@@ -32,8 +32,10 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       if (unavailable) return route.fulfill({ status: 503, json: { title: 'Audit Unavailable', detail: 'audit storage unavailable' } });
       if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
       const after = Number(url.searchParams.get('after'));
-      const rows = longHistory ? [{ ...events[0], id: after + 1 }] : events.filter((event) => event.id > after).slice(0, 100);
-      const result = { scope: 'instance', coverage: ['bootstrap', 'create', 'update', 'delete', 'prune'],
+      const sourceEvents = configReceipt ? [events[0], { ...events[1], action: 'config_operations_prune', target_user_id: null,
+        before: null, after: null, password_changed: false, affected_count: 4, through_id: 77 }, ...events.slice(2)] : events;
+      const rows = longHistory ? [{ ...events[0], id: after + 1 }] : sourceEvents.filter((event) => event.id > after).slice(0, 100);
+      const result = { scope: 'instance', coverage: ['bootstrap', 'create', 'update', 'delete', 'prune', 'config_operations_prune'],
         started_at_unix_ms: 1788999999000, records: rows, next_after: rows.at(-1)?.id ?? after,
         oldest_id: 1, latest_id: longHistory ? 100000 : 101, pruned_through: 0, truncated: false,
         stored_records: 100000, capacity: 100000, writes_available: false,
@@ -160,4 +162,12 @@ test('forward paging stays available beyond the bounded backcursor stack', async
   await expect(page.locator('#audit-next')).toBeEnabled();
   await page.locator('#audit-previous').click();
   await expect(page.locator('#audit-page-state')).toContainText('Page 65 ·');
+});
+
+test('account audit labels configuration operation pruning as a distinct receipt', async ({ page }) => {
+  await fixture(page, { configReceipt: true });
+  await page.locator('[data-view="audit"]').click();
+  await expect(page.locator('#audit-rows tr').nth(1)).toContainText('Configuration operation history pruned');
+  await expect(page.locator('#audit-rows tr').nth(1)).toContainText('4 terminal configuration operations pruned');
+  await expect(page.locator('#audit-rows tr').nth(1)).toContainText('Configuration operation through #77');
 });
