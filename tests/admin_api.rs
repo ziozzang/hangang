@@ -2086,6 +2086,411 @@ async fn config_operation_history_is_admin_only_strict_paginated_and_redacted() 
     }
 }
 
+async fn post_named_route(address: std::net::SocketAddr, id: &str, revision: u64) -> u16 {
+    let body =
+        format!(r#"{{"id":"{id}","path_prefix":"/{id}","backends":["http://127.0.0.1:9"]}}"#);
+    request(
+        address,
+        "POST",
+        "/v1/routes/http",
+        Some(&body),
+        Some(revision),
+    )
+    .await
+    .0
+}
+
+async fn config_operation_page(address: std::net::SocketAddr) -> serde_json::Value {
+    let (status, headers, body) = request(
+        address,
+        "GET",
+        "/v1/config/operations?after=0&limit=100",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    json(&body)
+}
+
+fn config_prune_body(page: &serde_json::Value, through_id: i64) -> String {
+    serde_json::json!({
+        "through_id": through_id,
+        "expected_latest_id": page["latest_id"],
+        "expected_history_revision": page["history_revision"],
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn config_operation_prune_keeps_unresolved_records_and_never_reuses_ids() {
+    let (address, manager, _directory) = server().await;
+    assert_eq!(post_named_route(address, "retention-one", 0).await, 201);
+
+    // A failed terminal journal write leaves a real Accepted operation even
+    // though the separately stored configuration was activated.
+    let db = manager.state_path.with_extension("admin-users.sqlite3");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_finish_for_retention BEFORE UPDATE ON admin_config_operations \
+             WHEN NEW.state!='accepted' BEGIN SELECT RAISE(ABORT, 'fixture completion failure'); END;",
+        )
+        .unwrap();
+    assert_eq!(post_named_route(address, "retention-two", 1).await, 503);
+    connection
+        .execute_batch("DROP TRIGGER reject_finish_for_retention")
+        .unwrap();
+
+    // A failed local persistence attempt is conservatively Indeterminate.
+    let backup = manager.state_path.with_extension("saved-state.json");
+    std::fs::rename(&manager.state_path, &backup).unwrap();
+    std::fs::create_dir(&manager.state_path).unwrap();
+    let failed_status = post_named_route(address, "retention-three", 2).await;
+    std::fs::remove_dir(&manager.state_path).unwrap();
+    std::fs::rename(&backup, &manager.state_path).unwrap();
+    assert_ne!(failed_status, 201);
+    assert_eq!(manager.active.load().config.revision, 2);
+    assert_eq!(post_named_route(address, "retention-four", 2).await, 201);
+    assert_eq!(post_named_route(address, "retention-five", 3).await, 201);
+
+    let before = config_operation_page(address).await;
+    assert_eq!(before["records"].as_array().unwrap().len(), 5);
+    assert_eq!(before["records"][0]["state"], "candidate_activated");
+    assert_eq!(before["records"][1]["state"], "accepted");
+    assert_eq!(before["records"][2]["state"], "indeterminate");
+    assert_eq!(before["records"][3]["state"], "candidate_activated");
+    assert_eq!(before["records"][4]["state"], "candidate_activated");
+    assert_eq!(before["latest_id"], 5);
+    assert_eq!(before["pruned_through"], 0);
+    assert_eq!(before["truncated"], false);
+
+    let stale = config_prune_body(&before, 5);
+    let operation_id = before["records"][1]["operation_id"].as_str().unwrap();
+    let reopened = hangang::admin_users::Store::open(db).unwrap();
+    reopened
+        .finish_config(
+            operation_id,
+            hangang::admin_users::ConfigOperationState::Indeterminate,
+        )
+        .await
+        .unwrap();
+    let changed = config_operation_page(address).await;
+    assert_eq!(changed["latest_id"], before["latest_id"]);
+    assert!(
+        changed["history_revision"].as_u64().unwrap()
+            > before["history_revision"].as_u64().unwrap()
+    );
+    let (status, headers, body) = request(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&stale),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["status"], 409);
+    let after_stale = config_operation_page(address).await;
+    assert_eq!(after_stale["history_revision"], changed["history_revision"]);
+    assert_eq!(after_stale["stored_records"], 5);
+
+    let valid = config_prune_body(&changed, 5);
+    let (status, headers, body) = request(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&valid),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["cache-control"], "no-store");
+    let pruned = json(&body);
+    assert_eq!(pruned["pruned_records"], 3);
+    assert_eq!(pruned["retained_unresolved"], 2);
+    assert_eq!(pruned["record"]["action"], "config_operations_prune");
+    assert_eq!(pruned["record"]["actor_kind"], "system");
+    assert_eq!(pruned["record"]["affected_count"], 3);
+    assert_eq!(pruned["record"]["through_id"], 5);
+    assert!(
+        pruned["record"]["through_id"].as_i64().unwrap() > pruned["record"]["id"].as_i64().unwrap(),
+        "cross-journal boundary may exceed account audit sequence"
+    );
+    let after = config_operation_page(address).await;
+    assert_eq!(after["records"].as_array().unwrap().len(), 2);
+    assert_eq!(after["records"][0]["id"], 2);
+    assert_eq!(after["records"][1]["id"], 3);
+    assert_eq!(after["records"][0]["state"], "indeterminate");
+    assert_eq!(after["records"][1]["state"], "indeterminate");
+    assert_eq!(after["stored_records"], 2);
+    assert_eq!(after["oldest_id"], 2);
+    assert_eq!(after["latest_id"], 5);
+    assert_eq!(after["pruned_through"], 5);
+    assert_eq!(after["truncated"], true);
+    assert!(
+        after["history_revision"].as_u64().unwrap() > changed["history_revision"].as_u64().unwrap()
+    );
+    let (_, _, audit_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    let audit = json(&audit_body);
+    assert!(
+        audit["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "config_operations_prune")
+    );
+    assert_eq!(audit["records"].as_array().unwrap().len(), 2);
+    assert_eq!(audit["records"][1]["action"], "config_operations_prune");
+
+    assert_eq!(post_named_route(address, "retention-six", 4).await, 201);
+    let newest = config_operation_page(address).await;
+    assert_eq!(newest["latest_id"], 6);
+    assert_eq!(newest["records"].as_array().unwrap().len(), 3);
+    assert_eq!(newest["records"][2]["id"], 6);
+    assert_eq!(newest["stored_records"], 3);
+}
+
+#[tokio::test]
+async fn config_operation_prune_checks_role_bounds_and_rolls_back_on_audit_failure() {
+    let (address, manager, _directory) = server().await;
+    assert_eq!(post_named_route(address, "prune-one", 0).await, 201);
+    assert_eq!(post_named_route(address, "prune-two", 1).await, 201);
+    let before = config_operation_page(address).await;
+    let valid = config_prune_body(&before, 2);
+
+    let (status, headers, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&valid),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["status"], 401);
+    let root_credentials = r#"{"username":"pruneroot","password":"first secure password 123"}"#;
+    let (status, _, root_body) = request(
+        address,
+        "POST",
+        "/v1/auth/bootstrap",
+        Some(root_credentials),
+        None,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let root_id = json(&root_body)["user"]["id"].as_i64().unwrap();
+    let (status, _, login_body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(root_credentials),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let root_token = json(&login_body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/users",
+            Some(r#"{"username":"pruneviewer","password":"viewer secure password 123","role":"viewer"}"#),
+            None,
+        )
+        .await
+        .0,
+        201
+    );
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"pruneviewer","password":"viewer secure password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let viewer = json(&body)["token"].as_str().unwrap().to_owned();
+    let (status, headers, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&valid),
+        None,
+        Some(&viewer),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["status"], 403);
+
+    let latest = before["latest_id"].as_i64().unwrap();
+    let history = before["history_revision"].as_u64().unwrap();
+    for invalid in [
+        serde_json::json!({"through_id":0,"expected_latest_id":latest,"expected_history_revision":history}),
+        serde_json::json!({"through_id":-1,"expected_latest_id":latest,"expected_history_revision":history}),
+        serde_json::json!({"through_id":9_007_199_254_740_992_u64,"expected_latest_id":latest,"expected_history_revision":history}),
+        serde_json::json!({"through_id":1,"expected_latest_id":latest,"expected_history_revision":9_007_199_254_740_992_u64}),
+        serde_json::json!({"through_id":1,"expected_latest_id":latest}),
+        serde_json::json!({"through_id":1,"expected_latest_id":latest,"expected_history_revision":history,"unknown":true}),
+    ] {
+        let (status, headers, body) = request(
+            address,
+            "POST",
+            "/v1/config/operations/prune",
+            Some(&invalid.to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400, "body {invalid}");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(json(&body)["status"], 400);
+    }
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/config/operations/prune?unused=1",
+            Some(&valid),
+            None,
+        )
+        .await
+        .0,
+        400
+    );
+
+    let db = manager.state_path.with_extension("admin-users.sqlite3");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_config_prune_receipt BEFORE INSERT ON admin_audit \
+             BEGIN SELECT RAISE(ABORT, 'fixture audit append failure'); END;",
+        )
+        .unwrap();
+    let (status, headers, _) = request(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&valid),
+        None,
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(headers["cache-control"], "no-store");
+    let unchanged = config_operation_page(address).await;
+    assert_eq!(unchanged["history_revision"], before["history_revision"]);
+    assert_eq!(unchanged["stored_records"], 2);
+    assert_eq!(unchanged["pruned_through"], 0);
+    assert_eq!(unchanged["records"].as_array().unwrap().len(), 2);
+    connection
+        .execute_batch("DROP TRIGGER reject_config_prune_receipt")
+        .unwrap();
+    let (_, _, audit_body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert!(
+        json(&audit_body)["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["action"] != "config_operations_prune")
+    );
+
+    let (status, headers, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&valid),
+        None,
+        Some(&root_token),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let result = json(&body);
+    assert_eq!(result["pruned_records"], 2);
+    assert_eq!(result["record"]["action"], "config_operations_prune");
+    assert_eq!(result["record"]["actor_kind"], "account");
+    assert_eq!(result["record"]["actor_user_id"], root_id);
+    assert_eq!(config_operation_page(address).await["stored_records"], 0);
+}
+
+#[tokio::test]
+async fn config_operation_prune_can_revisit_a_boundary_after_late_completion() {
+    let (address, manager, _directory) = server().await;
+    let db = manager.state_path.with_extension("admin-users.sqlite3");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER hold_config_completion BEFORE UPDATE ON admin_config_operations \
+             WHEN NEW.state!='accepted' BEGIN SELECT RAISE(ABORT, 'fixture delayed completion'); END;",
+        )
+        .unwrap();
+    assert_eq!(post_named_route(address, "late-first", 0).await, 503);
+    connection
+        .execute_batch("DROP TRIGGER hold_config_completion")
+        .unwrap();
+    assert_eq!(post_named_route(address, "late-second", 1).await, 201);
+    let before = config_operation_page(address).await;
+    let first_id = before["records"][0]["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(before["records"][0]["state"], "accepted");
+    let first_prune = config_prune_body(&before, 2);
+    let (status, _, body) = request(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&first_prune),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["pruned_records"], 1);
+    assert_eq!(json(&body)["retained_unresolved"], 1);
+    let retained = config_operation_page(address).await;
+    assert_eq!(retained["records"].as_array().unwrap().len(), 1);
+    assert_eq!(retained["records"][0]["id"], 1);
+    assert_eq!(retained["pruned_through"], 2);
+
+    let reopened = hangang::admin_users::Store::open(db).unwrap();
+    reopened
+        .finish_config(
+            &first_id,
+            hangang::admin_users::ConfigOperationState::CandidateActivated,
+        )
+        .await
+        .unwrap();
+    let completed = config_operation_page(address).await;
+    assert_eq!(completed["records"][0]["state"], "candidate_activated");
+    assert!(
+        completed["history_revision"].as_u64().unwrap()
+            > retained["history_revision"].as_u64().unwrap()
+    );
+    let second_prune = config_prune_body(&completed, 2);
+    let (status, _, body) = request(
+        address,
+        "POST",
+        "/v1/config/operations/prune",
+        Some(&second_prune),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["pruned_records"], 1);
+    assert_eq!(json(&body)["retained_unresolved"], 0);
+    let empty = config_operation_page(address).await;
+    assert!(empty["records"].as_array().unwrap().is_empty());
+    assert_eq!(empty["latest_id"], 2);
+    assert_eq!(empty["pruned_through"], 2);
+}
+
 #[tokio::test]
 async fn protected_route_api_rejects_missing_or_removed_auth_without_advancing_revision() {
     let (address, manager, _dir) = server().await;
