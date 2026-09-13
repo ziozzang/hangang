@@ -1141,7 +1141,7 @@ impl Snapshot {
         Self::build(config, Some(previous))
     }
     /// Side effects that belong to publication, not preparation: call once
-    /// right after this snapshot became the active one. Idempotent.
+    /// immediately before this snapshot becomes visible. Idempotent.
     pub fn activated(&self) {
         if let (Some(runtime), Some(settings)) = (&self.cache, &self.config.cache) {
             runtime.adopt_generation(settings.generation);

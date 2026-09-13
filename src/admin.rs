@@ -483,9 +483,12 @@ impl Manager {
         // Publication-time side effects (cache generation adoption) run
         // before the snapshot becomes visible, so no request can observe the
         // new revision with the previous invalidation fence.
-        next.activated();
-        self.active.store(next);
-        self.tcp.commit(prepared).await;
+        self.tcp
+            .commit_with_publication(prepared, || {
+                next.activated();
+                self.active.store(next);
+            })
+            .await?;
         self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
         self.attach_epoch(epoch);
         self.store_confirmed();
@@ -625,9 +628,12 @@ impl Manager {
         // Publication-time side effects (cache generation adoption) run
         // before the snapshot becomes visible, so no request can observe the
         // new revision with the previous invalidation fence.
-        next.activated();
-        self.active.store(next);
-        self.tcp.commit(prepared).await;
+        self.tcp
+            .commit_with_publication(prepared, || {
+                next.activated();
+                self.active.store(next);
+            })
+            .await?;
         self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
         Ok(config)
     }

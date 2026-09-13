@@ -269,12 +269,25 @@ impl TcpManager {
     /// Activate prepared sockets and stop listeners removed by the new
     /// configuration. Connection tasks are independent and continue draining.
     pub async fn commit(&self, prepared: Prepared) {
+        let _ = self.commit_with_publication(prepared, || {}).await;
+    }
+
+    /// Acquire the listener mutation lock before publishing a snapshot. Once
+    /// the callback runs there is no await until every listener is installed
+    /// or cancelled. Cancellation while waiting leaves the snapshot untouched.
+    pub async fn commit_with_publication(
+        &self,
+        prepared: Prepared,
+        publish: impl FnOnce(),
+    ) -> Result<()> {
         let mut stopped = Vec::new();
         {
             let mut state = self.state.lock().await;
-            if state.shutting_down {
-                return;
-            }
+            ensure!(
+                !state.shutting_down,
+                "TCP manager is shutting down before publication"
+            );
+            publish();
 
             if state.health_monitor.is_none() {
                 let task = tokio::spawn(monitor_tcp_health(
@@ -328,6 +341,7 @@ impl TcpManager {
         for task in stopped {
             let _ = task.await;
         }
+        Ok(())
     }
 
     /// Duplicate the active listening descriptors for transfer to a new
@@ -1038,6 +1052,83 @@ fn ensure_listening_socket(descriptor: &OwnedFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_publication_lock_wait_does_not_expose_candidate() {
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(Config::default()).unwrap(),
+        ));
+        let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 1);
+        let prepared = manager.prepare(&Config::default()).await.unwrap();
+        let changed = Config {
+            revision: 1,
+            ..Default::default()
+        };
+        let next = Arc::new(Snapshot::new(changed).unwrap());
+        let lock = manager.state.lock().await;
+        let mut commit = Box::pin(manager.commit_with_publication(prepared, || active.store(next)));
+        assert!(futures_util::poll!(&mut commit).is_pending());
+        assert_eq!(active.load().config.revision, 0);
+        drop(commit);
+        drop(lock);
+        assert_eq!(active.load().config.revision, 0);
+        assert!(manager.state.lock().await.listeners.is_empty());
+        manager.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_listener_join_keeps_complete_publication() {
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(Config::default()).unwrap(),
+        ));
+        let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 1);
+        let export = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = export.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        // A deliberately noncooperative old accept task keeps the join pending.
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        manager.state.lock().await.listeners.insert(
+            address,
+            ListenerHandle {
+                cancel: cancel.clone(),
+                task,
+                export,
+            },
+        );
+        let prepared = manager.prepare(&Config::default()).await.unwrap();
+        let changed = Config {
+            revision: 1,
+            ..Default::default()
+        };
+        let next = Arc::new(Snapshot::new(changed).unwrap());
+        let mut commit = Box::pin(manager.commit_with_publication(prepared, || active.store(next)));
+        assert!(futures_util::poll!(&mut commit).is_pending());
+        assert_eq!(active.load().config.revision, 1);
+        assert!(manager.state.lock().await.listeners.is_empty());
+        assert!(cancel.is_cancelled());
+        drop(commit);
+        assert_eq!(active.load().config.revision, 1);
+        abort.abort();
+        manager.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_tcp_manager_rejects_snapshot_publication() {
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(Config::default()).unwrap(),
+        ));
+        let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 1);
+        let prepared = manager.prepare(&Config::default()).await.unwrap();
+        manager.stop_accepting().await;
+        assert!(
+            manager
+                .commit_with_publication(prepared, || panic!("must not publish"))
+                .await
+                .is_err()
+        );
+        assert_eq!(active.load().config.revision, 0);
+    }
 
     #[test]
     fn idle_listener_index_does_not_retain_the_global_snapshot() {
