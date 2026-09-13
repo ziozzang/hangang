@@ -21,6 +21,7 @@ const coverage = new Map([
   ['GET /v1/events', ['#stream-state', 'console', "fetch('/v1/events'"]],
   ['GET /v1/traffic', ['#activity-panel', 'console', "fetch('/v1/traffic?limit=128'"]],
   ['GET /v1/operations', ['#view-operations', 'operations', '/v1/operations?offset=']],
+  ['GET /v1/retired-members', ['#retired-rows', 'operations', '/v1/retired-members?offset=']],
   ['GET /v1/status', ['#view-status', 'app', "api('/v1/status'"]],
   ['POST /v1/lifecycle/restart', ['#restart-server', 'app', "api('/v1/lifecycle/restart'"]],
   ['GET /v1/update/status', ['#update-state', 'app', "api('/v1/update/status'"]],

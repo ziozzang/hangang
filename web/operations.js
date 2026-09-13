@@ -2,6 +2,7 @@ import { formatDateLocale, formatNumberLocale, t } from './i18n.js';
 
 const $ = (selector) => document.querySelector(selector);
 const PAGE_SIZE = 100;
+const RETIRED_PAGE_SIZE = 64;
 let apiCall = null;
 let onUnauthorized = null;
 let page = null;
@@ -9,6 +10,10 @@ let offset = 0;
 let requestGeneration = 0;
 let loading = false;
 let loadedAt = null;
+let retiredPage = null;
+let retiredOffset = 0;
+let retiredRequestGeneration = 0;
+let retiredLoading = false;
 
 function node(tag, className, content) {
   const element = document.createElement(tag);
@@ -129,6 +134,96 @@ function render() {
   $('#operations-refresh').disabled = loading;
 }
 
+function renderRetiredRows(rows) {
+  $('#retired-rows').replaceChildren(...rows.map((row) => {
+    const tr = node('tr');
+    const id = node('td');
+    id.append(node('strong', 'operations-primary', Number.isSafeInteger(row.retirement_id) && row.retirement_id >= 0
+      ? `#${formatNumberLocale(row.retirement_id)}` : '—'));
+    const route = node('td');
+    route.append(node('strong', 'operations-primary', row.route_id));
+    route.append(node('span', 'operations-secondary', `${row.protocol.toUpperCase()} · ${row.member_id === null
+      ? t('Legacy target') : t('Member {id}', { id: row.member_id })}`));
+    const address = node('td');
+    address.append(node('code', 'operations-address', row.address));
+    const active = node('td');
+    active.append(node('strong', 'operations-primary', Number.isSafeInteger(row.active_admissions) && row.active_admissions >= 0
+      ? t('{count} admission leases', { count: formatNumberLocale(row.active_admissions) }) : '—'));
+    tr.append(id, route, address, active);
+    return tr;
+  }));
+  $('#retired-empty').hidden = rows.length > 0;
+}
+
+function renderRetired() {
+  if (!retiredPage) return;
+  const { total, rows } = retiredPage;
+  const start = total && rows.length ? retiredOffset + 1 : 0;
+  renderRetiredRows(rows);
+  $('#retired-range').textContent = t('{start}–{end} of {total} active retired generations', {
+    start: formatNumberLocale(start), end: formatNumberLocale(retiredOffset + rows.length),
+    total: formatNumberLocale(total),
+  });
+  $('#retired-capacity').textContent = t('Registry capacity {count}', {
+    count: formatNumberLocale(retiredPage.capacity),
+  });
+  $('#retired-prev').disabled = retiredLoading || retiredOffset === 0;
+  $('#retired-next').disabled = retiredLoading || retiredOffset + retiredPage.limit >= total;
+  $('#retired-refresh').disabled = retiredLoading;
+}
+
+async function fetchRetiredPage(nextOffset, allowCorrection = true) {
+  if (!apiCall) return;
+  const generation = ++retiredRequestGeneration;
+  retiredLoading = true;
+  if (retiredPage) renderRetired();
+  $('#retired-refresh').disabled = true;
+  $('#retired-empty').hidden = true;
+  $('#retired-message').textContent = t('Loading retired members…');
+  try {
+    const { data } = await apiCall(`/v1/retired-members?offset=${nextOffset}&limit=${RETIRED_PAGE_SIZE}`);
+    if (generation !== retiredRequestGeneration) return;
+    if (!data || !Array.isArray(data.rows) || data.rows.length > RETIRED_PAGE_SIZE
+      || !Number.isSafeInteger(data.total) || data.total < 0
+      || data.offset !== nextOffset || data.limit !== RETIRED_PAGE_SIZE
+      || data.capacity !== 4096
+      || data.rows.length > Math.max(0, data.total - nextOffset)
+      || data.rows.some((row) => !row || !['http', 'tcp'].includes(row.protocol)
+        || typeof row.route_id !== 'string' || typeof row.address !== 'string'
+        || (row.member_id !== null && typeof row.member_id !== 'string')
+        || !Number.isInteger(row.retirement_id) || row.retirement_id < 0
+        || !Number.isInteger(row.active_admissions) || row.active_admissions < 0)) {
+      throw new Error(t('Invalid retired members response.'));
+    }
+    if (allowCorrection && data.total > 0 && nextOffset >= data.total) {
+      retiredLoading = false;
+      return fetchRetiredPage(Math.floor((data.total - 1) / RETIRED_PAGE_SIZE) * RETIRED_PAGE_SIZE, false);
+    }
+    retiredOffset = nextOffset;
+    retiredPage = data;
+    $('#retired-message').textContent = '';
+  } catch (error) {
+    if (generation !== retiredRequestGeneration) return;
+    if (error.status === 401 || error.status === 403) {
+      const callback = onUnauthorized;
+      resetOperations();
+      callback?.();
+      return;
+    }
+    const detail = error.message || t('Could not load retired members.');
+    $('#retired-message').textContent = retiredPage
+      ? t('Refresh failed; showing last loaded retired members. {error}', { error: detail })
+      : detail;
+  } finally {
+    if (generation === retiredRequestGeneration) {
+      retiredLoading = false;
+      $('#retired-refresh').disabled = false;
+      if (retiredPage) renderRetired();
+      else $('#retired-empty').hidden = true;
+    }
+  }
+}
+
 async function fetchPage(nextOffset, allowCorrection = true) {
   if (!apiCall) return;
   const generation = ++requestGeneration;
@@ -173,21 +268,26 @@ async function fetchPage(nextOffset, allowCorrection = true) {
 export async function loadOperations(api, unauthorized) {
   apiCall = api;
   onUnauthorized = unauthorized;
-  await fetchPage(offset);
+  await Promise.all([fetchPage(offset), fetchRetiredPage(retiredOffset)]);
 }
 
 export function refreshOperationsCopy() {
   if (page) render();
+  if (retiredPage) renderRetired();
 }
 
 export function resetOperations() {
   requestGeneration += 1;
+  retiredRequestGeneration += 1;
   apiCall = null;
   onUnauthorized = null;
   page = null;
   loadedAt = null;
   offset = 0;
   loading = false;
+  retiredPage = null;
+  retiredOffset = 0;
+  retiredLoading = false;
   $('#operations-message').textContent = '';
   $('#operations-capabilities').replaceChildren();
   $('#operations-rows').replaceChildren();
@@ -198,8 +298,19 @@ export function resetOperations() {
   $('#operations-prev').disabled = true;
   $('#operations-next').disabled = true;
   $('#operations-refresh').disabled = false;
+  $('#retired-message').textContent = '';
+  $('#retired-rows').replaceChildren();
+  $('#retired-range').textContent = '';
+  $('#retired-capacity').textContent = '';
+  $('#retired-empty').hidden = false;
+  $('#retired-prev').disabled = true;
+  $('#retired-next').disabled = true;
+  $('#retired-refresh').disabled = false;
 }
 
 $('#operations-refresh').addEventListener('click', () => { if (!loading) fetchPage(offset); });
 $('#operations-prev').addEventListener('click', () => { if (!loading && offset > 0) fetchPage(Math.max(0, offset - PAGE_SIZE)); });
 $('#operations-next').addEventListener('click', () => { if (!loading && page && offset + PAGE_SIZE < page.total) fetchPage(offset + PAGE_SIZE); });
+$('#retired-refresh').addEventListener('click', () => { if (!retiredLoading) fetchRetiredPage(retiredOffset); });
+$('#retired-prev').addEventListener('click', () => { if (!retiredLoading && retiredOffset > 0) fetchRetiredPage(Math.max(0, retiredOffset - RETIRED_PAGE_SIZE)); });
+$('#retired-next').addEventListener('click', () => { if (!retiredLoading && retiredPage && retiredOffset + RETIRED_PAGE_SIZE < retiredPage.total) fetchRetiredPage(retiredOffset + RETIRED_PAGE_SIZE); });

@@ -26,7 +26,7 @@ const rows = [first, ...Array.from({ length: 99 }, (_, index) => ({
   ...first, backend_index: index + 1, address: `http://192.0.2.${index + 1}:8080`,
 })), last];
 
-async function fixture(page, viewer = false, operationRows = rows) {
+async function fixture(page, viewer = false, operationRows = rows, retiredRows = []) {
   const calls = [];
   await page.route('**/*', async (route) => {
     const request = route.request();
@@ -50,6 +50,14 @@ async function fixture(page, viewer = false, operationRows = rows) {
           signed_updates_enabled: false, configuration_source: 'shared',
         },
         total: operationRows.length, offset, limit, rows: operationRows.slice(offset, offset + limit),
+      } });
+    }
+    if (url.pathname === '/v1/retired-members') {
+      const offset = Number(url.searchParams.get('offset'));
+      const limit = Number(url.searchParams.get('limit'));
+      return route.fulfill({ json: {
+        total: retiredRows.length, offset, limit, capacity: 4096,
+        rows: retiredRows.slice(offset, offset + limit),
       } });
     }
     if (url.pathname === '/v1/events') return route.fulfill({ status: 503, body: 'unavailable' });
@@ -183,12 +191,107 @@ test('operations view shows real local eligibility, bounded paging and escaped t
   await expect(page.locator('#operations-rows')).toContainText(rows[0].address);
 });
 
+test('retired members have independent paging, refresh, escaped values and Korean labels', async ({ page }) => {
+  const retiredRows = Array.from({ length: 65 }, (_, index) => ({
+    retirement_id: index + 1, protocol: index ? 'tcp' : 'http',
+    route_id: index ? `tcp-${index}` : 'api-retired',
+    member_id: index ? null : 'blue',
+    address: index ? `192.0.2.${index}:443` : '<img src=x onerror="window.__retiredInjected=1">',
+    active_admissions: index ? 2 : 3,
+  }));
+  const calls = await fixture(page, false, [], retiredRows);
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#operations-rows tr')).toHaveCount(0);
+  await expect(page.locator('#retired-rows tr')).toHaveCount(64);
+  await expect(page.locator('#retired-rows tr').first()).toContainText('3 admission leases');
+  await expect(page.locator('#retired-rows tr').first()).toContainText('Member blue');
+  await expect(page.locator('#retired-rows')).toContainText(retiredRows[0].address);
+  await expect(page.locator('#retired-rows img')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__retiredInjected)).toBeUndefined();
+  expect(calls.find((call) => call.path === '/v1/retired-members')).toMatchObject({
+    search: '?offset=0&limit=64', authorization: `Bearer ${TOKEN}`,
+  });
+  await page.locator('#retired-next').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(1);
+  await expect(page.locator('#retired-range')).toContainText('65–65 of 65');
+  await expect(page.locator('#operations-rows tr')).toHaveCount(0);
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#retired-members-title')).toHaveText('교체되어 은퇴한 멤버');
+  await expect(page.locator('#retired-rows tr')).toContainText('진행 중인 admission lease 2개');
+  await page.locator('#retired-prev').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(64);
+  await page.locator('#retired-refresh').click();
+  await expect.poll(() => calls.filter((call) => call.path === '/v1/retired-members').length).toBe(4);
+  expect(calls.filter((call) => call.path === '/v1/operations')).toHaveLength(1);
+});
+
+test('empty retired inventory is instance-local and never presented as completed drain', async ({ page }) => {
+  await fixture(page, false, []);
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(0);
+  await expect(page.locator('#retired-empty')).toBeVisible();
+  await expect(page.locator('#retired-range')).toContainText('0–0 of 0');
+  await expect(page.locator('#retired-capacity')).toContainText('4,096');
+  await expect(page.locator('#view-operations')).toContainText('An empty list does not prove that other instances are drained.');
+});
+
+test('retired refresh failure keeps the last observation and reports the error', async ({ page }) => {
+  await fixture(page, false, [], [{ retirement_id: 4, protocol: 'http', route_id: 'api',
+    member_id: 'blue', address: 'http://192.0.2.4:80', active_admissions: 1 }]);
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(1);
+  await page.route('**/v1/retired-members?*', (route) => route.fulfill({ status: 503, json: { title: 'Unavailable' } }));
+  await page.locator('#retired-refresh').click();
+  await expect(page.locator('#retired-message')).toContainText('Refresh failed; showing last loaded retired members.');
+  await expect(page.locator('#retired-rows tr')).toHaveCount(1);
+  await expect(page.locator('#retired-empty')).toBeHidden();
+  await expect(page.locator('#retired-refresh')).toBeEnabled();
+});
+
+test('retired endpoint denial scrubs both privileged tables and delayed responses stay discarded', async ({ page }) => {
+  await fixture(page, false, [first], [{ retirement_id: 7, protocol: 'tcp',
+    route_id: 'socket', member_id: 'blue', address: '192.0.2.10:443', active_admissions: 2 }]);
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(1);
+  await page.route('**/v1/retired-members?*', (route) => route.fulfill({ status: 403, json: { title: 'Forbidden' } }));
+  await page.locator('#retired-refresh').click();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(0);
+  await expect(page.locator('#operations-rows tr')).toHaveCount(0);
+  await page.unroute('**/v1/retired-members?*');
+
+  await page.getByLabel('Administrator token').fill(TOKEN);
+  await page.getByRole('button', { name: 'Connect' }).click();
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(1);
+  let release;
+  let requested;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const seen = new Promise((resolve) => { requested = resolve; });
+  await page.route('**/v1/retired-members?*', async (route) => {
+    requested();
+    await gate;
+    await route.fulfill({ json: { total: 1, offset: 0, limit: 64, capacity: 4096,
+      rows: [{ retirement_id: 8, protocol: 'http', route_id: 'late', member_id: null,
+        address: 'http://late.example', active_admissions: 1 }] } });
+  });
+  await page.locator('#retired-refresh').click();
+  await seen;
+  await expect(page.locator('#retired-message')).toHaveText('Loading retired members…');
+  await expect(page.locator('#retired-refresh')).toBeDisabled();
+  await page.locator('#logout-button').click();
+  release();
+  await expect(page.locator('#retired-rows tr')).toHaveCount(0);
+  await expect(page.locator('#retired-rows')).not.toContainText('late');
+});
+
 test('viewer cannot navigate to operations or request its administrator API', async ({ page }) => {
   const calls = await fixture(page, true);
   await expect(page.locator('a[href="#operations"]')).toBeHidden();
   await page.evaluate(() => { location.hash = '#operations'; });
   await expect(page).toHaveURL(/#status$/);
   expect(calls.filter((call) => call.path === '/v1/operations')).toHaveLength(0);
+  expect(calls.filter((call) => call.path === '/v1/retired-members')).toHaveLength(0);
 });
 
 test('an expired or downgraded account clears privileged operations before showing sign-in', async ({ page }) => {
