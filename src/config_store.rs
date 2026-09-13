@@ -545,6 +545,8 @@ fn sequenced_observation(
     if count > COMMIT_RECEIPT_CAPACITY
         || authorities > COMMIT_AUTHORITY_CAPACITY
         || high_water > MAX_ACCEPTANCE_SEQUENCE
+        || (receipt.is_some() && count == 0)
+        || (high_water > 0 && authorities == 0)
         || receipt
             .as_ref()
             .is_some_and(|entry| entry.stamp.acceptance_seq > high_water)
@@ -1801,7 +1803,7 @@ fn sqlite_sequenced_observation(
         .map_err(sqlite_error)?;
     let authorities: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM hangang_sequenced_authorities",
+            "SELECT COUNT(*) FROM (SELECT 1 FROM hangang_sequenced_authorities LIMIT 4097)",
             [],
             |r| r.get(0),
         )
@@ -2051,7 +2053,7 @@ impl PostgresConfigStore {
             .query_opt(
                 Access::Read,
                 "SELECT m.stored_records,
-                (SELECT COUNT(*) FROM hangang_sequenced_authorities),
+                (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_sequenced_authorities LIMIT 4097)),
                 (SELECT high_water FROM hangang_sequenced_authorities WHERE authority_id=$1),
                 CASE WHEN octet_length(r.authority_id)<=32 THEN r.authority_id END,
                 r.acceptance_seq,
@@ -2280,7 +2282,7 @@ impl PostgresConfigStore {
                 GET DIAGNOSTICS changed=ROW_COUNT;
                 IF changed=0 THEN RETURN FALSE; END IF;
                 IF NOT EXISTS (SELECT 1 FROM hangang_sequenced_authorities WHERE authority_id=p_authority)
-                   AND (SELECT COUNT(*) FROM hangang_sequenced_authorities)>=4096 THEN
+                   AND (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_sequenced_authorities LIMIT 4096))>=4096 THEN
                     RAISE EXCEPTION 'sequenced authority capacity exhausted' USING ERRCODE='23514';
                 END IF;
                 INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
