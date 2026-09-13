@@ -272,10 +272,6 @@ impl AuthRouteLease {
         }
     }
 
-    fn current(&self) -> bool {
-        !self.retirement().any()
-    }
-
     async fn revoked(&self) -> AuthRetirement {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -295,6 +291,18 @@ async fn auth_retired(lease: Option<&AuthRouteLease>) -> AuthRetirement {
     } else {
         std::future::pending::<AuthRetirement>().await
     }
+}
+
+fn retired_auth_response(
+    lease: Option<&AuthRouteLease>,
+    metrics: &Metrics,
+) -> Option<Response<Body>> {
+    let retired = lease?.retirement();
+    if !retired.any() {
+        return None;
+    }
+    retired.record(metrics);
+    Some(response(503, "route authorization retired"))
 }
 
 // The Hyper connection watcher handles listener-material retirement; this
@@ -1466,6 +1474,17 @@ impl Proxy {
             }
         }
 
+        // A request transform may buffer or stream the client body before the
+        // upstream send loop starts. Guard the original body as soon as all
+        // gateway authenticators have established their lease.
+        if let Some(lease) = &auth_route_lease
+            && !request.body().is_end_stream()
+        {
+            let body = std::mem::replace(request.body_mut(), full_body(Bytes::new()));
+            *request.body_mut() =
+                AuthResponseBody::new(body, lease.clone(), self.metrics.clone()).boxed_unsync();
+        }
+
         if let Some(auth) = &runtime.route.auth {
             if auth
                 .request_headers
@@ -1481,7 +1500,18 @@ impl Proxy {
             for name in &auth.response_headers {
                 request.headers_mut().remove(name);
             }
-            match self.authorize(auth, &mut request, &edge).await {
+            let authorization = tokio::select! {
+                biased;
+                retired = auth_retired(auth_route_lease.as_ref()) => {
+                    retired.record(&self.metrics);
+                    return Ok(response(503, "route authorization retired"));
+                }
+                outcome = self.authorize(auth, &mut request, &edge) => outcome,
+            };
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
+            }
+            match authorization {
                 AuthOutcome::Allow(headers, cookies) => {
                     if let Some(policy) = resource_policy
                         && matches!(
@@ -1506,11 +1536,10 @@ impl Proxy {
                 }
                 AuthOutcome::Forward(mut forwarded) => {
                     self.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    if auth_route_lease
-                        .as_ref()
-                        .is_some_and(|lease| !lease.current())
+                    if let Some(denied) =
+                        retired_auth_response(auth_route_lease.as_ref(), &self.metrics)
                     {
-                        return Ok(response(503, "route authorization retired"));
+                        return Ok(denied);
                     }
                     if let Some(lease) = &auth_route_lease {
                         let body = std::mem::replace(forwarded.body_mut(), full_body(Bytes::new()));
@@ -1564,7 +1593,18 @@ impl Proxy {
                 path: request.uri().path().to_owned(),
                 headers: policy_headers(&visible_headers),
             };
-            match self.policy.evaluate(input).await {
+            let evaluation = tokio::select! {
+                biased;
+                retired = auth_retired(auth_route_lease.as_ref()) => {
+                    retired.record(&self.metrics);
+                    return Ok(response(503, "route authorization retired"));
+                }
+                result = self.policy.evaluate(input) => result,
+            };
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
+            }
+            match evaluation {
                 Ok(decision) => {
                     if let Some(status) = decision.reject {
                         let status = StatusCode::from_u16(status)
@@ -1637,11 +1677,8 @@ impl Proxy {
             }
         }
 
-        if auth_route_lease
-            .as_ref()
-            .is_some_and(|lease| !lease.current())
-        {
-            return Ok(response(503, "route authorization retired"));
+        if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+            return Ok(denied);
         }
 
         // Explicitly protected routes check gateway authentication and any
@@ -1723,16 +1760,25 @@ impl Proxy {
             // Config validation rejects a transform naming an identity header;
             // re-assert regardless so the authenticated identity always wins.
             reassert_identity_headers(&mut parts.headers, &established_identity, auth_reserved);
-            match crate::transform_body::transform(
+            let transformed = tokio::select! {
+                biased;
+                retired = auth_retired(auth_route_lease.as_ref()) => {
+                    retired.record(&self.metrics);
+                    return Ok(response(503, "route authorization retired"));
+                }
+                result = crate::transform_body::transform(
                 body,
                 config.clone(),
                 self.policy.clone(),
                 "request",
                 transform_budget.clone().expect("transform budget"),
                 self.metrics.clone(),
-            )
-            .await
-            {
+                ) => result,
+            };
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
+            }
+            match transformed {
                 Ok(body) => request = Request::from_parts(parts, body),
                 Err(error) => {
                     return Ok(response(
@@ -1902,11 +1948,8 @@ impl Proxy {
         let mut first_request = Some(Request::from_parts(parts, first_body));
         let mut attempt = 0usize;
         let upstream = loop {
-            if auth_route_lease
-                .as_ref()
-                .is_some_and(|lease| !lease.current())
-            {
-                return Ok(response(503, "route authorization retired"));
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
             }
             attempt += 1;
             let uri = match build_upstream_uri(&backend, &client_pq, host_override.as_deref()) {
@@ -1961,7 +2004,11 @@ impl Proxy {
                     request
                 }
             };
-            if let Some(lease) = &auth_route_lease
+            // Raw request bodies already carry the guard installed before
+            // external auth/Lua/transform buffering. A transformed body is a
+            // new stream and needs its own final output guard.
+            if runtime.request_transform.is_some()
+                && let Some(lease) = &auth_route_lease
                 && !outgoing.body().is_end_stream()
             {
                 outgoing = outgoing.map(|body| {
@@ -1986,7 +2033,18 @@ impl Proxy {
                     None => self.client.request(outgoing).await,
                 }
             };
-            match timeout(header_timeout, send).await {
+            let sent = tokio::select! {
+                biased;
+                retired = auth_retired(auth_route_lease.as_ref()) => {
+                    retired.record(&self.metrics);
+                    return Ok(response(503, "route authorization retired"));
+                }
+                result = timeout(header_timeout, send) => result,
+            };
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
+            }
+            match sent {
                 Ok(Ok(response)) => break response,
                 Ok(Err(error)) => {
                     if let Some(lease) = &backend_lease {
@@ -2029,11 +2087,8 @@ impl Proxy {
             }
         };
         let mut upstream = upstream;
-        if auth_route_lease
-            .as_ref()
-            .is_some_and(|lease| !lease.current())
-        {
-            return Ok(response(503, "route authorization retired"));
+        if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+            return Ok(denied);
         }
 
         let cache_header_ms = if cache_fill.is_some() {
@@ -2109,11 +2164,8 @@ impl Proxy {
         }
 
         if let (Some(downstream), Some(upstream)) = (downstream_upgrade, upstream_upgrade) {
-            if auth_route_lease
-                .as_ref()
-                .is_some_and(|lease| !lease.current())
-            {
-                return Ok(response(503, "route authorization retired"));
+            if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                return Ok(denied);
             }
             // Register admission before checking closed. Shutdown must either
             // see this token or prevent this new tunnel from being spawned.
@@ -2182,16 +2234,27 @@ impl Proxy {
                 }
                 let (mut parts, body) = response.into_parts();
                 crate::transform_body::rewrite_headers(&mut parts.headers, config);
-                match crate::transform_body::transform(
+                let transformed = tokio::select! {
+                    biased;
+                    retired = auth_retired(auth_route_lease.as_ref()) => {
+                        retired.record(&self.metrics);
+                        return Ok(crate::proxy::response(503, "route authorization retired"));
+                    }
+                    result = crate::transform_body::transform(
                     body,
                     config.clone(),
                     self.policy.clone(),
                     "response",
                     transform_budget.clone().expect("transform budget"),
                     self.metrics.clone(),
-                )
-                .await
+                    ) => result,
+                };
+                if let Some(denied) =
+                    retired_auth_response(auth_route_lease.as_ref(), &self.metrics)
                 {
+                    return Ok(denied);
+                }
+                match transformed {
                     Ok(body) => response = Response::from_parts(parts, body),
                     Err(error) => {
                         return Ok(self.failure(
