@@ -329,13 +329,15 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(args.listen).await?;
     // The address is useful for supervisors and lets an owned :0 fixture
     // confirm readiness from this process instead of probing a released port.
-    let mut output = std::io::stdout().lock();
-    let _ = writeln!(
-        output,
-        "HANGANG_ADMIN_GATEWAY_LISTEN {}",
-        listener.local_addr()?
-    );
-    let _ = output.flush();
+    {
+        let mut output = std::io::stdout().lock();
+        let _ = writeln!(
+            output,
+            "HANGANG_ADMIN_GATEWAY_LISTEN {}",
+            listener.local_addr()?
+        );
+        let _ = output.flush();
+    }
     let connections = Arc::new(Semaphore::new(args.max_connections));
     let state = Arc::new(State {
         socket: args.admin_socket,
