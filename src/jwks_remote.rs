@@ -30,13 +30,42 @@ fn default_timeout() -> u64 {
     3_000
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RemoteJwksEndpoint {
     /// Read OIDC metadata from `<issuer>/.well-known/openid-configuration`.
     Oidc,
     /// Explicitly trust a JWKS URL, including a different origin if needed.
     Jwks { url: String },
+}
+
+impl<'de> Deserialize<'de> for RemoteJwksEndpoint {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OidcWire {
+            kind: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct JwksWire {
+            kind: String,
+            url: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Oidc(OidcWire),
+            Jwks(JwksWire),
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Oidc(OidcWire { kind }) if kind == "oidc" => Ok(Self::Oidc),
+            Wire::Jwks(JwksWire { kind, url }) if kind == "jwks" => Ok(Self::Jwks { url }),
+            _ => Err(serde::de::Error::custom("invalid remote JWKS endpoint")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,13 +266,28 @@ impl RemoteJwksProvider {
                 });
             }
         }
-        let fetched = self.fetch_keys().await;
+        // Reserve the cooldown before the first await. If the caller cancels
+        // this future, the fetch guard drops but the next request cannot
+        // immediately start another network operation.
+        let fetch_started = Instant::now();
+        {
+            let mut cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
+            cache.next_refresh_at =
+                fetch_started + Duration::from_secs(self.config.refresh_cooldown_seconds);
+            cache.last_refresh_failed = true;
+        }
+        let fetch_deadline = fetch_started + Duration::from_secs(self.config.cache_ttl_seconds);
+        let fetched = tokio::time::timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.fetch_keys(),
+        )
+        .await;
         let now = Instant::now();
         let mut cache = self.cache.lock().map_err(|_| RemoteKeyError::Unavailable)?;
         cache.next_refresh_at = now + Duration::from_secs(self.config.refresh_cooldown_seconds);
         match fetched {
-            Ok(keys) => {
-                cache.expires_at = now + Duration::from_secs(self.config.cache_ttl_seconds);
+            Ok(Ok(keys)) if now < fetch_deadline => {
+                cache.expires_at = fetch_deadline;
                 cache.keys = Some(keys);
                 cache.last_refresh_failed = false;
                 cache
@@ -252,7 +296,7 @@ impl RemoteJwksProvider {
                     .and_then(|keys| keys.get_for(&request.kid, request.algorithm))
                     .ok_or(RemoteKeyError::UnknownKey)
             }
-            Err(_) => {
+            _ => {
                 cache.last_refresh_failed = true;
                 Err(RemoteKeyError::Unavailable)
             }
@@ -388,7 +432,7 @@ async fn fetch_bounded(client: &Client, url: &Url) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use base64::Engine;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn config(endpoint: RemoteJwksEndpoint) -> RemoteJwksConfig {
@@ -458,6 +502,30 @@ mod tests {
         assert!(candidate.validate("https://issuer.example").is_err());
     }
 
+    #[test]
+    fn endpoint_wire_shape_is_explicit_and_closed() {
+        let oidc: RemoteJwksConfig =
+            serde_json::from_str(r#"{"endpoint":{"kind":"oidc"}}"#).unwrap();
+        assert_eq!(oidc.cache_ttl_seconds, 300);
+        assert_eq!(oidc.refresh_cooldown_seconds, 10);
+        assert_eq!(oidc.timeout_ms, 3000);
+        let pinned: RemoteJwksConfig = serde_json::from_str(
+            r#"{"endpoint":{"kind":"jwks","url":"https://issuer.example/keys"}}"#,
+        )
+        .unwrap();
+        pinned.validate("https://issuer.example").unwrap();
+        for invalid in [
+            r#"{"endpoint":{"kind":"oidc","url":"https://issuer.example/keys"}}"#,
+            r#"{"endpoint":{"kind":"jwks"}}"#,
+            r#"{"endpoint":{"kind":"jwks","url":"https://issuer.example/keys","insecure":true}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RemoteJwksConfig>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn lazy_fetch_rotates_keys_and_expires_closed() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -475,11 +543,15 @@ mod tests {
         );
         let requests = Arc::new(AtomicUsize::new(0));
         let error = Arc::new(AtomicBool::new(false));
+        let hold_keys = Arc::new(AtomicBool::new(false));
+        let key_delay_ms = Arc::new(AtomicU64::new(0));
         let key_id = Arc::new(Mutex::new("old".to_owned()));
         let task = {
             let issuer = issuer.clone();
             let requests = requests.clone();
             let error = error.clone();
+            let hold_keys = hold_keys.clone();
+            let key_delay_ms = key_delay_ms.clone();
             let key_id = key_id.clone();
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
@@ -524,6 +596,15 @@ mod tests {
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
+                    if !discovery {
+                        while hold_keys.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(
+                            key_delay_ms.load(Ordering::SeqCst),
+                        ))
+                        .await;
+                    }
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 }
@@ -533,7 +614,8 @@ mod tests {
         spec.ca_pem = Some(cert.cert.pem());
         spec.cache_ttl_seconds = 1;
         spec.refresh_cooldown_seconds = 1;
-        let provider = RemoteJwksProvider::new(spec, &issuer, &[JwtAlgorithm::EdDSA]).unwrap();
+        let provider =
+            RemoteJwksProvider::new(spec.clone(), &issuer, &[JwtAlgorithm::EdDSA]).unwrap();
         assert_eq!(
             requests.load(Ordering::SeqCst),
             0,
@@ -581,6 +663,49 @@ mod tests {
             "rotated key loses its admission fence"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 4);
+
+        // Cancel a cold lookup while the JWKS response is held. The cancelled
+        // future must leave a cooldown, so a second attacker request cannot
+        // immediately start a fresh discovery/JWKS fetch.
+        hold_keys.store(true, Ordering::SeqCst);
+        let cancelled = Arc::new(
+            RemoteJwksProvider::new(spec.clone(), &issuer, &[JwtAlgorithm::EdDSA]).unwrap(),
+        );
+        let waiting = {
+            let cancelled = cancelled.clone();
+            let new = new.clone();
+            tokio::spawn(async move { cancelled.key(&new).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.load(Ordering::SeqCst) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(
+            cancelled.key(&new).await.err().unwrap(),
+            RemoteKeyError::Unavailable
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+        hold_keys.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert!(cancelled.key(&new).await.is_ok());
+        assert_eq!(requests.load(Ordering::SeqCst), 8);
+
+        // The two-request discovery/JWKS budget can finish before the 3-second
+        // network timeout but still exceed the one-second cache lifetime.
+        // Such a late key is never admitted.
+        key_delay_ms.store(1_100, Ordering::SeqCst);
+        let late = RemoteJwksProvider::new(spec, &issuer, &[JwtAlgorithm::EdDSA]).unwrap();
+        assert_eq!(
+            late.key(&new).await.err().unwrap(),
+            RemoteKeyError::Unavailable
+        );
+        key_delay_ms.store(0, Ordering::SeqCst);
+
         error.store(true, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1_050)).await;
         assert_eq!(
