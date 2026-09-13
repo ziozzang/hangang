@@ -1,19 +1,24 @@
 //! Bounded, offline country lookup from an operator-provided MaxMind MMDB.
 //!
-//! Loading and full verification are synchronous and must be called from a
-//! blocking worker. A verified `Database` is immutable and safe to share with
-//! requests; publication and fail-closed reloads belong to the caller.
+//! Loading and MMDB structural verification are synchronous and must be called
+//! from a blocking worker. Country-code schema is checked per lookup, with
+//! malformed records reported as errors. A loaded `Database` is immutable and
+//! safe to share with requests; publication and fail-closed reloads belong to
+//! the caller.
 
 use std::{
     fs::{self, Metadata, OpenOptions},
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use maxminddb::{Reader, path};
+use maxminddb::{path, Reader};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -100,7 +105,13 @@ pub struct Database {
     status: DatabaseStatus,
     build_time: SystemTime,
     expires_at: SystemTime,
+    expires_deadline: Instant,
+    freshness_failure: AtomicU8,
 }
+
+const FRESH: u8 = 0;
+const EXPIRED: u8 = 1;
+const CLOCK_REVERSED: u8 = 2;
 
 impl Database {
     /// Loads and verifies one immutable generation. Call from `spawn_blocking`.
@@ -114,12 +125,15 @@ impl Database {
         Self::load_at(path, max_file_bytes, max_age, SystemTime::now())
     }
 
-    fn load_at(
+    pub(crate) fn load_at(
         path: &Path,
         max_file_bytes: u64,
         max_age: Duration,
         now: SystemTime,
     ) -> Result<Arc<Self>, GeoIpError> {
+        // Capture both clocks before file reading and verification. Time spent
+        // preparing the generation must consume, not extend, its lifetime.
+        let load_instant = Instant::now();
         if max_file_bytes == 0
             || max_file_bytes > MAX_FILE_BYTES
             || max_age.is_zero()
@@ -160,6 +174,12 @@ impl Database {
         if age > max_age {
             return Err(GeoIpError::StaleDatabase);
         }
+        let remaining = expires_at
+            .duration_since(now)
+            .map_err(|_| GeoIpError::StaleDatabase)?;
+        let expires_deadline = load_instant
+            .checked_add(remaining)
+            .ok_or(GeoIpError::Clock)?;
         let path_after_verify = fs::metadata(path).map_err(|_| GeoIpError::ChangedDuringRead)?;
         if !same_file_stamp(&stamp, &path_after_verify) {
             return Err(GeoIpError::ChangedDuringRead);
@@ -180,11 +200,47 @@ impl Database {
             reader,
             build_time,
             expires_at,
+            expires_deadline,
+            freshness_failure: AtomicU8::new(FRESH),
         }))
     }
 
     pub fn status(&self) -> &DatabaseStatus {
         &self.status
+    }
+
+    /// A failed freshness check is latched for this immutable generation. A
+    /// later wall-clock correction cannot re-enable an expired country mapping.
+    pub fn check_freshness(&self) -> Result<(), GeoIpError> {
+        self.check_freshness_at(SystemTime::now(), Instant::now())
+    }
+
+    fn check_freshness_at(&self, now: SystemTime, instant: Instant) -> Result<(), GeoIpError> {
+        let existing = self.freshness_failure.load(Ordering::Acquire);
+        if existing != FRESH {
+            return Err(freshness_error(existing));
+        }
+        let observed = if instant >= self.expires_deadline || now > self.expires_at {
+            EXPIRED
+        } else if now < self.build_time {
+            CLOCK_REVERSED
+        } else {
+            FRESH
+        };
+        if observed != FRESH {
+            let _ = self.freshness_failure.compare_exchange(
+                FRESH,
+                observed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        let final_state = self.freshness_failure.load(Ordering::Acquire);
+        if final_state == FRESH {
+            Ok(())
+        } else {
+            Err(freshness_error(final_state))
+        }
     }
 
     /// Returns `None` for non-public or unrepresented addresses. Decode errors
@@ -199,12 +255,7 @@ impl Database {
         address: IpAddr,
         now: SystemTime,
     ) -> Result<Option<CountryCode>, GeoIpError> {
-        if now < self.build_time {
-            return Err(GeoIpError::FutureDatabase);
-        }
-        if now > self.expires_at {
-            return Err(GeoIpError::StaleDatabase);
-        }
+        self.check_freshness_at(now, Instant::now())?;
         let address = match address {
             IpAddr::V6(v6) => v6
                 .to_ipv4_mapped()
@@ -219,10 +270,18 @@ impl Database {
             .reader
             .lookup(address)
             .map_err(|_| GeoIpError::InvalidRecord)?;
-        let code: Option<String> = result
+        let code: Option<&str> = result
             .decode_path(&path!["country", "iso_code"])
             .map_err(|_| GeoIpError::InvalidRecord)?;
-        code.as_deref().map(CountryCode::from_db).transpose()
+        code.map(CountryCode::from_db).transpose()
+    }
+}
+
+fn freshness_error(state: u8) -> GeoIpError {
+    if state == CLOCK_REVERSED {
+        GeoIpError::FutureDatabase
+    } else {
+        GeoIpError::StaleDatabase
     }
 }
 
@@ -446,11 +505,9 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(directory_error, GeoIpError::NotRegularFile);
-        assert!(
-            !directory_error
-                .to_string()
-                .contains(dir.path().to_str().unwrap())
-        );
+        assert!(!directory_error
+            .to_string()
+            .contains(dir.path().to_str().unwrap()));
         let bad = dir.path().join("bad.mmdb");
         fs::write(&bad, b"not an MMDB").unwrap();
         assert_eq!(
@@ -545,6 +602,51 @@ mod tests {
         assert_eq!(
             database.lookup_at("81.2.69.160".parse().unwrap(), now + MAX_AGE,),
             Err(GeoIpError::StaleDatabase)
+        );
+    }
+
+    #[test]
+    fn expired_generation_cannot_revive_after_wall_clock_moves_back() {
+        let (_dir, database, now) = load_fixture();
+        let address = "81.2.69.160".parse().unwrap();
+        assert_eq!(
+            database.lookup_at(address, now).unwrap().unwrap().as_str(),
+            "GB"
+        );
+        assert_eq!(
+            database.lookup_at(address, database.expires_at + Duration::from_secs(1)),
+            Err(GeoIpError::StaleDatabase)
+        );
+        assert_eq!(
+            database.lookup_at(address, now),
+            Err(GeoIpError::StaleDatabase)
+        );
+    }
+
+    #[test]
+    fn monotonic_deadline_rejects_even_when_wall_clock_remains_fresh() {
+        let (_dir, database, now) = load_fixture();
+        assert_eq!(
+            database.check_freshness_at(now, database.expires_deadline),
+            Err(GeoIpError::StaleDatabase)
+        );
+        assert_eq!(
+            database.check_freshness_at(now, Instant::now()),
+            Err(GeoIpError::StaleDatabase)
+        );
+    }
+
+    #[test]
+    fn clock_reversal_is_latched_for_the_loaded_generation() {
+        let (_dir, database, now) = load_fixture();
+        assert_eq!(
+            database
+                .check_freshness_at(database.build_time - Duration::from_secs(1), Instant::now()),
+            Err(GeoIpError::FutureDatabase)
+        );
+        assert_eq!(
+            database.check_freshness_at(now, Instant::now()),
+            Err(GeoIpError::FutureDatabase)
         );
     }
 
