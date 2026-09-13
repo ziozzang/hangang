@@ -267,6 +267,7 @@ impl ConfigOperationState {
 
 #[derive(Clone, Debug)]
 pub struct ConfigAcceptRequest {
+    pub receipt_version: u8,
     pub store_kind: ConfigStoreKind,
     pub authority_epoch: Option<String>,
     pub expected_revision: u64,
@@ -277,6 +278,7 @@ pub struct ConfigAcceptRequest {
 pub struct ConfigOperation {
     pub id: i64,
     pub operation_id: String,
+    pub receipt_version: u8,
     pub authority_id: String,
     pub actor_kind: AuditActorKind,
     pub actor_user_id: Option<i64>,
@@ -392,7 +394,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 4,
+            version <= 5,
             "administrator user database schema is newer than this binary"
         );
         if version < 2 {
@@ -505,6 +507,10 @@ impl Store {
         if version < 4 {
             migrate_config_retention_v4(&transaction)?;
         }
+        if version < 5 {
+            transaction.execute_batch("ALTER TABLE admin_config_operations ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1 CHECK(receipt_version IN (1,2));
+                PRAGMA user_version=5;")?;
+        }
         let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
@@ -551,7 +557,7 @@ impl Store {
         );
         verify_config_history(&transaction, config_next, config_count, &ids_digest)?;
         {
-            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations ORDER BY id")?;
+            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations ORDER BY id")?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let record = read_config_operation(row)?;
@@ -923,6 +929,16 @@ impl Store {
         request: ConfigAcceptRequest,
     ) -> Result<ConfigOperation> {
         ensure!(
+            matches!(request.receipt_version, 1 | 2),
+            "unsupported local config operation receipt version"
+        );
+        ensure!(
+            request.receipt_version == 1
+                || (request.store_kind == ConfigStoreKind::SharedStore
+                    && request.authority_epoch.is_some()),
+            "version 2 receipts require a shared store and authority epoch"
+        );
+        ensure!(
             request.expected_revision <= MAX_SAFE_ID as u64,
             "configuration revision exceeds safe local audit range"
         );
@@ -937,7 +953,11 @@ impl Store {
                 .is_none_or(|epoch| valid_lower_hex(epoch, 32)),
             "authority epoch needs 32 lowercase hexadecimal characters"
         );
-        let operation_id = random_hex_id()?;
+        let v1_operation_id = if request.receipt_version == 1 {
+            Some(random_hex_id()?)
+        } else {
+            None
+        };
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection=connection(&path)?;
@@ -947,9 +967,13 @@ impl Store {
             ensure!(valid_lower_hex(&authority_id,32) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..MAX_SAFE_ID).contains(&history_revision) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
             let (_,mut verified_hasher)=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
             if stored_records>=CONFIG_OPERATION_CAPACITY || !(1..=MAX_SAFE_ID).contains(&next_id) {return Err(ConfigOperationCapacity.into());}
-            let record=ConfigOperation{id:next_id,operation_id,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
+            let operation_id = match v1_operation_id {
+                Some(id) => id,
+                None => crate::config_store::canonical_operation_id(&authority_id, u64::try_from(next_id)?)?,
+            };
+            let record=ConfigOperation{id:next_id,operation_id,receipt_version:request.receipt_version,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
             ensure!(valid_config_operation(&record),"invalid local config operation");
-            transaction.execute("INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'accepted',NULL)",params![record.id,record.operation_id,record.authority_id,record.actor_kind.as_str(),record.actor_user_id,record.accepted_at_unix_ms,i64::try_from(record.expected_revision)?,record.candidate_sha256,record.store_kind.as_str(),record.authority_epoch])?;
+            transaction.execute("INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'accepted',NULL,?11)",params![record.id,record.operation_id,record.authority_id,record.actor_kind.as_str(),record.actor_user_id,record.accepted_at_unix_ms,i64::try_from(record.expected_revision)?,record.candidate_sha256,record.store_kind.as_str(),record.authority_epoch,record.receipt_version])?;
             verified_hasher.update(next_id.to_be_bytes());
             let digest=hex_digest(verified_hasher);
             transaction.execute("UPDATE admin_config_operation_meta SET next_id=?1,stored_records=stored_records+1,history_revision=history_revision+1,retained_ids_sha256=?2 WHERE singleton=1",params![next_id+1,digest])?;
@@ -978,7 +1002,7 @@ impl Store {
             let changed=transaction.execute("UPDATE admin_config_operations SET state=?1,finished_at_unix_ms=?2 WHERE operation_id=?3 AND state='accepted'",params![state.as_str(),now_ms()?,operation_id])?;
             if changed!=1 {return Err(ConfigOperationConflict.into());}
             transaction.execute("UPDATE admin_config_operation_meta SET history_revision=history_revision+1 WHERE singleton=1",[])?;
-            let record=transaction.query_row("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE operation_id=?1",params![operation_id],read_config_operation)?;
+            let record=transaction.query_row("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations WHERE operation_id=?1",params![operation_id],read_config_operation)?;
             transaction.commit()?;
             Ok(record)
         }).await?
@@ -1002,7 +1026,7 @@ impl Store {
             let (authority_id,started_at,next_id,stored_records,history_revision,pruned_through,ids_digest):(String,i64,i64,i64,i64,i64,String)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records,history_revision,pruned_through,retained_ids_sha256 FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (0..=MAX_SAFE_ID).contains(&started_at) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..=MAX_SAFE_ID).contains(&history_revision) && (0..next_id).contains(&pruned_through) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
             let (oldest_id,_)=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
-            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
             ensure!(records.windows(2).all(|pair|pair[0].id<pair[1].id),"local config operation page ordering inconsistent");
@@ -1069,6 +1093,19 @@ fn valid_config_operation(record: &ConfigOperation) -> bool {
     (1..=MAX_SAFE_ID).contains(&record.id)
         && valid_lower_hex(&record.operation_id, 32)
         && valid_lower_hex(&record.authority_id, 32)
+        && match record.receipt_version {
+            1 => true,
+            2 => {
+                record.store_kind == ConfigStoreKind::SharedStore
+                    && record.authority_epoch.is_some()
+                    && crate::config_store::canonical_operation_id(
+                        &record.authority_id,
+                        record.id as u64,
+                    )
+                    .is_ok_and(|id| id == record.operation_id)
+            }
+            _ => false,
+        }
         && match record.actor_kind {
             AuditActorKind::System => record.actor_user_id.is_none(),
             AuditActorKind::Account => record
@@ -1095,6 +1132,8 @@ fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOper
     let record = ConfigOperation {
         id: row.get(0)?,
         operation_id: row.get(1)?,
+        receipt_version: u8::try_from(row.get::<_, i64>(12)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         authority_id: row.get(2)?,
         actor_kind: AuditActorKind::parse(&row.get::<_, String>(3)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -1549,10 +1588,20 @@ mod tests {
 
     fn config_request() -> ConfigAcceptRequest {
         ConfigAcceptRequest {
+            receipt_version: 1,
             store_kind: ConfigStoreKind::LocalFile,
             authority_epoch: None,
             expected_revision: 7,
             candidate_sha256: "a".repeat(64),
+        }
+    }
+
+    fn v2_config_request() -> ConfigAcceptRequest {
+        ConfigAcceptRequest {
+            receipt_version: 2,
+            store_kind: ConfigStoreKind::SharedStore,
+            authority_epoch: Some("b".repeat(32)),
+            ..config_request()
         }
     }
 
@@ -1615,7 +1664,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -1919,6 +1968,7 @@ mod tests {
                 "ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
             ALTER TABLE admin_config_operation_meta DROP COLUMN pruned_through;
             ALTER TABLE admin_config_operation_meta DROP COLUMN retained_ids_sha256;
+            ALTER TABLE admin_config_operations DROP COLUMN receipt_version;
             PRAGMA user_version=3;
             CREATE TABLE admin_audit_v4(dummy INTEGER);",
             )
@@ -1981,6 +2031,7 @@ mod tests {
                 "ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
             ALTER TABLE admin_config_operation_meta DROP COLUMN pruned_through;
             ALTER TABLE admin_config_operation_meta DROP COLUMN retained_ids_sha256;
+            ALTER TABLE admin_config_operations DROP COLUMN receipt_version;
             DELETE FROM admin_config_operations WHERE id=2;
             UPDATE admin_config_operation_meta SET stored_records=2 WHERE singleton=1;
             PRAGMA user_version=3;",
@@ -2383,7 +2434,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -3295,5 +3346,236 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         assert!(Store::open(path.clone()).is_err());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn v2_acceptance_binds_canonical_id_to_durable_sequence_and_authority() {
+        let (directory, store) = store();
+        let first = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        let second = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        assert_eq!(first.receipt_version, 2);
+        assert_eq!(second.receipt_version, 2);
+        assert_eq!(second.id, first.id + 1);
+        assert_ne!(first.operation_id, second.operation_id);
+        for record in [&first, &second] {
+            assert_eq!(
+                record.operation_id,
+                crate::config_store::canonical_operation_id(&record.authority_id, record.id as u64)
+                    .unwrap()
+            );
+        }
+        let (_other_directory, other_store) = self::store();
+        let other_first = other_store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        assert_eq!(other_first.id, first.id);
+        assert_ne!(other_first.authority_id, first.authority_id);
+        assert_ne!(other_first.operation_id, first.operation_id);
+
+        store
+            .finish_config(
+                &first.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        let page = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        store
+            .prune_config_operations(
+                MutationAuthority::System,
+                first.id,
+                second.id,
+                page.history_revision,
+            )
+            .await
+            .unwrap();
+        let third = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        assert_eq!(third.id, second.id + 1);
+        assert_eq!(third.receipt_version, 2);
+        let reopened = Store::open(directory.path().join("accounts.sqlite3")).unwrap();
+        let retained = reopened
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained
+                .records
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![second.id, third.id]
+        );
+        assert!(retained.records.iter().all(|row| row.receipt_version == 2));
+    }
+
+    #[tokio::test]
+    async fn v2_rejects_invalid_versions_and_authority_without_accepting() {
+        let (_directory, store) = store();
+        let before = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        for request in [
+            ConfigAcceptRequest {
+                receipt_version: 0,
+                ..v2_config_request()
+            },
+            ConfigAcceptRequest {
+                receipt_version: 3,
+                ..v2_config_request()
+            },
+            ConfigAcceptRequest {
+                store_kind: ConfigStoreKind::LocalFile,
+                ..v2_config_request()
+            },
+            ConfigAcceptRequest {
+                authority_epoch: None,
+                ..v2_config_request()
+            },
+        ] {
+            assert!(
+                store
+                    .accept_config(MutationAuthority::System, request)
+                    .await
+                    .is_err()
+            );
+        }
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .accept_config(MutationAuthority::Session(login.token), v2_config_request())
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        let after = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(after.latest_id, before.latest_id);
+        assert_eq!(after.history_revision, before.history_revision);
+        assert_eq!(after.stored_records, 0);
+    }
+
+    #[tokio::test]
+    async fn v4_to_v5_preserves_v1_rows_and_sessions_and_rolls_back_failed_migration() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy = store
+            .accept_config(MutationAuthority::System, config_request())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let connection = connection(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version=4;").unwrap();
+        assert!(
+            Store::open(path.clone()).is_err(),
+            "duplicate migration column must fail"
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT operation_id FROM admin_config_operations WHERE id=?1",
+                    params![legacy.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            legacy.operation_id
+        );
+        connection
+            .execute_batch("ALTER TABLE admin_config_operations DROP COLUMN receipt_version;")
+            .unwrap();
+        drop(connection);
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(
+            migrated.session(login.token).await.unwrap().unwrap().id,
+            login.user.id
+        );
+        let page = migrated
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.records[0].id, legacy.id);
+        assert_eq!(page.records[0].operation_id, legacy.operation_id);
+        assert_eq!(page.records[0].receipt_version, 1);
+        assert_eq!(
+            migrated
+                .accept_config(MutationAuthority::System, v2_config_request())
+                .await
+                .unwrap()
+                .id,
+            legacy.id + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_v2_id_and_version_are_checked_on_open() {
+        let (directory, store) = store();
+        let accepted = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let connection = connection(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE admin_config_operations SET operation_id=?1 WHERE id=?2",
+                params!["0".repeat(32), accepted.id],
+            )
+            .unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        connection
+            .execute(
+                "UPDATE admin_config_operations SET operation_id=?1 WHERE id=?2",
+                params![accepted.operation_id, accepted.id],
+            )
+            .unwrap();
+        connection.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE admin_config_operations SET receipt_version=3 WHERE id=1; PRAGMA ignore_check_constraints=OFF;").unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        connection
+            .execute(
+                "UPDATE admin_config_operations SET receipt_version=2 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        assert!(Store::open(path).is_ok());
     }
 }
