@@ -1794,7 +1794,7 @@ impl Snapshot {
         let mut tcp_inbound_tls = std::collections::HashMap::new();
         let mut inbound_material: std::collections::HashMap<
             Vec<u8>,
-            std::sync::Arc<crate::workload_tls::Prepared>,
+            std::sync::Arc<crate::workload_material::Slot>,
         > = std::collections::HashMap::new();
         for route in config.tcp.iter().filter(|route| route.enabled) {
             let Some(policy) = &route.inbound_tls else {
@@ -1822,19 +1822,16 @@ impl Snapshot {
             let prepared = match inbound_material.entry(policy_key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
                 std::collections::hash_map::Entry::Vacant(entry) => entry
-                    .insert(std::sync::Arc::new(crate::workload_tls::Prepared::load(
-                        policy,
-                    )?))
+                    .insert(std::sync::Arc::new(crate::workload_material::Slot::new(
+                        policy.clone(),
+                        std::sync::Arc::new(crate::workload_tls::Prepared::load(policy)?),
+                        false,
+                    )))
                     .clone(),
             };
-            tcp_inbound_tls.insert(
-                route.id.clone(),
-                std::sync::Arc::new(crate::workload_material::Slot::new(
-                    policy.clone(),
-                    prepared,
-                    false,
-                )),
-            );
+            // Identical new TCP policies share one live verification slot,
+            // bounding periodic PEM reads by material sets rather than routes.
+            tcp_inbound_tls.insert(route.id.clone(), prepared);
         }
         let mut http_workload_tls = std::collections::HashMap::new();
         for listener in config

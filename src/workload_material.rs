@@ -360,4 +360,30 @@ mod tests {
         let recovered = slot.load().unwrap();
         assert!(!Arc::ptr_eq(&first, &recovered));
     }
+    #[tokio::test]
+    async fn identical_new_tcp_policies_share_verification_without_coupling_disable() {
+        let (_dir, source, _) = fixture();
+        let mut config = source.load().config.clone();
+        let mut alias = config.tcp[0].clone();
+        alias.id = "alias".into();
+        alias.listen = "127.0.0.1:9444".parse().unwrap();
+        config.tcp.push(alias);
+        let first = Snapshot::new(config).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.tcp_inbound_tls["mtls"],
+            &first.tcp_inbound_tls["alias"]
+        ));
+        let slot = first.tcp_inbound_tls["alias"].clone();
+        let active = Arc::new(ArcSwap::from_pointee(first));
+        Slot::refresh(&active, &slot).await;
+        let generation = slot.load().unwrap();
+        let mut disabled = active.load().config.clone();
+        disabled.tcp[0].enabled = false;
+        let next = Snapshot::replace(disabled, &active.load_full()).unwrap();
+        assert!(!next.tcp_inbound_tls.contains_key("mtls"));
+        assert!(Arc::ptr_eq(&slot, &next.tcp_inbound_tls["alias"]));
+        active.store(Arc::new(next));
+        Slot::refresh(&active, &slot).await;
+        assert!(Arc::ptr_eq(&generation, &slot.load().unwrap()));
+    }
 }
