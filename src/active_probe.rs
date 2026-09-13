@@ -228,7 +228,13 @@ async fn probe_once(
         .uri(uri)
         .body(body)
         .context("build active probe request")?;
-    let client = pools.client_for_epoch(runtime, configured, target, discovery, prepared)?;
+    let client = if configured.starts_with("docker://") {
+        pools.client_for_epoch(runtime, configured, target, discovery, prepared)?
+    } else {
+        // A globally configured Docker handle must not give native probes a
+        // different pool identity from ordinary native outbound requests.
+        pools.client(runtime, configured, prepared)?
+    };
     let response = client
         .request(request)
         .await
