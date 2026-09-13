@@ -266,25 +266,30 @@ impl PreparedKeys {
             // A provider may publish encryption or next-generation public
             // keys beside the configured signing keys. They cannot authorize
             // a token, but must still pass global bounds and kid uniqueness.
-            if object
+            let usable_for_verification = !object
                 .get("use")
                 .is_some_and(|use_value| use_value != "sig")
-                || object
+                && !object
                     .get("key_ops")
-                    .is_some_and(|ops| ops.as_array().is_none_or(|items| items != &["verify"]))
-            {
-                continue;
-            }
-            let algorithm = match object.get("alg") {
-                Some(value) => value
-                    .as_str()
-                    .and_then(JwtAlgorithm::from_name)
-                    .filter(|alg| allowed.contains(alg)),
-                None => infer_unambiguous_algorithm(object, allowed),
+                    .is_some_and(|ops| ops.as_array().is_none_or(|items| items != &["verify"]));
+            let algorithm = if usable_for_verification {
+                match object.get("alg") {
+                    Some(value) => value
+                        .as_str()
+                        .and_then(JwtAlgorithm::from_name)
+                        .filter(|alg| allowed.contains(alg)),
+                    None => infer_unambiguous_algorithm(object, allowed),
+                }
+            } else {
+                None
             };
             if let Some(algorithm) = algorithm {
                 let key = prepare_jwk(object, algorithm)?;
                 keys.insert(key.kid.clone(), Arc::new(key));
+            } else {
+                // An ignored key can still form a valid withdrawal set, but
+                // malformed public material must remain a fetch failure.
+                validate_ignored_jwk(object)?;
             }
         }
         ensure!(
@@ -408,6 +413,74 @@ fn infer_unambiguous_algorithm(
         .filter(|alg| compatible(*alg).is_some());
     let one = matches.next()?;
     matches.next().is_none().then_some(one)
+}
+
+fn validate_ignored_jwk(object: &Map<String, Value>) -> Result<()> {
+    let field = |name| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("JWK missing string field {name}"))
+    };
+    match field("kty")? {
+        "RSA" => {
+            ensure!(
+                ["crv", "x", "y"]
+                    .iter()
+                    .all(|name| !object.contains_key(*name)),
+                "RSA JWK has non-RSA components"
+            );
+            let modulus = decode_url(field("n")?, 512)?;
+            let exponent = decode_url(field("e")?, 8)?;
+            let bits = modulus.len().saturating_mul(8).saturating_sub(
+                modulus
+                    .first()
+                    .map_or(8, |byte| byte.leading_zeros() as usize),
+            );
+            ensure!(
+                (2048..=4096).contains(&bits) && modulus.last().is_some_and(|byte| byte & 1 == 1),
+                "invalid ignored RSA modulus"
+            );
+            ensure!(exponent == [1, 0, 1], "invalid ignored RSA exponent");
+        }
+        "EC" => {
+            ensure!(
+                ["n", "e"].iter().all(|name| !object.contains_key(*name)),
+                "EC JWK has non-EC components"
+            );
+            let size = match field("crv")? {
+                "P-256" => 32,
+                "P-384" => 48,
+                "P-521" => 66,
+                _ => bail!("unsupported ignored EC curve"),
+            };
+            ensure!(
+                decode_url(field("x")?, size)?.len() == size
+                    && decode_url(field("y")?, size)?.len() == size,
+                "invalid ignored EC coordinates"
+            );
+        }
+        "OKP" => {
+            ensure!(
+                ["n", "e", "y"]
+                    .iter()
+                    .all(|name| !object.contains_key(*name)),
+                "OKP JWK has non-OKP components"
+            );
+            let size = match field("crv")? {
+                "Ed25519" | "X25519" => 32,
+                "Ed448" => 57,
+                "X448" => 56,
+                _ => bail!("unsupported ignored OKP curve"),
+            };
+            ensure!(
+                decode_url(field("x")?, size)?.len() == size,
+                "invalid ignored OKP key"
+            );
+        }
+        _ => bail!("unsupported ignored JWK type"),
+    }
+    Ok(())
 }
 
 fn prepare_jwk(object: &Map<String, Value>, algorithm: JwtAlgorithm) -> Result<PreparedKey> {
@@ -1184,7 +1257,8 @@ mod tests {
         });
         let migration = serde_json::json!({
             "kty":"EC", "crv":"P-384", "kid":"migration", "alg":"ES384",
-            "x":"public", "y":"public"
+            "x":URL_SAFE_NO_PAD.encode([1u8;48]),
+            "y":URL_SAFE_NO_PAD.encode([2u8;48])
         });
         let jwks = serde_json::json!({"keys":[selected, other, migration]});
         let keys =
@@ -1221,6 +1295,26 @@ mod tests {
                 &[JwtAlgorithm::EdDSA, JwtAlgorithm::ES256]
             )
             .is_err()
+        );
+        assert!(
+            PreparedKeys::from_remote_jwks_json(
+                none.to_string().as_bytes(),
+                &[JwtAlgorithm::EdDSA],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let malformed_ignored = serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-384","kid":"broken","alg":"ES384",
+            "x":"AA","y":"AA"
+        }]});
+        assert!(
+            PreparedKeys::from_remote_jwks_json(
+                malformed_ignored.to_string().as_bytes(),
+                &[JwtAlgorithm::EdDSA],
+            )
+            .is_err(),
+            "malformed ignored public material is an outage, not a withdrawal"
         );
     }
 
