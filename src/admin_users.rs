@@ -23,6 +23,8 @@ use tokio::sync::Semaphore;
 const MAX_USERS: i64 = 256;
 const MAX_SESSIONS: i64 = 4096;
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
+const MAX_SAFE_ID: i64 = 9_007_199_254_740_991;
+pub const AUDIT_CAPACITY: i64 = 100_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +89,125 @@ impl std::fmt::Display for AuthorizationRevoked {
 
 impl std::error::Error for AuthorizationRevoked {}
 
+#[derive(Debug)]
+pub struct AuditCapacity;
+impl std::fmt::Display for AuditCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("administrator audit capacity exhausted")
+    }
+}
+impl std::error::Error for AuditCapacity {}
+
+#[derive(Debug)]
+pub struct AuditConflict;
+impl std::fmt::Display for AuditConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("administrator audit revision or prune range conflicted")
+    }
+}
+impl std::error::Error for AuditConflict {}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    Baseline,
+    Bootstrap,
+    Create,
+    Update,
+    Delete,
+    Prune,
+}
+impl AuditAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Bootstrap => "bootstrap",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Prune => "prune",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "bootstrap" => Ok(Self::Bootstrap),
+            "create" => Ok(Self::Create),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "prune" => Ok(Self::Prune),
+            _ => anyhow::bail!("invalid stored audit action"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditActorKind {
+    System,
+    Account,
+}
+impl AuditActorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Account => "account",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "system" => Ok(Self::System),
+            "account" => Ok(Self::Account),
+            _ => anyhow::bail!("invalid stored audit actor"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub struct AuditUserState {
+    pub role: Role,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub time_unix_ms: i64,
+    pub action: AuditAction,
+    pub actor_kind: AuditActorKind,
+    pub actor_user_id: Option<i64>,
+    pub target_user_id: Option<i64>,
+    pub before: Option<AuditUserState>,
+    pub after: Option<AuditUserState>,
+    pub password_changed: bool,
+    pub affected_count: u64,
+    pub through_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditPage {
+    pub scope: &'static str,
+    pub coverage: [&'static str; 5],
+    pub started_at_unix_ms: i64,
+    pub records: Vec<AuditRecord>,
+    pub next_after: i64,
+    pub oldest_id: Option<i64>,
+    pub latest_id: i64,
+    pub pruned_through: i64,
+    pub truncated: bool,
+    pub stored_records: i64,
+    pub capacity: i64,
+    pub writes_available: bool,
+    pub server_time_unix_ms: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditPruneResult {
+    pub pruned_records: u64,
+    pub record: AuditRecord,
+}
+
 pub struct Store {
     path: PathBuf,
     password_workers: Arc<Semaphore>,
@@ -140,13 +261,15 @@ impl Store {
             }
         }
         drop(file);
-        let connection = connection(&path)?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let mut connection = connection(&path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 2,
             "administrator user database schema is newer than this binary"
         );
-        connection.execute_batch(
+        if version < 2 {
+            transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -165,8 +288,77 @@ impl Store {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
-            PRAGMA user_version=1;",
+            CREATE TABLE admin_audit_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                started_at_unix_ms INTEGER NOT NULL,
+                pruned_through INTEGER NOT NULL DEFAULT 0,
+                stored_records INTEGER NOT NULL DEFAULT 0,
+                next_user_id INTEGER NOT NULL,
+                next_audit_id INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time_unix_ms INTEGER NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('baseline','bootstrap','create','update','delete','prune')),
+                actor_kind TEXT NOT NULL CHECK(actor_kind IN ('system','account')),
+                actor_user_id INTEGER,
+                target_user_id INTEGER,
+                before_role TEXT CHECK(before_role IN ('admin','viewer')),
+                before_enabled INTEGER CHECK(before_enabled IN (0,1)),
+                after_role TEXT CHECK(after_role IN ('admin','viewer')),
+                after_enabled INTEGER CHECK(after_enabled IN (0,1)),
+                password_changed INTEGER NOT NULL CHECK(password_changed IN (0,1)),
+                affected_count INTEGER NOT NULL,
+                through_id INTEGER
+            );",
         )?;
+            let started_at = now_ms()?;
+            let max_id: i64 =
+                transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
+                    row.get(0)
+                })?;
+            ensure!(max_id < MAX_SAFE_ID, "administrator user id exhausted");
+            transaction.execute("INSERT INTO admin_audit_meta(singleton,started_at_unix_ms,next_user_id) VALUES(1,?1,?2)",params![started_at,max_id+1])?;
+            let existing_count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+            append_audit(
+                &transaction,
+                audit_record(
+                    AuditAction::Baseline,
+                    AuditActorKind::System,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    u64::try_from(existing_count)?,
+                    None,
+                )?,
+            )?;
+            transaction.execute_batch("PRAGMA user_version=2")?;
+        }
+        let (next_user_id,next_audit_id,stored_records,pruned_through):(i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let max_user_id: i64 =
+            transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
+                row.get(0)
+            })?;
+        let (count, max_audit_id): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM admin_audit",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(
+            next_user_id > max_user_id
+                && next_user_id <= MAX_SAFE_ID + 1
+                && count == stored_records
+                && (1..=AUDIT_CAPACITY).contains(&count)
+                && next_audit_id == max_audit_id + 1
+                && next_audit_id <= MAX_SAFE_ID + 1
+                && pruned_through >= 0
+                && pruned_through < next_audit_id,
+            "administrator audit metadata inconsistent"
+        );
+        transaction.commit()?;
         Ok(Self {
             path,
             password_workers: Arc::new(Semaphore::new(2)),
@@ -203,11 +395,13 @@ impl Store {
                 return Ok(None);
             }
             let now = now()?;
+            let id = allocate_user_id(&transaction)?;
             transaction.execute(
-                "INSERT INTO users(username,salt,password_hash,role,enabled,created_at,updated_at) VALUES(?1,?2,?3,'admin',1,?4,?4)",
-                params![username, salt.as_slice(), hash.as_slice(), now],
+                "INSERT INTO users(id,username,salt,password_hash,role,enabled,created_at,updated_at) VALUES(?1,?2,?3,?4,'admin',1,?5,?5)",
+                params![id, username, salt.as_slice(), hash.as_slice(), now],
             )?;
-            let user = User {id: transaction.last_insert_rowid(),username,role: Role::Admin,enabled:true};
+            let user = User {id,username,role: Role::Admin,enabled:true};
+            append_audit(&transaction, audit_record(AuditAction::Bootstrap, AuditActorKind::System, None, Some(id), None, Some(AuditUserState{role:Role::Admin,enabled:true}), true, 1, None)?)?;
             transaction.commit()?;
             Ok(Some(user))
         }).await?
@@ -330,13 +524,15 @@ impl Store {
             let (salt,hash)=hash_new_password(password.as_bytes())?;
             let mut connection=connection(&path)?;
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            authorize_mutation(&transaction, &authority)?;
+            let actor_id=authorize_mutation(&transaction, &authority)?;
             let count:i64=transaction.query_row("SELECT COUNT(*) FROM users",[],|row|row.get(0))?;
             if count==0 || count>=MAX_USERS {return Ok(None)}
             if transaction.query_row("SELECT 1 FROM users WHERE username=?1 COLLATE NOCASE",params![username],|row|row.get::<_,i64>(0)).optional()?.is_some(){return Ok(None)}
             let now=now()?;
-            transaction.execute("INSERT INTO users(username,salt,password_hash,role,enabled,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?5,?5)",params![username,salt.as_slice(),hash.as_slice(),role.as_str(),now])?;
-            let user=User{id:transaction.last_insert_rowid(),username,role,enabled:true};
+            let id=allocate_user_id(&transaction)?;
+            transaction.execute("INSERT INTO users(id,username,salt,password_hash,role,enabled,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,1,?6,?6)",params![id,username,salt.as_slice(),hash.as_slice(),role.as_str(),now])?;
+            let user=User{id,username,role,enabled:true};
+            append_audit(&transaction, audit_record(AuditAction::Create, actor_kind(&authority), actor_id, Some(id), None, Some(AuditUserState{role,enabled:true}), true, 1, None)?)?;
             transaction.commit()?;Ok(Some(user))
         }).await?
     }
@@ -368,14 +564,16 @@ impl Store {
             let new_password=password.map(|p|hash_new_password(p.as_bytes())).transpose()?;
             let mut connection=connection(&path)?;
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            authorize_mutation(&transaction, &authority)?;
+            let actor_id=authorize_mutation(&transaction, &authority)?;
             let existing:Option<User>=transaction.query_row("SELECT id,username,role,enabled FROM users WHERE id=?1",params![id],|row|Ok(User{id:row.get(0)?,username:row.get(1)?,role:Role::parse(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,enabled:row.get::<_,i64>(3)?==1})).optional()?;
             let Some(mut user)=existing else{return Ok((Change::NotFound,None))};
+            let before=AuditUserState{role:user.role,enabled:user.enabled};
             let next_role=role.unwrap_or(user.role);let next_enabled=enabled.unwrap_or(user.enabled);
             if user.role==Role::Admin && user.enabled && (next_role!=Role::Admin || !next_enabled) {
                 let admins:i64=transaction.query_row("SELECT COUNT(*) FROM users WHERE role='admin' AND enabled=1",[],|row|row.get(0))?;
                 if admins<=1{return Ok((Change::Conflict,None))}
             }
+            let password_changed=new_password.is_some();
             if let Some((salt,hash))=new_password {
                 transaction.execute("UPDATE users SET salt=?1,password_hash=?2,password_epoch=password_epoch+1,role=?3,enabled=?4,updated_at=?5 WHERE id=?6",params![salt.as_slice(),hash.as_slice(),next_role.as_str(),i64::from(next_enabled),now()?,id])?;
                 transaction.execute("DELETE FROM sessions WHERE user_id=?1",params![id])?;
@@ -384,6 +582,7 @@ impl Store {
                 if !next_enabled || next_role!=user.role {transaction.execute("DELETE FROM sessions WHERE user_id=?1",params![id])?;}
             }
             user.role=next_role;user.enabled=next_enabled;
+            append_audit(&transaction, audit_record(AuditAction::Update, actor_kind(&authority), actor_id, Some(id), Some(before), Some(AuditUserState{role:next_role,enabled:next_enabled}), password_changed, 1, None)?)?;
             transaction.commit()?;Ok((Change::Applied,Some(user)))
         }).await?
     }
@@ -394,7 +593,7 @@ impl Store {
             let mut connection = connection(&path)?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            authorize_mutation(&transaction, &authority)?;
+            let actor_id = authorize_mutation(&transaction, &authority)?;
             let existing: Option<(String, bool)> = transaction
                 .query_row(
                     "SELECT role,enabled FROM users WHERE id=?1",
@@ -416,10 +615,80 @@ impl Store {
                 }
             }
             transaction.execute("DELETE FROM users WHERE id=?1", params![id])?;
+            append_audit(
+                &transaction,
+                audit_record(
+                    AuditAction::Delete,
+                    actor_kind(&authority),
+                    actor_id,
+                    Some(id),
+                    Some(AuditUserState {
+                        role: Role::parse(&role)?,
+                        enabled,
+                    }),
+                    None,
+                    false,
+                    1,
+                    None,
+                )?,
+            )?;
             transaction.commit()?;
             Ok(Change::Applied)
         })
         .await?
+    }
+
+    pub async fn audit_page(
+        &self,
+        authority: MutationAuthority,
+        after: i64,
+        limit: usize,
+    ) -> Result<AuditPage> {
+        ensure!(
+            after >= 0 && (1..=100).contains(&limit),
+            "invalid audit page bounds"
+        );
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection=connection(&path)?;
+            let transaction=connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            authorize_mutation(&transaction,&authority)?;
+            let (started_at,pruned_through,next_audit_id,stored_records):(i64,i64,i64,i64)=transaction.query_row("SELECT started_at_unix_ms,pruned_through,next_audit_id,stored_records FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_audit",[],|row|row.get(0))?;
+            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_audit_record)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_more=records.len()>limit;
+            records.truncate(limit);
+            let next_after=records.last().map_or(after,|record|record.id);
+            drop(statement);
+            let page=AuditPage{scope:"instance",coverage:["bootstrap","create","update","delete","prune"],started_at_unix_ms:started_at,records,next_after,oldest_id,latest_id:next_audit_id-1,pruned_through,truncated:after<pruned_through,stored_records,capacity:AUDIT_CAPACITY,writes_available:stored_records<AUDIT_CAPACITY && next_audit_id<=MAX_SAFE_ID,server_time_unix_ms:now_ms()?,has_more};
+            transaction.commit()?;
+            Ok(page)
+        }).await?
+    }
+
+    pub async fn prune_audit(
+        &self,
+        authority: MutationAuthority,
+        through_id: i64,
+        expected_latest_id: i64,
+    ) -> Result<AuditPruneResult> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection=connection(&path)?;
+            let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let actor_id=authorize_mutation(&transaction,&authority)?;
+            let (pruned_through,next_audit_id):(i64,i64)=transaction.query_row("SELECT pruned_through,next_audit_id FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            let latest_id=next_audit_id-1;
+            if expected_latest_id!=latest_id || through_id<=pruned_through || through_id>latest_id {return Err(AuditConflict.into());}
+            if next_audit_id>MAX_SAFE_ID {return Err(AuditCapacity.into());}
+            let deleted=transaction.execute("DELETE FROM admin_audit WHERE id<=?1",params![through_id])?;
+            if deleted==0 {return Err(AuditConflict.into());}
+            transaction.execute("UPDATE admin_audit_meta SET pruned_through=?1,stored_records=stored_records-?2 WHERE singleton=1",params![through_id,i64::try_from(deleted)?])?;
+            let record=append_audit(&transaction,audit_record(AuditAction::Prune,actor_kind(&authority),actor_id,None,None,None,false,u64::try_from(deleted)?,Some(through_id))?)?;
+            transaction.commit()?;
+            Ok(AuditPruneResult{pruned_records:u64::try_from(deleted)?,record})
+        }).await?
     }
 }
 
@@ -430,9 +699,12 @@ fn valid_session_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn authorize_mutation(transaction: &Transaction<'_>, authority: &MutationAuthority) -> Result<()> {
+fn authorize_mutation(
+    transaction: &Transaction<'_>,
+    authority: &MutationAuthority,
+) -> Result<Option<i64>> {
     let MutationAuthority::Session(token) = authority else {
-        return Ok(());
+        return Ok(None);
     };
     if !valid_session_token(token) {
         return Err(AuthorizationRevoked.into());
@@ -450,7 +722,125 @@ fn authorize_mutation(transaction: &Transaction<'_>, authority: &MutationAuthori
     if valid.is_none() {
         return Err(AuthorizationRevoked.into());
     }
-    Ok(())
+    Ok(valid)
+}
+
+fn actor_kind(authority: &MutationAuthority) -> AuditActorKind {
+    match authority {
+        MutationAuthority::System => AuditActorKind::System,
+        MutationAuthority::Session(_) => AuditActorKind::Account,
+    }
+}
+
+fn allocate_user_id(transaction: &Transaction<'_>) -> Result<i64> {
+    let id: i64 = transaction.query_row(
+        "SELECT next_user_id FROM admin_audit_meta WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        (1..=MAX_SAFE_ID).contains(&id),
+        "administrator user id exhausted"
+    );
+    transaction.execute(
+        "UPDATE admin_audit_meta SET next_user_id=?1 WHERE singleton=1",
+        params![id + 1],
+    )?;
+    Ok(id)
+}
+
+fn now_ms() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_record(
+    action: AuditAction,
+    actor_kind: AuditActorKind,
+    actor_user_id: Option<i64>,
+    target_user_id: Option<i64>,
+    before: Option<AuditUserState>,
+    after: Option<AuditUserState>,
+    password_changed: bool,
+    affected_count: u64,
+    through_id: Option<i64>,
+) -> Result<AuditRecord> {
+    Ok(AuditRecord {
+        id: 0,
+        time_unix_ms: now_ms()?,
+        action,
+        actor_kind,
+        actor_user_id,
+        target_user_id,
+        before,
+        after,
+        password_changed,
+        affected_count,
+        through_id,
+    })
+}
+
+fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Result<AuditRecord> {
+    let count: i64 = transaction.query_row(
+        "SELECT stored_records FROM admin_audit_meta WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if count >= AUDIT_CAPACITY {
+        return Err(AuditCapacity.into());
+    }
+    let id: i64 = transaction.query_row(
+        "SELECT next_audit_id FROM admin_audit_meta WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if !(1..=MAX_SAFE_ID).contains(&id) {
+        return Err(AuditCapacity.into());
+    }
+    record.id = id;
+    let before_role = record.before.map(|s| s.role.as_str());
+    let before_enabled = record.before.map(|s| i64::from(s.enabled));
+    let after_role = record.after.map(|s| s.role.as_str());
+    let after_enabled = record.after.map(|s| i64::from(s.enabled));
+    transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id])?;
+    transaction.execute("UPDATE admin_audit_meta SET next_audit_id=?1,stored_records=stored_records+1 WHERE singleton=1", params![id+1])?;
+    Ok(record)
+}
+
+fn read_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
+    let before_role: Option<String> = row.get(6)?;
+    let before_enabled: Option<i64> = row.get(7)?;
+    let after_role: Option<String> = row.get(8)?;
+    let after_enabled: Option<i64> = row.get(9)?;
+    let state =
+        |role: Option<String>, enabled: Option<i64>| -> rusqlite::Result<Option<AuditUserState>> {
+            match (role, enabled) {
+                (None, None) => Ok(None),
+                (Some(role), Some(enabled)) => Ok(Some(AuditUserState {
+                    role: Role::parse(&role).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    enabled: enabled == 1,
+                })),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            }
+        };
+    Ok(AuditRecord {
+        id: row.get(0)?,
+        time_unix_ms: row.get(1)?,
+        action: AuditAction::parse(&row.get::<_, String>(2)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        actor_kind: AuditActorKind::parse(&row.get::<_, String>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        actor_user_id: row.get(4)?,
+        target_user_id: row.get(5)?,
+        before: state(before_role, before_enabled)?,
+        after: state(after_role, after_enabled)?,
+        password_changed: row.get::<_, i64>(10)? == 1,
+        affected_count: u64::try_from(row.get::<_, i64>(11)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        through_id: row.get(12)?,
+    })
 }
 
 fn connection(path: &Path) -> Result<Connection> {
@@ -531,6 +921,326 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn audit_migration_preserves_login_and_user_ids_never_recycle() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        connection(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1;",
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(path.clone()).unwrap();
+        assert_eq!(
+            reopened.session(login.token).await.unwrap().unwrap().id,
+            root.id
+        );
+        let page = reopened
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].action, AuditAction::Baseline);
+        assert_eq!(page.records[0].affected_count, 1);
+        assert_eq!(
+            page.coverage,
+            ["bootstrap", "create", "update", "delete", "prune"]
+        );
+        let second = reopened
+            .create(
+                MutationAuthority::System,
+                "second".into(),
+                "second secure password".into(),
+                Role::Admin,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened
+                .delete(MutationAuthority::System, root.id)
+                .await
+                .unwrap(),
+            Change::Applied
+        );
+        let third = reopened
+            .create(
+                MutationAuthority::System,
+                "third".into(),
+                "third secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.id > second.id && second.id > root.id);
+        assert_eq!(
+            connection(&path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_append_failure_rolls_back_password_sessions_and_sequence() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let target = store
+            .create(
+                MutationAuthority::System,
+                "target".into(),
+                "target secure password".into(),
+                Role::Admin,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("target".into(), "target secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let before = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        connection(&path).unwrap().execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON admin_audit BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;").unwrap();
+        assert!(
+            store
+                .update(
+                    MutationAuthority::System,
+                    target.id,
+                    None,
+                    Some(false),
+                    Some("changed secure password".into())
+                )
+                .await
+                .is_err()
+        );
+        assert!(store.session(login.token.clone()).await.unwrap().is_some());
+        assert!(
+            store
+                .login("target".into(), "target secure password".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .create(
+                    MutationAuthority::System,
+                    "never".into(),
+                    "another secure password".into(),
+                    Role::Viewer
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list().await.unwrap().len(), 2);
+        connection(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_audit")
+            .unwrap();
+        let next = store
+            .create(
+                MutationAuthority::System,
+                "next".into(),
+                "another secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.id,
+            target.id + 1,
+            "failed create cannot consume a durable user id"
+        );
+        let after = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(after.latest_id, before.latest_id + 1);
+        assert!(
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains("secure password")
+        );
+        assert!(
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains(&login.token)
+        );
+        assert!(
+            !serde_json::to_string(&after)
+                .unwrap()
+                .contains("\"username\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_paging_requires_live_admin_and_prune_is_cas_protected() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .create(
+                MutationAuthority::Session(login.token.clone()),
+                "viewer".into(),
+                "viewer secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap();
+        let first = store
+            .audit_page(MutationAuthority::Session(login.token.clone()), 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.records.len(), 2);
+        assert!(first.has_more);
+        let second = store
+            .audit_page(
+                MutationAuthority::Session(login.token.clone()),
+                first.next_after,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert!(!second.has_more);
+        assert_eq!(second.records[0].actor_kind, AuditActorKind::Account);
+        assert_eq!(second.records[0].actor_user_id, Some(login.user.id));
+        assert!(
+            store
+                .prune_audit(
+                    MutationAuthority::Session(login.token.clone()),
+                    first.next_after,
+                    first.latest_id - 1
+                )
+                .await
+                .unwrap_err()
+                .is::<AuditConflict>()
+        );
+        let pruned = store
+            .prune_audit(
+                MutationAuthority::Session(login.token.clone()),
+                first.next_after,
+                first.latest_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pruned.pruned_records, 2);
+        assert_eq!(pruned.record.action, AuditAction::Prune);
+        assert_eq!(pruned.record.through_id, Some(first.next_after));
+        let page = store
+            .audit_page(MutationAuthority::Session(login.token.clone()), 0, 100)
+            .await
+            .unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.pruned_through, first.next_after);
+        assert_eq!(page.records.len(), 2);
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .audit_page(MutationAuthority::Session(login.token.clone()), 0, 1)
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        assert!(
+            store
+                .prune_audit(
+                    MutationAuthority::Session(login.token),
+                    page.latest_id,
+                    page.latest_id
+                )
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_capacity_blocks_writes_and_explicit_prune_recovers() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        // Insert inert test records in one statement; ordinary account writes never prune.
+        connection.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 3 UNION ALL SELECT id+1 FROM ids WHERE id<100000) INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,password_changed,affected_count) SELECT id,0,'baseline','system',0,0 FROM ids; UPDATE admin_audit_meta SET next_audit_id=100001,stored_records=100000 WHERE singleton=1;").unwrap();
+        drop(connection);
+        let before = store
+            .audit_page(MutationAuthority::System, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(before.stored_records, AUDIT_CAPACITY);
+        assert!(!before.writes_available);
+        assert!(
+            store
+                .create(
+                    MutationAuthority::System,
+                    "blocked".into(),
+                    "blocked secure password".into(),
+                    Role::Viewer
+                )
+                .await
+                .unwrap_err()
+                .is::<AuditCapacity>()
+        );
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        let pruned = store
+            .prune_audit(MutationAuthority::System, 1000, before.latest_id)
+            .await
+            .unwrap();
+        assert_eq!(pruned.pruned_records, 1000);
+        assert!(
+            store
+                .audit_page(MutationAuthority::System, 0, 1)
+                .await
+                .unwrap()
+                .writes_available
+        );
+        let user = store
+            .create(
+                MutationAuthority::System,
+                "accepted".into(),
+                "accepted secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.id, 2, "capacity rejection rolls back next user id");
     }
 
     #[tokio::test]
