@@ -1921,6 +1921,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v3_to_v4_rejects_missing_middle_row_before_hashing_history() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .unwrap();
+        }
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let connection = connection(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
+            ALTER TABLE admin_config_operation_meta DROP COLUMN pruned_through;
+            ALTER TABLE admin_config_operation_meta DROP COLUMN retained_ids_sha256;
+            DELETE FROM admin_config_operations WHERE id=2;
+            UPDATE admin_config_operation_meta SET stored_records=2 WHERE singleton=1;
+            PRAGMA user_version=3;",
+            )
+            .unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        let columns:String=connection.query_row("SELECT group_concat(name,',') FROM pragma_table_info('admin_config_operation_meta')",[],|row|row.get(0)).unwrap();
+        assert!(!columns.contains("history_revision"));
+        // Migration failure leaves the already authorized account session intact.
+        let hash: [u8; 32] = Sha256::digest(login.token.as_bytes()).into();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE token_hash=?1",
+                    params![hash],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn config_acceptance_capacity_blocks_without_evicting_unresolved_rows() {
         let (directory, store) = store();
         let path = directory.path().join("accounts.sqlite3");
@@ -2157,49 +2211,63 @@ mod tests {
     #[tokio::test]
     #[ignore = "explicit release-mode local operation journal diagnostic"]
     async fn config_operation_acceptance_microbenchmark() {
-        let (_directory, store) = store();
-        store
-            .bootstrap("root".into(), "first secure password".into())
-            .await
-            .unwrap();
-        let login = store
-            .login("root".into(), "first secure password".into())
-            .await
-            .unwrap()
-            .unwrap();
         const PAIRS: usize = 100;
-        for account in [false, true] {
-            let started = std::time::Instant::now();
-            for _ in 0..PAIRS {
-                let authority = if account {
-                    MutationAuthority::Session(login.token.clone())
-                } else {
-                    MutationAuthority::System
-                };
-                let accepted = store
-                    .accept_config(authority, config_request())
-                    .await
-                    .unwrap();
-                let finished = store
-                    .finish_config(
-                        &accepted.operation_id,
-                        ConfigOperationState::CandidateActivated,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(finished.state, ConfigOperationState::CandidateActivated);
+        for retained_before in [0, 9_000] {
+            let (directory, store) = store();
+            store
+                .bootstrap("root".into(), "first secure password".into())
+                .await
+                .unwrap();
+            let login = store
+                .login("root".into(), "first secure password".into())
+                .await
+                .unwrap()
+                .unwrap();
+            if retained_before > 0 {
+                // Owned synthetic terminal rows, outside the timed region.
+                let path = directory.path().join("accounts.sqlite3");
+                let connection = connection(&path).unwrap();
+                connection.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<9000)
+                    INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms)
+                    SELECT id,printf('%032x',id),(SELECT authority_id FROM admin_config_operation_meta WHERE singleton=1),'system',NULL,0,0,printf('%064x',1),'local_file',NULL,'failed',0 FROM ids;
+                    UPDATE admin_config_operation_meta SET next_id=9001,stored_records=9000,history_revision=18000 WHERE singleton=1;").unwrap();
+                let digest =
+                    retained_ids_sha256(&connection.unchecked_transaction().unwrap()).unwrap();
+                connection.execute("UPDATE admin_config_operation_meta SET retained_ids_sha256=?1 WHERE singleton=1",params![digest]).unwrap();
             }
-            let elapsed = started.elapsed();
-            eprintln!(
-                "local config acceptance+finish {}: {PAIRS} pairs ({} SQLite FULL writes) in {elapsed:?} ({:.0} pairs/s); excludes Argon2, HTTP, configuration CAS, preparation and data plane",
-                if account {
-                    "session authority"
-                } else {
-                    "system authority"
-                },
-                PAIRS * 2,
-                PAIRS as f64 / elapsed.as_secs_f64()
-            );
+            for account in [false, true] {
+                let started = std::time::Instant::now();
+                for _ in 0..PAIRS {
+                    let authority = if account {
+                        MutationAuthority::Session(login.token.clone())
+                    } else {
+                        MutationAuthority::System
+                    };
+                    let accepted = store
+                        .accept_config(authority, config_request())
+                        .await
+                        .unwrap();
+                    let finished = store
+                        .finish_config(
+                            &accepted.operation_id,
+                            ConfigOperationState::CandidateActivated,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(finished.state, ConfigOperationState::CandidateActivated);
+                }
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "local config acceptance+finish retained_before={retained_before} {}: {PAIRS} pairs ({} SQLite FULL writes) in {elapsed:?} ({:.0} pairs/s); excludes synthetic seeding, Argon2, HTTP, configuration CAS, preparation and data plane",
+                    if account {
+                        "session authority"
+                    } else {
+                        "system authority"
+                    },
+                    PAIRS * 2,
+                    PAIRS as f64 / elapsed.as_secs_f64()
+                );
+            }
         }
     }
 
