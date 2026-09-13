@@ -1545,6 +1545,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_acceptance_capacity_blocks_without_evicting_unresolved_rows() {
+        let (directory, store) = store();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        connection.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000)
+            INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms)
+            SELECT id,printf('%032x',id),(SELECT authority_id FROM admin_config_operation_meta WHERE singleton=1),'system',NULL,0,0,printf('%064x',1),'local_file',NULL,'accepted',NULL FROM ids;
+            UPDATE admin_config_operation_meta SET next_id=10001,stored_records=10000 WHERE singleton=1;").unwrap();
+        drop(connection);
+        let full = store
+            .config_operations(MutationAuthority::System, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(full.stored_records, CONFIG_OPERATION_CAPACITY);
+        assert!(!full.writes_available);
+        assert_eq!(full.records[0].state, ConfigOperationState::Accepted);
+        assert!(
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationCapacity>()
+        );
+        // Finishing a row is allowed but does not silently free history capacity.
+        store
+            .finish_config(&full.records[0].operation_id, ConfigOperationState::Failed)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationCapacity>()
+        );
+        assert_eq!(
+            Store::open(path)
+                .unwrap()
+                .config_operations(MutationAuthority::System, 0, 1)
+                .await
+                .unwrap()
+                .stored_records,
+            CONFIG_OPERATION_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_config_operation_rows_fail_page_and_startup() {
+        let (directory, store) = store();
+        let accepted = store
+            .accept_config(MutationAuthority::System, config_request())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        assert!(connection.execute("UPDATE admin_config_operations SET actor_kind='account',actor_user_id=NULL WHERE id=1",[]).is_err());
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        for invalid in [
+            "UPDATE admin_config_operations SET actor_kind='account',actor_user_id=NULL WHERE id=1",
+            "UPDATE admin_config_operations SET state='candidate_activated',finished_at_unix_ms=NULL WHERE id=1",
+            "UPDATE admin_config_operations SET accepted_at_unix_ms=-1 WHERE id=1",
+            "UPDATE admin_config_operations SET candidate_sha256='garbage' WHERE id=1",
+            "UPDATE admin_config_operations SET authority_id='00000000000000000000000000000000' WHERE id=1",
+        ] {
+            connection.execute(invalid, []).unwrap();
+            assert!(
+                store
+                    .config_operations(MutationAuthority::System, 0, 100)
+                    .await
+                    .is_err(),
+                "malformed operation returned: {invalid}"
+            );
+            assert!(
+                Store::open(path.clone()).is_err(),
+                "malformed operation passed reopen: {invalid}"
+            );
+            connection.execute("UPDATE admin_config_operations SET actor_kind='system',actor_user_id=NULL,state='accepted',finished_at_unix_ms=NULL,accepted_at_unix_ms=?1,candidate_sha256=?2,authority_id=?3 WHERE id=1",params![accepted.accepted_at_unix_ms,accepted.candidate_sha256,accepted.authority_id]).unwrap();
+        }
+        assert!(Store::open(path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_v3_migration_rolls_back_and_keeps_v2_accounts() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2; CREATE TABLE admin_config_operation_meta(dummy INTEGER);").unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        let connection = connection(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(
+            connection
+                .query_row("SELECT 1 FROM admin_config_operations", [], |row| row
+                    .get::<_, i64>(0))
+                .is_err()
+        );
+        connection
+            .execute_batch("DROP TABLE admin_config_operation_meta")
+            .unwrap();
+        drop(connection);
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(
+            migrated.session(login.token).await.unwrap().unwrap().id,
+            root.id
+        );
+        assert_eq!(
+            migrated
+                .config_operations(MutationAuthority::System, 0, 1)
+                .await
+                .unwrap()
+                .stored_records,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn audit_migration_preserves_login_and_user_ids_never_recycle() {
         let (directory, store) = store();
         let root = store
