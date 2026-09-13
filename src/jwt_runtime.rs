@@ -650,4 +650,45 @@ mod tests {
             "same kid with new public key retires old admission"
         );
     }
+
+    /// Diagnostic only: the steady-state local session guard after one
+    /// admission. This excludes signature verification, routing, network I/O,
+    /// HTTP framing, and any vendor or gateway throughput comparison.
+    /// Run explicitly with:
+    /// cargo test --release --lib jwt_session_current_microbenchmark -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "explicit release-mode local guard diagnostic"]
+    async fn jwt_session_current_microbenchmark() {
+        let (runtime, signing) = local_runtime(61);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = runtime
+            .authenticate_session(
+                &token(&signing, now + 60),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            )
+            .await
+            .unwrap();
+        assert!(runtime.session_current(&session));
+
+        const ITERATIONS: usize = 2_000_000;
+        let started = Instant::now();
+        let mut accepted = 0usize;
+        for _ in 0..ITERATIONS {
+            accepted += usize::from(std::hint::black_box(
+                std::hint::black_box(&runtime).session_current(std::hint::black_box(&session)),
+            ));
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(
+            accepted, ITERATIONS,
+            "every guard check must remain authorized"
+        );
+        eprintln!(
+            "local JWT session_current guard: {ITERATIONS} checks in {elapsed:?} ({:.0} checks/s); excludes signature, network, HTTP, and routing",
+            ITERATIONS as f64 / elapsed.as_secs_f64()
+        );
+    }
 }
