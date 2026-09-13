@@ -769,10 +769,11 @@ async fn run(args: Args) -> Result<()> {
         Duration::from_secs(args.tcp_idle_seconds),
     )
     .with_discovery(discovery.clone());
-    // A replacement generation inherits its snapshot from the previous one
-    // and must not carry L4 traffic on it until the shared authority has
-    // confirmed (or updated) it; the gate opens after the readiness wait.
-    let tcp = Arc::new(if replacing && shared_store {
+    // A shared-store or Kubernetes generation must not accept TCP traffic
+    // before its authority confirms the initial snapshot. This also covers
+    // a replacement that inherited a snapshot from the previous process.
+    // The gate opens only after await_readiness succeeds below.
+    let tcp = Arc::new(if shared_store || args.kubernetes_controller {
         tcp.with_gate_closed()
     } else {
         tcp
