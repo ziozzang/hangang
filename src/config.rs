@@ -183,6 +183,8 @@ pub struct HttpRoute {
     pub id: String,
     #[serde(default, skip_serializing_if = "is_legacy_access_mode")]
     pub access_mode: AccessMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_policy: Option<crate::resource_policy::ResourcePolicy>,
     /// Persist policy while excluding this route from new traffic.
     #[serde(default = "enabled_default", skip_serializing_if = "is_enabled")]
     pub enabled: bool,
@@ -602,7 +604,29 @@ impl Config {
             );
             ensure!(ids.insert(id), "duplicate route id: {id}");
         }
+        let mut resources: std::collections::HashMap<&str, &HttpRoute> = Default::default();
         for r in &self.http {
+            if let Some(policy) = &r.resource_policy {
+                ensure!(
+                    r.access_mode == AccessMode::Protected,
+                    "resource policy requires access_mode protected"
+                );
+                policy.validate_binding(r.basic_auth.as_ref(), r.auth.as_ref())?;
+                if let Some(path) = &r.path_prefix {
+                    ensure!(
+                        crate::resource_policy::canonical_path(path)? == *path,
+                        "resource path_prefix must be canonical"
+                    );
+                }
+                if let Some(prior) = resources.insert(&policy.resource_id, r) {
+                    ensure!(
+                        prior.resource_policy == r.resource_policy
+                            && prior.basic_auth == r.basic_auth
+                            && prior.auth == r.auth,
+                        "routes sharing a resource_id must share policy and authenticators"
+                    );
+                }
+            }
             match r.access_mode {
                 AccessMode::Legacy => {}
                 AccessMode::Protected => ensure!(
@@ -950,12 +974,31 @@ impl Config {
         }
         Ok(())
     }
-    /// A document replacing an active snapshot must declare an intentional
+    /// Enforced resource namespaces survive deletion, renaming, and disabled
+    /// routes until a prior revision explicitly releases their exact scope.
+    /// A document replacing an active snapshot must also declare an intentional
     /// downgrade when an existing protected route keeps its ID. Older editors
     /// omit access_mode and authentication fields; serde would otherwise turn
     /// that replacement into an anonymous Legacy route.
     pub fn validate_transition_from(&self, previous: &Self) -> anyhow::Result<()> {
         use anyhow::ensure;
+        for old in &previous.http {
+            let Some(policy) = old.resource_policy.as_ref().filter(|policy| policy.enforce) else {
+                continue;
+            };
+            ensure!(
+                self.http.iter().any(|new| {
+                    new.resource_policy
+                        .as_ref()
+                        .is_some_and(|next| next.resource_id == policy.resource_id)
+                        && resource_hosts_preserved(old, new)
+                        && new.path_prefix == old.path_prefix
+                        && new.path_match == old.path_match
+                }),
+                "resource {} scope cannot be removed or moved; first publish enforce=false at its existing scope",
+                policy.resource_id
+            );
+        }
         let protected: std::collections::HashSet<&str> = previous
             .http
             .iter()
@@ -971,6 +1014,29 @@ impl Config {
         }
         Ok(())
     }
+}
+
+// Host aliases may be added or reordered without releasing an existing scope.
+// Prove containment structurally; never guess containment between regex/globs.
+fn resource_hosts_preserved(old: &HttpRoute, new: &HttpRoute) -> bool {
+    let unrestricted = |route: &HttpRoute| {
+        route.host.is_none() && route.hosts.is_empty() && route.host_regex.is_none()
+    };
+    if unrestricted(new) {
+        return true;
+    }
+    if unrestricted(old) {
+        return false;
+    }
+    if old.host_regex.is_some() || new.host_regex.is_some() {
+        return old.host_regex == new.host_regex;
+    }
+    old.host.iter().chain(old.hosts.iter()).all(|pattern| {
+        new.host
+            .iter()
+            .chain(new.hosts.iter())
+            .any(|next| pattern.eq_ignore_ascii_case(next))
+    })
 }
 
 fn deserialize_http_hosts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -1045,6 +1111,7 @@ pub struct Snapshot {
     pub admissions:
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
+    pub resource_guards: Vec<std::sync::Arc<HttpRuntime>>,
     pub tcp_health: std::collections::HashMap<String, std::sync::Arc<crate::tcp_health::TcpHealth>>,
     pub tcp_member_admissions: std::collections::HashMap<
         String,
@@ -1459,6 +1526,17 @@ impl Snapshot {
             certificates,
             cache,
             config,
+            resource_guards: http
+                .iter()
+                .filter(|runtime| {
+                    runtime
+                        .route
+                        .resource_policy
+                        .as_ref()
+                        .is_some_and(|policy| policy.enforce)
+                })
+                .cloned()
+                .collect(),
             http,
             tcp_health,
             tcp_member_activity,

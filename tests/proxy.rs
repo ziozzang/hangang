@@ -256,6 +256,7 @@ async fn frontend(proxy: Proxy) -> (SocketAddr, JoinHandle<()>, Arc<Metrics>) {
 fn route(backends: Vec<String>) -> HttpRoute {
     HttpRoute {
         access_mode: Default::default(),
+        resource_policy: None,
         enabled: true,
         upstream: Default::default(),
         priority: 0,

@@ -191,7 +191,7 @@ impl ResourcePolicy {
                 if values.next().is_some() {
                     return false;
                 }
-                let Ok(subject) = first.to_str() else {
+                let Ok(subject) = std::str::from_utf8(first.as_bytes()) else {
                     return false;
                 };
                 subject
@@ -349,6 +349,21 @@ mod tests {
         headers.append("x-auth-subject", HeaderValue::from_static("bob"));
         assert!(!p.allows("GET", PrincipalEvidence::External(&headers)));
         headers.clear();
+        assert!(!p.allows("GET", PrincipalEvidence::External(&headers)));
+    }
+
+    #[test]
+    fn external_subject_utf8_is_exact_and_invalid_encoding_is_denied() {
+        let mut p = policy();
+        p.allow[0].subjects = vec!["사용자".into()];
+        p.validate_binding(None, Some(&auth())).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-auth-subject",
+            HeaderValue::from_bytes("사용자".as_bytes()).unwrap(),
+        );
+        assert!(p.allows("GET", PrincipalEvidence::External(&headers)));
+        headers.insert("x-auth-subject", HeaderValue::from_bytes(&[0xff]).unwrap());
         assert!(!p.allows("GET", PrincipalEvidence::External(&headers)));
     }
 

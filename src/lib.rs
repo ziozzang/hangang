@@ -59,3 +59,6 @@ pub mod upstream_dns;
 pub mod member_admission;
 
 pub mod retired_members;
+
+mod resource_guard;
+pub mod resource_policy;

@@ -54,6 +54,7 @@ impl RouteCache {
 /// Returns whether a route can produce one deterministic, shareable representation.
 pub fn route_eligible(route: &crate::config::HttpRoute) -> bool {
     route.cache.is_some()
+        && route.resource_policy.is_none()
         && route.access_mode != crate::config::AccessMode::Protected
         && route.auth.is_none()
         && route.basic_auth.is_none()
@@ -454,6 +455,17 @@ mod tests {
         assert!(route_eligible(&route));
         route.access_mode = crate::config::AccessMode::Protected;
         assert!(!route_eligible(&route));
+        route.access_mode = crate::config::AccessMode::Legacy;
+        route.resource_policy = Some(
+            serde_json::from_value(json!({
+                "resource_id":"records", "principal":{"source":"basic"}, "allow":[]
+            }))
+            .unwrap(),
+        );
+        assert!(
+            !route_eligible(&route),
+            "defensive eligibility rejects an invalid unprotected resource policy"
+        );
     }
 
     #[test]

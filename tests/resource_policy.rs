@@ -644,3 +644,36 @@ async fn resource_policy_rejects_native_identity_transform_and_defensively_reass
     upstream_task.abort();
     policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn concurrent_subjects_cannot_share_resource_permission() {
+    let (upstream, hits, upstream_task) = origin("private").await;
+    let (front, policy, front_task) = gateway(vec![protected_route(upstream)]).await;
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 0..96 {
+        requests.spawn(async move {
+            let (user, expected) = match index % 3 {
+                0 => (Some("alice"), 200),
+                1 => (Some("bob"), 403),
+                _ => (None, 401),
+            };
+            let status = request(
+                front,
+                "GET",
+                "/secure/records",
+                user,
+                &[("x-verified-user", "alice")],
+                None,
+            )
+            .await;
+            assert_eq!(status, expected);
+        });
+    }
+    while let Some(result) = requests.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 32);
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}

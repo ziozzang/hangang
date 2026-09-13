@@ -784,11 +784,28 @@ impl Proxy {
         let (parts, body) = request.into_parts();
         let mut request = Request::from_parts(parts, boxed_incoming(body));
 
+        let (protected_resource, canonical_resource_path) = match crate::resource_guard::check(
+            &snapshot.resource_guards,
+            &request,
+            edge.forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok()),
+        ) {
+            Ok(guard) => guard,
+            Err(status) => return Ok(response(status, "resource namespace refused")),
+        };
         let mut inspected = None;
         let mut selected: Option<Arc<HttpRuntime>> = None;
         for runtime in &snapshot.http {
             if !runtime.route.enabled
-                || !basic_match(&runtime.route, &request, runtime.host_regex.as_ref())
+                || !basic_match_path(
+                    &runtime.route,
+                    &request,
+                    runtime.host_regex.as_ref(),
+                    canonical_resource_path
+                        .as_deref()
+                        .unwrap_or(request.uri().path()),
+                )
             {
                 continue;
             }
@@ -861,6 +878,15 @@ impl Proxy {
                 "no matching route",
             ));
         };
+        if protected_resource.is_some_and(|id| {
+            !runtime
+                .route
+                .resource_policy
+                .as_ref()
+                .is_some_and(|policy| policy.enforce && policy.resource_id == id)
+        }) {
+            return Ok(response(403, "resource namespace refused"));
+        }
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.chars().take(128).collect());
         }
@@ -985,6 +1011,12 @@ impl Proxy {
         // later connection retry must not replace it with a balancer-selected
         // backend the policy never approved.
         let mut policy_pinned_backend = false;
+        let resource_policy = runtime
+            .route
+            .resource_policy
+            .as_ref()
+            .filter(|policy| policy.enforce);
+        let mut resource_allowed = resource_policy.is_none();
         if let Some(basic) = &runtime.route.basic_auth {
             let prepared = runtime
                 .basic_auth
@@ -1004,6 +1036,19 @@ impl Proxy {
             };
             match verified {
                 Some(authenticated) => {
+                    if let Some(policy) = resource_policy
+                        && matches!(
+                            policy.principal,
+                            crate::resource_policy::PrincipalSource::Basic
+                        )
+                    {
+                        resource_allowed = policy.allows(
+                            request.method().as_str(),
+                            crate::resource_policy::PrincipalEvidence::Basic(
+                                &authenticated.username,
+                            ),
+                        );
+                    }
                     if basic.hide_credentials {
                         request.headers_mut().remove(header::AUTHORIZATION);
                     }
@@ -1056,6 +1101,17 @@ impl Proxy {
             }
             match self.authorize(auth, &mut request, &edge).await {
                 AuthOutcome::Allow(headers, cookies) => {
+                    if let Some(policy) = resource_policy
+                        && matches!(
+                            policy.principal,
+                            crate::resource_policy::PrincipalSource::External { .. }
+                        )
+                    {
+                        resource_allowed = policy.allows(
+                            request.method().as_str(),
+                            crate::resource_policy::PrincipalEvidence::External(&headers),
+                        );
+                    }
                     for (name, value) in headers.iter() {
                         request.headers_mut().insert(name.clone(), value.clone());
                         established_identity.push((name.clone(), value.clone()));
@@ -1073,6 +1129,10 @@ impl Proxy {
             }
         }
 
+        if !resource_allowed {
+            self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(response(403, "resource permission denied"));
+        }
         let Some(mut index) = self.select_http_backend(&runtime) else {
             return Ok(self.failure(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1774,63 +1834,31 @@ async fn inspect_json_body(
     Ok((Request::from_parts(parts, full_body(bytes)), json))
 }
 
+#[cfg(test)]
 fn basic_match<B>(
     route: &HttpRoute,
     request: &Request<B>,
     host_regex: Option<&regex::Regex>,
 ) -> bool {
-    let actual = if route.host.is_some() || !route.hosts.is_empty() || host_regex.is_some() {
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<hyper::http::uri::Authority>().ok())
-            .map(|a| a.host().to_owned())
-            .or_else(|| request.uri().authority().map(|a| a.host().to_owned()))
-    } else {
-        None
-    };
-    if let Some(expected) = &route.host
-        && !actual
-            .as_deref()
-            .is_some_and(|host| crate::host_match::matches(expected, host))
+    basic_match_path(route, request, host_regex, request.uri().path())
+}
+
+fn basic_match_path<B>(
+    route: &HttpRoute,
+    request: &Request<B>,
+    host_regex: Option<&regex::Regex>,
+    path: &str,
+) -> bool {
+    let constrained_host = route.host.is_some() || !route.hosts.is_empty() || host_regex.is_some();
+    if (constrained_host
+        && !crate::resource_guard::host_matches(
+            route,
+            host_regex,
+            crate::resource_guard::request_host(request).as_deref(),
+        ))
+        || !crate::resource_guard::path_matches(route, path)
     {
         return false;
-    }
-    if !route.hosts.is_empty()
-        && !actual.as_deref().is_some_and(|host| {
-            route
-                .hosts
-                .iter()
-                .any(|pattern| crate::host_match::matches(pattern, host))
-        })
-    {
-        return false;
-    }
-    if let Some(regex) = host_regex
-        && !actual
-            .as_deref()
-            .is_some_and(|host| host.len() <= 253 && host.is_ascii() && regex.is_match(host))
-    {
-        return false;
-    }
-    if let Some(prefix) = &route.path_prefix {
-        let path = request.uri().path();
-        let matches = match route.path_match {
-            crate::config::PathMatch::Prefix => path.starts_with(prefix),
-            crate::config::PathMatch::Exact => path == prefix,
-            crate::config::PathMatch::SegmentPrefix => {
-                let base = prefix.trim_end_matches('/');
-                base.is_empty()
-                    || path == base
-                    || path
-                        .strip_prefix(base)
-                        .is_some_and(|tail| tail.starts_with('/'))
-            }
-        };
-        if !matches {
-            return false;
-        }
     }
     route.headers.iter().all(|(name, value)| {
         request
@@ -2619,6 +2647,7 @@ mod tests {
     fn route() -> HttpRoute {
         HttpRoute {
             access_mode: Default::default(),
+            resource_policy: None,
             enabled: true,
             upstream: Default::default(),
             priority: 0,

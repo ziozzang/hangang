@@ -1,0 +1,57 @@
+{
+  "http": [
+    {
+      "id": "records",
+      "hosts": [
+        "app.example",
+        "www.app.example"
+      ],
+      "path_prefix": "/records",
+      "path_match": "segment_prefix",
+      "access_mode": "protected",
+      "backends": [
+        "http://127.0.0.1:8080"
+      ],
+      "auth": {
+        "url": "https://identity.example.test/check",
+        "response_headers": [
+          "x-authenticated-subject"
+        ],
+        "request_headers": [
+          "authorization"
+        ]
+      },
+      "resource_policy": {
+        "resource_id": "records",
+        "principal": {
+          "source": "external",
+          "subject_header": "x-authenticated-subject"
+        },
+        "allow": [
+          {
+            "subjects": [
+              "reader"
+            ],
+            "methods": [
+              "GET",
+              "HEAD"
+            ]
+          },
+          {
+            "subjects": [
+              "editor"
+            ],
+            "methods": [
+              "GET",
+              "HEAD",
+              "POST",
+              "PATCH"
+            ]
+          }
+        ]
+      },
+      "require_tls": true,
+      "lua": "hangang.set_header('x-application-policy', 'resource-example')"
+    }
+  ]
+}
