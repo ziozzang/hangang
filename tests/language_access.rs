@@ -226,6 +226,70 @@ async fn absent_empty_zero_quality_and_malformed_signals_do_not_open_deny_only_r
 }
 
 #[tokio::test]
+async fn oversized_accept_language_is_rejected_before_origin() {
+    let fixture = fixture(
+        |origin| {
+            json!([route(
+                "bounded",
+                origin,
+                language("any", &["en"], &[], "allow")
+            )])
+        },
+        false,
+    )
+    .await;
+    let oversized = "a".repeat(hangang::language_policy::MAX_HEADER_BYTES + 1);
+    assert_eq!(
+        status(&fixture, &[("accept-language", &oversized)]).await,
+        400
+    );
+    assert_eq!(fixture.origin_hits.load(Ordering::SeqCst), 0);
+    fixture.close().await;
+}
+
+#[test]
+#[ignore = "owned release diagnostic: parser and policy evaluation only, not HTTP throughput"]
+fn language_parser_and_policy_release_diagnostic() {
+    use hangang::language_policy::{
+        AcceptLanguage, CompiledLanguagePolicy, MatchMode, MissingAction,
+    };
+    let typical = b"en-US,en;q=0.7".as_slice();
+    let max_header = (0..32)
+        .map(|index| format!("l{index};q=0.9"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cases: [(&str, &[u8], &str); 2] = [
+        ("typical", typical, "en"),
+        ("max_32_ranges", max_header.as_bytes(), "l31"),
+    ];
+    const ITERATIONS: usize = 100_000;
+    for (name, header, allow) in cases {
+        let policy = CompiledLanguagePolicy::new(
+            MatchMode::Any,
+            MissingAction::Deny,
+            true,
+            [allow],
+            std::iter::empty::<&str>(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let parsed = AcceptLanguage::parse_values([std::hint::black_box(header)]).unwrap();
+            assert!(std::hint::black_box(
+                policy.allows(std::hint::black_box(&parsed))
+            ));
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "language_parse_evaluate case={name} header_bytes={} iterations={ITERATIONS} elapsed_ms={:.3} ns_per_iteration={:.1}",
+            header.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_nanos() as f64 / ITERATIONS as f64
+        );
+    }
+}
+
+#[tokio::test]
 async fn language_denial_precedes_cache_only_and_lua_policy() {
     let cached = fixture(
         |origin| {
