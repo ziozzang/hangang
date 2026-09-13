@@ -23,6 +23,10 @@ pub struct Config {
     pub certificates: Vec<crate::certificates::CertificateFiles>,
     #[serde(default)]
     pub cache: Option<crate::cache_store::CacheConfig>,
+    /// Node-local database path and limits; database bytes never enter the
+    /// configuration authority. A new source starts pending after publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip_database: Option<crate::geoip_runtime::Source>,
     #[serde(default)]
     pub http: Vec<HttpRoute>,
     #[serde(default)]
@@ -190,6 +194,8 @@ pub struct HttpRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language_policy: Option<crate::language_policy::Policy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_policy: Option<crate::country_policy::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_auth: Option<crate::jwt_runtime::JwtAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_auth: Option<crate::workload_auth::Policy>,
@@ -351,6 +357,8 @@ pub struct TcpRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<crate::tcp_health::TcpHealthPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_policy: Option<crate::country_policy::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbound_tls: Option<crate::workload_tls::Policy>,
     #[serde(default)]
     pub sni: Option<crate::client_hello::SniMatch>,
@@ -449,6 +457,25 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
+        if let Some(source) = &self.geoip_database {
+            source.validate().context("geoip_database")?;
+        }
+        for policy in self
+            .http
+            .iter()
+            .filter_map(|route| route.country_policy.as_ref())
+            .chain(
+                self.tcp
+                    .iter()
+                    .filter_map(|route| route.country_policy.as_ref()),
+            )
+        {
+            policy.validate()?;
+            ensure!(
+                !policy.enforce || self.geoip_database.is_some(),
+                "enforced country policy requires geoip_database"
+            );
+        }
         ensure!(
             self.cache_generation_floor <= crate::cache_store::MAX_GENERATION,
             "cache_generation_floor must be 0..4294967295"
@@ -770,6 +797,7 @@ impl Config {
                     ensure!(
                         prior.resource_policy == r.resource_policy
                             && prior.language_policy == r.language_policy
+                            && prior.country_policy == r.country_policy
                             && prior.basic_auth == r.basic_auth
                             && prior.auth == r.auth
                             && prior.jwt_auth == r.jwt_auth
@@ -1307,6 +1335,7 @@ pub struct HttpRuntime {
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
     pub language_policy: Option<crate::language_policy::CompiledLanguagePolicy>,
+    pub country_policy: Option<crate::country_policy::CompiledCountryPolicy>,
     pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
     pub workload_auth: Option<std::sync::Arc<crate::workload_auth::Runtime>>,
     pub auth_reserved: Vec<hyper::header::HeaderName>,
@@ -1342,6 +1371,7 @@ pub struct Snapshot {
         std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
     pub certificates: Option<std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
     pub cache: Option<std::sync::Arc<crate::cache::CacheRuntime>>,
+    pub geoip: Option<std::sync::Arc<crate::geoip_runtime::Slot>>,
     pub config: Config,
     pub admissions:
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -1457,6 +1487,9 @@ impl Snapshot {
     pub fn replace_fresh(config: Config, previous: &Self) -> anyhow::Result<Self> {
         config.validate_transition_from(&previous.config)?;
         let mut next = Self::new(config)?;
+        if next.config.geoip_database == previous.config.geoip_database {
+            next.geoip = previous.geoip.clone();
+        }
         next.retired_members = previous.retired_members.clone();
         next.retirements = std::sync::Mutex::new(Some(next.retirements_from(previous)?));
         Ok(next)
@@ -1538,6 +1571,17 @@ impl Snapshot {
             config.validate_transition_from(&previous.config)?;
         }
         let settings = std::sync::Arc::new(PreparedSettings::prepare(&config.settings)?);
+        let geoip = config
+            .geoip_database
+            .as_ref()
+            .map(|source| {
+                previous
+                    .filter(|old| old.config.geoip_database.as_ref() == Some(source))
+                    .and_then(|old| old.geoip.clone())
+                    .map(Ok)
+                    .unwrap_or_else(|| crate::geoip_runtime::Slot::new(source.clone()))
+            })
+            .transpose()?;
         let http_match_headers = config
             .http
             .iter()
@@ -1671,6 +1715,10 @@ impl Snapshot {
                         .language_policy
                         .as_ref()
                         .map(|policy| policy.compile().expect("validated language policy")),
+                    country_policy: route
+                        .country_policy
+                        .as_ref()
+                        .map(|policy| policy.compile().expect("validated country policy")),
                     cache_fingerprint: {
                         use sha2::Digest;
                         format!(
@@ -1927,6 +1975,7 @@ impl Snapshot {
             tcp_inbound_tls,
             certificates,
             cache,
+            geoip,
             config,
             resource_guards: http
                 .iter()
@@ -2032,6 +2081,124 @@ pub(crate) fn valid_response_header_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn geoip_source(file: &str) -> crate::geoip_runtime::Source {
+        crate::geoip_runtime::Source {
+            file: file.into(),
+            max_file_bytes: 32 * 1024 * 1024,
+            max_age_days: 14,
+            reload_interval_seconds: 30,
+        }
+    }
+
+    #[test]
+    fn geoip_source_is_optional_validated_without_file_io_and_reuses_only_exact_policy() {
+        let mut config = Config::default();
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("geoip_database")
+                .is_none()
+        );
+        assert!(Snapshot::new(config.clone()).unwrap().geoip.is_none());
+
+        config.geoip_database = Some(geoip_source("/not-a-real-geoip.mmdb"));
+        let first = Snapshot::new(config.clone()).unwrap();
+        let original = first.geoip.as_ref().unwrap();
+        assert!(!original.status().ready);
+        assert!(original.load().is_none());
+        assert_eq!(
+            serde_json::from_value::<Config>(serde_json::to_value(&config).unwrap())
+                .unwrap()
+                .geoip_database,
+            config.geoip_database
+        );
+
+        let same = Snapshot::replace(config.clone(), &first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            original,
+            same.geoip.as_ref().unwrap()
+        ));
+        let fresh_authority = Snapshot::replace_fresh(config.clone(), &same).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            original,
+            fresh_authority.geoip.as_ref().unwrap()
+        ));
+
+        config
+            .geoip_database
+            .as_mut()
+            .unwrap()
+            .reload_interval_seconds = 31;
+        let changed = Snapshot::replace(config.clone(), &fresh_authority).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            original,
+            changed.geoip.as_ref().unwrap()
+        ));
+        assert!(changed.geoip.as_ref().unwrap().load().is_none());
+        let changed_slot = changed.geoip.as_ref().unwrap();
+
+        config.geoip_database = Some(geoip_source("/another-geoip.mmdb"));
+        let changed_file = Snapshot::replace(config.clone(), &changed).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            changed_slot,
+            changed_file.geoip.as_ref().unwrap()
+        ));
+        config.geoip_database = None;
+        assert!(
+            Snapshot::replace(config, &changed_file)
+                .unwrap()
+                .geoip
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn geoip_source_invalid_structure_rejected_even_without_file_read() {
+        let mut config = Config::default();
+        config.geoip_database = Some(geoip_source("relative.mmdb"));
+        assert!(config.validate().is_err());
+        config.geoip_database = Some(geoip_source("/valid-shape.mmdb"));
+        config.geoip_database.as_mut().unwrap().max_file_bytes = 0;
+        assert!(Snapshot::new(config).is_err());
+    }
+
+    #[test]
+    fn country_policy_validates_both_protocols_and_compiles_without_database_io() {
+        let policy = crate::country_policy::Policy {
+            allow: vec!["KR".into()],
+            deny: vec![],
+            on_unknown: crate::country_policy::UnknownAction::Deny,
+            enforce: true,
+        };
+        let mut config = route();
+        config.http[0].country_policy = Some(policy.clone());
+        assert!(config.validate().is_err(), "enforced HTTP needs a source");
+        config.http[0].enabled = false;
+        assert!(config.validate().is_err(), "disabled routes still validate");
+        config.geoip_database = Some(geoip_source("/not-a-real-geoip.mmdb"));
+        let prepared = Snapshot::new(config.clone()).unwrap();
+        assert!(prepared.http[0].country_policy.as_ref().unwrap().enforced());
+        assert!(prepared.geoip.as_ref().unwrap().load().is_none());
+
+        let mut tcp: TcpRoute = serde_json::from_str(
+            r#"{"id":"tcp","enabled":false,"listen":"127.0.0.1:9009","backends":["127.0.0.1:9010"]}"#,
+        )
+        .unwrap();
+        tcp.country_policy = Some(policy);
+        config.tcp.push(tcp);
+        assert!(Snapshot::new(config.clone()).is_ok());
+        config.geoip_database = None;
+        assert!(Snapshot::new(config.clone()).is_err());
+        config.http[0].country_policy.as_mut().unwrap().enforce = false;
+        config.tcp[0].country_policy.as_mut().unwrap().enforce = false;
+        assert!(Snapshot::new(config.clone()).is_ok());
+        config.tcp[0].country_policy.as_mut().unwrap().allow = vec!["bad".into()];
+        assert!(
+            config.validate().is_err(),
+            "inactive rules remain validated"
+        );
+    }
+
     fn route() -> Config {
         serde_json::from_str(r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080"]}]}"#)
             .unwrap()

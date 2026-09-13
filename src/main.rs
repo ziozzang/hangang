@@ -1023,6 +1023,11 @@ async fn run(args: Args) -> Result<()> {
         active.clone(),
         workload_cancel.clone(),
     ));
+    // The GeoIP source is node-local. Keep exactly one verifier for the
+    // published slot, and retain it through the connection drain so a
+    // withdrawal remains observable by in-flight work.
+    let geoip_cancel = CancellationToken::new();
+    let geoip_watcher = tokio::spawn(watch_geoip_slot(active.clone(), geoip_cancel.clone()));
     let mut tls_watchers = Vec::new();
     // New slots are quarantined until the watcher verifies their files after
     // publication. Do not signal startup readiness or accept traffic earlier.
@@ -1045,7 +1050,9 @@ async fn run(args: Args) -> Result<()> {
     {
         cancel.cancel();
         workload_cancel.cancel();
+        geoip_cancel.cancel();
         let _ = workload_watcher.await;
+        let _ = geoip_watcher.await;
         anyhow::bail!("workload TLS material did not become ready within 10 seconds");
     }
     tcp.open_gate();
@@ -1210,10 +1217,72 @@ async fn run(args: Args) -> Result<()> {
     );
     workload_cancel.cancel();
     let _ = workload_watcher.await;
+    geoip_cancel.cancel();
+    let _ = geoip_watcher.await;
     pool.shutdown().await;
     validation_pool.shutdown().await;
     drop(lock);
     Ok(())
+}
+
+/// Switch node-local GeoIP verification only after the predecessor has
+/// stopped and its in-flight blocking read has drained. A candidate slot may
+/// receive a database only while that exact Arc is in the active snapshot.
+async fn watch_geoip_slot(active: Arc<arc_swap::ArcSwap<Snapshot>>, cancel: CancellationToken) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut current: Option<Arc<hangang::geoip_runtime::Slot>> = None;
+    let mut child_cancel: Option<CancellationToken> = None;
+    let mut child: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
+        let selected = active.load().geoip.clone();
+        let same = match (&current, &selected) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        if same && child.as_ref().is_none_or(|task| !task.is_finished()) {
+            continue;
+        }
+        if let Some(token) = child_cancel.take() {
+            token.cancel();
+        }
+        if let Some(task) = child.take() {
+            let _ = task.await;
+        }
+        current = None;
+        if cancel.is_cancelled() {
+            break;
+        }
+        // A publication may have changed while the previous verifier drained.
+        // Re-read it before starting work on a new source.
+        let selected = active.load().geoip.clone();
+        if let Some(slot) = selected {
+            let published_active = active.clone();
+            let published: Arc<hangang::geoip_runtime::Published> = Arc::new(move |candidate| {
+                published_active
+                    .load()
+                    .geoip
+                    .as_ref()
+                    .is_some_and(|active_slot| Arc::ptr_eq(active_slot, candidate))
+            });
+            let token = CancellationToken::new();
+            child = Some(tokio::spawn(hangang::geoip_runtime::watch(
+                slot.clone(),
+                published,
+                token.clone(),
+            )));
+            child_cancel = Some(token);
+            current = Some(slot);
+        }
+    }
+    if let Some(token) = child_cancel {
+        token.cancel();
+    }
+    if let Some(task) = child {
+        let _ = task.await;
+    }
 }
 #[derive(Clone)]
 enum Handler {
