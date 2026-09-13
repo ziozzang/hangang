@@ -119,6 +119,8 @@ pub struct SequencedReceiptObservation {
     pub high_water: u64,
     pub stored_records: u64,
     pub capacity: u64,
+    pub registered_authorities: u64,
+    pub authority_capacity: u64,
     pub writes_available: bool,
 }
 
@@ -377,6 +379,8 @@ pub(crate) fn resolve_cas(current: Stored, epoch: &str, next: &Config) -> CasRes
 struct OperationMetadata {
     revision: u64,
     stamp: OperationStamp,
+    version: u8,
+    sequence: Option<u64>,
 }
 
 fn valid_hex(value: &str, len: usize) -> bool {
@@ -410,6 +414,18 @@ pub fn canonical_operation_id(authority_id: &str, seq: u64) -> StoreResult<Strin
         write!(&mut id, "{byte:02x}").expect("String write is infallible");
     }
     Ok(id)
+}
+
+fn validate_sequenced_stamp(stamp: &SequencedOperationStamp, encoded: &str) -> StoreResult<()> {
+    if stamp.operation_id != canonical_operation_id(&stamp.authority_id, stamp.acceptance_seq)?
+        || !valid_hex(&stamp.candidate_sha256, 64)
+        || stamp.candidate_sha256 != sha256_hex(encoded.as_bytes())
+    {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid sequenced operation stamp"
+        )));
+    }
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -482,18 +498,93 @@ fn receipt_observation(
     })
 }
 
+fn sequenced_receipt(
+    authority_id: String,
+    acceptance_seq: i64,
+    operation_id: String,
+    epoch: String,
+    revision: i64,
+    candidate_sha256: String,
+) -> StoreResult<SequencedCommitReceipt> {
+    let seq = u64::try_from(acceptance_seq)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid sequenced receipt")))?;
+    if operation_id != canonical_operation_id(&authority_id, seq)?
+        || !valid_hex(&candidate_sha256, 64)
+    {
+        return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt")));
+    }
+    check_epoch(&epoch)?;
+    let revision = i64_to_revision(revision)?;
+    if revision == 0 {
+        return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt")));
+    }
+    Ok(SequencedCommitReceipt {
+        epoch,
+        revision,
+        stamp: SequencedOperationStamp {
+            authority_id,
+            acceptance_seq: seq,
+            operation_id,
+            candidate_sha256,
+        },
+    })
+}
+
+fn sequenced_observation(
+    receipt: Option<SequencedCommitReceipt>,
+    high_water: Option<i64>,
+    stored_records: i64,
+    registered_authorities: i64,
+) -> StoreResult<SequencedReceiptObservation> {
+    let count = u64::try_from(stored_records)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt count")))?;
+    let authorities = u64::try_from(registered_authorities)
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid authority count")))?;
+    let high_water = u64::try_from(high_water.unwrap_or(0))
+        .map_err(|_| StoreError::Invalid(anyhow!("invalid authority high water")))?;
+    if count > COMMIT_RECEIPT_CAPACITY
+        || authorities > COMMIT_AUTHORITY_CAPACITY
+        || high_water > MAX_ACCEPTANCE_SEQUENCE
+        || receipt
+            .as_ref()
+            .is_some_and(|entry| entry.stamp.acceptance_seq > high_water)
+    {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid sequenced receipt metadata"
+        )));
+    }
+    Ok(SequencedReceiptObservation {
+        receipt,
+        high_water,
+        stored_records: count,
+        capacity: COMMIT_RECEIPT_CAPACITY,
+        registered_authorities: authorities,
+        authority_capacity: COMMIT_AUTHORITY_CAPACITY,
+        writes_available: count < COMMIT_RECEIPT_CAPACITY
+            && (high_water > 0 || authorities < COMMIT_AUTHORITY_CAPACITY),
+    })
+}
+
 fn decode_operation_metadata(
     authority_id: Option<String>,
     operation_id: Option<String>,
     revision: Option<i64>,
     candidate_sha256: Option<String>,
+    version: Option<i64>,
+    sequence: Option<i64>,
 ) -> StoreResult<Option<OperationMetadata>> {
     if authority_id.is_none()
         && operation_id.is_none()
         && revision.is_none()
         && candidate_sha256.is_none()
     {
-        return Ok(None);
+        return if version.is_none() && sequence.is_none() {
+            Ok(None)
+        } else {
+            Err(StoreError::Invalid(anyhow!(
+                "invalid stored operation stamp"
+            )))
+        };
     }
     let (Some(authority_id), Some(operation_id), Some(revision), Some(candidate_sha256)) =
         (authority_id, operation_id, revision, candidate_sha256)
@@ -516,7 +607,30 @@ fn decode_operation_metadata(
             "invalid stored operation stamp"
         )));
     }
-    Ok(Some(OperationMetadata { revision, stamp }))
+    let (version, sequence) = match (version, sequence) {
+        (None, None) | (Some(1), None) => (1, None),
+        (Some(2), Some(seq)) if (1..=MAX_ACCEPTANCE_SEQUENCE as i64).contains(&seq) => {
+            let seq = u64::try_from(seq)
+                .map_err(|_| StoreError::Invalid(anyhow!("invalid stored operation stamp")))?;
+            if stamp.operation_id != canonical_operation_id(&stamp.authority_id, seq)? {
+                return Err(StoreError::Invalid(anyhow!(
+                    "invalid stored sequenced identity"
+                )));
+            }
+            (2, Some(seq))
+        }
+        _ => {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid stored operation version"
+            )));
+        }
+    };
+    Ok(Some(OperationMetadata {
+        revision,
+        stamp,
+        version,
+        sequence,
+    }))
 }
 
 fn current_operation_proof(
@@ -531,6 +645,37 @@ fn current_operation_proof(
         epoch: stored.epoch.clone(),
         revision: metadata.revision,
         stamp: metadata.stamp.clone(),
+    })
+}
+
+fn current_v1_operation_proof(
+    stored: &Stored,
+    encoded: &str,
+    metadata: &Option<OperationMetadata>,
+) -> Option<OperationProof> {
+    if !metadata
+        .as_ref()
+        .is_some_and(|meta| meta.version == 1 && meta.sequence.is_none())
+    {
+        return None;
+    }
+    current_operation_proof(stored, encoded, metadata)
+}
+
+fn current_sequenced_proof(
+    stored: &Stored,
+    encoded: &str,
+    metadata: &Option<OperationMetadata>,
+    stamp: &SequencedOperationStamp,
+) -> bool {
+    metadata.as_ref().is_some_and(|meta| {
+        meta.version == 2
+            && meta.sequence == Some(stamp.acceptance_seq)
+            && meta.revision == stored.config.revision
+            && meta.stamp.authority_id == stamp.authority_id
+            && meta.stamp.operation_id == stamp.operation_id
+            && meta.stamp.candidate_sha256 == stamp.candidate_sha256
+            && stamp.candidate_sha256 == sha256_hex(encoded.as_bytes())
     })
 }
 
@@ -562,7 +707,7 @@ fn resolve_operation_cas(
         }
         Err(error) => return Err(error),
     };
-    let proof = current_operation_proof(&stored, &encoded, &metadata);
+    let proof = current_v1_operation_proof(&stored, &encoded, &metadata);
     if metadata
         .as_ref()
         .is_some_and(|current| current.stamp.operation_id == stamp.operation_id)
@@ -1070,7 +1215,7 @@ impl ConfigStore for SqliteConfigStore {
                 .map_err(sqlite_error)?;
             let changed = transaction
                 .execute(
-                    "UPDATE hangang_config SET revision = ?1, config_json = ?2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL WHERE singleton = 1 AND revision = ?3 AND epoch = ?4",
+                    "UPDATE hangang_config SET revision = ?1, config_json = ?2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL, operation_version=NULL, operation_sequence=NULL, write_generation=write_generation+1 WHERE singleton = 1 AND revision = ?3 AND epoch = ?4 AND write_generation<9223372036854775807",
                     rusqlite::params![next_revision, encoded, expected_revision, epoch],
                 )
                 .map_err(sqlite_error)?;
@@ -1099,6 +1244,74 @@ impl ConfigStore for SqliteConfigStore {
 
     fn supports_commit_receipts(&self) -> bool {
         true
+    }
+
+    fn supports_sequenced_operation_cas(&self) -> bool {
+        true
+    }
+
+    async fn lookup_commit_receipt_v2(
+        &self,
+        authority_id: &str,
+        acceptance_seq: u64,
+    ) -> StoreResult<SequencedReceiptObservation> {
+        canonical_operation_id(authority_id, acceptance_seq)?;
+        let authority_id = authority_id.to_owned();
+        self.with_connection(Access::Read, move |connection| {
+            let tx = connection.transaction().map_err(sqlite_error)?;
+            let observation = sqlite_sequenced_observation(&tx, &authority_id, acceptance_seq)?;
+            tx.commit().map_err(sqlite_error)?;
+            Ok(observation)
+        })
+        .await
+    }
+
+    async fn compare_and_swap_operation_v2(
+        &self,
+        epoch: &str,
+        expected: u64,
+        mut next: Config,
+        stamp: SequencedOperationStamp,
+    ) -> StoreResult<CasResult> {
+        check_epoch(epoch)?;
+        next.revision = next_revision(expected)?;
+        let encoded = encode(&next)?;
+        validate_sequenced_stamp(&stamp, &encoded)?;
+        let revision = revision_to_i64(next.revision)?;
+        let expected = revision_to_i64(expected)?;
+        let seq = i64::try_from(stamp.acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        let epoch = epoch.to_owned();
+        self.with_connection(Access::Mutation,move|connection|{
+            let tx=connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sqlite_error)?;
+            let current=sqlite_load_operation(&tx)?.ok_or_else(||StoreError::Invalid(anyhow!("SQLite configuration store is not initialized")))?;
+            let observation=sqlite_sequenced_observation(&tx,&stamp.authority_id,stamp.acceptance_seq)?;
+            if let Some(receipt)=observation.receipt {
+                if receipt.epoch!=epoch || receipt.revision!=next.revision || receipt.stamp!=stamp {
+                    return Err(StoreError::Invalid(anyhow!("sequenced operation identity reused")));
+                }
+                return Ok(if current.0.epoch==epoch && current.0.config==next && current_sequenced_proof(&current.0,&current.1,&current.2,&stamp){
+                    CasResult::Applied(current.0)
+                }else{CasResult::Conflict{current:current.0}});
+            }
+            if stamp.acceptance_seq<=observation.high_water {
+                return Ok(CasResult::Conflict{current:current.0});
+            }
+            if !observation.writes_available {
+                return Err(StoreError::Unavailable(anyhow!("sequenced receipt or authority capacity exhausted")));
+            }
+            let changed=tx.execute(
+                "UPDATE hangang_config SET revision=?1,config_json=?2,operation_authority_id=?3,operation_id=?4,operation_revision=?1,operation_sha256=?5,operation_version=2,operation_sequence=?6,write_generation=write_generation+1 WHERE singleton=1 AND revision=?7 AND epoch=?8 AND write_generation<9223372036854775807",
+                rusqlite::params![revision,encoded,stamp.authority_id,stamp.operation_id,stamp.candidate_sha256,seq,expected,epoch]
+            ).map_err(sqlite_error)?;
+            if changed!=1 {return Ok(CasResult::Conflict{current:current.0});}
+            tx.execute("INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![stamp.authority_id,seq,stamp.operation_id,epoch,revision,stamp.candidate_sha256]).map_err(sqlite_error)?;
+            let hwm=tx.execute("INSERT INTO hangang_sequenced_authorities(authority_id,high_water) VALUES(?1,?2) ON CONFLICT(authority_id) DO UPDATE SET high_water=excluded.high_water WHERE high_water<excluded.high_water",rusqlite::params![stamp.authority_id,seq]).map_err(sqlite_error)?;
+            let counted=tx.execute("UPDATE hangang_commit_receipt_meta SET stored_records=stored_records+1 WHERE singleton=1 AND stored_records<100000",[]).map_err(sqlite_error)?;
+            if hwm!=1 || counted!=1 {return Err(StoreError::Unavailable(anyhow!("sequenced receipt capacity exhausted")));}
+            tx.commit().map_err(sqlite_error)?;
+            Ok(CasResult::Applied(Stored{epoch,config:next}))
+        }).await
     }
 
     async fn lookup_commit_receipt(
@@ -1157,7 +1370,7 @@ impl ConfigStore for SqliteConfigStore {
                     return Err(StoreError::Invalid(anyhow!("operation identifier reused with another candidate or precondition")));
                 }
                 let result=if current.0.epoch==epoch && current.0.config==next &&
-                    current_operation_proof(&current.0,&current.1,&current.2).is_some_and(|proof| proof.stamp==stamp) {
+                    current_v1_operation_proof(&current.0,&current.1,&current.2).is_some_and(|proof| proof.stamp==stamp) {
                     CasResult::Applied(current.0)
                 } else {CasResult::Conflict{current:current.0}};
                 return Ok(result);
@@ -1169,7 +1382,7 @@ impl ConfigStore for SqliteConfigStore {
                 return resolve_operation_cas(Ok(Some(current)),&epoch,&next,&stamp,false);
             }
             let changed=transaction.execute(
-                "UPDATE hangang_config SET revision=?1,config_json=?2,operation_authority_id=?3,operation_id=?4,operation_revision=?1,operation_sha256=?5 WHERE singleton=1 AND revision=?6 AND epoch=?7 AND (operation_id IS NULL OR operation_id!=?4)",
+                "UPDATE hangang_config SET revision=?1,config_json=?2,operation_authority_id=?3,operation_id=?4,operation_revision=?1,operation_sha256=?5,operation_version=1,operation_sequence=NULL,write_generation=write_generation+1 WHERE singleton=1 AND revision=?6 AND epoch=?7 AND write_generation<9223372036854775807 AND (operation_id IS NULL OR operation_id!=?4)",
                 rusqlite::params![next_revision,encoded,stamp.authority_id,stamp.operation_id,stamp.candidate_sha256,expected_revision,epoch]
             ).map_err(sqlite_error)?;
             let result=if changed==1 {
@@ -1286,7 +1499,10 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
                 operation_authority_id TEXT,
                 operation_id TEXT,
                 operation_revision INTEGER,
-                operation_sha256 TEXT
+                operation_sha256 TEXT,
+                operation_version INTEGER,
+                operation_sequence INTEGER,
+                write_generation INTEGER NOT NULL DEFAULT 0
             ) STRICT;
             CREATE TABLE IF NOT EXISTS hangang_acme_challenges (
                 token TEXT PRIMARY KEY,
@@ -1304,6 +1520,20 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             CREATE TABLE IF NOT EXISTS hangang_commit_receipt_meta (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 stored_records INTEGER NOT NULL CHECK(stored_records >= 0 AND stored_records <= 100000)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS hangang_sequenced_receipts (
+                authority_id TEXT NOT NULL,
+                acceptance_seq INTEGER NOT NULL CHECK(acceptance_seq > 0 AND acceptance_seq <= 9007199254740991),
+                operation_id TEXT NOT NULL,
+                epoch TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision > 0),
+                candidate_sha256 TEXT NOT NULL,
+                PRIMARY KEY(authority_id, acceptance_seq),
+                UNIQUE(authority_id, operation_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
+                authority_id TEXT PRIMARY KEY,
+                high_water INTEGER NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991)
             ) STRICT;",
         )
         .map_err(sqlite_error)?;
@@ -1333,6 +1563,18 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
             "operation_sha256",
             "ALTER TABLE hangang_config ADD COLUMN operation_sha256 TEXT",
         ),
+        (
+            "operation_version",
+            "ALTER TABLE hangang_config ADD COLUMN operation_version INTEGER",
+        ),
+        (
+            "operation_sequence",
+            "ALTER TABLE hangang_config ADD COLUMN operation_sequence INTEGER",
+        ),
+        (
+            "write_generation",
+            "ALTER TABLE hangang_config ADD COLUMN write_generation INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if !sqlite_has_column(connection, name)?
             && let Err(error) = connection.execute_batch(ddl)
@@ -1345,6 +1587,20 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
         "INSERT OR IGNORE INTO hangang_commit_receipt_meta(singleton, stored_records) VALUES(1, 0)",
         [],
     ).map_err(sqlite_error)?;
+    connection
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS hangang_stamped_write_generation_v2
+         BEFORE UPDATE ON hangang_config
+         WHEN (OLD.operation_id IS NOT NULL OR NEW.operation_id IS NOT NULL)
+          AND NEW.write_generation <= OLD.write_generation
+          AND (NEW.revision IS NOT OLD.revision OR NEW.config_json IS NOT OLD.config_json
+               OR NEW.operation_authority_id IS NOT OLD.operation_authority_id
+               OR NEW.operation_id IS NOT OLD.operation_id
+               OR NEW.operation_revision IS NOT OLD.operation_revision
+               OR NEW.operation_sha256 IS NOT OLD.operation_sha256)
+         BEGIN SELECT RAISE(ABORT, 'stamped writer requires a new write generation'); END;",
+        )
+        .map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -1450,14 +1706,14 @@ fn sqlite_load_operation(
             "SQLite configuration row changed during proof read"
         )));
     }
-    let (present,authority_id,operation_id,operation_revision,candidate_sha256):
-        (i64,Option<String>,Option<String>,Option<i64>,Option<String>)=connection.query_row(
-        "SELECT (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL),
+    let (present,authority_id,operation_id,operation_revision,candidate_sha256,version,sequence)=connection.query_row(
+        "SELECT (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL OR operation_version IS NOT NULL OR operation_sequence IS NOT NULL),
                 CASE WHEN octet_length(operation_authority_id)<=32 THEN operation_authority_id END,
                 CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
                 operation_revision,
-                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END
-         FROM hangang_config WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).map_err(sqlite_error)?;
+                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END,
+                operation_version,operation_sequence
+         FROM hangang_config WHERE singleton=1",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<i64>>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<i64>>(5)?,row.get::<_,Option<i64>>(6)?))).map_err(sqlite_error)?;
     let metadata = if present == 0 {
         None
     } else {
@@ -1466,6 +1722,8 @@ fn sqlite_load_operation(
             operation_id,
             operation_revision,
             candidate_sha256,
+            version,
+            sequence,
         )?
     };
     if present != 0 && metadata.is_none() {
@@ -1527,6 +1785,79 @@ fn sqlite_receipt_observation(
         })
         .transpose()?;
     receipt_observation(receipt, count)
+}
+
+fn sqlite_sequenced_observation(
+    connection: &rusqlite::Connection,
+    authority_id: &str,
+    seq: u64,
+) -> StoreResult<SequencedReceiptObservation> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT stored_records FROM hangang_commit_receipt_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let authorities: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM hangang_sequenced_authorities",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let high_water: Option<i64> = connection
+        .query_row(
+            "SELECT high_water FROM hangang_sequenced_authorities WHERE authority_id=?1",
+            [authority_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    type Row = (
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+    );
+    let row: Option<Row> = connection
+        .query_row(
+            "SELECT CASE WHEN octet_length(authority_id)<=32 THEN authority_id END,
+                acceptance_seq,
+                CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
+                CASE WHEN octet_length(epoch)<=32 THEN epoch END,
+                revision,
+                CASE WHEN octet_length(candidate_sha256)<=64 THEN candidate_sha256 END
+         FROM hangang_sequenced_receipts WHERE authority_id=?1 AND acceptance_seq=?2",
+            rusqlite::params![
+                authority_id,
+                i64::try_from(seq)
+                    .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?
+            ],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let receipt = row
+        .map(|(a, s, o, e, r, h)| {
+            let (Some(a), Some(o), Some(e), Some(h)) = (a, o, e, h) else {
+                return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt")));
+            };
+            sequenced_receipt(a, s, o, e, r, h)
+        })
+        .transpose()?;
+    sequenced_observation(receipt, high_water, count, authorities)
 }
 
 #[derive(Clone)]
@@ -1709,6 +2040,50 @@ impl PostgresConfigStore {
         };
         receipt_observation(receipt, count)
     }
+    async fn sequenced_observation(
+        &self,
+        authority_id: &str,
+        seq: u64,
+    ) -> StoreResult<SequencedReceiptObservation> {
+        let seq = i64::try_from(seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        let row = self
+            .query_opt(
+                Access::Read,
+                "SELECT m.stored_records,
+                (SELECT COUNT(*) FROM hangang_sequenced_authorities),
+                (SELECT high_water FROM hangang_sequenced_authorities WHERE authority_id=$1),
+                CASE WHEN octet_length(r.authority_id)<=32 THEN r.authority_id END,
+                r.acceptance_seq,
+                CASE WHEN octet_length(r.operation_id)<=32 THEN r.operation_id END,
+                CASE WHEN octet_length(r.epoch)<=32 THEN r.epoch END,
+                r.revision,
+                CASE WHEN octet_length(r.candidate_sha256)<=64 THEN r.candidate_sha256 END
+             FROM hangang_commit_receipt_meta m
+             LEFT JOIN hangang_sequenced_receipts r ON r.authority_id=$1 AND r.acceptance_seq=$2
+             WHERE m.singleton=1",
+                &[&authority_id, &seq],
+            )
+            .await?
+            .ok_or_else(|| StoreError::Invalid(anyhow!("sequenced receipt metadata is missing")))?;
+        let count: i64 = postgres_column(&row, 0)?;
+        let authorities: i64 = postgres_column(&row, 1)?;
+        let high_water: Option<i64> = postgres_column(&row, 2)?;
+        let authority: Option<String> = postgres_column(&row, 3)?;
+        let receipt_seq: Option<i64> = postgres_column(&row, 4)?;
+        let operation: Option<String> = postgres_column(&row, 5)?;
+        let epoch: Option<String> = postgres_column(&row, 6)?;
+        let revision: Option<i64> = postgres_column(&row, 7)?;
+        let digest: Option<String> = postgres_column(&row, 8)?;
+        let receipt = match (authority, receipt_seq, operation, epoch, revision, digest) {
+            (None, None, None, None, None, None) => None,
+            (Some(a), Some(s), Some(o), Some(e), Some(r), Some(h)) => {
+                Some(sequenced_receipt(a, s, o, e, r, h)?)
+            }
+            _ => return Err(StoreError::Invalid(anyhow!("invalid sequenced receipt"))),
+        };
+        sequenced_observation(receipt, high_water, count, authorities)
+    }
     /// Connect without transport encryption. This intentionally rejects
     /// non-loopback TCP hosts and `sslmode=require`; production remote
     /// PostgreSQL integration must use a separately verified TLS constructor.
@@ -1821,13 +2196,19 @@ impl PostgresConfigStore {
                 operation_authority_id TEXT,
                 operation_id TEXT,
                 operation_revision BIGINT,
-                operation_sha256 TEXT
+                operation_sha256 TEXT,
+                operation_version SMALLINT,
+                operation_sequence BIGINT,
+                write_generation BIGINT NOT NULL DEFAULT 0
             );
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS epoch TEXT NOT NULL DEFAULT '';
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_authority_id TEXT;
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_id TEXT;
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_revision BIGINT;
             ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_sha256 TEXT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_version SMALLINT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS operation_sequence BIGINT;
+            ALTER TABLE hangang_config ADD COLUMN IF NOT EXISTS write_generation BIGINT NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS hangang_acme_challenges (
                 token TEXT PRIMARY KEY,
                 key_authorization TEXT NOT NULL,
@@ -1845,8 +2226,77 @@ impl PostgresConfigStore {
                 singleton SMALLINT PRIMARY KEY CHECK(singleton = 1),
                 stored_records BIGINT NOT NULL CHECK(stored_records >= 0 AND stored_records <= 100000)
             );
+            CREATE TABLE IF NOT EXISTS hangang_sequenced_receipts (
+                authority_id TEXT NOT NULL,
+                acceptance_seq BIGINT NOT NULL CHECK(acceptance_seq > 0 AND acceptance_seq <= 9007199254740991),
+                operation_id TEXT NOT NULL,
+                epoch TEXT NOT NULL,
+                revision BIGINT NOT NULL CHECK(revision > 0),
+                candidate_sha256 TEXT NOT NULL,
+                PRIMARY KEY(authority_id, acceptance_seq),
+                UNIQUE(authority_id, operation_id)
+            );
+            CREATE TABLE IF NOT EXISTS hangang_sequenced_authorities (
+                authority_id TEXT PRIMARY KEY,
+                high_water BIGINT NOT NULL CHECK(high_water > 0 AND high_water <= 9007199254740991)
+            );
             INSERT INTO hangang_commit_receipt_meta(singleton,stored_records)
-            VALUES(1,0) ON CONFLICT(singleton) DO NOTHING",
+            VALUES(1,0) ON CONFLICT(singleton) DO NOTHING;
+            CREATE OR REPLACE FUNCTION hangang_stamped_generation_guard() RETURNS trigger
+            LANGUAGE plpgsql AS $$ BEGIN
+                IF (OLD.operation_id IS NOT NULL OR NEW.operation_id IS NOT NULL)
+                   AND NEW.write_generation <= OLD.write_generation
+                   AND (NEW.revision IS DISTINCT FROM OLD.revision
+                     OR NEW.config_json IS DISTINCT FROM OLD.config_json
+                     OR NEW.operation_authority_id IS DISTINCT FROM OLD.operation_authority_id
+                     OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+                     OR NEW.operation_revision IS DISTINCT FROM OLD.operation_revision
+                     OR NEW.operation_sha256 IS DISTINCT FROM OLD.operation_sha256)
+                THEN RAISE EXCEPTION 'stamped writer requires a new write generation' USING ERRCODE='23514';
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE OR REPLACE TRIGGER hangang_stamped_write_generation
+            BEFORE UPDATE ON hangang_config FOR EACH ROW
+            EXECUTE FUNCTION hangang_stamped_generation_guard();
+            CREATE OR REPLACE FUNCTION hangang_cas_v2(
+                p_revision BIGINT,p_encoded TEXT,p_authority TEXT,p_operation TEXT,
+                p_digest TEXT,p_sequence BIGINT,p_expected BIGINT,p_epoch TEXT
+            ) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY INVOKER SET search_path FROM CURRENT AS $v2$
+            DECLARE changed BIGINT;
+            BEGIN
+                IF p_sequence<=0 OR p_sequence>9007199254740991 THEN
+                    RAISE EXCEPTION 'invalid sequenced operation' USING ERRCODE='23514';
+                END IF;
+                UPDATE hangang_config SET
+                    revision=p_revision,config_json=p_encoded,operation_authority_id=p_authority,
+                    operation_id=p_operation,operation_revision=p_revision,operation_sha256=p_digest,
+                    operation_version=2,operation_sequence=p_sequence,write_generation=write_generation+1
+                WHERE singleton=1 AND revision=p_expected AND epoch=p_epoch
+                  AND write_generation<9223372036854775807
+                  AND NOT EXISTS (SELECT 1 FROM hangang_sequenced_receipts WHERE authority_id=p_authority AND acceptance_seq=p_sequence)
+                  AND COALESCE((SELECT high_water FROM hangang_sequenced_authorities WHERE authority_id=p_authority),0)<p_sequence
+                  AND EXISTS (SELECT 1 FROM hangang_commit_receipt_meta WHERE singleton=1 AND stored_records<100000);
+                GET DIAGNOSTICS changed=ROW_COUNT;
+                IF changed=0 THEN RETURN FALSE; END IF;
+                IF NOT EXISTS (SELECT 1 FROM hangang_sequenced_authorities WHERE authority_id=p_authority)
+                   AND (SELECT COUNT(*) FROM hangang_sequenced_authorities)>=4096 THEN
+                    RAISE EXCEPTION 'sequenced authority capacity exhausted' USING ERRCODE='23514';
+                END IF;
+                INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
+                VALUES(p_authority,p_sequence,p_operation,p_epoch,p_revision,p_digest);
+                INSERT INTO hangang_sequenced_authorities(authority_id,high_water)
+                VALUES(p_authority,p_sequence)
+                ON CONFLICT(authority_id) DO UPDATE SET high_water=EXCLUDED.high_water
+                WHERE hangang_sequenced_authorities.high_water<EXCLUDED.high_water;
+                GET DIAGNOSTICS changed=ROW_COUNT;
+                IF changed<>1 THEN RAISE EXCEPTION 'sequenced authority fence changed' USING ERRCODE='23514'; END IF;
+                UPDATE hangang_commit_receipt_meta SET stored_records=stored_records+1
+                WHERE singleton=1 AND stored_records<100000;
+                GET DIAGNOSTICS changed=ROW_COUNT;
+                IF changed<>1 THEN RAISE EXCEPTION 'sequenced receipt capacity exhausted' USING ERRCODE='23514'; END IF;
+                RETURN TRUE;
+            END $v2$",
         ))
         .await
         .map_err(|failure| {
@@ -2009,11 +2459,12 @@ impl PostgresConfigStore {
             "SELECT revision,
                 CASE WHEN octet_length(config_json)<=$1 THEN config_json END,
                 CASE WHEN octet_length(epoch)<=$2 THEN epoch END,
-                (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL),
+                (operation_authority_id IS NOT NULL OR operation_id IS NOT NULL OR operation_revision IS NOT NULL OR operation_sha256 IS NOT NULL OR operation_version IS NOT NULL OR operation_sequence IS NOT NULL),
                 CASE WHEN octet_length(operation_authority_id)<=32 THEN operation_authority_id END,
                 CASE WHEN octet_length(operation_id)<=32 THEN operation_id END,
                 operation_revision,
-                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END
+                CASE WHEN octet_length(operation_sha256)<=64 THEN operation_sha256 END,
+                operation_version,operation_sequence
              FROM hangang_config WHERE singleton=1",
             &[&max_config_bytes,&max_epoch_bytes]).await? else {return Ok(None)};
         let revision: i64 = postgres_column(&row, 0)?;
@@ -2031,12 +2482,16 @@ impl PostgresConfigStore {
         let operation_id: Option<String> = postgres_column(&row, 5)?;
         let operation_revision: Option<i64> = postgres_column(&row, 6)?;
         let candidate_sha256: Option<String> = postgres_column(&row, 7)?;
+        let version: Option<i64> = postgres_column::<Option<i16>>(&row, 8)?.map(i64::from);
+        let sequence: Option<i64> = postgres_column(&row, 9)?;
         let metadata = if present {
             decode_operation_metadata(
                 authority_id,
                 operation_id,
                 operation_revision,
                 candidate_sha256,
+                version,
+                sequence,
             )?
         } else {
             None
@@ -2107,7 +2562,7 @@ impl ConfigStore for PostgresConfigStore {
             .run(Access::Mutation, |client| async move {
                 client
                     .query_opt(
-                        "UPDATE hangang_config SET revision = $1, config_json = $2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL WHERE singleton = 1 AND revision = $3 AND epoch = $4 RETURNING revision",
+                        "UPDATE hangang_config SET revision = $1, config_json = $2, operation_authority_id=NULL, operation_id=NULL, operation_revision=NULL, operation_sha256=NULL, operation_version=NULL, operation_sequence=NULL, write_generation=write_generation+1 WHERE singleton = 1 AND revision = $3 AND epoch = $4 AND write_generation<9223372036854775807 RETURNING revision",
                         parameters,
                     )
                     .await
@@ -2137,6 +2592,128 @@ impl ConfigStore for PostgresConfigStore {
 
     fn supports_commit_receipts(&self) -> bool {
         true
+    }
+
+    fn supports_sequenced_operation_cas(&self) -> bool {
+        true
+    }
+
+    async fn lookup_commit_receipt_v2(
+        &self,
+        authority_id: &str,
+        acceptance_seq: u64,
+    ) -> StoreResult<SequencedReceiptObservation> {
+        canonical_operation_id(authority_id, acceptance_seq)?;
+        self.sequenced_observation(authority_id, acceptance_seq)
+            .await
+    }
+
+    async fn compare_and_swap_operation_v2(
+        &self,
+        epoch: &str,
+        expected: u64,
+        mut next: Config,
+        stamp: SequencedOperationStamp,
+    ) -> StoreResult<CasResult> {
+        check_epoch(epoch)?;
+        next.revision = next_revision(expected)?;
+        let encoded = encode(&next)?;
+        validate_sequenced_stamp(&stamp, &encoded)?;
+        let revision = revision_to_i64(next.revision)?;
+        let expected_i64 = revision_to_i64(expected)?;
+        let seq = i64::try_from(stamp.acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &revision,
+            &encoded,
+            &stamp.authority_id,
+            &stamp.operation_id,
+            &stamp.candidate_sha256,
+            &seq,
+            &expected_i64,
+            &epoch,
+        ];
+        let attempted = self
+            .run(Access::Mutation, |client| async move {
+                client
+                    .query_one("SELECT hangang_cas_v2($1,$2,$3,$4,$5,$6,$7,$8)", parameters)
+                    .await
+            })
+            .await?;
+        let changed: bool = postgres_column(&attempted.value, 0)?;
+        if changed {
+            return Ok(CasResult::Applied(Stored {
+                epoch: epoch.to_owned(),
+                config: next,
+            }));
+        }
+        let observation = match self
+            .sequenced_observation(&stamp.authority_id, stamp.acceptance_seq)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if attempted.uncertain => {
+                return Err(StoreError::Indeterminate(
+                    error
+                        .into_inner()
+                        .context("sequenced CAS receipt recovery failed"),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(receipt) = observation.receipt {
+            if receipt.epoch != epoch || receipt.revision != next.revision || receipt.stamp != stamp
+            {
+                return if attempted.uncertain {
+                    Err(StoreError::Indeterminate(anyhow!(
+                        "sequenced CAS unanswered and identity differs"
+                    )))
+                } else {
+                    Err(StoreError::Invalid(anyhow!(
+                        "sequenced operation identity reused"
+                    )))
+                };
+            }
+            let current =
+                receipt_recovery_read(self.load_stored_with_proof().await, attempted.uncertain)?;
+            return match current {
+                Some((stored, encoded, metadata))
+                    if stored.epoch == epoch
+                        && stored.config == next
+                        && current_sequenced_proof(&stored, &encoded, &metadata, &stamp) =>
+                {
+                    Ok(CasResult::Applied(stored))
+                }
+                Some((_stored, _, _)) if attempted.uncertain => Err(StoreError::Indeterminate(
+                    anyhow!("sequenced CAS committed historically but current document changed"),
+                )),
+                Some((stored, _, _)) => Ok(CasResult::Conflict { current: stored }),
+                None => Err(StoreError::Indeterminate(anyhow!(
+                    "sequenced receipt exists but current configuration is absent"
+                ))),
+            };
+        }
+        let current =
+            receipt_recovery_read(self.load_stored_with_proof().await, attempted.uncertain)?;
+        let Some((stored, _, _)) = current else {
+            return Err(StoreError::Indeterminate(anyhow!(
+                "sequenced CAS current configuration is absent"
+            )));
+        };
+        if attempted.uncertain {
+            return Err(StoreError::Indeterminate(anyhow!(
+                "sequenced CAS outcome is not provable"
+            )));
+        }
+        if stored.epoch == epoch
+            && stored.config.revision == expected
+            && !observation.writes_available
+        {
+            return Err(StoreError::Unavailable(anyhow!(
+                "sequenced receipt or authority capacity exhausted"
+            )));
+        }
+        Ok(CasResult::Conflict { current: stored })
     }
 
     async fn lookup_commit_receipt(
@@ -2182,8 +2759,9 @@ impl ConfigStore for PostgresConfigStore {
             client.query_opt(
                 "WITH updated AS (
                     UPDATE hangang_config
-                    SET revision=$1,config_json=$2,operation_authority_id=$3,operation_id=$4,operation_revision=$1,operation_sha256=$5
+                    SET revision=$1,config_json=$2,operation_authority_id=$3,operation_id=$4,operation_revision=$1,operation_sha256=$5,operation_version=1,operation_sequence=NULL,write_generation=write_generation+1
                     WHERE singleton=1 AND revision=$6 AND epoch=$7
+                      AND write_generation<9223372036854775807
                       AND (operation_id IS NULL OR operation_id<>$4)
                       AND NOT EXISTS (SELECT 1 FROM hangang_commit_receipts WHERE authority_id=$3 AND operation_id=$4)
                       AND EXISTS (SELECT 1 FROM hangang_commit_receipt_meta WHERE singleton=1 AND stored_records<100000)
@@ -2234,7 +2812,7 @@ impl ConfigStore for PostgresConfigStore {
             if let Some((stored, encoded, metadata)) = current {
                 if stored.epoch == epoch
                     && stored.config == next
-                    && current_operation_proof(&stored, &encoded, &metadata)
+                    && current_v1_operation_proof(&stored, &encoded, &metadata)
                         .is_some_and(|proof| proof.stamp == stamp)
                 {
                     return Ok(CasResult::Applied(stored));
@@ -2588,6 +3166,93 @@ mod tests {
         }
     }
 
+    fn sequenced_test_stamp(authority: &str, seq: u64, config: &Config) -> SequencedOperationStamp {
+        SequencedOperationStamp {
+            authority_id: authority.to_owned(),
+            acceptance_seq: seq,
+            operation_id: canonical_operation_id(authority, seq).unwrap(),
+            candidate_sha256: sha256_hex(encode(config).unwrap().as_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_sequenced_receipts_fence_replay_after_later_commit_and_reseed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sequenced.db");
+        let store = SqliteConfigStore::open(&path).await.unwrap();
+        assert!(store.supports_sequenced_operation_cas());
+        let initial = store.bootstrap(document(0, false)).await.unwrap();
+        let authority = "a".repeat(32);
+        let first = sequenced_test_stamp(&authority, 7, &document(1, false));
+        assert!(matches!(
+            store
+                .compare_and_swap_operation_v2(&initial.epoch, 0, document(0, false), first.clone())
+                .await
+                .unwrap(),
+            CasResult::Applied(_)
+        ));
+        let observation = store.lookup_commit_receipt_v2(&authority, 7).await.unwrap();
+        assert_eq!(observation.high_water, 7);
+        assert_eq!(observation.registered_authorities, 1);
+        assert_eq!(observation.stored_records, 1);
+        assert_eq!(observation.receipt.unwrap().stamp, first);
+        let second = sequenced_test_stamp(&authority, 9, &document(2, true));
+        assert!(matches!(
+            store
+                .compare_and_swap_operation_v2(&initial.epoch, 1, document(0, true), second.clone())
+                .await
+                .unwrap(),
+            CasResult::Applied(_)
+        ));
+        assert!(
+            matches!(store.compare_and_swap_operation_v2(&initial.epoch,0,document(0,false),first.clone()).await.unwrap(),CasResult::Conflict{current} if current.config.revision==2)
+        );
+        let old = sequenced_test_stamp(&authority, 8, &document(3, false));
+        assert!(
+            matches!(store.compare_and_swap_operation_v2(&initial.epoch,2,document(0,false),old).await.unwrap(),CasResult::Conflict{current} if current.config.revision==2)
+        );
+        let mut reused = first.clone();
+        reused.candidate_sha256 = sha256_hex(encode(&document(3, true)).unwrap().as_bytes());
+        assert!(matches!(
+            store
+                .compare_and_swap_operation_v2(&initial.epoch, 2, document(0, true), reused)
+                .await,
+            Err(StoreError::Invalid(_))
+        ));
+        let old_writer = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            old_writer
+                .execute(
+                    "UPDATE hangang_config SET revision=3,config_json=?1 WHERE singleton=1",
+                    [encode(&document(3, true)).unwrap()]
+                )
+                .is_err()
+        );
+        old_writer
+            .execute("DELETE FROM hangang_config", [])
+            .unwrap();
+        let reseeded = store.bootstrap(document(0, false)).await.unwrap();
+        assert_ne!(reseeded.epoch, initial.epoch);
+        assert_eq!(
+            store
+                .lookup_commit_receipt_v2(&authority, 7)
+                .await
+                .unwrap()
+                .high_water,
+            9
+        );
+        assert!(matches!(
+            store
+                .compare_and_swap_operation_v2(&reseeded.epoch, 0, document(0, false), first)
+                .await,
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(
+            store.load_latest().await.unwrap().unwrap().config.revision,
+            0
+        );
+    }
+
     #[test]
     fn operation_resolver_requires_exact_stamp_even_for_identical_document() {
         let next = document(1, false);
@@ -2605,6 +3270,8 @@ mod tests {
                 Some(OperationMetadata {
                     revision: 1,
                     stamp: first.clone(),
+                    version: 1,
+                    sequence: None,
                 }),
             )))
         };
@@ -2641,6 +3308,8 @@ mod tests {
             Some(OperationMetadata {
                 revision: 1,
                 stamp: first.clone(),
+                version: 1,
+                sequence: None,
             }),
         )));
         assert!(matches!(
@@ -2720,23 +3389,34 @@ mod tests {
                 .unwrap_err(),
             StoreError::Invalid(_)
         ));
-        // A pre-upgrade SQL writer advances revision but does not know the
-        // optional stamp columns. Their stale values cannot prove its write.
+        // A pre-upgrade SQL writer leaves the stamp and generation unchanged;
+        // the migration gate rejects that mutation rather than carrying stale
+        // identity into a newer document.
         let old_writer = rusqlite::Connection::open(&path).unwrap();
-        old_writer
-            .execute(
-                "UPDATE hangang_config SET revision=2,config_json=?1 WHERE singleton=1",
-                rusqlite::params![encode(&document(2, true)).unwrap()],
-            )
-            .unwrap();
-        assert_eq!(store.load_current_operation_proof().await.unwrap(), None);
+        assert!(
+            old_writer
+                .execute(
+                    "UPDATE hangang_config SET revision=2,config_json=?1 WHERE singleton=1",
+                    rusqlite::params![encode(&document(2, true)).unwrap()],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_current_operation_proof()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
         assert_eq!(
             store.load_latest().await.unwrap().unwrap().config,
-            document(2, true)
+            document(1, false)
         );
         assert!(matches!(
             store
-                .compare_and_swap(&initial.epoch, 2, document(0, false))
+                .compare_and_swap(&initial.epoch, 1, document(0, false))
                 .await
                 .unwrap(),
             CasResult::Applied(_)
