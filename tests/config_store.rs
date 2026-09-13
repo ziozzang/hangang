@@ -2,8 +2,9 @@ use hangang::{
     certificates::CertificateFiles,
     config::{Config, HttpRoute},
     config_store::{
-        CasResult, ConfigStore, EPOCH_LEN, FileConfigStore, OperationProof, OperationStamp,
-        PostgresConfigStore, SqliteConfigStore, StoreError, Stored, bootstrap_prepared,
+        CasResult, CommitReceipt, ConfigStore, EPOCH_LEN, FileConfigStore, OperationProof,
+        OperationStamp, PostgresConfigStore, SqliteConfigStore, StoreError, Stored,
+        bootstrap_prepared,
     },
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -260,6 +261,121 @@ async fn assert_operation_cas_contract(store: &dyn ConfigStore) -> anyhow::Resul
     Ok(())
 }
 
+async fn assert_commit_receipt_contract(store: &dyn ConfigStore) -> anyhow::Result<()> {
+    assert!(store.supports_commit_receipts());
+    let initial = store.bootstrap(config(0, "receipt-initial")).await?;
+    let epoch = initial.epoch;
+    let candidate_a = config(0, "receipt-A");
+    let stamp_a = operation_stamp(0, &"1".repeat(32), &candidate_a);
+    let absent = store
+        .lookup_commit_receipt(&stamp_a.authority_id, &stamp_a.operation_id)
+        .await?;
+    assert_eq!(absent.receipt, None);
+    assert_eq!(absent.stored_records, 0);
+    assert_eq!(absent.capacity, 100_000);
+    assert!(absent.writes_available);
+
+    let committed_a = applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate_a.clone(), stamp_a.clone())
+            .await?,
+    );
+    assert_eq!(committed_a.config.revision, 1);
+    let receipt_a = CommitReceipt {
+        epoch: epoch.clone(),
+        revision: 1,
+        stamp: stamp_a.clone(),
+    };
+    let observed = store
+        .lookup_commit_receipt(&stamp_a.authority_id, &stamp_a.operation_id)
+        .await?;
+    assert_eq!(observed.receipt, Some(receipt_a.clone()));
+    assert_eq!(observed.stored_records, 1);
+    assert!(observed.writes_available);
+    assert_eq!(
+        applied(
+            store
+                .compare_and_swap_operation(&epoch, 0, candidate_a.clone(), stamp_a.clone())
+                .await?
+        ),
+        committed_a
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&stamp_a.authority_id, &stamp_a.operation_id)
+            .await?
+            .stored_records,
+        1,
+        "same-ID retry cannot append another receipt"
+    );
+
+    let candidate_b = config(0, "receipt-B");
+    let stamp_b = operation_stamp(1, &"2".repeat(32), &candidate_b);
+    let committed_b = applied(
+        store
+            .compare_and_swap_operation(&epoch, 1, candidate_b, stamp_b.clone())
+            .await?,
+    );
+    assert_eq!(committed_b.config.revision, 2);
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&stamp_a.authority_id, &stamp_a.operation_id)
+            .await?
+            .receipt,
+        Some(receipt_a)
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&stamp_b.authority_id, &stamp_b.operation_id)
+            .await?
+            .receipt,
+        Some(CommitReceipt {
+            epoch: epoch.clone(),
+            revision: 2,
+            stamp: stamp_b
+        })
+    );
+    let replay = store
+        .compare_and_swap_operation(&epoch, 0, candidate_a, stamp_a.clone())
+        .await?;
+    assert!(
+        matches!(replay, CasResult::Conflict { current } if current == committed_b),
+        "a retained historical receipt is not permission to activate stale A again"
+    );
+
+    // Existing system/old SQL writers can still advance the config, but they
+    // cannot create a governed receipt or erase A and B's retained evidence.
+    applied(
+        store
+            .compare_and_swap(&epoch, 2, config(0, "legacy-C"))
+            .await?,
+    );
+    assert_eq!(store.load_current_operation_proof().await?, None);
+    let observed = store
+        .lookup_commit_receipt(&stamp_a.authority_id, &stamp_a.operation_id)
+        .await?;
+    assert_eq!(observed.stored_records, 2);
+    assert_eq!(observed.receipt.unwrap().revision, 1);
+    let absent = store
+        .lookup_commit_receipt(&stamp_a.authority_id, &"f".repeat(32))
+        .await?;
+    assert_eq!(absent.receipt, None);
+    assert_eq!(absent.stored_records, 2);
+
+    for (authority, operation) in [
+        ("not-hex", stamp_a.operation_id.as_str()),
+        (stamp_a.authority_id.as_str(), "synthetic-secret-id"),
+    ] {
+        let error = store
+            .lookup_commit_receipt(authority, operation)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Invalid(_)));
+        assert!(!error.to_string().contains("synthetic-secret-id"));
+    }
+    Ok(())
+}
+
 async fn assert_challenge_contract(store: &dyn ConfigStore) {
     let ttl = Duration::from_secs(30);
     assert_eq!(store.lookup_challenge("absent").await.unwrap(), None);
@@ -393,6 +509,13 @@ async fn file_store_explicitly_rejects_operation_cas() -> anyhow::Result<()> {
         Err(StoreError::Invalid(_))
     ));
     assert_eq!(store.load_latest().await?, Some(initial));
+    assert!(!store.supports_commit_receipts());
+    assert!(matches!(
+        store
+            .lookup_commit_receipt(&"a".repeat(32), &"1".repeat(32))
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
     Ok(())
 }
 
@@ -587,6 +710,159 @@ async fn sqlite_operation_cas_proves_only_the_winning_operation_and_survives_reo
 }
 
 #[tokio::test]
+async fn sqlite_commit_receipts_survive_later_writes_reopen_and_new_epoch() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    assert_commit_receipt_contract(&store).await?;
+    let original = store.load_latest().await?.unwrap();
+    let first = operation_stamp(0, &"1".repeat(32), &config(0, "receipt-A"));
+    drop(store);
+
+    let reopened = SqliteConfigStore::open(&path).await?;
+    assert_eq!(
+        reopened
+            .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+            .await?
+            .receipt,
+        Some(CommitReceipt {
+            epoch: original.epoch.clone(),
+            revision: 1,
+            stamp: first.clone()
+        })
+    );
+    rusqlite::Connection::open(&path)?
+        .execute("DELETE FROM hangang_config WHERE singleton=1", [])?;
+    let fresh = reopened.bootstrap(config(0, "fresh-authority")).await?;
+    assert_ne!(fresh.epoch, original.epoch);
+    assert_eq!(reopened.load_current_operation_proof().await?, None);
+    let observed = reopened
+        .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+        .await?;
+    assert_eq!(observed.receipt.unwrap().epoch, original.epoch);
+    assert_eq!(observed.stored_records, 2);
+
+    // Receipt IDs remain reserved across a new configuration epoch when the
+    // same database is retained; a stale caller cannot repurpose one.
+    let reused = config(0, "reused-id");
+    let reused_stamp = operation_stamp(0, &first.operation_id, &reused);
+    assert!(matches!(
+        reopened
+            .compare_and_swap_operation(&fresh.epoch, 0, reused, reused_stamp)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(reopened.load_latest().await?, Some(fresh));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_receipt_insert_failure_rolls_back_configuration_and_stamp() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let initial = store.bootstrap(config(0, "initial")).await?;
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(
+        "CREATE TRIGGER fail_receipt BEFORE INSERT ON hangang_commit_receipts
+        BEGIN SELECT RAISE(ABORT, 'fixture receipt append failed'); END;",
+    )?;
+    let candidate = config(0, "candidate");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    assert!(
+        store
+            .compare_and_swap_operation(&initial.epoch, 0, candidate.clone(), stamp.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load_latest().await?, Some(initial.clone()));
+    assert_eq!(store.load_current_operation_proof().await?, None);
+    let observed = store
+        .lookup_commit_receipt(&stamp.authority_id, &stamp.operation_id)
+        .await?;
+    assert_eq!(observed.receipt, None);
+    assert_eq!(observed.stored_records, 0);
+    connection.execute_batch("DROP TRIGGER fail_receipt")?;
+    applied(
+        store
+            .compare_and_swap_operation(&initial.epoch, 0, candidate, stamp.clone())
+            .await?,
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&stamp.authority_id, &stamp.operation_id)
+            .await?
+            .stored_records,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_receipt_capacity_blocks_config_write_without_losing_history() -> anyhow::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate_a = config(0, "A");
+    let first = operation_stamp(0, &"1".repeat(32), &candidate_a);
+    let committed = applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate_a, first.clone())
+            .await?,
+    );
+    let connection = rusqlite::Connection::open(&path)?;
+    // Synthetic metadata exercises the production 100,000-record gate.
+    // Resetting it below is test-only: this phase has no production pruning
+    // or full-capacity recovery protocol.
+    connection.execute(
+        "UPDATE hangang_commit_receipt_meta SET stored_records=100000 WHERE singleton=1",
+        [],
+    )?;
+    let full = store
+        .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+        .await?;
+    assert_eq!(full.receipt.unwrap().revision, 1);
+    assert_eq!(full.stored_records, 100_000);
+    assert_eq!(full.capacity, 100_000);
+    assert!(!full.writes_available);
+    let candidate_b = config(0, "B");
+    let second = operation_stamp(1, &"2".repeat(32), &candidate_b);
+    assert!(
+        store
+            .compare_and_swap_operation(&epoch, 1, candidate_b.clone(), second.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load_latest().await?, Some(committed));
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&second.authority_id, &second.operation_id)
+            .await?
+            .receipt,
+        None
+    );
+    connection.execute(
+        "UPDATE hangang_commit_receipt_meta SET stored_records=1 WHERE singleton=1",
+        [],
+    )?;
+    applied(
+        store
+            .compare_and_swap_operation(&epoch, 1, candidate_b, second.clone())
+            .await?,
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&second.authority_id, &second.operation_id)
+            .await?
+            .stored_records,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
 -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -620,6 +896,16 @@ async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
         None,
         "an old SQL writer that leaves the stamp cannot claim its new revision"
     );
+    let retained = store
+        .lookup_commit_receipt(&"a".repeat(32), &"1".repeat(32))
+        .await?;
+    assert_eq!(retained.receipt.unwrap().revision, 1);
+    assert_eq!(retained.stored_records, 1);
+    let fabricated = store
+        .lookup_commit_receipt(&"a".repeat(32), &"2".repeat(32))
+        .await?;
+    assert_eq!(fabricated.receipt, None);
+    assert_eq!(fabricated.stored_records, 1);
 
     connection.execute(
         "UPDATE hangang_config SET operation_id='synthetic-secret-id' WHERE singleton=1",
@@ -685,6 +971,34 @@ async fn sqlite_operation_cas_same_candidate_concurrent_ids_has_one_winner() -> 
             revision: 1,
             stamp: winner
         })
+    );
+    Ok(())
+}
+
+/// Control-plane diagnostic only: one process, sequential SQLite CAS, no
+/// account acceptance, HTTP request, local activation or data-plane work.
+#[tokio::test]
+#[ignore = "run explicitly in release mode for an operation-CAS diagnostic"]
+async fn sqlite_operation_cas_release_diagnostic() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = SqliteConfigStore::open(directory.path().join("state.db")).await?;
+    let epoch = store.bootstrap(config(0, "diagnostic")).await?.epoch;
+    let iterations = 100_u64;
+    let start = std::time::Instant::now();
+    for expected in 0..iterations {
+        let candidate = config(0, "diagnostic");
+        let stamp = operation_stamp(expected, &format!("{:032x}", expected + 1), &candidate);
+        applied(
+            store
+                .compare_and_swap_operation(&epoch, expected, candidate, stamp)
+                .await?,
+        );
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "SQLite operation CAS diagnostic: {iterations} sequential writes in {:.3}s ({:.1} writes/s); account acceptance, HTTP, activation and data plane excluded",
+        elapsed.as_secs_f64(),
+        iterations as f64 / elapsed.as_secs_f64()
     );
     Ok(())
 }
@@ -951,9 +1265,7 @@ async fn postgres_operation_cas_same_candidate_ids_prove_only_one_commit() -> an
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client
-        .batch_execute("DROP TABLE IF EXISTS hangang_config")
-        .await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let left = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
     let right = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
     assert!(left.supports_operation_cas());
@@ -1046,7 +1358,7 @@ async fn postgres_operation_cas_same_candidate_ids_prove_only_one_commit() -> an
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
-async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::Result<()> {
+async fn postgres_commit_receipts_survive_later_writer_and_rebootstrap() -> anyhow::Result<()> {
     let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
         return Ok(());
     };
@@ -1055,6 +1367,289 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     client
         .batch_execute("DROP TABLE IF EXISTS hangang_config")
         .await?;
+    let store = PostgresConfigStore::connect_unencrypted(&url).await?;
+    assert_commit_receipt_contract(&store).await?;
+    let original = store.load_latest().await?.unwrap();
+    let first = operation_stamp(0, &"1".repeat(32), &config(0, "receipt-A"));
+    drop(store);
+
+    let reopened = PostgresConfigStore::connect_unencrypted(&url).await?;
+    assert_eq!(
+        reopened
+            .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+            .await?
+            .receipt,
+        Some(CommitReceipt {
+            epoch: original.epoch.clone(),
+            revision: 1,
+            stamp: first.clone()
+        })
+    );
+    client
+        .execute("DELETE FROM hangang_config WHERE singleton=1", &[])
+        .await?;
+    let fresh = reopened.bootstrap(config(0, "fresh-authority")).await?;
+    assert_ne!(fresh.epoch, original.epoch);
+    let observed = reopened
+        .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+        .await?;
+    assert_eq!(observed.receipt.unwrap().epoch, original.epoch);
+    assert_eq!(observed.stored_records, 2);
+    let reused = config(0, "reused-id");
+    let reused_stamp = operation_stamp(0, &first.operation_id, &reused);
+    assert!(matches!(
+        reopened
+            .compare_and_swap_operation(&fresh.epoch, 0, reused, reused_stamp)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(reopened.load_latest().await?, Some(fresh));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_receipt_insert_failure_rolls_back_configuration_and_stamp() -> anyhow::Result<()>
+{
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let store = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let initial = store.bootstrap(config(0, "initial")).await?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION fail_receipt_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'fixture receipt append failed'; END $$;
+        CREATE TRIGGER fail_receipt BEFORE INSERT ON hangang_commit_receipts
+        FOR EACH ROW EXECUTE FUNCTION fail_receipt_fixture();",
+        )
+        .await?;
+    let candidate = config(0, "candidate");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    assert!(
+        store
+            .compare_and_swap_operation(&initial.epoch, 0, candidate.clone(), stamp.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load_latest().await?, Some(initial.clone()));
+    assert_eq!(store.load_current_operation_proof().await?, None);
+    let observed = store
+        .lookup_commit_receipt(&stamp.authority_id, &stamp.operation_id)
+        .await?;
+    assert_eq!(observed.receipt, None);
+    assert_eq!(observed.stored_records, 0);
+    client.batch_execute("DROP TRIGGER fail_receipt ON hangang_commit_receipts; DROP FUNCTION fail_receipt_fixture();").await?;
+    applied(
+        store
+            .compare_and_swap_operation(&initial.epoch, 0, candidate, stamp.clone())
+            .await?,
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&stamp.authority_id, &stamp.operation_id)
+            .await?
+            .stored_records,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_receipt_capacity_blocks_config_write_without_losing_history() -> anyhow::Result<()>
+{
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let store = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let epoch = store.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate_a = config(0, "A");
+    let first = operation_stamp(0, &"1".repeat(32), &candidate_a);
+    let committed = applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate_a, first.clone())
+            .await?,
+    );
+    // Synthetic metadata only. Its reset below is not production retention.
+    client
+        .execute(
+            "UPDATE hangang_commit_receipt_meta SET stored_records=100000 WHERE singleton=1",
+            &[],
+        )
+        .await?;
+    let full = store
+        .lookup_commit_receipt(&first.authority_id, &first.operation_id)
+        .await?;
+    assert_eq!(full.receipt.unwrap().revision, 1);
+    assert_eq!(full.stored_records, 100_000);
+    assert_eq!(full.capacity, 100_000);
+    assert!(!full.writes_available);
+    let candidate_b = config(0, "B");
+    let second = operation_stamp(1, &"2".repeat(32), &candidate_b);
+    assert!(
+        store
+            .compare_and_swap_operation(&epoch, 1, candidate_b.clone(), second.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load_latest().await?, Some(committed));
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&second.authority_id, &second.operation_id)
+            .await?
+            .receipt,
+        None
+    );
+    client
+        .execute(
+            "UPDATE hangang_commit_receipt_meta SET stored_records=1 WHERE singleton=1",
+            &[],
+        )
+        .await?;
+    applied(
+        store
+            .compare_and_swap_operation(&epoch, 1, candidate_b, second.clone())
+            .await?,
+    );
+    assert_eq!(
+        store
+            .lookup_commit_receipt(&second.authority_id, &second.operation_id)
+            .await?
+            .stored_records,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_retained_receipt_survives_lost_ack_and_later_winner() -> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let epoch = direct.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate_a = config(0, "A");
+    let stamp_a = operation_stamp(0, &"1".repeat(32), &candidate_a);
+    let candidate_b = config(0, "B");
+    let stamp_b = operation_stamp(1, &"2".repeat(32), &candidate_b);
+    let (upstream, _) = proxied_url(&url, "127.0.0.1:1".parse()?)?;
+    // The receipt and configuration are one SQL statement. Drop that atomic
+    // statement's answer, then hold A's recovery read until B wins revision 2.
+    let mut proxy = losing_proxy(upstream, vec![RECEIPT_CAS_MARKER]).await?;
+    proxy.hold(LOAD_MARKER);
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    let pending_a = tokio::spawn({
+        let epoch = epoch.clone();
+        async move {
+            writer
+                .compare_and_swap_operation(&epoch, 0, candidate_a, stamp_a)
+                .await
+        }
+    });
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(RECEIPT_CAS_MARKER));
+    let observed_a = direct
+        .lookup_commit_receipt(&"a".repeat(32), &"1".repeat(32))
+        .await?;
+    assert_eq!(
+        observed_a.receipt.as_ref().map(|receipt| receipt.revision),
+        Some(1)
+    );
+    proxy.gate.send_replace(true);
+    assert_eq!(next_fault(&mut proxy.held).await?, Some(LOAD_MARKER));
+    let committed_b = applied(
+        direct
+            .compare_and_swap_operation(&epoch, 1, candidate_b, stamp_b.clone())
+            .await?,
+    );
+    proxy.release.send_replace(true);
+    let error = join_fault(pending_a).await?.unwrap_err();
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    assert_eq!(direct.load_latest().await?, Some(committed_b));
+    assert_eq!(
+        direct.load_current_operation_proof().await?.unwrap().stamp,
+        stamp_b
+    );
+    assert_eq!(
+        direct
+            .lookup_commit_receipt(&"a".repeat(32), &"1".repeat(32))
+            .await?
+            .receipt
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(
+        direct
+            .lookup_commit_receipt(&"a".repeat(32), &"2".repeat(32))
+            .await?
+            .stored_records,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_lost_ack_receipt_with_failed_current_read_stays_indeterminate()
+-> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let epoch = direct.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate = config(0, "committed-but-unreadable");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    let (upstream, _) = proxied_url(&url, "127.0.0.1:1".parse()?)?;
+    let mut proxy =
+        losing_proxy(upstream, vec![RECEIPT_CAS_MARKER, LOAD_MARKER, LOAD_MARKER]).await?;
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    proxy.gate.send_replace(true);
+    let error = writer
+        .compare_and_swap_operation(&epoch, 0, candidate, stamp.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(RECEIPT_CAS_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(LOAD_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(LOAD_MARKER));
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    assert_eq!(
+        direct
+            .lookup_commit_receipt(&stamp.authority_id, &stamp.operation_id)
+            .await?
+            .receipt
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(direct.load_latest().await?.unwrap().config.revision, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
     let initial = direct.bootstrap(config(0, "initial")).await?;
     let epoch = initial.epoch.clone();
@@ -1065,7 +1660,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
 
     // The update commits but its answer is dropped. The same operation's
     // retry may use its exact durable stamp to prove the current commit.
-    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    let mut proxy = losing_proxy(upstream, vec![RECEIPT_CAS_MARKER]).await?;
     let (_, through) = proxied_url(&url, proxy.address)?;
     let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
     proxy.gate.send_replace(true);
@@ -1074,7 +1669,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
             .compare_and_swap_operation(&epoch, 0, candidate.clone(), first.clone())
             .await?,
     );
-    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(RECEIPT_CAS_MARKER));
     assert_eq!(committed.config.revision, 1);
     assert_eq!(
         direct.load_current_operation_proof().await?,
@@ -1088,7 +1683,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
 
     // A different ID proposing the same document has no ownership proof.
     // Its unanswered attempt remains uncertain; an answered retry conflicts.
-    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    let mut proxy = losing_proxy(upstream, vec![RECEIPT_CAS_MARKER]).await?;
     let (_, through) = proxied_url(&url, proxy.address)?;
     let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
     proxy.gate.send_replace(true);
@@ -1096,7 +1691,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
         .compare_and_swap_operation(&epoch, 0, candidate.clone(), second.clone())
         .await
         .unwrap_err();
-    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(RECEIPT_CAS_MARKER));
     assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
     assert_eq!(
         conflict(
@@ -1119,7 +1714,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     drop(proxy);
     let candidate = config(0, "lost-before-old-writer");
     let third = operation_stamp(1, &"3".repeat(32), &candidate);
-    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    let mut proxy = losing_proxy(upstream, vec![RECEIPT_CAS_MARKER]).await?;
     proxy.hold(LOAD_MARKER);
     let (_, through) = proxied_url(&url, proxy.address)?;
     let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
@@ -1131,7 +1726,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
                 .await
         }
     });
-    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(RECEIPT_CAS_MARKER));
     assert_eq!(direct.load_latest().await?.unwrap().config.revision, 2);
     proxy.gate.send_replace(true);
     assert_eq!(next_fault(&mut proxy.held).await?, Some(LOAD_MARKER));
@@ -1154,6 +1749,18 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     assert_eq!(
         direct.load_latest().await?.unwrap().config,
         old_writer_document
+    );
+    let retained = direct
+        .lookup_commit_receipt(&"a".repeat(32), &"3".repeat(32))
+        .await?;
+    assert_eq!(retained.receipt.unwrap().revision, 2);
+    assert_eq!(retained.stored_records, 2);
+    assert_eq!(
+        direct
+            .lookup_commit_receipt(&"a".repeat(32), &"4".repeat(32))
+            .await?
+            .receipt,
+        None
     );
     Ok(())
 }
@@ -1526,6 +2133,7 @@ fn proxied_url(
 }
 
 const CAS_MARKER: &str = "UPDATE hangang_config SET revision";
+const RECEIPT_CAS_MARKER: &str = "INSERT INTO hangang_commit_receipts";
 const LOAD_MARKER: &str = "SELECT revision,";
 const BOOTSTRAP_MARKER: &str = "INSERT INTO hangang_config(singleton";
 
