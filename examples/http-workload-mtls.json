@@ -1,0 +1,42 @@
+{
+  "revision": 0,
+  "workload_http": [
+    {
+      "id": "orders-listener",
+      "listen": "127.0.0.1:9443",
+      "tls": {
+        "cert_file": "/etc/hangang/workload/server.pem",
+        "key_file": "/etc/hangang/workload/server-key.pem",
+        "client_ca_file": "/etc/hangang/workload/client-ca.pem",
+        "client_crl_file": null,
+        "allowed_uri_sans": ["spiffe://example.test/services/orders"],
+        "handshake_timeout_ms": 5000
+      }
+    }
+  ],
+  "http": [
+    {
+      "id": "orders-api",
+      "access_mode": "protected",
+      "host": "api.example.test",
+      "path_prefix": "/orders",
+      "backends": ["http://127.0.0.1:8081"],
+      "workload_auth": {
+        "listener_ids": ["orders-listener"],
+        "allowed_uri_sans": ["spiffe://example.test/services/orders"],
+        "identity_header": "x-workload-identity"
+      },
+      "resource_policy": {
+        "resource_id": "orders",
+        "principal": { "source": "workload" },
+        "allow": [
+          {
+            "subjects": ["spiffe://example.test/services/orders"],
+            "methods": ["GET"]
+          }
+        ]
+      }
+    }
+  ],
+  "tcp": []
+}
