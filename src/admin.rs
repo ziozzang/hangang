@@ -1038,6 +1038,7 @@ impl Admin {
                 || path == "/v1/config/operations"
                 || path == "/v1/config/operations/prune"
                 || path == "/v1/config/operation-proof"
+                || path == "/v1/config/commit-receipt"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -1076,6 +1077,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/commit-receipt" {
+            return Ok(self.handle_config_commit_receipt(req, &actor).await);
         }
         if path == "/v1/config/operation-proof" {
             return Ok(self.handle_config_operation_proof(req, &actor).await);
@@ -2277,6 +2281,28 @@ fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {
     Some((offset, limit))
 }
 
+fn commit_receipt_query(query: Option<&str>) -> Option<(String, String)> {
+    let mut authority_id = None;
+    let mut operation_id = None;
+    let mut parsed = reqwest::Url::parse("http://receipt.invalid/").ok()?;
+    parsed.set_query(query);
+    for (key, value) in parsed.query_pairs() {
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        match key.as_ref() {
+            "authority_id" if authority_id.is_none() => authority_id = Some(value.into_owned()),
+            "operation_id" if operation_id.is_none() => operation_id = Some(value.into_owned()),
+            _ => return None,
+        }
+    }
+    Some((authority_id?, operation_id?))
+}
+
 fn user_audit_query(query: Option<&str>) -> Option<(i64, usize)> {
     let mut after = None;
     let mut limit = None;
@@ -2442,6 +2468,80 @@ impl Admin {
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
             Err(error) => account_problem(error),
         }
+    }
+
+    async fn handle_config_commit_receipt(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.method() != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET required");
+        }
+        let Some((authority_id, operation_id)) = commit_receipt_query(req.uri().query()) else {
+            return problem(
+                400,
+                "Invalid Commit Receipt Query",
+                "exactly one authority_id and operation_id, each 32 lowercase hexadecimal characters, are required",
+            );
+        };
+        let observation = match self.manager.config_store.as_ref() {
+            Some(store) if store.supports_commit_receipts() => {
+                match store
+                    .lookup_commit_receipt(&authority_id, &operation_id)
+                    .await
+                {
+                    Ok(observation) => Some(observation),
+                    Err(_) => {
+                        return problem(
+                            503,
+                            "Commit Receipt Unavailable",
+                            "configuration store commit receipt could not be read",
+                        );
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        let observed_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|value| u64::try_from(value.as_millis()).ok())
+            .filter(|value| *value <= 9_007_199_254_740_991);
+        let Some(observed_ms) = observed_ms else {
+            return problem(
+                503,
+                "Commit Receipt Unavailable",
+                "observation clock unavailable",
+            );
+        };
+        if observation.as_ref().is_some_and(|o| {
+            o.capacity > 9_007_199_254_740_991
+                || o.stored_records > o.capacity
+                || o.receipt
+                    .as_ref()
+                    .is_some_and(|r| r.revision > 9_007_199_254_740_991)
+        }) {
+            return problem(
+                503,
+                "Commit Receipt Unavailable",
+                "observation exceeds supported numeric range",
+            );
+        }
+        auth_json(
+            200,
+            &serde_json::json!({
+                "scope":"configuration_authority", "supported":observation.is_some(),
+                "receipt":observation.as_ref().and_then(|o| o.receipt.as_ref()),
+                "stored_records":observation.as_ref().map(|o| o.stored_records),
+                "capacity":observation.as_ref().map(|o| o.capacity),
+                "writes_available":observation.as_ref().map(|o| o.writes_available),
+                "server_time_unix_ms":observed_ms,
+            }),
+        )
     }
 
     async fn handle_config_operation_proof(

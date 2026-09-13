@@ -1231,6 +1231,10 @@ async fn first_run_bootstrap_login_role_limits_and_logout() {
     for (method, path) in [
         ("GET", "/v1/config"),
         ("GET", "/v1/config/operation-proof"),
+        (
+            "GET",
+            "/v1/config/commit-receipt?authority_id=11111111111111111111111111111111&operation_id=22222222222222222222222222222222",
+        ),
         ("GET", "/v1/routes/http"),
         ("GET", "/v1/users"),
         ("POST", "/v1/cache/purge"),
@@ -4950,6 +4954,28 @@ struct HeldProofStore {
 
 #[async_trait::async_trait]
 impl hangang::config_store::ConfigStore for HeldProofStore {
+    fn supports_commit_receipts(&self) -> bool {
+        true
+    }
+    async fn lookup_commit_receipt(
+        &self,
+        _authority_id: &str,
+        operation_id: &str,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::CommitReceiptObservation> {
+        if operation_id == "ffffffffffffffffffffffffffffffff" {
+            return Err(hangang::config_store::StoreError::Unavailable(
+                anyhow::anyhow!("private-receipt-database-detail"),
+            ));
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(hangang::config_store::CommitReceiptObservation {
+            receipt: None,
+            stored_records: 0,
+            capacity: 100000,
+            writes_available: true,
+        })
+    }
     fn supports_operation_cas(&self) -> bool {
         true
     }
@@ -5179,4 +5205,175 @@ async fn operation_aware_cas_failure_never_falls_back_to_legacy_write() {
     let records = config_operation_records(address).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["state"], "indeterminate");
+}
+
+#[tokio::test]
+async fn retained_commit_receipt_is_historical_after_later_http_write() {
+    use hangang::config_store::{ConfigStore, SqliteConfigStore};
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("receipts.db");
+    let store = Arc::new(SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap());
+    let initial = Config::default();
+    store.bootstrap(initial.clone()).await.unwrap();
+    let (address, manager) = server_on(
+        directory.path().join("seed.json"),
+        initial,
+        Some(store),
+        false,
+        64,
+        16,
+    )
+    .await;
+    manager.reload_file().await.unwrap();
+    for (revision, id) in [(0, "first"), (1, "second")] {
+        let route =
+            format!(r#"{{"id":"{id}","path_prefix":"/{id}","backends":["http://127.0.0.1:9"]}}"#);
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/v1/routes/http",
+                Some(&route),
+                Some(revision)
+            )
+            .await
+            .0,
+            201
+        );
+    }
+    let records = config_operation_records(address).await;
+    let first = &records[0];
+    let authority = first["authority_id"].as_str().unwrap();
+    let operation = first["operation_id"].as_str().unwrap();
+    let path =
+        format!("/v1/config/commit-receipt?authority_id={authority}&operation_id={operation}");
+    let (status, headers, body) = request(address, "GET", &path, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let observation = json(&body);
+    assert_eq!(observation["supported"], true);
+    assert_eq!(observation["scope"], "configuration_authority");
+    assert_eq!(observation["stored_records"], 2);
+    assert_eq!(observation["capacity"], 100000);
+    assert_eq!(observation["writes_available"], true);
+    assert_eq!(observation["receipt"]["revision"], 1);
+    for key in ["authority_id", "operation_id", "candidate_sha256"] {
+        assert_eq!(observation["receipt"]["stamp"][key], first[key]);
+    }
+    let reopened = SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            reopened
+                .lookup_commit_receipt(authority, operation)
+                .await
+                .unwrap()
+                .receipt
+        )
+        .unwrap(),
+        observation["receipt"]
+    );
+    assert_eq!(manager.active.load().config.revision, 2);
+    assert_eq!(
+        reopened
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .config
+            .revision,
+        2
+    );
+    let path = format!(
+        "/v1/config/commit-receipt?authority_id={authority}&operation_id=00000000000000000000000000000000"
+    );
+    let (status, _, body) = request(address, "GET", &path, None, None).await;
+    assert_eq!(status, 200);
+    assert!(json(&body)["receipt"].is_null());
+    assert_eq!(json(&body)["stored_records"], 2);
+}
+
+#[tokio::test]
+async fn retained_commit_receipt_validates_query_and_reports_unsupported() {
+    let (address, _, _directory) = server().await;
+    let query = "authority_id=11111111111111111111111111111111&operation_id=22222222222222222222222222222222";
+    let path = format!("/v1/config/commit-receipt?{query}");
+    let (status, headers, body) = request(address, "GET", &path, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let observation = json(&body);
+    assert_eq!(observation["supported"], false);
+    for field in ["receipt", "stored_records", "capacity", "writes_available"] {
+        assert!(observation[field].is_null());
+    }
+    assert_eq!(
+        request_with_token(address, "GET", &path, None, None, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(request(address, "POST", &path, None, None).await.0, 405);
+    for invalid in [
+        String::new(),
+        "?".into(),
+        "?authority_id=11111111111111111111111111111111".into(),
+        format!("?{query}&extra=0"),
+        format!("?{query}&operation_id=22222222222222222222222222222222"),
+        format!("?{}", query.replace('1', "A")),
+        format!("?{}", query.replace("operation_id=", "operation_id=x")),
+    ] {
+        assert_eq!(
+            request(
+                address,
+                "GET",
+                &format!("/v1/config/commit-receipt{invalid}"),
+                None,
+                None
+            )
+            .await
+            .0,
+            400,
+            "{invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_commit_receipt_rechecks_after_wait_and_redacts_read_failures() {
+    use hangang::config_store::ConfigStore;
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("held-receipt.json");
+    let initial = Config::default();
+    let inner = FileConfigStore::new(state_path.clone());
+    inner.bootstrap(initial.clone()).await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(HeldProofStore {
+        inner,
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let (address, _) = server_on(state_path, initial, Some(store), false, 64, 16).await;
+    let token = account_admin_token(address).await;
+    let read = tokio::spawn({
+        let token = token.clone();
+        async move {
+            request_with_token(address, "GET", "/v1/config/commit-receipt?authority_id=11111111111111111111111111111111&operation_id=22222222222222222222222222222222", None, None, Some(&token)).await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    revoke_account_session(address, &token).await;
+    release.notify_one();
+    let (status, _, body) = read.await.unwrap();
+    assert_eq!(status, 403);
+    assert!(json(&body).get("receipt").is_none());
+    let (status, headers, body) = request(address, "GET", "/v1/config/commit-receipt?authority_id=11111111111111111111111111111111&operation_id=ffffffffffffffffffffffffffffffff", None, None).await;
+    assert_eq!(status, 503);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("private-receipt-database-detail")
+    );
 }
