@@ -181,6 +181,35 @@ impl Drop for FetchGuard<'_> {
 }
 
 impl RemoteJwksProvider {
+    /// Time until the next bounded refresh attempt. This reads local cache
+    /// metadata only; the caller performs network I/O outside the lock.
+    pub(crate) fn refresh_delay(&self) -> Duration {
+        let Ok(cache) = self.cache.lock() else {
+            return Duration::from_secs(1);
+        };
+        let now = Instant::now();
+        cache
+            .refresh_after
+            .max(cache.next_refresh_at)
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(100))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_test_cache(&self, keys: PreparedKeys, lifetime: Duration) {
+        let now = Instant::now();
+        let mut cache = self.cache.lock().unwrap();
+        cache.keys = Some(Arc::new(keys));
+        cache.refresh_after = now + lifetime / 2;
+        cache.expires_at = now + lifetime;
+        cache.next_refresh_at = now + lifetime / 2;
+        cache.last_refresh_failed = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_test_cache(&self) {
+        self.cache.lock().unwrap().expires_at = Instant::now();
+    }
     /// Validates local policy and TLS roots without doing network I/O.
     /// The first key request fetches discovery (if selected) and JWKS.
     pub fn new(
