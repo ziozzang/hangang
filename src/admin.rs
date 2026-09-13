@@ -652,7 +652,7 @@ impl Manager {
                         ConfigOperationUnavailable.into()
                     }
                 })?;
-            Some((authority.users, operation.operation_id))
+            Some((authority.users, operation))
         } else {
             None
         };
@@ -662,10 +662,33 @@ impl Manager {
                     let epoch = self.recorded_epoch().ok_or_else(|| {
                         anyhow::anyhow!("shared configuration authority is unknown")
                     })?;
-                    match store
-                        .compare_and_swap(&epoch, expected, config.clone())
-                        .await?
-                    {
+                    let result = if store.supports_operation_cas() {
+                        if let Some((_, operation)) = &accepted {
+                            store
+                                .compare_and_swap_operation(
+                                    &epoch,
+                                    expected,
+                                    config.clone(),
+                                    crate::config_store::OperationStamp {
+                                        authority_id: operation.authority_id.clone(),
+                                        operation_id: operation.operation_id.clone(),
+                                        candidate_sha256: operation.candidate_sha256.clone(),
+                                    },
+                                )
+                                .await?
+                        } else {
+                            store
+                                .compare_and_swap(&epoch, expected, config.clone())
+                                .await?
+                        }
+                    } else {
+                        // Legacy stores expose only document equality; they do
+                        // not provide operation-specific commit evidence.
+                        store
+                            .compare_and_swap(&epoch, expected, config.clone())
+                            .await?
+                    };
+                    match result {
                         crate::config_store::CasResult::Applied(committed) => {
                             anyhow::ensure!(
                                 committed.config == config,
@@ -713,7 +736,7 @@ impl Manager {
             Ok(config)
         }
         .await;
-        if let Some((users, operation_id)) = accepted {
+        if let Some((users, operation)) = accepted {
             use crate::admin_users::ConfigOperationState;
             let state = match &outcome {
                 Ok(_) => ConfigOperationState::CandidateActivated,
@@ -723,7 +746,7 @@ impl Manager {
                 Err(_) => ConfigOperationState::Indeterminate,
             };
             users
-                .finish_config(&operation_id, state)
+                .finish_config(&operation.operation_id, state)
                 .await
                 .map_err(|_| ConfigOperationUnavailable)?;
         }
@@ -1014,6 +1037,7 @@ impl Admin {
                 || path == "/v1/config/validate"
                 || path == "/v1/config/operations"
                 || path == "/v1/config/operations/prune"
+                || path == "/v1/config/operation-proof"
                 || path == "/v1/lifecycle/restart"
                 || path.starts_with("/v1/update/")
                 || path.starts_with("/v1/audit/")
@@ -1052,6 +1076,9 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/config/operation-proof" {
+            return Ok(self.handle_config_operation_proof(req, &actor).await);
         }
         if path == "/v1/config/operations/prune" {
             return Ok(self.handle_config_operation_prune(req, &actor).await);
@@ -2415,6 +2442,87 @@ impl Admin {
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
             Err(error) => account_problem(error),
         }
+    }
+
+    async fn handle_config_operation_proof(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.method() != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET required");
+        }
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Operation Proof Query",
+                "operation proof does not accept query parameters",
+            );
+        }
+        let supported = self
+            .manager
+            .config_store
+            .as_ref()
+            .is_some_and(|store| store.supports_operation_cas());
+        let proof = if supported {
+            match self
+                .manager
+                .config_store
+                .as_ref()
+                .expect("supported store exists")
+                .load_current_operation_proof()
+                .await
+            {
+                Ok(proof) => proof,
+                Err(_) => {
+                    return problem(
+                        503,
+                        "Operation Proof Unavailable",
+                        "current configuration store operation proof could not be read",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        // A remote read can outlive the account admitted by HTTP headers.
+        // Recheck disclosure authority after that wait, without holding an
+        // account database transaction across remote I/O.
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return problem(
+                503,
+                "Operation Proof Unavailable",
+                "observation clock unavailable",
+            );
+        };
+        let Ok(observed_ms) = u64::try_from(elapsed.as_millis()) else {
+            return problem(
+                503,
+                "Operation Proof Unavailable",
+                "observation clock unavailable",
+            );
+        };
+        if observed_ms > 9_007_199_254_740_991
+            || proof
+                .as_ref()
+                .is_some_and(|p| p.revision > 9_007_199_254_740_991)
+        {
+            return problem(
+                503,
+                "Operation Proof Unavailable",
+                "observation exceeds supported numeric range",
+            );
+        }
+        auth_json(
+            200,
+            &serde_json::json!({
+                "scope":"configuration_authority", "supported":supported,
+                "proof":proof, "server_time_unix_ms":observed_ms,
+            }),
+        )
     }
 
     async fn handle_config_operation_prune(

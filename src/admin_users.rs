@@ -685,6 +685,21 @@ impl Store {
         .await?
     }
 
+    /// Recheck administrator disclosure authority after an external read.
+    /// This does not make the external store and account DB one snapshot.
+    pub async fn authorize_admin(&self, authority: MutationAuthority) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            authorize_mutation(&transaction, &authority)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
     pub async fn list(&self, authority: MutationAuthority) -> Result<Vec<User>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {

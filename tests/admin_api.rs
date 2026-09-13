@@ -1230,6 +1230,7 @@ async fn first_run_bootstrap_login_role_limits_and_logout() {
     );
     for (method, path) in [
         ("GET", "/v1/config"),
+        ("GET", "/v1/config/operation-proof"),
         ("GET", "/v1/routes/http"),
         ("GET", "/v1/users"),
         ("POST", "/v1/cache/purge"),
@@ -4939,4 +4940,243 @@ async fn audit_append_failure_rolls_back_user_password_and_session_mutations() {
     let after = json(&after_body);
     assert_eq!(after["latest_id"], before["latest_id"]);
     assert_eq!(after["records"], before["records"]);
+}
+
+struct HeldProofStore {
+    inner: FileConfigStore,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl hangang::config_store::ConfigStore for HeldProofStore {
+    fn supports_operation_cas(&self) -> bool {
+        true
+    }
+    async fn load_current_operation_proof(
+        &self,
+    ) -> hangang::config_store::StoreResult<Option<hangang::config_store::OperationProof>> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(None)
+    }
+    async fn load_latest(
+        &self,
+    ) -> hangang::config_store::StoreResult<Option<hangang::config_store::Stored>> {
+        hangang::config_store::ConfigStore::load_latest(&self.inner).await
+    }
+
+    async fn bootstrap(
+        &self,
+        initial: Config,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::Stored> {
+        hangang::config_store::ConfigStore::bootstrap(&self.inner, initial).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        epoch: &str,
+        expected: u64,
+        next: Config,
+    ) -> hangang::config_store::StoreResult<hangang::config_store::CasResult> {
+        hangang::config_store::ConfigStore::compare_and_swap(&self.inner, epoch, expected, next)
+            .await
+    }
+
+    async fn publish_challenge(
+        &self,
+        token: &str,
+        key_authorization: &str,
+        ttl: std::time::Duration,
+    ) -> hangang::config_store::StoreResult<()> {
+        hangang::config_store::ConfigStore::publish_challenge(
+            &self.inner,
+            token,
+            key_authorization,
+            ttl,
+        )
+        .await
+    }
+
+    async fn lookup_challenge(
+        &self,
+        token: &str,
+    ) -> hangang::config_store::StoreResult<Option<String>> {
+        hangang::config_store::ConfigStore::lookup_challenge(&self.inner, token).await
+    }
+
+    async fn withdraw_challenge(&self, token: &str) -> hangang::config_store::StoreResult<()> {
+        hangang::config_store::ConfigStore::withdraw_challenge(&self.inner, token).await
+    }
+}
+
+#[tokio::test]
+async fn current_operation_proof_matches_sql_write_and_survives_reopen() {
+    use hangang::config_store::{ConfigStore, SqliteConfigStore};
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("authority.db");
+    let store = Arc::new(SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap());
+    let initial = Config::default();
+    store.bootstrap(initial.clone()).await.unwrap();
+    let (address, manager) = server_on(
+        directory.path().join("seed.json"),
+        initial,
+        Some(store.clone()),
+        false,
+        64,
+        16,
+    )
+    .await;
+    manager.reload_file().await.unwrap();
+    let (status, headers, body) =
+        request(address, "GET", "/v1/config/operation-proof", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["supported"], true);
+    assert!(json(&body)["proof"].is_null());
+    let route = r#"{"id":"proof-route","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(route), Some(0))
+            .await
+            .0,
+        201
+    );
+    let records = config_operation_records(address).await;
+    assert_eq!(records.len(), 1);
+    let (status, _, body) = request(address, "GET", "/v1/config/operation-proof", None, None).await;
+    assert_eq!(status, 200);
+    let response = json(&body);
+    assert_eq!(response["scope"], "configuration_authority");
+    assert_eq!(response["proof"]["revision"], 1);
+    for key in ["authority_id", "operation_id", "candidate_sha256"] {
+        assert_eq!(response["proof"]["stamp"][key], records[0][key]);
+    }
+    let reopened = SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.load_current_operation_proof().await.unwrap()).unwrap(),
+        response["proof"]
+    );
+    // Ungoverned legacy writes cannot retain the previous operation's claim.
+    let current = store.load_latest().await.unwrap().unwrap();
+    store
+        .compare_and_swap(&current.epoch, 1, current.config)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .load_current_operation_proof()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(config_operation_records(address).await.len(), 1);
+}
+
+#[tokio::test]
+async fn current_operation_proof_reports_unsupported_and_rejects_invalid_requests() {
+    let (address, _, _directory) = server().await;
+    let (status, _, body) = request(address, "GET", "/v1/config/operation-proof", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["supported"], false);
+    assert!(json(&body)["proof"].is_null());
+    assert_eq!(
+        request(address, "GET", "/v1/config/operation-proof?x=1", None, None)
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        request(address, "POST", "/v1/config/operation-proof", None, None)
+            .await
+            .0,
+        405
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/config/operation-proof",
+            None,
+            None,
+            None
+        )
+        .await
+        .0,
+        401
+    );
+}
+
+#[tokio::test]
+async fn current_operation_proof_rechecks_authority_after_remote_wait() {
+    use hangang::config_store::ConfigStore;
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("held.json");
+    let initial = Config::default();
+    let inner = FileConfigStore::new(state_path.clone());
+    inner.bootstrap(initial.clone()).await.unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(HeldProofStore {
+        inner,
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let (address, _) = server_on(state_path, initial, Some(store), false, 64, 16).await;
+    let token = account_admin_token(address).await;
+    let read = tokio::spawn({
+        let token = token.clone();
+        async move {
+            request_with_token(
+                address,
+                "GET",
+                "/v1/config/operation-proof",
+                None,
+                None,
+                Some(&token),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    revoke_account_session(address, &token).await;
+    release.notify_one();
+    let (status, _, body) = read.await.unwrap();
+    assert_eq!(status, 403);
+    assert!(json(&body).get("proof").is_none());
+}
+
+#[tokio::test]
+async fn operation_aware_cas_failure_never_falls_back_to_legacy_write() {
+    use hangang::config_store::ConfigStore;
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("no-fallback.json");
+    let initial = Config::default();
+    let inner = FileConfigStore::new(state_path.clone());
+    inner.bootstrap(initial.clone()).await.unwrap();
+    // This fixture advertises operation-aware support but its operation CAS
+    // rejects writes. Its ordinary CAS would succeed if incorrectly called.
+    let store = Arc::new(HeldProofStore {
+        inner,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let (address, manager) =
+        server_on(state_path, initial, Some(store.clone()), false, 64, 16).await;
+    manager.reload_file().await.unwrap();
+    let route = r#"{"id":"must-not-write","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    let (status, _, _) = request(address, "POST", "/v1/routes/http", Some(route), Some(0)).await;
+    assert!(
+        status >= 400,
+        "failed operation CAS must not become success"
+    );
+    assert_eq!(manager.active.load().config.revision, 0);
+    assert_eq!(
+        store.load_latest().await.unwrap().unwrap().config.revision,
+        0
+    );
+    let records = config_operation_records(address).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["state"], "indeterminate");
 }
