@@ -24,6 +24,7 @@ pub mod tls;
 pub mod ui;
 pub mod update;
 pub mod upstream;
+pub mod workload_tls;
 
 pub mod ingress;
 pub mod kubernetes;
