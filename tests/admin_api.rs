@@ -1456,6 +1456,161 @@ async fn protected_route_api_rejects_missing_or_removed_auth_without_advancing_r
 }
 
 #[tokio::test]
+async fn resource_policy_scope_requires_explicit_release_before_api_removal() {
+    let (address, manager, _dir) = server().await;
+    let route = serde_json::json!({
+        "id": "guarded-resource",
+        "access_mode": "protected",
+        "host": "app.test",
+        "path_prefix": "/admin",
+        "path_match": "segment_prefix",
+        "backends": ["http://127.0.0.1:9"],
+        "auth": {
+            "url": "http://127.0.0.1:9/check",
+            "response_headers": ["x-subject"]
+        },
+        "resource_policy": {
+            "resource_id": "admin",
+            "principal": {"source": "external", "subject_header": "x-subject"},
+            "allow": [{"subjects": ["alice"], "methods": ["GET"]}]
+        }
+    });
+    let (status, headers, body) = request(
+        address,
+        "POST",
+        "/v1/routes/http",
+        Some(&route.to_string()),
+        Some(0),
+    )
+    .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["etag"], "\"1\"");
+    assert_eq!(json(&body)["resource_policy"]["resource_id"], "admin");
+
+    let active = serde_json::to_value(&manager.active.load().config).unwrap();
+    let persisted = std::fs::read(&manager.state_path).unwrap();
+    let assert_unchanged = || {
+        assert_eq!(manager.active.load().config.revision, 1);
+        assert_eq!(
+            serde_json::to_value(&manager.active.load().config).unwrap(),
+            active
+        );
+        assert_eq!(std::fs::read(&manager.state_path).unwrap(), persisted);
+    };
+
+    let (status, _, _) = request(
+        address,
+        "DELETE",
+        "/v1/routes/http/guarded-resource",
+        None,
+        Some(1),
+    )
+    .await;
+    assert_eq!(status, 422, "protected namespace deletion must be rejected");
+    assert_unchanged();
+
+    // An older route editor may retain Protected/auth but omit the new policy.
+    let mut without_policy = route.clone();
+    without_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("resource_policy");
+    let (status, _, _) = request(
+        address,
+        "PUT",
+        "/v1/routes/http/guarded-resource",
+        Some(&without_policy.to_string()),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "omitted resource policy must not release scope"
+    );
+    assert_unchanged();
+
+    // A host/path move under the same resource ID must not expose the old URL.
+    for (name, value) in [
+        ("host", serde_json::json!("elsewhere.test")),
+        ("path_prefix", serde_json::json!("/elsewhere")),
+    ] {
+        let mut moved = route.clone();
+        moved[name] = value;
+        let (status, _, _) = request(
+            address,
+            "PUT",
+            "/v1/routes/http/guarded-resource",
+            Some(&moved.to_string()),
+            Some(1),
+        )
+        .await;
+        assert_eq!(status, 422, "{name} move must not release old scope");
+        assert_unchanged();
+    }
+
+    // Full-document preview and commit have the same transition guard.
+    let mut dropped = active.clone();
+    dropped["http"] = serde_json::json!([]);
+    let dropped = dropped.to_string();
+    assert_eq!(
+        request(address, "POST", "/v1/config/validate", Some(&dropped), None)
+            .await
+            .0,
+        422
+    );
+    assert_eq!(
+        request(address, "PUT", "/v1/config", Some(&dropped), Some(1))
+            .await
+            .0,
+        422
+    );
+    assert_unchanged();
+
+    // A separate, reviewable revision explicitly releases this exact scope.
+    let mut released = route;
+    released["resource_policy"]["enforce"] = serde_json::json!(false);
+    let (status, headers, body) = request(
+        address,
+        "PUT",
+        "/v1/routes/http/guarded-resource",
+        Some(&released.to_string()),
+        Some(1),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["etag"], "\"2\"");
+    assert_eq!(json(&body)["resource_policy"]["enforce"], false);
+    assert_eq!(
+        serde_json::to_value(&manager.active.load().config).unwrap()["http"][0]["resource_policy"]
+            ["enforce"],
+        false
+    );
+    assert_eq!(
+        serde_json::to_value(hangang::store::load(&manager.state_path).unwrap()).unwrap()["http"]
+            [0]["resource_policy"]["enforce"],
+        false
+    );
+
+    let (status, headers, _) = request(
+        address,
+        "DELETE",
+        "/v1/routes/http/guarded-resource",
+        None,
+        Some(2),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(headers["etag"], "\"3\"");
+    assert!(manager.active.load().config.http.is_empty());
+    assert!(
+        hangang::store::load(&manager.state_path)
+            .unwrap()
+            .http
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn tcp_route_collection_and_body_limits_are_strict() {
     let (address, _manager, _dir) = server().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
