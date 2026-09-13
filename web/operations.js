@@ -40,6 +40,13 @@ function healthLabel(row) {
   return t('Unmonitored');
 }
 
+function desiredStateLabel(state) {
+  if (state === 'serving') return t('Serving');
+  if (state === 'draining') return t('Draining');
+  if (state === 'maintenance') return t('Maintenance');
+  return t('State unavailable');
+}
+
 function renderCapabilities(capabilities = {}) {
   const root = $('#operations-capabilities');
   root.replaceChildren();
@@ -80,14 +87,22 @@ function renderRows(rows) {
       : `${String(row.protocol || '').toUpperCase()} · #${Number(row.backend_index) + 1}`));
     const selection = node('td');
     const inactive = row.enabled === false;
-    selection.append(node('span', `operations-eligibility ${!inactive && row.available ? 'is-eligible' : 'is-excluded'}`,
-      inactive ? t('Inactive') : row.available ? t('Eligible') : t('Excluded')));
+    const admissionOpen = row.admission_open;
+    selection.append(node('span', `operations-eligibility ${!inactive && admissionOpen !== false && row.available ? 'is-eligible' : 'is-excluded'}`,
+      inactive ? t('Inactive') : admissionOpen === false ? t('Admission closed') : row.available ? t('Eligible') : t('Excluded')));
+    selection.append(node('span', 'operations-secondary', t('Desired: {state}', { state: desiredStateLabel(row.desired_state) })));
+    selection.append(node('span', 'operations-secondary', admissionOpen === true ? t('Member gate open')
+      : admissionOpen === false ? t('Member gate closed') : t('Member gate state unavailable')));
     selection.append(node('span', 'operations-secondary',
       t('{mode} · weight {weight}', { mode: modeLabel(row.balance_mode), weight: formatNumberLocale(row.weight) })));
     const health = node('td');
-    health.append(node('span', 'operations-primary', inactive ? t('Route inactive') : healthLabel(row)));
+    const suspended = row.desired_state === 'maintenance' && row.health_mode !== 'unmonitored';
+    health.append(node('span', 'operations-primary', inactive ? t('Route inactive')
+      : suspended ? t('Probes suspended') : healthLabel(row)));
     health.append(node('span', 'operations-secondary', inactive ? t('No health checks while inactive')
-      : row.initial_check_pending === true ? t(row.protocol === 'tcp' ? 'Checking — waiting for successful connection probes' : 'Checking — waiting for healthy probes')
+      : suspended ? t('Probes suspended for maintenance; existing work continues')
+        : row.desired_state === 'maintenance' ? t('No probes configured; maintenance blocks new admissions')
+        : row.initial_check_pending === true ? t(row.protocol === 'tcp' ? 'Checking — waiting for successful connection probes' : 'Checking — waiting for healthy probes')
         : row.initial_check_pending === false && row.probe_observed === true && !row.available
           ? t(row.protocol === 'tcp' ? 'Excluded after observed connection failures' : 'Excluded after observed health evidence')
           : row.probe_observed === null ? t('No active probe evidence')
@@ -98,6 +113,12 @@ function renderRows(rows) {
       ? t('{count} active route connections', { count: formatNumberLocale(row.route_active_connections ?? 0) })
       : row.active_requests == null ? t('Not tracked')
         : t('{count} active requests', { count: formatNumberLocale(row.active_requests) })));
+    load.append(node('span', 'operations-secondary', Number.isSafeInteger(row.active_admissions) && row.active_admissions >= 0
+      ? t('{count} active admission leases', { count: formatNumberLocale(row.active_admissions) })
+      : t('Admission count unavailable')));
+    load.append(node('span', 'operations-secondary', t(row.protocol === 'tcp'
+      ? 'Current TCP member leases include pending dials; retired generations are listed separately. Zero does not prove drain completion.'
+      : 'Current HTTP member leases include in-flight requests; retired generations are listed separately. Zero does not prove drain completion.')));
     if (row.protocol === 'tcp') {
       if (row.member_id) {
         const count = row.member_active_streams;

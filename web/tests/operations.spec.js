@@ -122,6 +122,47 @@ test('named members show stable ID, configured address and effective weight in b
   await expect(row).toContainText('가중치 7');
 });
 
+test('desired state, admission gate and live leases remain distinct for HTTP and TCP', async ({ page }) => {
+  await fixture(page, false, [
+    { ...first, route_id: 'http-drain', member_id: 'blue', desired_state: 'draining', admission_open: false, active_admissions: 2, active_requests: 2 },
+    { ...last, route_id: 'tcp-maint', member_id: 'green', desired_state: 'maintenance', admission_open: false, active_admissions: 3, member_active_streams: 2, health_mode: 'active_tcp', probe_observed: true },
+    { ...last, route_id: 'unprobed', member_id: 'white', desired_state: 'maintenance', admission_open: false, active_admissions: 0 },
+    { ...first, route_id: 'http-serving', member_id: 'orange', desired_state: 'serving', admission_open: true, active_admissions: 0, available: true },
+  ]);
+  await page.locator('a[href="#operations"]').click();
+  const row = (id) => page.locator('#operations-rows tr').filter({ hasText: id });
+  await expect(row('http-drain')).toContainText('Desired: Draining');
+  await expect(row('http-drain')).toContainText('Admission closed');
+  await expect(row('http-drain')).toContainText('2 active admission leases');
+  await expect(row('tcp-maint')).toContainText('Desired: Maintenance');
+  await expect(row('tcp-maint')).toContainText('3 active admission leases');
+  await expect(row('tcp-maint')).toContainText('2 established member streams');
+  await expect(row('tcp-maint')).toContainText('Probes suspended for maintenance');
+  await expect(row('unprobed')).toContainText('No probes configured');
+  await expect(row('tcp-maint')).toContainText('TCP member leases include pending dials');
+  await expect(row('http-serving')).toContainText('Member gate open');
+  await expect(row('http-serving')).toContainText('0 active admission leases');
+  await expect(row('http-serving')).toContainText('Zero does not prove drain completion');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(row('http-drain')).toContainText('설정 상태: 드레이닝');
+  await expect(row('tcp-maint')).toContainText('설정 상태: 유지보수');
+  await expect(row('tcp-maint')).toContainText('진행 중인 admission lease 3개');
+  await expect(row('http-serving')).toContainText('멤버 요청 게이트 열림');
+});
+
+test('older operations responses do not invent serving, an open gate or zero leases', async ({ page }) => {
+  await fixture(page, false, [{ ...first, route_id: 'old-server', member_id: 'blue' }]);
+  await page.locator('a[href="#operations"]').click();
+  const row = page.locator('#operations-rows tr').first();
+  await expect(row).toContainText('State unavailable');
+  await expect(row).toContainText('Member gate state unavailable');
+  await expect(row).toContainText('Admission count unavailable');
+  await expect(row).not.toContainText('0 active admission leases');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(row).toContainText('멤버 요청 게이트 상태 확인 불가');
+  await expect(row).toContainText('진행 중인 admission 수 확인 불가');
+});
+
 test('named TCP rows show established member streams separately from route connections in both languages', async ({ page }) => {
   await fixture(page, false, [{ ...last, route_id: 'tcp-streams', member_id: 'blue',
     member_active_streams: 3, route_active_connections: 7 }]);

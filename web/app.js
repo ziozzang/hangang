@@ -1372,12 +1372,14 @@ function memberRow(member = {}, sourceIndex = -1) {
   const id = field('Member ID', `member_id_${++memberControlSequence}`, member.id || '', { required: true, maxlength: 64, help: 'Stable within this route; 1–64 ASCII letters, digits, dots, underscores or dashes. Starts with a letter or digit.' });
   const address = field('Member address', `member_address_${memberControlSequence}`, member.address || '', { required: true, help: 'HTTP(S) URL, host:port for TCP, or docker://container/network/port.' });
   const weight = field('Member weight', `member_weight_${memberControlSequence}`, member.weight ?? 1, { type: 'number', min: 1, max: 1000, required: true, help: '1–1,000. Weight 1 is the default.' });
+  const state = field('Desired state', `member_state_${memberControlSequence}`, member.desired_state ?? 'serving', { select: [['serving', 'Serving'], ['draining', 'Draining'], ['maintenance', 'Maintenance']], help: 'Draining blocks new admissions while existing work continues. Maintenance also stops probes. These are local instance states, not a fleet drain-completion signal.' });
   id.querySelector('input').classList.add('backend-member-id');
   address.querySelector('input').classList.add('backend-member-address');
   weight.querySelector('input').classList.add('backend-member-weight');
+  state.querySelector('select').classList.add('backend-member-state');
   const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet backend-member-remove'; copy(remove, 'Remove member');
   remove.addEventListener('click', () => { row.remove(); syncRouteJsonFromForm(); });
-  row.append(id, address, weight, remove);
+  row.append(id, address, weight, state, remove);
   return row;
 }
 
@@ -1393,7 +1395,7 @@ function updateBackendModeUi() {
   editor.querySelector('.backend-legacy').hidden = named;
   editor.querySelector('.backend-named').hidden = !named;
   editor.querySelector('.backend-legacy textarea').disabled = named;
-  for (const input of editor.querySelectorAll('.backend-named input')) input.disabled = !named;
+  for (const input of editor.querySelectorAll('.backend-named input, .backend-named select')) input.disabled = !named;
   const convert = editor.querySelector('.backend-convert');
   copy(convert, named ? 'Convert to legacy addresses' : 'Convert to named members');
   const weights = $('#route-form [name="balance_weights"]');
@@ -1417,16 +1419,18 @@ function readBackendValues(base) {
     const id = row.querySelector('.backend-member-id').value.trim();
     const address = row.querySelector('.backend-member-address').value.trim();
     const rawWeight = row.querySelector('.backend-member-weight').value.trim();
+    const desiredState = row.querySelector('.backend-member-state').value;
     if (!MEMBER_ID.test(id)) throw new Error(t('Member ID must be 1–64 ASCII characters, starting with a letter or digit'));
     if (ids.has(id)) throw new Error(t('Member IDs must be unique within a route'));
     if (!address) throw new Error(t('Member address is required'));
     if (addresses.has(address)) throw new Error(t('Member addresses must be unique within a route'));
     if (!/^\d+$/.test(rawWeight) || Number(rawWeight) < 1 || Number(rawWeight) > 1000) throw new Error(t('Member weight must be a whole number from 1 to 1,000'));
-    if (previous.desired_state !== undefined && previous.desired_state !== 'serving') throw new Error(t('Only serving members are supported in this release'));
+    if (!['serving', 'draining', 'maintenance'].includes(desiredState)) throw new Error(t('Choose a valid member state'));
     ids.add(id); addresses.add(address);
     const member = { ...previous, id, address };
     const weight = Number(rawWeight);
     if (weight !== 1 || Object.hasOwn(previous, 'weight')) member.weight = weight;
+    if (desiredState !== 'serving' || Object.hasOwn(previous, 'desired_state')) member.desired_state = desiredState;
     return member;
   });
 }
@@ -1451,7 +1455,7 @@ function backendFields(type, route) {
     : 'One host:port per line (or docker://container/network/port); 1–128 entries.' });
   legacy.classList.add('backend-legacy'); legacy.hidden = named;
   const namedWrap = document.createElement('div'); namedWrap.className = 'backend-named'; namedWrap.hidden = !named;
-  const note = document.createElement('p'); note.className = 'field-help-inline'; copy(note, 'Named members keep stable IDs and per-member weights. Only serving is supported in this release. Local-file configuration authority is required; shared stores reject named members.');
+  const note = document.createElement('p'); note.className = 'field-help-inline'; copy(note, 'Named members keep stable IDs, per-member weights and serving, draining or maintenance state. Local-file configuration authority is required; shared stores reject named members.');
   const rows = document.createElement('div'); rows.className = 'backend-member-list';
   if (named) rows.append(...route.backends.map((member, index) => memberRow(member, index)));
   const add = document.createElement('button'); add.type = 'button'; add.className = 'button button-quiet backend-member-add'; copy(add, 'Add member');
@@ -1466,6 +1470,7 @@ function backendFields(type, route) {
       if (editor.dataset.mode === 'invalid') throw new Error(t('Backends must be all addresses or all named members'));
       if (editor.dataset.mode === 'named') {
         const members = readBackendValues(draft.backends);
+        if (members.some((member) => member.desired_state && member.desired_state !== 'serving')) throw new Error(t('Set every member to Serving before converting to legacy addresses'));
         const weights = members.map((member) => member.weight ?? 1);
         if (type === 'tcp' && weights.some((weight) => weight !== 1)) throw new Error(t('TCP member weights cannot be preserved in legacy address mode'));
         draft.backends = members.map((member) => member.address);

@@ -117,7 +117,7 @@ test('advanced JSON named/legacy changes survive an unrelated native edit', asyn
   expect(writes[0].future_route_field).toEqual({ retain: true });
 });
 
-test('native duplicate IDs and nonserving members fail closed without issuing a write', async ({ page }) => {
+test('native duplicate IDs and invalid member states fail closed without issuing a write', async ({ page }) => {
   const configured = structuredClone(http);
   configured.backends = [{ id: 'blue', address: 'http://127.0.0.1:8080' }, { id: 'green', address: 'http://127.0.0.1:8081' }];
   configured.balance.weights = [];
@@ -126,12 +126,61 @@ test('native duplicate IDs and nonserving members fail closed without issuing a 
   await expect(page.locator('#route-message')).toContainText('Member IDs must be unique');
   await page.getByRole('button', { name: 'Save route' }).click();
   expect(writes).toHaveLength(0);
-  const nonserving = structuredClone(configured); nonserving.backends[0].desired_state = 'draining';
+  const invalid = structuredClone(configured); invalid.backends[0].desired_state = 'unknown-state';
   await openAdvanced(page);
-  await page.locator('#route-json').fill(JSON.stringify(nonserving));
+  await page.locator('#route-json').fill(JSON.stringify(invalid));
   await page.locator('#route-field-priority').fill('8');
-  await expect(page.locator('#route-message')).toContainText('Only serving members');
+  await expect(page.locator('#route-message')).toContainText('Choose a valid member state');
   await page.getByRole('button', { name: 'Save route' }).click();
+  expect(writes).toHaveLength(0);
+});
+
+test('HTTP named state changes round-trip without adding a default state or losing unknown fields', async ({ page }) => {
+  const configured = structuredClone(http);
+  configured.backends = [
+    { id: 'blue', address: 'http://127.0.0.1:8080', future_member_field: { retain: true } },
+    { id: 'green', address: 'http://127.0.0.1:8081', desired_state: 'serving' },
+  ];
+  configured.balance.weights = [];
+  const writes = await fixture(page, 'http', configured);
+  const states = page.locator('.backend-member-state');
+  await expect(states.first()).toHaveValue('serving');
+  await states.nth(0).selectOption('draining');
+  await states.nth(1).selectOption('maintenance');
+  await page.locator('#locale-select-route').selectOption('ko');
+  await expect(page.locator('.backend-member-row').first()).toContainText('드레이닝');
+  await expect(states.first()).toHaveValue('draining');
+  await expect(states.nth(1)).toHaveValue('maintenance');
+  await save(page);
+  expect(writes[0].backends).toEqual([
+    { id: 'blue', address: 'http://127.0.0.1:8080', future_member_field: { retain: true }, desired_state: 'draining' },
+    { id: 'green', address: 'http://127.0.0.1:8081', desired_state: 'maintenance' },
+  ]);
+});
+
+test('advanced JSON member state survives unrelated native edit, and default remains omitted', async ({ page }) => {
+  const configured = structuredClone(tcp);
+  configured.backends = [{ id: 'blue', address: '127.0.0.1:8080' }, { id: 'green', address: '127.0.0.1:8081' }];
+  const writes = await fixture(page, 'tcp', configured);
+  await openAdvanced(page);
+  const draft = structuredClone(configured);
+  draft.backends[0].desired_state = 'maintenance';
+  await page.locator('#route-json').fill(JSON.stringify(draft));
+  await expect(page.locator('.backend-member-state').first()).toHaveValue('maintenance');
+  await page.locator('#route-field-priority').fill('3');
+  await save(page);
+  expect(writes[0].backends).toEqual(draft.backends);
+  expect(writes[0].backends[1]).not.toHaveProperty('desired_state');
+});
+
+test('reverse conversion refuses nonserving state that legacy addresses cannot preserve', async ({ page }) => {
+  const configured = structuredClone(http);
+  configured.backends = [{ id: 'blue', address: 'http://127.0.0.1:8080', desired_state: 'draining' }];
+  configured.balance.weights = [];
+  const writes = await fixture(page, 'http', configured);
+  await page.getByRole('button', { name: 'Convert to legacy addresses' }).click();
+  await expect(page.locator('#route-message')).toContainText('Set every member to Serving');
+  await expect(page.locator('.backend-member-row')).toHaveCount(1);
   expect(writes).toHaveLength(0);
 });
 
