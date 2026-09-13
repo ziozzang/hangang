@@ -98,3 +98,10 @@ fn listener_role_change_requires_a_separate_retirement_revision() {
             .is_empty()
     );
 }
+
+#[test]
+fn published_workload_http_example_passes_structural_validation() {
+    let example: Config =
+        serde_json::from_str(include_str!("../examples/http-workload-mtls.json")).unwrap();
+    example.validate().unwrap();
+}
