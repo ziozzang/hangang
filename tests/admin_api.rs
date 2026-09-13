@@ -226,6 +226,59 @@ fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).unwrap()
 }
 
+async fn read_raw_response_headers(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut headers = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() < 8192);
+        }
+    })
+    .await
+    .expect("administrator response headers stalled");
+    headers
+}
+
+async fn admitted_user_mutation_waiting_for_body(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let headers = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    let interim = read_raw_response_headers(&mut stream).await;
+    assert!(
+        interim.starts_with(b"HTTP/1.1 100 Continue"),
+        "body was not polled after account authorization: {interim:?}"
+    );
+    stream
+}
+
+async fn finish_user_mutation(stream: &mut tokio::net::TcpStream, body: &str) -> u16 {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(body.as_bytes()).await.unwrap();
+    let headers = read_raw_response_headers(stream).await;
+    let line = String::from_utf8_lossy(&headers);
+    line.lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 async fn event_fixture(
     event_limit: usize,
 ) -> (
@@ -1209,6 +1262,174 @@ async fn last_admin_and_password_change_are_enforced_through_api() {
 }
 
 #[tokio::test]
+async fn revoked_account_cannot_finish_user_creation_after_body_admission() {
+    let (address, _manager, _directory) = server().await;
+    let credentials = r#"{"username":"operator","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/auth/bootstrap",
+            Some(credentials),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(credentials),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let token = json(&body)["token"].as_str().unwrap().to_owned();
+    let create = r#"{"username":"lateviewer","password":"viewer password 123","role":"viewer"}"#;
+    let mut pending =
+        admitted_user_mutation_waiting_for_body(address, "POST", "/v1/users", &token, create).await;
+    // The 100 Continue response is a protocol barrier: read_json has polled
+    // the body, which occurs only after handle_inner authenticated the actor.
+    assert_eq!(
+        request_with_token(address, "POST", "/v1/auth/logout", None, None, Some(&token))
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/auth/me", None, None, Some(&token))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(finish_user_mutation(&mut pending, create).await, 403);
+    let (status, _, body) = request(address, "GET", "/v1/users", None, None).await;
+    assert_eq!(status, 200);
+    assert!(
+        json(&body)["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|user| user["username"] != "lateviewer"),
+        "revoked account created a user after its session was removed"
+    );
+}
+
+#[tokio::test]
+async fn demoted_account_cannot_finish_password_update_after_body_admission() {
+    let (address, _manager, _directory) = server().await;
+    let credentials = r#"{"username":"operator","password":"correct horse battery"}"#;
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/auth/bootstrap",
+            Some(credentials),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (status, _, body) = request(
+        address,
+        "POST",
+        "/v1/users",
+        Some(r#"{"username":"secondadmin","password":"second password 123","role":"admin"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let actor_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request(
+        address,
+        "POST",
+        "/v1/users",
+        Some(r#"{"username":"targetviewer","password":"viewer password 123","role":"viewer"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, 201);
+    let target_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"secondadmin","password":"second password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let actor_token = json(&body)["token"].as_str().unwrap().to_owned();
+    let update = r#"{"password":"replacement password 123"}"#;
+    let mut pending = admitted_user_mutation_waiting_for_body(
+        address,
+        "PUT",
+        &format!("/v1/users/{target_id}"),
+        &actor_token,
+        update,
+    )
+    .await;
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            &format!("/v1/users/{actor_id}"),
+            Some(r#"{"role":"viewer"}"#),
+            None,
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/auth/me",
+            None,
+            None,
+            Some(&actor_token),
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(finish_user_mutation(&mut pending, update).await, 403);
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/auth/login",
+            Some(r#"{"username":"targetviewer","password":"replacement password 123"}"#),
+            None,
+            None,
+        )
+        .await
+        .0,
+        401,
+        "a demoted actor changed another user's password"
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/auth/login",
+            Some(r#"{"username":"targetviewer","password":"viewer password 123"}"#),
+            None,
+            None,
+        )
+        .await
+        .0,
+        200
+    );
+}
+
+#[tokio::test]
 async fn status_and_openapi_have_stable_contracts() {
     let (address, manager, _dir) = server().await;
     manager
@@ -1244,7 +1465,19 @@ async fn status_and_openapi_have_stable_contracts() {
     let (status, _, body) =
         request_with_token(address, "GET", "/openapi.json", None, None, None).await;
     assert_eq!(status, 200);
-    assert_eq!(json(&body)["openapi"], "3.1.0");
+    let spec = json(&body);
+    assert_eq!(spec["openapi"], "3.1.0");
+    for (path, method, status) in [
+        ("/v1/users", "post", "201"),
+        ("/v1/users/{id}", "put", "200"),
+    ] {
+        assert_eq!(
+            spec["paths"][path][method]["responses"][status]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/AuthUserResponse",
+            "{method} {path} must document the actual {{user: ...}} envelope"
+        );
+    }
     let (status, headers, body) =
         request_with_token(address, "GET", "/v1/status", None, None, None).await;
     assert_eq!(status, 401);
