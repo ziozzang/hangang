@@ -533,7 +533,9 @@ impl Store {
                 && (1..=MAX_SAFE_ID + 1).contains(&config_next)
                 && config_count == actual_config_count
                 && (0..=CONFIG_OPERATION_CAPACITY).contains(&config_count)
-                && config_next == max_config_id + 1,
+                && config_next == max_config_id + 1
+                && config_count == max_config_id
+                && config_count == config_next - 1,
             "local config operation metadata inconsistent"
         );
         {
@@ -915,6 +917,7 @@ impl Store {
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let actor_user_id=authorize_mutation(&transaction,&authority)?;
             let (authority_id,next_id,stored_records):(String,i64,i64)=transaction.query_row("SELECT authority_id,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+            ensure!(valid_lower_hex(&authority_id,32) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && stored_records==next_id-1,"local config operation metadata inconsistent");
             if stored_records>=CONFIG_OPERATION_CAPACITY || !(1..=MAX_SAFE_ID).contains(&next_id) {return Err(ConfigOperationCapacity.into());}
             let record=ConfigOperation{id:next_id,operation_id,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
             ensure!(valid_config_operation(&record),"invalid local config operation");
@@ -964,10 +967,16 @@ impl Store {
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
             authorize_mutation(&transaction,&authority)?;
             let (authority_id,started_at,next_id,stored_records):(String,i64,i64,i64)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            ensure!(valid_lower_hex(&authority_id,32) && (0..=MAX_SAFE_ID).contains(&started_at) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && stored_records==next_id-1,"local config operation metadata inconsistent");
             let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_config_operations",[],|row|row.get(0))?;
+            ensure!(oldest_id==if stored_records==0 {None}else{Some(1)},"local config operation history does not start at id 1");
             let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
+            if after<next_id-1 {ensure!(!records.is_empty(),"local config operation page has a gap");}
+            for (index,record) in records.iter().enumerate() {
+                ensure!(record.id==after+1+i64::try_from(index)?,"local config operation page has a gap");
+            }
             let has_more=records.len()>limit;
             records.truncate(limit);
             let next_after=records.last().map_or(after,|record|record.id);
@@ -1675,6 +1684,88 @@ mod tests {
                 .stored_records,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn missing_middle_operation_fails_open_page_and_next_acceptance() {
+        let (directory, store) = store();
+        for _ in 0..3 {
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .unwrap();
+        }
+        let path = directory.path().join("accounts.sqlite3");
+        connection(&path).unwrap().execute_batch("DELETE FROM admin_config_operations WHERE id=2; UPDATE admin_config_operation_meta SET stored_records=2 WHERE singleton=1;").unwrap();
+        assert!(
+            Store::open(path).is_err(),
+            "startup must reject a missing middle row even when count metadata was adjusted"
+        );
+        assert!(
+            store
+                .config_operations(MutationAuthority::System, 0, 100)
+                .await
+                .is_err(),
+            "paged history must not imply a complete range"
+        );
+        assert!(
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .is_err(),
+            "a broken sequence cannot accept a new row"
+        );
+    }
+
+    /// Two local SQLite FULL transactions per pair: acceptance and terminal
+    /// observation. Excludes Argon2, HTTP, configuration CAS and data plane.
+    #[tokio::test]
+    #[ignore = "explicit release-mode local operation journal diagnostic"]
+    async fn config_operation_acceptance_microbenchmark() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        const PAIRS: usize = 100;
+        for account in [false, true] {
+            let started = std::time::Instant::now();
+            for _ in 0..PAIRS {
+                let authority = if account {
+                    MutationAuthority::Session(login.token.clone())
+                } else {
+                    MutationAuthority::System
+                };
+                let accepted = store
+                    .accept_config(authority, config_request())
+                    .await
+                    .unwrap();
+                let finished = store
+                    .finish_config(
+                        &accepted.operation_id,
+                        ConfigOperationState::CandidateActivated,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(finished.state, ConfigOperationState::CandidateActivated);
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "local config acceptance+finish {}: {PAIRS} pairs ({} SQLite FULL writes) in {elapsed:?} ({:.0} pairs/s); excludes Argon2, HTTP, configuration CAS, preparation and data plane",
+                if account {
+                    "session authority"
+                } else {
+                    "system authority"
+                },
+                PAIRS * 2,
+                PAIRS as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[tokio::test]
