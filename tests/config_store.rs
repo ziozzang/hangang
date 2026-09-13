@@ -2,11 +2,25 @@ use hangang::{
     certificates::CertificateFiles,
     config::{Config, HttpRoute},
     config_store::{
-        CasResult, ConfigStore, EPOCH_LEN, FileConfigStore, PostgresConfigStore, SqliteConfigStore,
-        StoreError, Stored, bootstrap_prepared,
+        CasResult, ConfigStore, EPOCH_LEN, FileConfigStore, OperationProof, OperationStamp,
+        PostgresConfigStore, SqliteConfigStore, StoreError, Stored, bootstrap_prepared,
     },
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+fn operation_stamp(expected: u64, operation_id: &str, candidate: &Config) -> OperationStamp {
+    use sha2::{Digest, Sha256};
+    let mut committed = candidate.clone();
+    committed.revision = expected + 1;
+    OperationStamp {
+        authority_id: "a".repeat(32),
+        operation_id: operation_id.to_owned(),
+        candidate_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&committed).unwrap())
+        ),
+    }
+}
 
 fn config(revision: u64, id: &str) -> Config {
     Config {
@@ -148,6 +162,104 @@ async fn assert_cas_contract(store: &dyn ConfigStore) {
     assert_eq!(current, first);
 }
 
+async fn assert_operation_cas_contract(store: &dyn ConfigStore) -> anyhow::Result<()> {
+    assert!(store.supports_operation_cas());
+    let initial = store.bootstrap(config(0, "initial")).await?;
+    let epoch = initial.epoch;
+    let candidate = config(0, "same-candidate");
+    let first = operation_stamp(0, &"1".repeat(32), &candidate);
+    let second = operation_stamp(0, &"2".repeat(32), &candidate);
+
+    let mut bad_digest = first.clone();
+    bad_digest.candidate_sha256 = "0".repeat(64);
+    assert!(matches!(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate.clone(), bad_digest)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    let mut bad_id = first.clone();
+    bad_id.operation_id = "synthetic-secret-id".into();
+    let error = store
+        .compare_and_swap_operation(&epoch, 0, candidate.clone(), bad_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Invalid(_)));
+    assert!(!error.to_string().contains("synthetic-secret-id"));
+    assert_eq!(
+        store.load_latest().await?,
+        Some(Stored {
+            epoch: epoch.clone(),
+            config: config(0, "initial")
+        })
+    );
+    assert_eq!(store.load_current_operation_proof().await?, None);
+
+    let committed = applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate.clone(), first.clone())
+            .await?,
+    );
+    assert_eq!(committed.config.revision, 1);
+    assert_eq!(committed.http_id(), "same-candidate");
+    let proof = OperationProof {
+        epoch: epoch.clone(),
+        revision: 1,
+        stamp: first.clone(),
+    };
+    assert_eq!(
+        store.load_current_operation_proof().await?,
+        Some(proof.clone())
+    );
+    assert_eq!(
+        applied(
+            store
+                .compare_and_swap_operation(&epoch, 0, candidate.clone(), first.clone())
+                .await?
+        ),
+        committed,
+        "only the same operation ID may idempotently recover its own commit"
+    );
+    assert_eq!(
+        conflict(
+            store
+                .compare_and_swap_operation(&epoch, 0, candidate.clone(), second)
+                .await?
+        ),
+        committed,
+        "a distinct operation with identical bytes did not commit"
+    );
+    assert_eq!(store.load_current_operation_proof().await?, Some(proof));
+
+    let changed_candidate = config(0, "changed-candidate");
+    let reused_id = operation_stamp(0, &first.operation_id, &changed_candidate);
+    assert!(matches!(
+        store
+            .compare_and_swap_operation(&epoch, 0, changed_candidate, reused_id)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    let later_candidate = config(0, "later-candidate");
+    let reused_id = operation_stamp(1, &first.operation_id, &later_candidate);
+    assert!(matches!(
+        store
+            .compare_and_swap_operation(&epoch, 1, later_candidate, reused_id)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.load_latest().await?, Some(committed));
+
+    // Legacy writers remain supported, but their revision is never attributed
+    // to the previous operation after the durable document changes.
+    applied(
+        store
+            .compare_and_swap(&epoch, 1, config(0, "legacy-next"))
+            .await?,
+    );
+    assert_eq!(store.load_current_operation_proof().await?, None);
+    Ok(())
+}
+
 async fn assert_challenge_contract(store: &dyn ConfigStore) {
     let ttl = Duration::from_secs(30);
     assert_eq!(store.lookup_challenge("absent").await.unwrap(), None);
@@ -260,6 +372,28 @@ async fn file_store_honours_the_cas_and_challenge_contracts() {
     let store = FileConfigStore::new(directory.path().join("state.json"));
     assert_cas_contract(&store).await;
     assert_challenge_contract(&store).await;
+}
+
+#[tokio::test]
+async fn file_store_explicitly_rejects_operation_cas() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = FileConfigStore::new(directory.path().join("state.json"));
+    assert!(!store.supports_operation_cas());
+    let initial = store.bootstrap(config(0, "initial")).await?;
+    let candidate = config(0, "candidate");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    assert!(matches!(
+        store
+            .compare_and_swap_operation(&initial.epoch, 0, candidate, stamp)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert!(matches!(
+        store.load_current_operation_proof().await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.load_latest().await?, Some(initial));
+    Ok(())
 }
 
 /// A file written by `store::save` (as an operator or the admin API would)
@@ -421,6 +555,138 @@ async fn sqlite_store_honours_the_cas_and_challenge_contracts() {
         .unwrap();
     assert_cas_contract(&store).await;
     assert_challenge_contract(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_operation_cas_proves_only_the_winning_operation_and_survives_reopen()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    assert_operation_cas_contract(&store).await?;
+
+    let epoch = store.load_latest().await?.unwrap().epoch;
+    let candidate = config(0, "reopened-proof");
+    let stamp = operation_stamp(2, &"3".repeat(32), &candidate);
+    applied(
+        store
+            .compare_and_swap_operation(&epoch, 2, candidate, stamp.clone())
+            .await?,
+    );
+    drop(store);
+    let reopened = SqliteConfigStore::open(path).await?;
+    assert_eq!(
+        reopened.load_current_operation_proof().await?,
+        Some(OperationProof {
+            epoch,
+            revision: 3,
+            stamp,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate = config(0, "candidate");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate, stamp)
+            .await?,
+    );
+
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute(
+        "UPDATE hangang_config SET config_json=?1 WHERE singleton=1",
+        [serde_json::to_string(&config(1, "different-document"))?],
+    )?;
+    assert_eq!(
+        store.load_current_operation_proof().await?,
+        None,
+        "the old stamp cannot prove a different document at the same revision"
+    );
+    connection.execute(
+        "UPDATE hangang_config SET revision=2, config_json=?1 WHERE singleton=1",
+        [serde_json::to_string(&config(2, "old-sql-writer"))?],
+    )?;
+    assert_eq!(
+        store.load_current_operation_proof().await?,
+        None,
+        "an old SQL writer that leaves the stamp cannot claim its new revision"
+    );
+
+    connection.execute(
+        "UPDATE hangang_config SET operation_id='synthetic-secret-id' WHERE singleton=1",
+        [],
+    )?;
+    let error = store.load_current_operation_proof().await.unwrap_err();
+    assert!(matches!(error, StoreError::Invalid(_)));
+    assert!(!error.to_string().contains("synthetic-secret-id"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_operation_cas_same_candidate_concurrent_ids_has_one_winner() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let left = Arc::new(SqliteConfigStore::open(&path).await?);
+    let right = Arc::new(SqliteConfigStore::open(&path).await?);
+    let epoch = left.bootstrap(config(0, "initial")).await?.epoch;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let run = |store: Arc<SqliteConfigStore>,
+               barrier: Arc<tokio::sync::Barrier>,
+               epoch: String,
+               id: char| {
+        tokio::spawn(async move {
+            let candidate = config(0, "identical");
+            let stamp = operation_stamp(0, &id.to_string().repeat(32), &candidate);
+            barrier.wait().await;
+            let result = store
+                .compare_and_swap_operation(&epoch, 0, candidate, stamp.clone())
+                .await;
+            (stamp, result)
+        })
+    };
+    let left_task = run(left.clone(), barrier.clone(), epoch.clone(), '1');
+    let right_task = run(right.clone(), barrier, epoch.clone(), '2');
+    let (stamp_a, result_a) = left_task.await?;
+    let (stamp_b, result_b) = right_task.await?;
+    let results = [(stamp_a, result_a?), (stamp_b, result_b?)];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, result)| matches!(result, CasResult::Applied(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, result)| matches!(result, CasResult::Conflict { .. }))
+            .count(),
+        1
+    );
+    let winner = results
+        .iter()
+        .find(|(_, result)| matches!(result, CasResult::Applied(_)))
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(
+        left.load_current_operation_proof().await?,
+        Some(OperationProof {
+            epoch,
+            revision: 1,
+            stamp: winner
+        })
+    );
+    Ok(())
 }
 
 /// Deleting the document and bootstrapping again is a new authority: the
@@ -672,6 +938,178 @@ async fn postgres_cas_when_disposable_fixture_is_explicitly_provided() -> anyhow
     );
     assert_eq!(current, winner);
     assert_challenge_contract(&*peer).await;
+    Ok(())
+}
+
+/// Run only through `tests/pg_fixture.py`; that fixture creates and removes
+/// its own loopback PostgreSQL container and runs ignored tests serially.
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_operation_cas_same_candidate_ids_prove_only_one_commit() -> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client
+        .batch_execute("DROP TABLE IF EXISTS hangang_config")
+        .await?;
+    let left = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
+    let right = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
+    assert!(left.supports_operation_cas());
+    let epoch = left.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate = config(0, "identical");
+    let first = operation_stamp(0, &"1".repeat(32), &candidate);
+    let second = operation_stamp(0, &"2".repeat(32), &candidate);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_task = tokio::spawn({
+        let store = left.clone();
+        let epoch = epoch.clone();
+        let candidate = candidate.clone();
+        let stamp = first.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .compare_and_swap_operation(&epoch, 0, candidate, stamp)
+                .await
+        }
+    });
+    let second_task = tokio::spawn({
+        let store = right.clone();
+        let epoch = epoch.clone();
+        let candidate = candidate.clone();
+        let stamp = second.clone();
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .compare_and_swap_operation(&epoch, 0, candidate, stamp)
+                .await
+        }
+    });
+    let results = [first_task.await??, second_task.await??];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, CasResult::Applied(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, CasResult::Conflict { .. }))
+            .count(),
+        1
+    );
+    let winning_stamp = if matches!(results[0], CasResult::Applied(_)) {
+        first.clone()
+    } else {
+        second.clone()
+    };
+    let losing_stamp = if winning_stamp == first {
+        second
+    } else {
+        first
+    };
+    assert_eq!(
+        left.load_current_operation_proof().await?,
+        Some(OperationProof {
+            epoch: epoch.clone(),
+            revision: 1,
+            stamp: winning_stamp.clone(),
+        })
+    );
+    assert_eq!(
+        applied(
+            right
+                .compare_and_swap_operation(&epoch, 0, candidate.clone(), winning_stamp)
+                .await?
+        )
+        .config
+        .revision,
+        1
+    );
+    assert_eq!(
+        conflict(
+            right
+                .compare_and_swap_operation(&epoch, 0, candidate, losing_stamp)
+                .await?
+        )
+        .config
+        .revision,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client
+        .batch_execute("DROP TABLE IF EXISTS hangang_config")
+        .await?;
+    let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let initial = direct.bootstrap(config(0, "initial")).await?;
+    let epoch = initial.epoch.clone();
+    let candidate = config(0, "identical");
+    let first = operation_stamp(0, &"1".repeat(32), &candidate);
+    let second = operation_stamp(0, &"2".repeat(32), &candidate);
+    let (upstream, _) = proxied_url(&url, "127.0.0.1:1".parse()?)?;
+
+    // The update commits but its answer is dropped. The same operation's
+    // retry may use its exact durable stamp to prove the current commit.
+    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    proxy.gate.send_replace(true);
+    let committed = applied(
+        writer
+            .compare_and_swap_operation(&epoch, 0, candidate.clone(), first.clone())
+            .await?,
+    );
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert_eq!(committed.config.revision, 1);
+    assert_eq!(
+        direct.load_current_operation_proof().await?,
+        Some(OperationProof {
+            epoch: epoch.clone(),
+            revision: 1,
+            stamp: first.clone(),
+        })
+    );
+    drop(proxy);
+
+    // A different ID proposing the same document has no ownership proof.
+    // Its unanswered attempt remains uncertain; an answered retry conflicts.
+    let mut proxy = losing_proxy(upstream, vec![CAS_MARKER]).await?;
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    proxy.gate.send_replace(true);
+    let error = writer
+        .compare_and_swap_operation(&epoch, 0, candidate.clone(), second.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(CAS_MARKER));
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    assert_eq!(
+        conflict(
+            direct
+                .compare_and_swap_operation(&epoch, 0, candidate, second)
+                .await?
+        ),
+        committed
+    );
+    assert_eq!(
+        direct.load_current_operation_proof().await?.unwrap().stamp,
+        first
+    );
     Ok(())
 }
 
