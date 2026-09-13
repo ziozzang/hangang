@@ -48,6 +48,8 @@ pub(crate) const MAX_CONFIG_BYTES: usize = store::MAX_CONFIG_BYTES;
 pub const EPOCH_LEN: usize = 32;
 /// Retained SQL receipts are bounded; a full history refuses new operation CAS.
 pub const COMMIT_RECEIPT_CAPACITY: u64 = 100_000;
+pub const COMMIT_AUTHORITY_CAPACITY: u64 = 4_096;
+pub const MAX_ACCEPTANCE_SEQUENCE: u64 = 9_007_199_254_740_991;
 /// ACME HTTP-01 token limits shared by every store.
 pub const MAX_CHALLENGE_TOKEN_LEN: usize = 128;
 pub const MAX_KEY_AUTHORIZATION_LEN: usize = 512;
@@ -90,6 +92,31 @@ pub struct CommitReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitReceiptObservation {
     pub receipt: Option<CommitReceipt>,
+    pub stored_records: u64,
+    pub capacity: u64,
+    pub writes_available: bool,
+}
+
+/// A locally accepted operation, bound to its never-reused local sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SequencedOperationStamp {
+    pub authority_id: String,
+    pub acceptance_seq: u64,
+    pub operation_id: String,
+    pub candidate_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SequencedCommitReceipt {
+    pub epoch: String,
+    pub revision: u64,
+    pub stamp: SequencedOperationStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SequencedReceiptObservation {
+    pub receipt: Option<SequencedCommitReceipt>,
+    pub high_water: u64,
     pub stored_records: u64,
     pub capacity: u64,
     pub writes_available: bool,
@@ -229,6 +256,29 @@ pub trait ConfigStore: Send + Sync {
             "retained commit receipts are unsupported by this store"
         )))
     }
+    fn supports_sequenced_operation_cas(&self) -> bool {
+        false
+    }
+    async fn compare_and_swap_operation_v2(
+        &self,
+        _epoch: &str,
+        _expected: u64,
+        _next: Config,
+        _stamp: SequencedOperationStamp,
+    ) -> StoreResult<CasResult> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced operation CAS is unsupported by this store"
+        )))
+    }
+    async fn lookup_commit_receipt_v2(
+        &self,
+        _authority_id: &str,
+        _acceptance_seq: u64,
+    ) -> StoreResult<SequencedReceiptObservation> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced commit receipts are unsupported by this store"
+        )))
+    }
     /// ACME HTTP-01 sharing: every instance behind a load balancer can answer
     /// the CA's validation request. `token`: 1..=128 chars of `[A-Za-z0-9_-]`;
     /// `key_authorization`: 1..=512 printable ASCII; `ttl`: 1 s..=1 h.
@@ -334,6 +384,32 @@ fn valid_hex(value: &str, len: usize) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Opaque correlation ID with an injective sequence prefix. The suffix is a
+/// checksum, not an authentication code or a credential.
+pub fn canonical_operation_id(authority_id: &str, seq: u64) -> StoreResult<String> {
+    if !valid_hex(authority_id, 32) || !(1..=MAX_ACCEPTANCE_SEQUENCE).contains(&seq) {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid sequenced operation identity"
+        )));
+    }
+    let mut authority = [0u8; 16];
+    for (index, byte) in authority.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&authority_id[index * 2..index * 2 + 2], 16)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid sequenced operation identity")))?;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"hangang-op-v2");
+    hasher.update(authority);
+    hasher.update(seq.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut id = format!("{seq:016x}");
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        write!(&mut id, "{byte:02x}").expect("String write is infallible");
+    }
+    Ok(id)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
