@@ -68,7 +68,7 @@ const state = {
   openapi: null,
   lastStatus: null,
   lastUpdateStatus: null,
-  audit: { page: null, after: 0, previous: [], sequence: 0, error: null, notice: null },
+  audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -3524,6 +3524,7 @@ function resetAudit() {
   state.audit.page = null;
   state.audit.after = 0;
   state.audit.previous = [];
+  state.audit.pageNumber = 1;
   state.audit.error = null;
   state.audit.notice = null;
   $('#audit-rows').replaceChildren();
@@ -3549,9 +3550,10 @@ function auditChange(record) {
   const parts = [];
   if (record.before) parts.push(t('Before: {role}, {state}', { role: t(record.before.role), state: record.before.enabled ? t('enabled') : t('disabled') }));
   if (record.after) parts.push(t('After: {role}, {state}', { role: t(record.after.role), state: record.after.enabled ? t('enabled') : t('disabled') }));
-  if (record.password_changed) parts.push(t('Password changed'));
-  if (Number.isSafeInteger(record.affected_count)) parts.push(t('{count} records pruned', { count: formatNumber(record.affected_count) }));
-  if (Number.isSafeInteger(record.through_id)) parts.push(t('Through #{id}', { id: record.through_id }));
+  if (record.password_changed) parts.push(t(record.action === 'bootstrap' || record.action === 'create' ? 'Password set' : 'Password changed'));
+  if (record.action === 'baseline' && Number.isSafeInteger(record.affected_count)) parts.push(t('Existing accounts at audit start: {count}', { count: formatNumber(record.affected_count) }));
+  if (record.action === 'prune' && Number.isSafeInteger(record.affected_count)) parts.push(t('{count} records pruned', { count: formatNumber(record.affected_count) }));
+  if (record.action === 'prune' && Number.isSafeInteger(record.through_id)) parts.push(t('Through #{id}', { id: record.through_id }));
   return parts.join(' · ') || t('No role or enabled-state change');
 }
 
@@ -3584,15 +3586,15 @@ function renderAudit() {
       rows.append(tr);
     }
     if (!page.records.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 6; td.className = 'audit-empty'; td.textContent = t('No account audit records on this page.'); tr.append(td); rows.append(tr); }
-    $('#audit-page-state').textContent = t('Page {page} · latest sequence #{latest}', { page: audit.previous.length + 1, latest: page.latest_id });
+    $('#audit-page-state').textContent = t('Page {page} · latest sequence #{latest}', { page: audit.pageNumber, latest: page.latest_id });
   }
   $('#audit-export').disabled = !page?.records?.length;
   $('#audit-prune').disabled = !page?.records?.length || !Number.isSafeInteger(page.latest_id);
   $('#audit-previous').disabled = !audit.previous.length || !page;
-  $('#audit-next').disabled = !page?.has_more || !page.records.length || audit.previous.length >= 63;
+  $('#audit-next').disabled = !page?.has_more || !page.records.length;
 }
 
-async function loadAudit(after = 0, previous = []) {
+async function loadAudit(after = 0, previous = [], pageNumber = 1) {
   if (!isAdmin() || !state.token) { resetAudit(); return; }
   const sequence = ++state.audit.sequence;
   state.audit.page = null;
@@ -3605,15 +3607,20 @@ async function loadAudit(after = 0, previous = []) {
     if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
       !['bootstrap', 'create', 'update', 'delete', 'prune'].every((action) => data.coverage.includes(action)) ||
       !Array.isArray(data.records) || data.records.length > 100 ||
-      !Number.isSafeInteger(data.latest_id) || !Number.isSafeInteger(data.next_after) ||
-      !Number.isSafeInteger(data.stored_records) || !Number.isSafeInteger(data.capacity) ||
-      !Number.isSafeInteger(data.started_at_unix_ms) || !Number.isSafeInteger(data.server_time_unix_ms) || typeof data.writes_available !== 'boolean' ||
+      !Number.isSafeInteger(data.latest_id) || data.latest_id < 0 || !Number.isSafeInteger(data.next_after) ||
+      !Number.isSafeInteger(data.pruned_through) || data.pruned_through < 0 || typeof data.truncated !== 'boolean' ||
+      !(data.oldest_id === null || (Number.isSafeInteger(data.oldest_id) && data.oldest_id > 0 && data.oldest_id <= data.latest_id)) ||
+      !Number.isSafeInteger(data.stored_records) || data.stored_records < 0 || !Number.isSafeInteger(data.capacity) || data.capacity < 1 ||
+      !Number.isSafeInteger(data.started_at_unix_ms) || data.started_at_unix_ms < 0 ||
+      !Number.isSafeInteger(data.server_time_unix_ms) || data.server_time_unix_ms < 0 || typeof data.writes_available !== 'boolean' ||
       typeof data.has_more !== 'boolean' ||
-      data.records.some((record, index) => !isObject(record) || !Number.isSafeInteger(record.id) || record.id <= (index ? data.records[index - 1].id : after)))
+      data.records.some((record, index) => !isObject(record) || !Number.isSafeInteger(record.id) || record.id <= (index ? data.records[index - 1].id : after) || record.id > data.latest_id) ||
+      data.next_after !== (data.records.at(-1)?.id ?? after) || (data.records.length && data.oldest_id === null))
       throw new Error(t('Account audit response is invalid.'));
     state.audit.page = data;
     state.audit.after = after;
     state.audit.previous = previous;
+    state.audit.pageNumber = pageNumber;
     renderAudit();
   } catch (error) {
     if (sequence !== state.audit.sequence) return;
@@ -3730,12 +3737,14 @@ $('#audit-previous').addEventListener('click', () => {
   const previous = state.audit.previous.slice();
   if (!previous.length) return;
   const after = previous.pop();
-  loadAudit(after, previous);
+  loadAudit(after, previous, state.audit.pageNumber - 1);
 });
 $('#audit-next').addEventListener('click', () => {
   const page = state.audit.page;
-  if (!page?.has_more || !page.records.length || state.audit.previous.length >= 63) return;
-  loadAudit(page.next_after, [...state.audit.previous, state.audit.after]);
+  if (!page?.has_more || !page.records.length) return;
+  const previous = [...state.audit.previous, state.audit.after];
+  if (previous.length > 63) previous.shift();
+  loadAudit(page.next_after, previous, state.audit.pageNumber + 1);
 });
 $('#audit-export').addEventListener('click', exportAuditPage);
 $('#audit-prune').addEventListener('click', pruneAuditPage);

@@ -5,10 +5,10 @@ const events = Array.from({ length: 101 }, (_, index) => ({
   id: index + 1, time_unix_ms: 1789000000000 + index * 1000,
   action: index ? 'create' : 'baseline', actor_kind: index ? 'account' : 'system',
   ...(index ? { actor_user_id: 1, target_user_id: index + 1, after: { role: 'viewer', enabled: true } } : {}),
-  password_changed: false,
+  password_changed: false, affected_count: 1, through_id: null,
 }));
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, pruneConflict = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, pruneConflict = false, longHistory = false, missingRetention = false } = {}) {
   const calls = [];
   let release;
   const blocked = new Promise((resolve) => { release = resolve; });
@@ -32,12 +32,14 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
       if (unavailable) return route.fulfill({ status: 503, json: { title: 'Audit Unavailable', detail: 'audit storage unavailable' } });
       if (request.headers().authorization === 'Bearer viewer-session') return route.fulfill({ status: 403, json: { title: 'Forbidden' } });
       const after = Number(url.searchParams.get('after'));
-      const rows = events.filter((event) => event.id > after).slice(0, 100);
-      return route.fulfill({ json: { scope: 'instance', coverage: ['bootstrap', 'create', 'update', 'delete', 'prune'],
+      const rows = longHistory ? [{ ...events[0], id: after + 1 }] : events.filter((event) => event.id > after).slice(0, 100);
+      const result = { scope: 'instance', coverage: ['bootstrap', 'create', 'update', 'delete', 'prune'],
         started_at_unix_ms: 1788999999000, records: rows, next_after: rows.at(-1)?.id ?? after,
-        oldest_id: 1, latest_id: 101, pruned_through: 0, truncated: false,
+        oldest_id: 1, latest_id: longHistory ? 100000 : 101, pruned_through: 0, truncated: false,
         stored_records: 100000, capacity: 100000, writes_available: false,
-        server_time_unix_ms: 1789000111000, has_more: after === 0 } });
+        server_time_unix_ms: 1789000111000, has_more: longHistory ? after < 99999 : after === 0 };
+      if (missingRetention) delete result.pruned_through;
+      return route.fulfill({ json: result });
     }
     if (url.pathname === '/v1/audit/users/prune') return route.fulfill(pruneConflict
       ? { status: 409, json: { title: 'Revision Conflict', detail: 'audit changed' } }
@@ -64,6 +66,8 @@ test('admin audit shows scope, capacity and bounded ordered pages; export includ
   await expect(page.locator('#audit-meta')).toContainText('This instance only');
   await expect(page.locator('#audit-meta')).toContainText('100,000/100,000');
   await expect(page.locator('#audit-message')).toContainText('Account changes are blocked');
+  await expect(page.locator('#audit-rows tr').first()).toContainText('Existing accounts at audit start: 1');
+  await expect(page.locator('#audit-rows tr').nth(1)).not.toContainText('records pruned');
   await expect(page.locator('#audit-prune')).toBeEnabled();
   await page.locator('#audit-next').click();
   await expect(page.locator('#audit-rows tr')).toHaveCount(1);
@@ -108,6 +112,14 @@ test('unavailable audit never appears as empty history, and viewer cannot open i
   await expect(page.locator('#audit-prune')).toBeDisabled();
 });
 
+test('missing retention metadata fails closed as unavailable history', async ({ page }) => {
+  await fixture(page, { missingRetention: true });
+  await page.locator('[data-view="audit"]').click();
+  await expect(page.locator('#audit-meta')).toContainText('Audit unavailable');
+  await expect(page.locator('#audit-rows')).toBeEmpty();
+  await expect(page.locator('#audit-prune')).toBeDisabled();
+});
+
 test('delayed admin audit response cannot repopulate after logout and viewer login', async ({ page }) => {
   const { calls, release } = await fixture(page, { accounts: true, delayed: true });
   await page.locator('[data-view="audit"]').click();
@@ -133,4 +145,19 @@ test('Korean audit copy and row labels follow locale without losing page data', 
   await page.locator('#locale-select').selectOption('en');
   await expect(page.locator('#audit-rows tr').first()).toContainText('Audit baseline');
   await expect(page.locator('#audit-rows tr')).toHaveCount(100);
+});
+
+test('forward paging stays available beyond the bounded backcursor stack', async ({ page }) => {
+  test.setTimeout(60_000);
+  await fixture(page, { longHistory: true });
+  await page.locator('[data-view="audit"]').click();
+  await expect(page.locator('#audit-page-state')).toContainText('Page 1');
+  for (let index = 2; index <= 66; index++) {
+    await page.locator('#audit-next').click();
+    await expect(page.locator('#audit-page-state')).toContainText(`Page ${index} ·`);
+  }
+  await expect(page.locator('#audit-rows')).toContainText('66');
+  await expect(page.locator('#audit-next')).toBeEnabled();
+  await page.locator('#audit-previous').click();
+  await expect(page.locator('#audit-page-state')).toContainText('Page 65 ·');
 });
