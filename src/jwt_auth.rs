@@ -28,6 +28,10 @@ const MAX_KEY_ID: usize = 128;
 const MAX_IDENTITY_BYTES: usize = 255;
 const MAX_ATTRIBUTES: usize = 32;
 const MAX_ATTRIBUTE_BYTES: usize = 128;
+const MAX_REVOKED_TOKEN_IDS: usize = 1024;
+/// Last representable second of UTC year 9999. Keep operator cutoffs within
+/// calendar values that the management API and UI can render consistently.
+const MAX_REVOCATION_CUTOFF: u64 = 253_402_300_799;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JwtAlgorithm {
@@ -83,6 +87,36 @@ fn default_groups_claim() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct JwtRevocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_ids: Vec<String>,
+}
+
+impl JwtRevocation {
+    fn validate(&self) -> Result<()> {
+        if let Some(cutoff) = self.issued_before {
+            ensure!(
+                cutoff <= MAX_REVOCATION_CUTOFF,
+                "JWT issued_before exceeds the supported UTC epoch"
+            );
+        }
+        ensure!(
+            self.token_ids.len() <= MAX_REVOKED_TOKEN_IDS,
+            "too many revoked JWT token IDs"
+        );
+        let mut seen = HashSet::with_capacity(self.token_ids.len());
+        for id in &self.token_ids {
+            ensure!(valid_identity(id), "invalid revoked JWT token ID");
+            ensure!(seen.insert(id), "duplicate revoked JWT token ID");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtConfig {
     pub issuer: String,
     pub audiences: Vec<String>,
@@ -100,6 +134,8 @@ pub struct JwtConfig {
     pub required_scopes: Vec<String>,
     #[serde(default)]
     pub required_groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<JwtRevocation>,
 }
 
 impl JwtConfig {
@@ -160,6 +196,9 @@ impl JwtConfig {
         );
         validate_required(&self.required_scopes, true)?;
         validate_required(&self.required_groups, false)?;
+        if let Some(revocation) = &self.revocation {
+            revocation.validate()?;
+        }
         Ok(())
     }
 
@@ -631,12 +670,21 @@ impl std::error::Error for VerifyError {}
 
 pub struct JwtVerifier {
     config: JwtConfig,
+    revoked_token_ids: HashSet<String>,
 }
 
 impl JwtVerifier {
     pub fn prepare(config: JwtConfig) -> Result<Self> {
         config.validate()?;
-        Ok(Self { config })
+        let revoked_token_ids = config
+            .revocation
+            .as_ref()
+            .map(|revocation| revocation.token_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        Ok(Self {
+            config,
+            revoked_token_ids,
+        })
     }
 
     pub fn config(&self) -> &JwtConfig {
@@ -731,6 +779,16 @@ impl JwtVerifier {
         let exp = object.get("exp").and_then(Value::as_u64).ok_or(invalid)?;
         let iat = object.get("iat").and_then(Value::as_u64).ok_or(invalid)?;
         if exp <= iat || exp.saturating_sub(iat) > self.config.max_lifetime_seconds {
+            return Err(invalid);
+        }
+        if self.revoked_token_ids.contains(jti)
+            || self
+                .config
+                .revocation
+                .as_ref()
+                .and_then(|revocation| revocation.issued_before)
+                .is_some_and(|cutoff| iat < cutoff)
+        {
             return Err(invalid);
         }
         let not_before = object
@@ -1015,6 +1073,7 @@ mod tests {
             groups_claim: "groups".into(),
             required_scopes: vec!["billing:read".into()],
             required_groups: vec!["ops".into()],
+            revocation: None,
         }
     }
 
@@ -1124,6 +1183,156 @@ mod tests {
             !verifier.config().allows(&verified),
             "valid but unauthorized is 403 at the caller"
         );
+    }
+
+    #[test]
+    fn signed_token_id_revocation_is_exact_and_configured_only() {
+        let (signing, keys) = key_material();
+        let key = keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap();
+        let access_token = token(&signing, &claims());
+        assert!(
+            JwtVerifier::prepare(config())
+                .unwrap()
+                .verify(&access_token, &key, 1100)
+                .is_ok()
+        );
+
+        let mut revoked = config();
+        revoked.revocation = Some(JwtRevocation {
+            issued_before: None,
+            token_ids: vec!["token-1".into()],
+        });
+        let verifier = JwtVerifier::prepare(revoked).unwrap();
+        assert!(verifier.revoked_token_ids.contains("token-1"));
+        assert_eq!(
+            verifier.verify(&access_token, &key, 1100),
+            Err(VerifyError::Invalid)
+        );
+
+        let mut another = claims();
+        another["jti"] = serde_json::json!("token-10");
+        assert!(
+            verifier
+                .verify(&token(&signing, &another), &key, 1100)
+                .is_ok(),
+            "a token ID prefix must not match an exact revocation"
+        );
+    }
+
+    #[test]
+    fn issued_before_cutoff_is_strict_and_independent_of_clock_leeway() {
+        let (signing, keys) = key_material();
+        let key = keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap();
+        let access_token = token(&signing, &claims()); // iat=1000
+        let mut policy = config();
+        policy.revocation = Some(JwtRevocation {
+            issued_before: Some(1000),
+            token_ids: vec![],
+        });
+        assert!(
+            JwtVerifier::prepare(policy.clone())
+                .unwrap()
+                .verify(&access_token, &key, 1100)
+                .is_ok(),
+            "iat equal to cutoff is allowed"
+        );
+        policy.revocation.as_mut().unwrap().issued_before = Some(1001);
+        policy.leeway_seconds = 60;
+        assert_eq!(
+            JwtVerifier::prepare(policy)
+                .unwrap()
+                .verify(&access_token, &key, 1100),
+            Err(VerifyError::Invalid),
+            "clock leeway cannot soften an explicit revocation cutoff"
+        );
+    }
+
+    #[test]
+    fn revocation_wire_bounds_duplicates_and_legacy_omission() {
+        let legacy = config();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("revocation").is_none());
+        let parsed: JwtConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.revocation, None);
+        assert!(parsed.validate().is_ok());
+
+        let mut policy = config();
+        let mut revocation = JwtRevocation {
+            issued_before: Some(MAX_REVOCATION_CUTOFF),
+            token_ids: vec!["α-token".into()],
+        };
+        policy.revocation = Some(revocation.clone());
+        assert!(policy.validate().is_ok());
+        assert_eq!(
+            serde_json::from_value::<JwtConfig>(serde_json::to_value(&policy).unwrap()).unwrap(),
+            policy
+        );
+        revocation.issued_before = Some(MAX_REVOCATION_CUTOFF + 1);
+        assert!(revocation.validate().is_err());
+        revocation.issued_before = None;
+        revocation.token_ids = vec!["same".into(), "same".into()];
+        assert!(revocation.validate().is_err());
+        for bad in ["", " leading", "trailing ", "a\n", &"x".repeat(256)] {
+            revocation.token_ids = vec![bad.into()];
+            assert!(revocation.validate().is_err(), "invalid jti {bad:?}");
+        }
+        revocation.token_ids = (0..=MAX_REVOKED_TOKEN_IDS)
+            .map(|i| format!("id-{i}"))
+            .collect();
+        assert!(revocation.validate().is_err());
+        assert!(
+            serde_json::from_value::<JwtRevocation>(
+                serde_json::json!({"token_ids":[],"unexpected":true})
+            )
+            .is_err(),
+            "revocation rejects unknown fields"
+        );
+    }
+
+    /// Diagnostic only: compare one already signed token with and without a
+    /// maximum-size local denylist. This measures signature + strict claims +
+    /// exact JTI lookup, not network, HTTP, or gateway request throughput.
+    /// Run explicitly with:
+    /// cargo test --release --lib jwt_revocation_verification_microbenchmark -- --ignored --nocapture
+    #[test]
+    #[ignore = "explicit release-mode JWT verification diagnostic"]
+    fn jwt_revocation_verification_microbenchmark() {
+        use std::time::Instant;
+
+        let (signing, keys) = key_material();
+        let key = keys.get("signer-1", JwtAlgorithm::EdDSA).unwrap();
+        let access_token = token(&signing, &claims());
+        let baseline = JwtVerifier::prepare(config()).unwrap();
+        let mut with_revocation = config();
+        with_revocation.revocation = Some(JwtRevocation {
+            issued_before: Some(1000), // equal iat remains allowed
+            token_ids: (0..MAX_REVOKED_TOKEN_IDS)
+                .map(|index| format!("other-token-{index}"))
+                .collect(),
+        });
+        let with_revocation = JwtVerifier::prepare(with_revocation).unwrap();
+        assert!(baseline.verify(&access_token, &key, 1100).is_ok());
+        assert!(with_revocation.verify(&access_token, &key, 1100).is_ok());
+
+        const ITERATIONS: usize = 2_000;
+        for (label, verifier) in [
+            ("no revocation", &baseline),
+            ("1024 token IDs", &with_revocation),
+        ] {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                assert!(
+                    std::hint::black_box(verifier)
+                        .verify(std::hint::black_box(&access_token), &key, 1100)
+                        .is_ok()
+                );
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "JWT signed verification {label}: {ITERATIONS} checks in {elapsed:?} ({:.0} checks/s); excludes network, HTTP, and routing",
+                ITERATIONS as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
