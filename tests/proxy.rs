@@ -275,7 +275,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         cache: None,
         headers: BTreeMap::new(),
         json: BTreeMap::new(),
-        backends,
+        backends: backends.into_iter().map(Into::into).collect(),
         deny_cidrs: Vec::new(),
         lua: None,
         request_transform: None,

@@ -2668,7 +2668,14 @@ mod tls_isolation_tests {
         // and serves the victim's certificate only in front of its backend.
         let (snapshot, owners) = cache.publish();
         assert_eq!(snapshot.config.http.len(), 1);
-        assert_eq!(snapshot.config.http[0].backends, ["http://api.zulu.svc:80"]);
+        assert_eq!(
+            snapshot.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.zulu.svc:80"]
+        );
         assert_eq!(snapshot.certificates.len(), 1);
         assert_eq!(owners["api.example.test"], "zulu");
         assert_eq!(
@@ -2684,7 +2691,14 @@ mod tls_isolation_tests {
         cache.upsert(ResourceKind::Ingress, attacker(Some("api-tls")));
         let (snapshot, owners) = cache.publish();
         assert_eq!(snapshot.config.http.len(), 1);
-        assert_eq!(snapshot.config.http[0].backends, ["http://api.zulu.svc:80"]);
+        assert_eq!(
+            snapshot.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.zulu.svc:80"]
+        );
         assert_eq!(snapshot.certificates.len(), 1);
         assert_eq!(owners["api.example.test"], "zulu");
         // Ownership survives while the older object still claims the host,
@@ -2699,7 +2713,11 @@ mod tls_isolation_tests {
         cache.delete(ResourceKind::Ingress, "zulu", "app");
         let (snapshot, owners) = cache.publish();
         assert_eq!(
-            snapshot.config.http[0].backends,
+            snapshot.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
             ["http://api.alpha.svc:80"]
         );
         assert_eq!(owners["api.example.test"], "alpha");
@@ -2741,7 +2759,14 @@ mod tls_isolation_tests {
             .unwrap();
         let (first, owners) = warm.publish();
         assert_eq!(owners["api.example.test"], "red");
-        assert_eq!(first.config.http[0].backends, ["http://api.red.svc:80"]);
+        assert_eq!(
+            first.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.red.svc:80"]
+        );
         warm.upsert(ResourceKind::Ingress, blue.clone());
         let (from_history, warm_owners) = warm.publish();
         let (from_cold, cold_owners) = cold.publish();
@@ -2750,7 +2775,11 @@ mod tls_isolation_tests {
         assert_eq!(cold_owners["api.example.test"], "blue");
         assert_eq!(from_cold.config.http.len(), 1);
         assert_eq!(
-            from_cold.config.http[0].backends,
+            from_cold.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
             ["http://api.blue.svc:80"]
         );
         // Equal timestamps are broken by uid, never by namespace order.
@@ -2761,7 +2790,14 @@ mod tls_isolation_tests {
         );
         let (snapshot, owners) = tied.publish();
         assert_eq!(owners["api.example.test"], "red");
-        assert_eq!(snapshot.config.http[0].backends, ["http://api.red.svc:80"]);
+        assert_eq!(
+            snapshot.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.red.svc:80"]
+        );
         // Objects without a timestamp sort after every dated object.
         let mut undated = cold.clone();
         undated.upsert(
@@ -2886,7 +2922,14 @@ mod tls_isolation_tests {
             .unwrap();
         let (snapshot, owners) = cache.publish();
         assert_eq!(snapshot.config.http.len(), 1);
-        assert_eq!(snapshot.config.http[0].backends, ["http://api.zulu.svc:80"]);
+        assert_eq!(
+            snapshot.config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.zulu.svc:80"]
+        );
         assert_eq!(
             owners,
             HostOwners::from([(CATCH_ALL_HOST.to_owned(), "zulu".to_owned())])

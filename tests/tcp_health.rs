@@ -49,7 +49,7 @@ fn route(listen: SocketAddr, backends: Vec<String>) -> TcpRoute {
         sni: None,
         max_connections: None,
         listen,
-        backends,
+        backends: backends.into_iter().map(Into::into).collect(),
         deny_cidrs: Vec::new(),
     }
 }
@@ -431,8 +431,9 @@ async fn retired_tls_probe_cannot_qualify_replaced_route() {
     let mut replaced = original.clone();
     // This new member refuses TCP connections. Reusing the old health state
     // would incorrectly admit it when the delayed TLS handshake completes.
-    replaced.tcp[0].backends[0] =
-        SocketAddr::from(([127, 0, 0, 2], backend_address.port())).to_string();
+    replaced.tcp[0].backends[0] = SocketAddr::from(([127, 0, 0, 2], backend_address.port()))
+        .to_string()
+        .into();
     let prepared = manager.prepare(&replaced).await.unwrap();
     let next = Snapshot::replace(replaced, &active.load_full()).unwrap();
     let new_health = next.tcp_health["checked-stream"].clone();

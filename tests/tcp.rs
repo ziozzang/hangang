@@ -36,7 +36,7 @@ fn route(id: &str, listen: SocketAddr, backend: SocketAddr) -> TcpRoute {
         sni: None,
         id: id.into(),
         listen,
-        backends: vec![backend.to_string()],
+        backends: vec![backend.to_string().into()],
         deny_cidrs: Vec::new(),
     }
 }

@@ -69,7 +69,7 @@ async fn run_monitor(
                 tasks.spawn(run_backend(
                     Arc::downgrade(runtime),
                     index,
-                    backend.clone(),
+                    backend.address().to_owned(),
                     prepared.clone(),
                     pools.clone(),
                     shutdown.clone(),

@@ -274,7 +274,14 @@ async fn tls_api_paginates_rotates_token_and_applies_watch_deletion() -> Result<
         .await?
         .unwrap();
     assert_eq!(first.config.http.len(), 1);
-    assert_eq!(first.config.http[0].backends, ["http://api.blue.svc:8080"]);
+    assert_eq!(
+        first.config.http[0]
+            .backends
+            .iter()
+            .map(|backend| backend.address())
+            .collect::<Vec<_>>(),
+        ["http://api.blue.svc:8080"]
+    );
     assert_eq!(first.certificates.len(), 1);
     assert_eq!(first.certificates[0].hosts, ["api.example.test"]);
 
@@ -473,7 +480,16 @@ async fn cross_namespace_host_claims_never_hijack_the_older_owner() -> Result<()
         assert!(!snapshot.config.http.is_empty());
         for route in &snapshot.config.http {
             assert_eq!(route.host.as_deref(), Some("api.example.test"));
-            assert_eq!(route.backends, ["http://api.zulu.svc:8080"], "{}", route.id);
+            assert_eq!(
+                route
+                    .backends
+                    .iter()
+                    .map(|backend| backend.address())
+                    .collect::<Vec<_>>(),
+                ["http://api.zulu.svc:8080"],
+                "{}",
+                route.id
+            );
         }
         assert_eq!(snapshot.certificates.len(), 1);
         assert_eq!(snapshot.certificates[0].cert_pem, zulu_cert.as_bytes());
@@ -498,14 +514,25 @@ async fn replicas_with_different_histories_publish_identical_snapshots() -> Resu
     let (warm_cancel, warm_task) = spawn(warm);
     let (cold_cancel, cold_task) = spawn(cold);
     let first = next_snapshot(&mut warm_rx, Duration::from_secs(4)).await?;
-    assert_eq!(first.config.http[0].backends, ["http://api.red.svc:8080"]);
+    assert_eq!(
+        first.config.http[0]
+            .backends
+            .iter()
+            .map(|backend| backend.address())
+            .collect::<Vec<_>>(),
+        ["http://api.red.svc:8080"]
+    );
     let warm_final = next_snapshot(&mut warm_rx, Duration::from_secs(4)).await?;
     let cold_final = next_snapshot(&mut cold_rx, Duration::from_secs(4)).await?;
     // A cold start over a contested host publishes the oldest claimant
     // instead of rejecting both, and both replicas agree.
     assert_eq!(cold_final.config.http.len(), 1);
     assert_eq!(
-        cold_final.config.http[0].backends,
+        cold_final.config.http[0]
+            .backends
+            .iter()
+            .map(|backend| backend.address())
+            .collect::<Vec<_>>(),
         ["http://api.blue.svc:8080"]
     );
     assert_eq!(warm_final, cold_final);
@@ -635,7 +662,11 @@ async fn withdrawn_ingress_never_receives_the_address_and_loses_it() -> Result<(
     let (cancel, task) = spawn(controller);
     let snapshot = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
     assert_eq!(
-        snapshot.config.http[0].backends,
+        snapshot.config.http[0]
+            .backends
+            .iter()
+            .map(|backend| backend.address())
+            .collect::<Vec<_>>(),
         ["http://api.blue.svc:8080"]
     );
     let state = harness.state.clone();

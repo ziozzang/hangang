@@ -241,7 +241,7 @@ pub struct HttpRoute {
     /// RFC 6901 JSON pointers mapped to expected values.
     #[serde(default)]
     pub json: BTreeMap<String, serde_json::Value>,
-    pub backends: Vec<String>,
+    pub backends: Vec<crate::pool_member::Backend>,
     #[serde(default)]
     pub deny_cidrs: Vec<ipnet::IpNet>,
     #[serde(default)]
@@ -345,7 +345,7 @@ pub struct TcpRoute {
     #[serde(default)]
     pub max_connections: Option<usize>,
     pub listen: std::net::SocketAddr,
-    pub backends: Vec<String>,
+    pub backends: Vec<crate::pool_member::Backend>,
     #[serde(default)]
     pub deny_cidrs: Vec<ipnet::IpNet>,
 }
@@ -364,6 +364,16 @@ struct PreparedUpstreamTls {
 }
 
 impl Config {
+    /// Whether this document uses identified pool members. Shared-store
+    /// writers must gate this wire format until all readers support it.
+    pub fn has_named_members(&self) -> bool {
+        self.http
+            .iter()
+            .flat_map(|route| &route.backends)
+            .chain(self.tcp.iter().flat_map(|route| &route.backends))
+            .any(|backend| backend.id().is_some())
+    }
+
     pub fn prepare_upstream_tls(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>>
@@ -646,7 +656,9 @@ impl Config {
             }
             if r.upstream.tls.is_some() {
                 ensure!(
-                    r.backends.iter().all(|b| b.starts_with("https://")),
+                    r.backends
+                        .iter()
+                        .all(|b| b.address().starts_with("https://")),
                     "HTTP upstream TLS options require HTTPS backends"
                 );
             }
@@ -657,7 +669,7 @@ impl Config {
                 ensure!(
                     !r.backends
                         .iter()
-                        .any(|backend| backend.starts_with("docker://")),
+                        .any(|backend| backend.address().starts_with("docker://")),
                     "checking initial health does not support Docker backends"
                 );
             }
@@ -811,11 +823,18 @@ impl Config {
                 "route {} needs 1..128 backends",
                 r.id
             );
+            let backend_kind =
+                crate::pool_member::validate_backends(&r.backends, &r.balance.weights)?;
+            ensure!(
+                backend_kind == crate::pool_member::BackendKind::Legacy,
+                "named pool members are not activated until lifecycle admission is installed"
+            );
             ensure!(
                 r.deny_cidrs.len() <= 1024 && r.headers.len() <= 64 && r.json.len() <= 64,
                 "too many route conditions"
             );
             for b in &r.backends {
+                let b = b.address();
                 if crate::discovery::parse_reference(b)?.is_some() {
                     continue;
                 }
@@ -928,8 +947,14 @@ impl Config {
                 !r.backends.is_empty() && r.backends.len() <= 128,
                 "TCP route needs 1..128 backends"
             );
+            let backend_kind = crate::pool_member::validate_backends(&r.backends, &[])?;
+            ensure!(
+                backend_kind == crate::pool_member::BackendKind::Legacy,
+                "named pool members are not activated until lifecycle admission is installed"
+            );
             ensure!(r.deny_cidrs.len() <= 1024, "too many CIDRs");
             for b in &r.backends {
+                let b = b.address();
                 if crate::discovery::parse_reference(b)?.is_some() {
                     continue;
                 }

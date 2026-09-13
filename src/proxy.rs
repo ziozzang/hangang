@@ -1054,7 +1054,7 @@ impl Proxy {
                 "all backends are unavailable",
             ));
         };
-        let mut backend = runtime.route.backends[index].clone();
+        let mut backend = runtime.route.backends[index].address().to_owned();
 
         if let Some(script) = &runtime.route.lua {
             // The policy API exposes one value per header name while the
@@ -1091,7 +1091,7 @@ impl Proxy {
                             .route
                             .backends
                             .iter()
-                            .position(|backend| backend == &chosen)
+                            .position(|backend| backend.address() == chosen)
                         else {
                             self.metrics.policy_errors.fetch_add(1, Ordering::Relaxed);
                             return Ok(self.failure(
@@ -1445,7 +1445,7 @@ impl Proxy {
                         && attempt < max_attempts
                         && let Some(next) = runtime.balancer.select()
                     {
-                        let candidate = runtime.route.backends[next].clone();
+                        let candidate = runtime.route.backends[next].address().to_owned();
                         if !candidate.starts_with("docker://")
                             && let Some(lease) = runtime.balancer.acquire(next)
                         {

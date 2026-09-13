@@ -209,8 +209,9 @@ impl Discovery {
                     .flat_map(|route| route.backends.iter()),
             )
         {
+            let backend = backend.address();
             if let Some(reference) = parse_reference(backend)? {
-                references.entry(backend.clone()).or_insert(reference);
+                references.entry(backend.to_owned()).or_insert(reference);
             }
         }
         if references.is_empty() {

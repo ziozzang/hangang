@@ -598,7 +598,7 @@ async fn run_tcp_probe(
         let Some(health) = health.upgrade() else {
             break;
         };
-        let configured = &route.backends[index];
+        let configured = route.backends[index].address();
         let Some(target) = resolve_probe_target(configured, discovery.as_deref()) else {
             health.record_failure_current(index);
             continue;
@@ -774,7 +774,7 @@ fn spawn_accept_loop(
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                let Some(target) = resolve_probe_target(&route.backends[index], task_discovery.as_deref()) else {
+                let Some(target) = resolve_probe_target(route.backends[index].address(), task_discovery.as_deref()) else {
                     task_metrics.errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
@@ -783,7 +783,7 @@ fn spawn_accept_loop(
                     return;
                 }
                 let backend = target.endpoint.clone();
-                let admission = TcpDialAdmission { configured: route.backends[index].clone(), target, health, discovery: task_discovery, index };
+                let admission = TcpDialAdmission { configured: route.backends[index].address().to_owned(), target, health, discovery: task_discovery, index };
                 if let Err(error) =
                     // SNI inspection remains passthrough. When this route also
                     // configures upstream TLS, the consumed ClientHello is sent
@@ -843,10 +843,12 @@ fn next_backend_index(
         .map(|offset| (index + offset) % route.backends.len())
         .find(|candidate| {
             health.is_none_or(|health| {
-                resolve_probe_target(&route.backends[*candidate], discovery).is_some_and(|target| {
-                    health.observe_epoch(*candidate, target.epoch)
-                        && health.available_for(*candidate, target.epoch)
-                })
+                resolve_probe_target(route.backends[*candidate].address(), discovery).is_some_and(
+                    |target| {
+                        health.observe_epoch(*candidate, target.epoch)
+                            && health.available_for(*candidate, target.epoch)
+                    },
+                )
             })
         })
 }

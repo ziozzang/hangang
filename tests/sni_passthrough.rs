@@ -63,7 +63,7 @@ fn route(
         }),
         max_connections: None,
         listen,
-        backends: vec![backend.to_string()],
+        backends: vec![backend.to_string().into()],
         deny_cidrs: Vec::new(),
     }
 }
@@ -618,7 +618,7 @@ async fn listener_wide_cidr_denial_precedes_hello_and_global_admission() {
         sni: None,
         max_connections: None,
         listen: allowed_listen,
-        backends: vec![allowed_backend.to_string()],
+        backends: vec![allowed_backend.to_string().into()],
         deny_cidrs: Vec::new(),
     };
     let (active, metrics, manager) = manager_with_limit(1);

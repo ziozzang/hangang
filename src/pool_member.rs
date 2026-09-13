@@ -1,6 +1,5 @@
-//! Staged pool-member wire model. Routes still use `Vec<String>` and cannot
-//! deserialize object members until publication gates and runtime admission
-//! are integrated. This module performs only pure shape validation.
+//! Pool-member wire model. Routes deserialize the enum, but validation rejects
+//! named members until lifecycle publication and runtime admission are wired.
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,6 +12,41 @@ use std::collections::HashSet;
 pub enum Backend {
     Legacy(String),
     Member(PoolMember),
+}
+
+impl Backend {
+    pub fn address(&self) -> &str {
+        match self {
+            Self::Legacy(address) => address,
+            Self::Member(member) => &member.address,
+        }
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Member(member) => Some(&member.id),
+        }
+    }
+
+    pub fn weight(&self) -> u16 {
+        match self {
+            Self::Legacy(_) => 1,
+            Self::Member(member) => member.weight,
+        }
+    }
+}
+
+impl From<String> for Backend {
+    fn from(address: String) -> Self {
+        Self::Legacy(address)
+    }
+}
+
+impl From<&str> for Backend {
+    fn from(address: &str) -> Self {
+        Self::Legacy(address.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,17 +201,73 @@ mod tests {
             let typed: Backend = serde_json::from_value(member.clone()).unwrap();
             validate_backends(&[typed], &[]).unwrap();
             let document = serde_json::json!({"http":[{"id":"route", "backends":[member]}]});
-            assert!(serde_json::from_value::<crate::config::Config>(document).is_err());
+            let mut config: crate::config::Config = serde_json::from_value(document).unwrap();
+            assert!(config.has_named_members());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("named pool members are not activated")
+            );
+            config.http[0].enabled = false;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("named pool members are not activated")
+            );
             let document = serde_json::json!({"tcp":[{"id":"stream", "listen":"127.0.0.1:9000",
                 "backends":[{"id":"origin", "address":"127.0.0.1:8080", "desired_state":state}]}]});
-            assert!(serde_json::from_value::<crate::config::Config>(document).is_err());
+            let mut config: crate::config::Config = serde_json::from_value(document).unwrap();
+            assert!(config.has_named_members());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("named pool members are not activated")
+            );
+            config.tcp[0].enabled = false;
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("named pool members are not activated")
+            );
         }
+    }
+
+    #[test]
+    fn accessors_and_legacy_conversions_keep_address_semantics() {
+        let legacy = Backend::from("http://a.example");
+        assert_eq!(legacy.address(), "http://a.example");
+        assert_eq!(legacy.id(), None);
+        assert_eq!(legacy.weight(), 1);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), "http://a.example");
+        let named = Backend::Member(PoolMember {
+            id: "stable-a".into(),
+            address: "http://b.example".into(),
+            weight: 7,
+            desired_state: DesiredState::Serving,
+        });
+        assert_eq!(named.address(), "http://b.example");
+        assert_eq!(named.id(), Some("stable-a"));
+        assert_eq!(named.weight(), 7);
     }
 
     #[test]
     fn legacy_string_arrays_round_trip_without_conversion() {
         let wire = json!(["https://a.example:443", "https://b.example:443"]);
         let backends: Vec<Backend> = serde_json::from_value(wire.clone()).unwrap();
+        let legacy_config: crate::config::Config = serde_json::from_value(json!({
+            "http": [{"id": "legacy", "backends": wire.clone()}]
+        }))
+        .unwrap();
+        assert!(!legacy_config.has_named_members());
+        legacy_config.validate().unwrap();
         assert_eq!(
             validate_backends(&backends, &[3, 1]).unwrap(),
             BackendKind::Legacy

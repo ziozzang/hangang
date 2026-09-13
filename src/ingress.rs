@@ -392,7 +392,14 @@ mod tests {
         assert_eq!(config.http.len(), 2);
         assert_eq!(config.http[0].path_match, PathMatch::Exact);
         assert_eq!(config.http[1].path_match, PathMatch::SegmentPrefix);
-        assert_eq!(config.http[0].backends, ["http://api.blue.svc:8080"]);
+        assert_eq!(
+            config.http[0]
+                .backends
+                .iter()
+                .map(|backend| backend.address())
+                .collect::<Vec<_>>(),
+            ["http://api.blue.svc:8080"]
+        );
         assert!(import(&input(), "other").unwrap().http.is_empty());
     }
     #[test]
