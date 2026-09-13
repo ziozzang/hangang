@@ -3,12 +3,13 @@ import { readFile } from 'node:fs/promises';
 
 const authority = 'a'.repeat(32);
 const operation = 'b'.repeat(32);
+const v2Operation = `${(7).toString(16).padStart(16, '0')}${'b'.repeat(16)}`;
 const receipt = { scope: 'configuration_authority', supported: true,
   receipt: { epoch: 'c'.repeat(32), revision: 17,
     stamp: { authority_id: authority, operation_id: operation, candidate_sha256: 'd'.repeat(64) } },
   stored_records: 2, capacity: 100000, writes_available: true, server_time_unix_ms: 1789000002000 };
 const v2Receipt = { ...receipt,
-  receipt: { ...receipt.receipt, stamp: { ...receipt.receipt.stamp, acceptance_seq: 7 } },
+  receipt: { ...receipt.receipt, stamp: { ...receipt.receipt.stamp, operation_id: v2Operation, acceptance_seq: 7 } },
   high_water: 9, registered_authorities: 2, authority_capacity: 4096 };
 const emptyHistory = { scope: 'instance', coverage: ['acceptance', 'local_outcome'],
   authority_id: 'e'.repeat(32), started_at_unix_ms: 1788999999000,
@@ -46,6 +47,8 @@ async function fixture(page, { mode = 'present', v2Mode = 'present', hold = fals
         stored_records: null, capacity: null, writes_available: null } });
       if (v2Mode === 'invalid') return route.fulfill({ json: { ...v2Receipt, receipt: { ...v2Receipt.receipt,
         stamp: { ...v2Receipt.receipt.stamp, acceptance_seq: 8 } } } });
+      if (v2Mode === 'invalid-prefix') return route.fulfill({ json: { ...v2Receipt, receipt: { ...v2Receipt.receipt,
+        stamp: { ...v2Receipt.receipt.stamp, operation_id: operation } } } });
       return route.fulfill({ json: v2Receipt });
     }
     if (url.pathname === '/v1/config/commit-receipt') {
@@ -210,7 +213,7 @@ test('V2 rejects zero, leading zeros and unsafe sequence before request', async 
 
 for (const [v2Mode, expected] of [
   ['missing', 'commit outcome is unknown'], ['unsupported', 'does not support historical SQL receipts'],
-  ['invalid', 'receipt unavailable'], ['error', 'receipt unavailable'],
+  ['invalid', 'receipt unavailable'], ['invalid-prefix', 'receipt unavailable'], ['error', 'receipt unavailable'],
 ]) test(`V2 ${v2Mode} stays distinct from historical commit evidence`, async ({ page }) => {
   await fixture(page, { v2Mode });
   await page.locator('[data-view="config-operations"]').click();
@@ -237,7 +240,9 @@ test('switching receipt version while V1 response is pending cannot display V1 e
 });
 
 test('local journal labels explicit V1, V2 and missing-version legacy rows without mixing IDs', async ({ page }) => {
-  const row = (id, receiptVersion) => ({ id, operation_id: String(id).repeat(32), authority_id: emptyHistory.authority_id,
+  const row = (id, receiptVersion) => ({ id,
+    operation_id: receiptVersion === 2 ? `${id.toString(16).padStart(16, '0')}${'b'.repeat(16)}` : String(id).repeat(32),
+    authority_id: emptyHistory.authority_id,
     actor_kind: 'system', actor_user_id: null, accepted_at_unix_ms: 1789000000000,
     expected_revision: id - 1, candidate_sha256: 'f'.repeat(64), store_kind: 'shared_store',
     authority_epoch: 'c'.repeat(32), state: 'accepted', finished_at_unix_ms: null,
@@ -257,6 +262,24 @@ test('local journal labels explicit V1, V2 and missing-version legacy rows witho
   const exported = JSON.parse(await readFile(await download.path(), 'utf8'));
   expect(exported.records.map((record) => record.receipt_version)).toEqual([undefined, 1, 2]);
   expect(exported.receipt_version_compatibility).toBe('missing means legacy_v1');
+});
+
+for (const [label, invalid] of [
+  ['operation ID', { operation_id: 'b'.repeat(32) }],
+  ['store kind', { operation_id: `${(3).toString(16).padStart(16, '0')}${'b'.repeat(16)}`, store_kind: 'local_file' }],
+]) test(`a V2 journal row with invalid ${label} is unavailable rather than presented as sequenced evidence`, async ({ page }) => {
+  const record = { id: 3, operation_id: `${(3).toString(16).padStart(16, '0')}${'b'.repeat(16)}`,
+    authority_id: emptyHistory.authority_id, receipt_version: 2,
+    actor_kind: 'system', actor_user_id: null, accepted_at_unix_ms: 1789000000000,
+    expected_revision: 2, candidate_sha256: 'f'.repeat(64), store_kind: 'shared_store',
+    authority_epoch: 'c'.repeat(32), state: 'accepted', finished_at_unix_ms: null,
+    ...invalid };
+  const history = { ...emptyHistory, records: [record], next_after: 3, oldest_id: 3,
+    latest_id: 3, history_revision: 3, stored_records: 1 };
+  await fixture(page, { history });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-message')).toContainText('response is invalid');
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
 });
 
 test('Korean V2 copy rerenders without changing the namespace or numeric fence', async ({ page }) => {

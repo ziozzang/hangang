@@ -3806,7 +3806,8 @@ function validConfigReceipt(data, mode, authorityId, identity) {
     ? receipt.stamp?.operation_id === identity
     : receipt.stamp?.acceptance_seq === Number(identity) &&
       safe(receipt.stamp.acceptance_seq) && receipt.stamp.acceptance_seq > 0 &&
-      receipt.stamp.acceptance_seq <= data.high_water && hex(receipt.stamp.operation_id, 32);
+      receipt.stamp.acceptance_seq <= data.high_water && hex(receipt.stamp.operation_id, 32) &&
+      receipt.stamp.operation_id.startsWith(receipt.stamp.acceptance_seq.toString(16).padStart(16, '0'));
   return hex(receipt.epoch, 32) && safe(receipt.revision) && receipt.stamp.authority_id === authorityId &&
     identityValid && hex(receipt.stamp.candidate_sha256, 64);
 }
@@ -3953,7 +3954,10 @@ function validConfigOperationsPage(data, after) {
   return data.records.every((record, index) => isObject(record) && safe(record.id) &&
     record.id > (index ? data.records[index - 1].id : after) && record.id <= data.latest_id &&
     idValue(record.operation_id) && record.authority_id === data.authority_id &&
-    (record.receipt_version === undefined || record.receipt_version === 1 || record.receipt_version === 2) &&
+    (record.receipt_version === undefined || record.receipt_version === 1 ||
+      (record.receipt_version === 2 && record.store_kind === 'shared_store' &&
+        idValue(record.authority_epoch) &&
+        record.operation_id.startsWith(record.id.toString(16).padStart(16, '0')))) &&
     ['system', 'account'].includes(record.actor_kind) &&
     (record.actor_kind === 'system' ? record.actor_user_id == null : safe(record.actor_user_id) && record.actor_user_id > 0) &&
     safe(record.accepted_at_unix_ms) &&
