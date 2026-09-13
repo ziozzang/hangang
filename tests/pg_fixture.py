@@ -14,6 +14,9 @@ def run(*args, **kwargs):
 
 
 def main():
+    target=os.environ.get("HANGANG_PG_TEST_TARGET","config_store")
+    if target not in {"config_store","sequenced_store"}:
+        raise ValueError("HANGANG_PG_TEST_TARGET must be config_store or sequenced_store")
     name="hangang-configstore-"+secrets.token_hex(6)
     password=secrets.token_hex(24)
     with socket.socket() as listener:
@@ -39,7 +42,7 @@ def main():
             time.sleep(.3)
             env={**os.environ,"HANGANG_TEST_POSTGRES_URL":f"postgresql://postgres:{password}@127.0.0.1:{port}/hangang","HANGANG_TEST_POSTGRES_TLS_URL":f"postgresql://postgres:{password}@localhost:{port}/hangang","HANGANG_TEST_POSTGRES_CA":str(cert),"HANGANG_TEST_POSTGRES_CONTAINER":name}
             command=["cargo","llvm-cov","--no-report"] if os.environ.get("HANGANG_PG_COVERAGE")=="1" else ["cargo","test"]
-            run(*command,"--locked","--test","config_store","--","postgres_","--test-threads=1","--nocapture","--include-ignored",env=env)
+            run(*command,"--locked","--test",target,"--","postgres_","--test-threads=1","--nocapture","--include-ignored",env=env)
         finally:
             if created:run("docker","rm","--force",name,stdout=subprocess.DEVNULL)
 
