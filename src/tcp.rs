@@ -517,7 +517,7 @@ impl ListenerRoutes {
     }
 
     fn all_routes_deny(&self, peer: std::net::IpAddr) -> bool {
-        self.routes.iter().all(|(route, _, _, _)| {
+        self.routes.iter().all(|(route, _, _, _, _)| {
             route
                 .deny_cidrs
                 .iter()

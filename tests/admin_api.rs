@@ -854,6 +854,10 @@ async fn operations_are_admin_only_paginated_and_reflect_backend_state() {
     assert_eq!(tcp["protocol"], "tcp");
     assert_eq!(tcp["listen"], "127.0.0.1:18099");
     assert!(tcp["active_requests"].is_null());
+    assert_eq!(
+        tcp.get("member_active_streams"),
+        Some(&serde_json::Value::Null)
+    );
     assert!(tcp["initial_check_pending"].is_null());
     assert_eq!(tcp["route_active_connections"], 0);
     for path in [
@@ -2766,5 +2770,56 @@ async fn frozen_controller_tracks_authority_but_withdrawn_endpoint_cannot_revive
     assert!(
         !manager.ready.load(Ordering::Acquire),
         "confirmation must not undo endpoint withdrawal"
+    );
+}
+
+#[tokio::test]
+async fn operations_tcp_member_streams_remain_distinct_from_http_requests() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "http": [{"id":"http", "backends":["http://127.0.0.1:18001"]}],
+        "tcp": [{"id":"tcp", "enabled":false, "listen":"127.0.0.1:19001",
+                 "backends":[{"id":"blue", "address":"127.0.0.1:18002"}]}]
+    }))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (address, manager) = server_on(
+        dir.path().join("state.json"),
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let counter = manager.active.load().tcp_member_activity["tcp"]
+        .node(0)
+        .unwrap();
+    let lease = counter.acquire().unwrap();
+    let (status, _, body) = request(address, "GET", "/v1/operations", None, None).await;
+    assert_eq!(status, 200);
+    let data = json(&body);
+    let rows = data["rows"].as_array().unwrap();
+    let http = rows.iter().find(|row| row["protocol"] == "http").unwrap();
+    assert_eq!(
+        http.get("member_active_streams"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(http["active_requests"], 0);
+    let tcp = rows.iter().find(|row| row["protocol"] == "tcp").unwrap();
+    assert_eq!(tcp["member_active_streams"], 1);
+    assert_eq!(tcp["member_id"], "blue");
+    assert_eq!(tcp["enabled"], false);
+    assert!(tcp["active_requests"].is_null());
+    drop(lease);
+    let (_, _, body) = request(address, "GET", "/v1/operations", None, None).await;
+    let data = json(&body);
+    assert_eq!(
+        data["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["protocol"] == "tcp")
+            .unwrap()["member_active_streams"],
+        0
     );
 }

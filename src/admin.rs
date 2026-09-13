@@ -1350,6 +1350,7 @@ impl Admin {
                             "probe_observed": state.probe_observed,
                             "initial_check_pending": state.initial_check_pending,
                             "active_requests": state.active_requests,
+                            "member_active_streams": null,
                             "route_active_connections": null
                         }));
                     }
@@ -1394,6 +1395,8 @@ impl Admin {
                             "probe_observed": health.as_ref().map(|state| state.probe_observed),
                             "initial_check_pending": health.as_ref().map(|state| state.initial_check_pending),
                             "active_requests": null,
+                            "member_active_streams": snapshot.tcp_member_activity.get(&route.id)
+                                .and_then(|activity| activity.node(backend_index)).map(|counter| counter.active()),
                             "route_active_connections": active_connections
                         }));
                     }

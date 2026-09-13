@@ -251,3 +251,44 @@ fn legacy_tcp_backend_has_no_named_member_counter() {
     let snapshot = Snapshot::new(config).unwrap();
     assert!(snapshot.tcp_member_activity["stream"].node(0).is_none());
 }
+
+#[tokio::test]
+async fn established_member_lease_releases_on_idle_expiry_and_forced_shutdown() {
+    for idle in [Duration::ZERO, Duration::from_millis(100)] {
+        let (address, origin_task) = origin(b'a').await;
+        let bound = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = bound.local_addr().unwrap();
+        let config = config(listen, &[("a", address, 1)]);
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(config.clone()).unwrap(),
+        ));
+        let manager =
+            TcpManager::with_idle_timeout(active.clone(), Arc::new(Metrics::default()), 16, idle);
+        let prepared = manager
+            .prepare_with_inherited(&config, vec![(listen, OwnedFd::from(bound))])
+            .await
+            .unwrap();
+        manager.commit(prepared).await;
+        let mut stream = connect_tag(listen, b'a').await;
+        let count = counter(&active.load(), "a");
+        assert_eq!(count.active(), 1);
+        if idle.is_zero() {
+            let mut disabled = config.clone();
+            disabled.tcp[0].enabled = false;
+            publish(&manager, &active, disabled).await;
+            assert_eq!(counter(&active.load(), "a").active(), 1);
+            manager.shutdown(Duration::ZERO).await;
+        }
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Ok(0) | Err(_)),
+            "closed stream unexpectedly forwarded data"
+        );
+        wait_count(&count, 0).await;
+        manager.shutdown(Duration::ZERO).await;
+        origin_task.abort();
+    }
+}

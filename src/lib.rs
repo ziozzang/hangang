@@ -19,6 +19,7 @@ pub mod store;
 pub mod supervisor;
 pub mod tcp;
 pub mod tcp_health;
+pub mod tcp_member;
 pub mod tls;
 pub mod ui;
 pub mod update;

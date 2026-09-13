@@ -1051,6 +1051,8 @@ pub struct Snapshot {
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
     pub tcp_health: std::collections::HashMap<String, std::sync::Arc<crate::tcp_health::TcpHealth>>,
+    pub tcp_member_activity:
+        std::collections::HashMap<String, std::sync::Arc<crate::tcp_member::TcpMemberActivity>>,
 }
 fn named_backends(backends: &[crate::pool_member::Backend]) -> bool {
     backends
@@ -1215,6 +1217,28 @@ impl Snapshot {
             .flat_map(|old| old.config.tcp.iter())
             .map(|route| (route.id.as_str(), route))
             .collect();
+        let tcp_member_activity = config
+            .tcp
+            .iter()
+            .map(|route| {
+                let old = previous.and_then(|snapshot| {
+                    Some((
+                        previous_tcp_routes
+                            .get(route.id.as_str())?
+                            .backends
+                            .as_slice(),
+                        snapshot.tcp_member_activity.get(&route.id)?.as_ref(),
+                    ))
+                });
+                (
+                    route.id.clone(),
+                    std::sync::Arc::new(crate::tcp_member::TcpMemberActivity::new(
+                        &route.backends,
+                        old,
+                    )),
+                )
+            })
+            .collect();
         let mut tcp_health = std::collections::HashMap::new();
         for route in &config.tcp {
             let Some(health) = &route.health else {
@@ -1304,6 +1328,7 @@ impl Snapshot {
             config,
             http,
             tcp_health,
+            tcp_member_activity,
             admissions,
         })
     }
