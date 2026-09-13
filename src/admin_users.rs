@@ -918,6 +918,7 @@ impl Store {
             let actor_user_id=authorize_mutation(&transaction,&authority)?;
             let (authority_id,next_id,stored_records):(String,i64,i64)=transaction.query_row("SELECT authority_id,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && stored_records==next_id-1,"local config operation metadata inconsistent");
+            verify_config_history(&transaction,next_id,stored_records)?;
             if stored_records>=CONFIG_OPERATION_CAPACITY || !(1..=MAX_SAFE_ID).contains(&next_id) {return Err(ConfigOperationCapacity.into());}
             let record=ConfigOperation{id:next_id,operation_id,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
             ensure!(valid_config_operation(&record),"invalid local config operation");
@@ -968,8 +969,7 @@ impl Store {
             authorize_mutation(&transaction,&authority)?;
             let (authority_id,started_at,next_id,stored_records):(String,i64,i64,i64)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (0..=MAX_SAFE_ID).contains(&started_at) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && stored_records==next_id-1,"local config operation metadata inconsistent");
-            let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_config_operations",[],|row|row.get(0))?;
-            ensure!(oldest_id==if stored_records==0 {None}else{Some(1)},"local config operation history does not start at id 1");
+            let oldest_id=verify_config_history(&transaction,next_id,stored_records)?;
             let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
@@ -1058,6 +1058,29 @@ fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOper
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(record)
+}
+
+/// No pruning exists in this journal. This bounded (at most 10,000 rows)
+/// control-plane aggregate detects deleted rows even if metadata was adjusted.
+/// It is deliberately outside the data-plane request path.
+fn verify_config_history(
+    transaction: &Transaction<'_>,
+    next_id: i64,
+    stored_records: i64,
+) -> Result<Option<i64>> {
+    let (actual_count, oldest_id, actual_max): (i64, Option<i64>, i64) = transaction.query_row(
+        "SELECT COUNT(*),MIN(id),COALESCE(MAX(id),0) FROM admin_config_operations",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    ensure!(
+        actual_count == stored_records
+            && actual_count == actual_max
+            && next_id == actual_max + 1
+            && oldest_id == if actual_count == 0 { None } else { Some(1) },
+        "local config operation history has a gap"
+    );
+    Ok(oldest_id)
 }
 
 fn authorize_mutation(
@@ -1714,6 +1737,52 @@ mod tests {
                 .await
                 .is_err(),
             "a broken sequence cannot accept a new row"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_only_gap_fails_page_after_gap_and_accept_but_keeps_login() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            store
+                .accept_config(MutationAuthority::System, config_request())
+                .await
+                .unwrap();
+        }
+        let path = directory.path().join("accounts.sqlite3");
+        connection(&path)
+            .unwrap()
+            .execute("DELETE FROM admin_config_operations WHERE id=2", [])
+            .unwrap();
+        assert!(Store::open(path).is_err());
+        assert!(
+            store
+                .config_operations(MutationAuthority::Session(login.token.clone()), 2, 1)
+                .await
+                .is_err(),
+            "page after a deleted row must not imply complete history"
+        );
+        assert!(
+            store
+                .accept_config(
+                    MutationAuthority::Session(login.token.clone()),
+                    config_request()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store.session(login.token).await.unwrap().is_some(),
+            "journal corruption does not revoke a healthy login"
         );
     }
 
