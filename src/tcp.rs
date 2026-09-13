@@ -401,6 +401,7 @@ type ListenerRoute = (
     Arc<AtomicUsize>,
     Option<Arc<rustls::ClientConfig>>,
     Option<Arc<crate::tcp_health::TcpHealth>>,
+    Option<Arc<crate::tcp_member::TcpMemberActivity>>,
 );
 
 struct ListenerRoutes {
@@ -437,6 +438,7 @@ impl ListenerRoutes {
                 snapshot.admissions[&route.id].clone(),
                 snapshot.upstream_tls.get(&route.id).cloned(),
                 snapshot.tcp_health.get(&route.id).cloned(),
+                snapshot.tcp_member_activity.get(&route.id).cloned(),
             ));
             if let Some(sni) = &route.sni {
                 hello_settings = Some((sni.max_client_hello_bytes, sni.hello_timeout_ms));
@@ -752,7 +754,8 @@ fn spawn_accept_loop(
                     };
                     (route_index, hello.consumed)
                 };
-                let (route, counter, upstream_tls, health) = routes.routes[route_index].clone();
+                let (route, counter, upstream_tls, health, member_activity) =
+                    routes.routes[route_index].clone();
                 drop(routes);
                 if route
                     .deny_cidrs
@@ -782,8 +785,26 @@ fn spawn_accept_loop(
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                let member_counter = if route.backends[index].id().is_some() {
+                    let Some(counter) = member_activity.as_ref().and_then(|activity| activity.node(index)) else {
+                        // A named route must have a prepared counter for every
+                        // member. Do not serve it without activity ownership.
+                        task_metrics.errors.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    Some(counter)
+                } else {
+                    None
+                };
                 let backend = target.endpoint.clone();
-                let admission = TcpDialAdmission { configured: route.backends[index].address().to_owned(), target, health, discovery: task_discovery, index };
+                let admission = TcpDialAdmission {
+                    configured: route.backends[index].address().to_owned(),
+                    target,
+                    health,
+                    discovery: task_discovery,
+                    member_counter,
+                    index,
+                };
                 if let Err(error) =
                     // SNI inspection remains passthrough. When this route also
                     // configures upstream TLS, the consumed ClientHello is sent
@@ -884,6 +905,7 @@ struct TcpDialAdmission {
     target: crate::discovery::ResolvedTarget,
     health: Option<Arc<crate::tcp_health::TcpHealth>>,
     discovery: Option<Arc<crate::discovery::Discovery>>,
+    member_counter: Option<Arc<crate::tcp_member::StreamCounter>>,
     index: usize,
 }
 
@@ -917,6 +939,18 @@ async fn proxy_connection(
             .is_none_or(|health| health.available_for(admission.index, admission.target.epoch)),
         "TCP backend became unavailable while connecting"
     );
+    // Count only established streams. A failed dial or an endpoint/health
+    // change during the dial never acquires a member lease. Keep the guard
+    // through ClientHello forwarding, byte copy, cancellation, and idle exit.
+    let _member_lease = admission
+        .member_counter
+        .as_ref()
+        .map(|counter| {
+            counter
+                .acquire()
+                .context("TCP member stream capacity exhausted")
+        })
+        .transpose()?;
     if !consumed.is_empty() {
         tokio::select! {
             biased;
