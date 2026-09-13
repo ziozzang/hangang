@@ -186,17 +186,23 @@ async fn closed_gate_binds_but_defers_accepts_until_opened() {
     backend_task.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn proxies_echo_after_client_half_close() {
     let (backend, backend_task) = spawn_read_to_end_echo().await;
-    let listen = reserve_address();
+    // Keep ownership of the ephemeral port until the manager adopts it. A
+    // dropped reservation can be claimed by another parallel test process.
+    let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let listen = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
     let (active, metrics, manager) = manager();
-    publish_and_commit(
-        &manager,
-        &active,
-        config(vec![route("echo", listen, backend)]),
-    )
-    .await;
+    let candidate = config(vec![route("echo", listen, backend)]);
+    let prepared = manager
+        .prepare_with_inherited(&candidate, vec![(listen, listener.into())])
+        .await
+        .unwrap();
+    active.store(Arc::new(Snapshot::new(candidate).unwrap()));
+    manager.commit(prepared).await;
 
     let mut client = TcpStream::connect(listen).await.unwrap();
     client.write_all(b"half-close").await.unwrap();
