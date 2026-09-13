@@ -48,6 +48,7 @@ fn is_enforced(value: &bool) -> bool {
 pub enum PrincipalSource {
     Basic,
     Jwt,
+    Workload,
     External { subject_header: String },
 }
 
@@ -64,6 +65,7 @@ impl<'de> Deserialize<'de> for PrincipalSource {
         match (wire.source.as_str(), wire.subject_header) {
             ("basic", None) => Ok(Self::Basic),
             ("jwt", None) => Ok(Self::Jwt),
+            ("workload", None) => Ok(Self::Workload),
             ("external", Some(subject_header)) => Ok(Self::External { subject_header }),
             ("basic", Some(_)) => Err(D::Error::custom("basic principal has no subject_header")),
             ("external", None) => Err(D::Error::custom("external principal needs subject_header")),
@@ -84,6 +86,7 @@ pub struct AllowRule {
 pub enum PrincipalEvidence<'a> {
     Basic(&'a str),
     Jwt(&'a crate::jwt_auth::Verified),
+    Workload(&'a crate::workload_tls::Identity),
     External(&'a HeaderMap),
 }
 
@@ -103,6 +106,16 @@ impl ResourcePolicy {
         external_auth: Option<&crate::config::ExternalAuth>,
         jwt_auth: Option<&crate::jwt_runtime::JwtAuth>,
     ) -> Result<()> {
+        self.validate_binding_with_workload(basic_auth, external_auth, jwt_auth, None)
+    }
+
+    pub fn validate_binding_with_workload(
+        &self,
+        basic_auth: Option<&crate::config::BasicAuth>,
+        external_auth: Option<&crate::config::ExternalAuth>,
+        jwt_auth: Option<&crate::jwt_runtime::JwtAuth>,
+        workload_auth: Option<&crate::workload_auth::Policy>,
+    ) -> Result<()> {
         ensure!(
             !self.resource_id.is_empty()
                 && self.resource_id.len() <= MAX_RESOURCE_ID
@@ -116,6 +129,10 @@ impl ResourcePolicy {
             "resource policy cannot use external auth terminal_response"
         );
         match &self.principal {
+            PrincipalSource::Workload => ensure!(
+                workload_auth.is_some(),
+                "resource principal workload requires workload_auth"
+            ),
             PrincipalSource::Jwt => ensure!(
                 jwt_auth.is_some(),
                 "resource principal jwt requires jwt_auth"
@@ -159,10 +176,9 @@ impl ResourcePolicy {
             let mut subjects = HashSet::new();
             for subject in &rule.subjects {
                 ensure!(
-                    valid_subject(
-                        subject,
-                        matches!(self.principal, PrincipalSource::External { .. })
-                    ),
+                    valid_subject(subject, &self.principal)
+                        && (!matches!(self.principal, PrincipalSource::Workload)
+                            || crate::workload_tls::validate_spiffe_id(subject).is_ok()),
                     "invalid resource subject"
                 );
                 ensure!(subjects.insert(subject), "duplicate resource subject");
@@ -193,6 +209,7 @@ impl ResourcePolicy {
         let subject = match (&self.principal, evidence) {
             (PrincipalSource::Jwt, PrincipalEvidence::Jwt(verified)) => verified.subject.as_str(),
             (PrincipalSource::Basic, PrincipalEvidence::Basic(subject)) => subject,
+            (PrincipalSource::Workload, PrincipalEvidence::Workload(identity)) => &identity.uri,
             (
                 PrincipalSource::External { subject_header },
                 PrincipalEvidence::External(headers),
@@ -214,11 +231,7 @@ impl ResourcePolicy {
             }
             _ => return false,
         };
-        if !valid_subject(
-            subject,
-            matches!(self.principal, PrincipalSource::External { .. }),
-        ) || !valid_method(method)
-        {
+        if !valid_subject(subject, &self.principal) || !valid_method(method) {
             return false;
         }
         self.allow.iter().any(|rule| {
@@ -231,15 +244,20 @@ impl ResourcePolicy {
     }
 }
 
-fn valid_subject(subject: &str, external_header: bool) -> bool {
+fn valid_subject(subject: &str, source: &PrincipalSource) -> bool {
     !subject.is_empty()
-        && subject.len() <= MAX_SUBJECT
+        && subject.len()
+            <= if matches!(source, PrincipalSource::Workload) {
+                2048
+            } else {
+                MAX_SUBJECT
+            }
         && subject.trim() == subject
         && !subject.chars().any(char::is_control)
         // A comma can denote a proxy-merged list even in one external header
         // field. Basic usernames are verified as a single UTF-8 credential and
         // may legitimately contain a comma.
-        && (!external_header || !subject.contains(','))
+        && (!matches!(source, PrincipalSource::External { .. }) || !subject.contains(','))
 }
 
 fn valid_method(method: &str) -> bool {
@@ -427,6 +445,43 @@ mod tests {
                 "resource_id":"x", "principal":{"source":"basic","subject_header":"x"}, "allow":[]
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn workload_principal_requires_typed_identity_and_accepts_bounded_spiffe_uri() {
+        let uri = format!("spiffe://example.org/ns/{}/sa/caller", "a".repeat(260));
+        let workload = crate::workload_auth::Policy {
+            listener_ids: vec!["edge".into()],
+            allowed_uri_sans: vec![uri.clone()],
+            identity_header: Some("x-workload-subject".into()),
+        };
+        let mut p = policy();
+        p.principal = PrincipalSource::Workload;
+        p.allow[0].subjects = vec![uri.clone()];
+        assert!(
+            p.validate_binding_with_workload(None, None, None, None)
+                .is_err()
+        );
+        p.validate_binding_with_workload(None, None, None, Some(&workload))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&p).unwrap()["principal"]["source"],
+            "workload"
+        );
+        let identity = crate::workload_tls::Identity {
+            uri: uri.clone(),
+            expires_at: u64::MAX,
+        };
+        assert!(p.allows("GET", PrincipalEvidence::Workload(&identity)));
+        assert!(!p.allows("GET", PrincipalEvidence::Basic(&uri)));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-workload-subject", HeaderValue::from_str(&uri).unwrap());
+        assert!(!p.allows("GET", PrincipalEvidence::External(&headers)));
+        p.allow[0].subjects = vec!["spiffe://example.org/ns/../admin".into()];
+        assert!(
+            p.validate_binding_with_workload(None, None, None, Some(&workload))
+                .is_err()
         );
     }
 

@@ -14,6 +14,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -188,6 +189,108 @@ impl TrafficContext {
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+/// A long response or upgraded tunnel retains both listener and route policy
+/// generations. Unrelated publications can reuse the prepared route Arc.
+#[derive(Clone)]
+struct WorkloadRouteLease {
+    active: Arc<ArcSwap<Snapshot>>,
+    route_id: String,
+    runtime: Arc<crate::workload_auth::Runtime>,
+    evidence: crate::workload_http::Evidence,
+}
+
+impl WorkloadRouteLease {
+    fn current(&self) -> bool {
+        let snapshot = self.active.load();
+        self.evidence.current(&snapshot)
+            && snapshot
+                .workload_routes
+                .get(&self.route_id)
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+    }
+
+    async fn revoked(&self) {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if !self.current() {
+                return;
+            }
+        }
+    }
+}
+
+async fn workload_retired(lease: Option<&WorkloadRouteLease>) {
+    if let Some(lease) = lease {
+        lease.revoked().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+// The Hyper connection watcher handles listener-material retirement; this
+// body guard also retires a route whose workload rules changed while an SSE or
+// other streaming response remains open on an otherwise valid connection.
+struct WorkloadResponseBody {
+    body: Body,
+    lease: WorkloadRouteLease,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+    metrics: Arc<Metrics>,
+    terminated: bool,
+}
+
+impl WorkloadResponseBody {
+    fn new(body: Body, lease: WorkloadRouteLease, metrics: Arc<Metrics>) -> Self {
+        Self {
+            body,
+            lease,
+            timer: Box::pin(tokio::time::sleep(Duration::from_millis(250))),
+            metrics,
+            terminated: false,
+        }
+    }
+}
+
+impl hyper::body::Body for WorkloadResponseBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BodyError>>> {
+        if self.terminated {
+            return std::task::Poll::Ready(None);
+        }
+        if !self.lease.current() {
+            self.terminated = true;
+            self.metrics
+                .workload_route_terminations
+                .fetch_add(1, Ordering::Relaxed);
+            return std::task::Poll::Ready(Some(Err(BodyError::from_error(
+                std::io::Error::other("workload route authorization retired"),
+            ))));
+        }
+        if self.timer.as_mut().poll(cx).is_ready() {
+            self.timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+            // Register the next wake even when the upstream body is idle.
+            let _ = self.timer.as_mut().poll(cx);
+        }
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -550,7 +653,7 @@ impl Proxy {
 
     pub async fn handle(
         &self,
-        request: Request<Incoming>,
+        mut request: Request<Incoming>,
         peer: SocketAddr,
     ) -> Result<Response<Body>, Infallible> {
         // Canonicalize the peer address so an IPv4-mapped IPv6 address
@@ -573,6 +676,16 @@ impl Proxy {
         // probe decision, routing and the document's settings all come from
         // the same activation.
         let snapshot = self.active.load_full();
+        // A workload identity is only an extension created by the mandatory
+        // mTLS listener. Client-supplied lookalike fields must not participate
+        // in route predicates, external auth, Lua, or eventual forwarding.
+        let workload_evidence = request
+            .extensions()
+            .get::<crate::workload_http::Evidence>()
+            .cloned();
+        for name in &snapshot.workload_identity_headers {
+            request.headers_mut().remove(name);
+        }
         let health_path = snapshot
             .settings
             .health_path
@@ -765,7 +878,15 @@ impl Proxy {
             .as_deref()
             .map(Vec::as_slice)
             .unwrap_or(&self.trusted_proxies);
-        let edge = match self.resolve_edge(&request, peer, trusted_proxies) {
+        let edge = match self.resolve_edge(
+            &request,
+            peer,
+            if workload_evidence.is_some() {
+                &[]
+            } else {
+                trusted_proxies
+            },
+        ) {
             Ok(edge) => edge,
             Err(_) => {
                 return Ok(response(
@@ -892,6 +1013,39 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.chars().take(128).collect());
         }
+        let (workload_identity, workload_route_lease) =
+            if let Some(prepared) = &runtime.workload_auth {
+                match prepared.authorize(workload_evidence.as_ref(), &snapshot) {
+                    Ok(identity) => (
+                        Some(identity.clone()),
+                        Some(WorkloadRouteLease {
+                            active: self.active.clone(),
+                            route_id: runtime.route.id.clone(),
+                            runtime: prepared.clone(),
+                            evidence: workload_evidence
+                                .as_ref()
+                                .expect("authorized workload has evidence")
+                                .clone(),
+                        }),
+                    ),
+                    Err(denial) => {
+                        self.metrics
+                            .workload_auth_rejections
+                            .fetch_add(1, Ordering::Relaxed);
+                        let (status, message) = match denial {
+                            crate::workload_auth::Denial::Forbidden => {
+                                (403, "workload identity is not allowed")
+                            }
+                            crate::workload_auth::Denial::Retired => {
+                                (503, "workload listener generation retired")
+                            }
+                        };
+                        return Ok(response(status, message));
+                    }
+                }
+            } else {
+                (None, None)
+            };
         // Enforce TLS for require_tls routes reached over plaintext.
         if runtime.route.require_tls && edge.proto != "https" {
             return Ok(self.https_redirect(
@@ -934,6 +1088,7 @@ impl Proxy {
         if only_if_cached
             && runtime.route.access_mode != crate::config::AccessMode::Protected
             && runtime.route.jwt_auth.is_none()
+            && runtime.route.workload_auth.is_none()
         {
             return Ok(response(504, "only-if-cached cannot be satisfied"));
         }
@@ -1005,17 +1160,7 @@ impl Proxy {
         let mut established_identity: Vec<(HeaderName, HeaderValue)> = Vec::new();
         // Includes compatibility identity names whose authenticated value is
         // null: those names must remain absent all the way to the origin.
-        let basic_reserved = runtime
-            .jwt_auth
-            .as_ref()
-            .map(|jwt| jwt.reserved_headers())
-            .or_else(|| {
-                runtime
-                    .basic_auth
-                    .as_ref()
-                    .map(|prepared| prepared.reserved_headers())
-            })
-            .unwrap_or(&[]);
+        let auth_reserved = runtime.auth_reserved.as_slice();
         // Session cookies issued by the authorization service on a 2xx.
         let mut auth_cookies: Vec<HeaderValue> = Vec::new();
         // A policy-selected backend is an authorization/routing decision. A
@@ -1027,9 +1172,44 @@ impl Proxy {
             .resource_policy
             .as_ref()
             .filter(|policy| policy.enforce);
-        let mut resource_allowed = resource_policy.is_none();
+        let mut resource_allowed = match (resource_policy, workload_identity.as_ref()) {
+            (Some(policy), Some(identity))
+                if matches!(
+                    policy.principal,
+                    crate::resource_policy::PrincipalSource::Workload
+                ) =>
+            {
+                policy.allows(
+                    request.method().as_str(),
+                    crate::resource_policy::PrincipalEvidence::Workload(identity),
+                )
+            }
+            (None, _) => true,
+            _ => false,
+        };
+        if let (Some(identity), Some(name)) = (
+            workload_identity.as_ref(),
+            runtime
+                .route
+                .workload_auth
+                .as_ref()
+                .and_then(|policy| policy.identity_header.as_ref()),
+        ) {
+            let name: HeaderName = name.parse().expect("validated workload identity header");
+            let value = match HeaderValue::from_str(&identity.uri) {
+                Ok(value) => value,
+                Err(_) => return Ok(response(503, "workload identity cannot be forwarded")),
+            };
+            request.headers_mut().insert(name.clone(), value.clone());
+            established_identity.push((name, value));
+        }
         if let Some(jwt) = &runtime.route.jwt_auth {
-            for name in basic_reserved {
+            for name in runtime
+                .jwt_auth
+                .as_ref()
+                .map(|prepared| prepared.reserved_headers())
+                .unwrap_or(&[])
+            {
                 request.headers_mut().remove(name);
             }
             let authenticated = match bearer_token(request.headers()) {
@@ -1221,6 +1401,12 @@ impl Proxy {
                 }
                 AuthOutcome::Forward(forwarded) => {
                     self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    if workload_route_lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.current())
+                    {
+                        return Ok(response(503, "workload authorization retired"));
+                    }
                     return Ok(*forwarded);
                 }
             }
@@ -1313,7 +1499,7 @@ impl Proxy {
                         decision.headers,
                         protected,
                         basic_identity,
-                        basic_reserved,
+                        auth_reserved,
                     ) {
                         self.metrics.policy_errors.fetch_add(1, Ordering::Relaxed);
                         return Ok(self.failure(
@@ -1338,6 +1524,13 @@ impl Proxy {
                     );
                 }
             }
+        }
+
+        if workload_route_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.current())
+        {
+            return Ok(response(503, "workload authorization retired"));
         }
 
         // Explicitly protected routes check gateway authentication and any
@@ -1418,7 +1611,7 @@ impl Proxy {
             crate::transform_body::rewrite_headers(&mut parts.headers, config);
             // Config validation rejects a transform naming an identity header;
             // re-assert regardless so the authenticated identity always wins.
-            reassert_identity_headers(&mut parts.headers, &established_identity, basic_reserved);
+            reassert_identity_headers(&mut parts.headers, &established_identity, auth_reserved);
             match crate::transform_body::transform(
                 body,
                 config.clone(),
@@ -1523,7 +1716,7 @@ impl Proxy {
         // Identity established by the authorization service or a policy may
         // live under `x-forwarded-user`-style names that the forwarding pass
         // above just cleared; the authenticated values always win.
-        reassert_identity_headers(request.headers_mut(), &established_identity, basic_reserved);
+        reassert_identity_headers(request.headers_mut(), &established_identity, auth_reserved);
         *request.version_mut() = Version::HTTP_11;
         // Regenerate HTTP/1 framing for an unknown-length body now that the
         // incoming Transfer-Encoding is gone. Without an explicit header the
@@ -1598,6 +1791,12 @@ impl Proxy {
         let mut first_request = Some(Request::from_parts(parts, first_body));
         let mut attempt = 0usize;
         let upstream = loop {
+            if workload_route_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.current())
+            {
+                return Ok(response(503, "workload authorization retired"));
+            }
             attempt += 1;
             let uri = match build_upstream_uri(&backend, &client_pq, host_override.as_deref()) {
                 Ok(uri) => uri,
@@ -1630,7 +1829,7 @@ impl Proxy {
             } else {
                 None
             };
-            let outgoing = match first_request.take() {
+            let mut outgoing = match first_request.take() {
                 Some(mut request) => {
                     *request.uri_mut() = uri.clone();
                     // hyper-util synthesizes Host from the URI for HTTP/1.
@@ -1651,6 +1850,14 @@ impl Proxy {
                     request
                 }
             };
+            if let Some(lease) = &workload_route_lease
+                && !outgoing.body().is_end_stream()
+            {
+                outgoing = outgoing.map(|body| {
+                    WorkloadResponseBody::new(body, lease.clone(), self.metrics.clone())
+                        .boxed_unsync()
+                });
+            }
             if let Some((configured, target, discovery)) = &docker_target
                 && (discovery
                     .resolve_with_epoch(configured, crate::discovery::Protocol::Http)
@@ -1712,6 +1919,12 @@ impl Proxy {
             }
         };
         let mut upstream = upstream;
+        if workload_route_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.current())
+        {
+            return Ok(response(503, "workload authorization retired"));
+        }
 
         let cache_header_ms = if cache_fill.is_some() {
             crate::cache::now_ms()
@@ -1786,6 +1999,12 @@ impl Proxy {
         }
 
         if let (Some(downstream), Some(upstream)) = (downstream_upgrade, upstream_upgrade) {
+            if workload_route_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.current())
+            {
+                return Ok(response(503, "workload authorization retired"));
+            }
             // Register admission before checking closed. Shutdown must either
             // see this token or prevent this new tunnel from being spawned.
             let admission = self.tunnels.token();
@@ -1796,13 +2015,20 @@ impl Proxy {
             let tunnel_backend = backend_lease.clone();
             let tunnel_route = route_permit.clone();
             let tunnel_idle = self.tunnel_idle;
+            let tunnel_workload = workload_route_lease.clone();
+            let tunnel_metrics = self.metrics.clone();
             self.tunnels.spawn(async move {
                 let _backend_lease = tunnel_backend;
                 let _route_permit = tunnel_route;
                 let _admission = admission;
                 let _connection_lease = connection_lease;
                 let upgraded = tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return,
+                    _ = workload_retired(tunnel_workload.as_ref()) => {
+                        tunnel_metrics.workload_route_terminations.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    },
                     upgraded = async { tokio::try_join!(downstream, upstream) } => upgraded,
                 };
                 if let Ok((downstream, upstream)) = upgraded {
@@ -1813,7 +2039,11 @@ impl Proxy {
                         crate::idle::IdleIo::new(TokioIo::new(downstream), tunnel_idle);
                     let mut upstream = TokioIo::new(upstream);
                     tokio::select! {
+                        biased;
                         _ = cancel.cancelled() => {}
+                        _ = workload_retired(tunnel_workload.as_ref()) => {
+                            tunnel_metrics.workload_route_terminations.fetch_add(1, Ordering::Relaxed);
+                        }
                         _ = idle.expired() => {}
                         _ = copy_bidirectional(&mut downstream, &mut upstream) => {}
                     }
@@ -1882,6 +2112,11 @@ impl Proxy {
         }
         if let Some(permit) = route_permit {
             response.extensions_mut().insert(permit);
+        }
+        if let Some(lease) = workload_route_lease {
+            response = response.map(|body| {
+                WorkloadResponseBody::new(body, lease, self.metrics.clone()).boxed_unsync()
+            });
         }
         Ok(response)
     }
@@ -2010,7 +2245,7 @@ fn apply_policy_headers(
     mutations: BTreeMap<String, String>,
     protected: &[String],
     basic_identity: Option<&str>,
-    basic_reserved: &[HeaderName],
+    auth_reserved: &[HeaderName],
 ) -> Result<(), ()> {
     for (name, value) in mutations {
         let name: HeaderName = name.parse().map_err(|_| ())?;
@@ -2022,7 +2257,7 @@ fn apply_policy_headers(
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(name.as_str()))
             || basic_identity.is_some_and(|p| p.eq_ignore_ascii_case(name.as_str()))
-            || basic_reserved.contains(&name)
+            || auth_reserved.contains(&name)
         {
             return Err(());
         }
@@ -2174,9 +2409,9 @@ fn collapse_duplicate_policy_headers(headers: &mut HeaderMap) -> Result<(), ()> 
 fn reassert_identity_headers(
     headers: &mut HeaderMap,
     identity: &[(HeaderName, HeaderValue)],
-    basic_reserved: &[HeaderName],
+    auth_reserved: &[HeaderName],
 ) {
-    for name in basic_reserved {
+    for name in auth_reserved {
         headers.remove(name);
     }
     for (name, _) in identity {
