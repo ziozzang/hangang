@@ -837,7 +837,33 @@ fn next_backend_index(
         counters.clear();
     }
     let counter = counters.entry(route.id.clone()).or_default();
-    let index = *counter % route.backends.len();
+    let index = if route
+        .backends
+        .first()
+        .is_some_and(|backend| backend.id().is_none())
+    {
+        *counter % route.backends.len()
+    } else {
+        let total_weight: usize = route
+            .backends
+            .iter()
+            .map(|backend| backend.weight() as usize)
+            .sum();
+        let mut slot = *counter % total_weight;
+        route
+            .backends
+            .iter()
+            .position(|backend| {
+                let weight = backend.weight() as usize;
+                if slot < weight {
+                    true
+                } else {
+                    slot -= weight;
+                    false
+                }
+            })
+            .expect("validated positive backend weights")
+    };
     *counter = counter.wrapping_add(1);
     (0..route.backends.len())
         .map(|offset| (index + offset) % route.backends.len())

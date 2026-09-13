@@ -3,7 +3,7 @@
 use crate::balance::InitialHealthState;
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
@@ -101,7 +101,7 @@ impl Node {
 
 pub struct TcpHealth {
     policy: TcpHealthPolicy,
-    nodes: Vec<Node>,
+    nodes: Vec<Arc<Node>>,
 }
 
 impl TcpHealth {
@@ -109,8 +109,27 @@ impl TcpHealth {
         let checking = policy.initial_state == InitialHealthState::Checking;
         Self {
             policy,
-            nodes: (0..count).map(|_| Node::new(checking)).collect(),
+            nodes: (0..count).map(|_| Arc::new(Node::new(checking))).collect(),
         }
+    }
+
+    /// Preserve compatible health/endpoint epochs by validated stable identity.
+    /// Mapping never mutates previous state or changes an existing stream.
+    pub fn with_reused_nodes(
+        policy: TcpHealthPolicy,
+        previous: &Self,
+        mapping: &[Option<usize>],
+    ) -> Self {
+        let compatible = policy == previous.policy;
+        let mut next = Self::new(policy, mapping.len());
+        if compatible {
+            for (node, old_index) in next.nodes.iter_mut().zip(mapping) {
+                if let Some(old) = old_index.and_then(|index| previous.nodes.get(index)) {
+                    *node = old.clone();
+                }
+            }
+        }
+        next
     }
 
     pub fn available(&self, index: usize) -> bool {
@@ -262,6 +281,29 @@ mod tests {
             unhealthy_failures: 2,
             initial_state,
         }
+    }
+
+    #[test]
+    fn stable_mapping_keeps_epochs_and_reordered_health_but_not_new_identity() {
+        let policy = policy(InitialHealthState::Checking);
+        let old = TcpHealth::new(policy.clone(), 2);
+        old.observe_epoch(0, 8);
+        old.record_success_for(0, 8);
+        old.record_success_for(0, 8);
+        assert!(old.available_for(0, 8));
+        let next = TcpHealth::with_reused_nodes(policy.clone(), &old, &[Some(1), Some(0), None]);
+        assert!(!next.available(0));
+        assert!(next.available_for(1, 8));
+        assert!(!next.available(2));
+        // Results on a continuously retained endpoint refer to the same
+        // member even though its display index moved. New epoch still fences
+        // both selector generations from delayed old observations.
+        next.observe_epoch(1, 9);
+        old.record_success_for(0, 8);
+        assert!(!next.available_for(1, 9));
+        assert!(!old.available_for(0, 8));
+        let fresh = TcpHealth::with_reused_nodes(policy, &next, &[None]);
+        assert!(!fresh.backend_state(0).unwrap().probe_observed);
     }
 
     #[test]

@@ -1,0 +1,45 @@
+{
+  "http": [
+    {
+      "id": "named-http",
+      "backends": [
+        {
+          "id": "blue",
+          "address": "http://127.0.0.1:18081",
+          "weight": 3,
+          "desired_state": "serving"
+        },
+        {
+          "id": "green",
+          "address": "http://127.0.0.1:18082",
+          "weight": 1,
+          "desired_state": "serving"
+        }
+      ],
+      "balance": {
+        "mode": "round_robin",
+        "weights": []
+      }
+    }
+  ],
+  "tcp": [
+    {
+      "id": "named-tcp",
+      "listen": "127.0.0.1:19000",
+      "backends": [
+        {
+          "id": "blue",
+          "address": "127.0.0.1:18081",
+          "weight": 3,
+          "desired_state": "serving"
+        },
+        {
+          "id": "green",
+          "address": "127.0.0.1:18082",
+          "weight": 1,
+          "desired_state": "serving"
+        }
+      ]
+    }
+  ]
+}

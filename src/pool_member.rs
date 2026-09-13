@@ -1,5 +1,6 @@
 //! Pool-member wire model. Routes deserialize the enum, but validation rejects
-//! named members until lifecycle publication and runtime admission are wired.
+//! named nonserving members until lifecycle publication is wired. Serving
+//! members are supported by local-file routes, with stable state mapping.
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -193,50 +194,33 @@ mod tests {
     }
 
     #[test]
-    fn staged_members_are_not_accepted_as_live_route_configuration() {
-        // Remove this staging guard only when runtime/publish admission gates
-        // enforce every desired state, including Lua and retries.
+    fn serving_members_validate_but_unimplemented_lifecycle_states_remain_closed() {
         for state in ["serving", "draining", "maintenance"] {
-            let member = serde_json::json!({"id":"origin", "address":"http://127.0.0.1:8080", "desired_state":state});
-            let typed: Backend = serde_json::from_value(member.clone()).unwrap();
-            validate_backends(&[typed], &[]).unwrap();
-            let document = serde_json::json!({"http":[{"id":"route", "backends":[member]}]});
-            let mut config: crate::config::Config = serde_json::from_value(document).unwrap();
-            assert!(config.has_named_members());
-            assert!(
-                config
-                    .validate()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("named pool members are not activated")
-            );
-            config.http[0].enabled = false;
-            assert!(
-                config
-                    .validate()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("named pool members are not activated")
-            );
-            let document = serde_json::json!({"tcp":[{"id":"stream", "listen":"127.0.0.1:9000",
-                "backends":[{"id":"origin", "address":"127.0.0.1:8080", "desired_state":state}]}]});
-            let mut config: crate::config::Config = serde_json::from_value(document).unwrap();
-            assert!(config.has_named_members());
-            assert!(
-                config
-                    .validate()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("named pool members are not activated")
-            );
-            config.tcp[0].enabled = false;
-            assert!(
-                config
-                    .validate()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("named pool members are not activated")
-            );
+            for protocol in ["http", "tcp"] {
+                for enabled in [true, false] {
+                    let route = if protocol == "http" {
+                        serde_json::json!({"id":"route", "enabled":enabled,
+                            "backends":[{"id":"origin","address":"http://127.0.0.1:8080","desired_state":state}]})
+                    } else {
+                        serde_json::json!({"id":"stream", "listen":"127.0.0.1:9000", "enabled":enabled,
+                            "backends":[{"id":"origin","address":"127.0.0.1:8080","desired_state":state}]})
+                    };
+                    let config: crate::config::Config =
+                        serde_json::from_value(serde_json::json!({protocol:[route]})).unwrap();
+                    assert!(config.has_named_members());
+                    if state == "serving" {
+                        config.validate().unwrap();
+                    } else {
+                        assert!(
+                            config
+                                .validate()
+                                .unwrap_err()
+                                .to_string()
+                                .contains("lifecycle publication")
+                        );
+                    }
+                }
+            }
         }
     }
 

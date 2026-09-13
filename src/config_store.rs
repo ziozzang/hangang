@@ -210,6 +210,7 @@ pub async fn bootstrap_prepared(
 }
 
 async fn prepare_snapshot(config: Config, context: &'static str) -> StoreResult<Snapshot> {
+    ensure_reader_compatibility(&config)?;
     match tokio::task::spawn_blocking(move || Snapshot::new(config)).await {
         Ok(Ok(snapshot)) => Ok(snapshot),
         Ok(Err(error)) => Err(StoreError::Invalid(error.context(context))),
@@ -514,6 +515,7 @@ impl ConfigStore for FileConfigStore {
             let Some(config) = load_optional(&path)? else {
                 return Ok(None);
             };
+            ensure_reader_compatibility(&config)?;
             let epoch = file_epoch(&epoch_path)?;
             Ok(Some(Stored { epoch, config }))
         })
@@ -1517,8 +1519,18 @@ fn load_optional(path: &Path) -> StoreResult<Option<Config>> {
     }
 }
 
+pub(crate) fn ensure_reader_compatibility(config: &Config) -> StoreResult<()> {
+    if config.has_named_members() {
+        return Err(StoreError::Invalid(anyhow!(
+            "named pool members require fleet reader capability coordination; use local file authority until it is available"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode(config: &Config) -> StoreResult<String> {
     config.validate().map_err(StoreError::Invalid)?;
+    ensure_reader_compatibility(config)?;
     let json = serde_json::to_string(config)
         .map_err(|error| StoreError::Invalid(anyhow!(error).context("encode configuration")))?;
     if json.len() > MAX_CONFIG_BYTES {
@@ -1542,6 +1554,7 @@ pub(crate) fn decode(revision: u64, json: &str) -> StoreResult<Config> {
         )));
     }
     config.validate().map_err(StoreError::Invalid)?;
+    ensure_reader_compatibility(&config)?;
     Ok(config)
 }
 

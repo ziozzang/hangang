@@ -134,7 +134,7 @@ impl StoreHealth {
         let degraded = state.failure.as_ref().is_some_and(|(reason, _)| {
             matches!(
                 *reason,
-                "unavailable" | "invalid" | "indeterminate" | "missing" | "stalled"
+                "unavailable" | "indeterminate" | "missing" | "stalled"
             )
         });
         StoreHealthReport {
@@ -356,10 +356,9 @@ impl Manager {
                     StoreError::Invalid(_) => "invalid",
                     StoreError::Indeterminate(_) => "indeterminate",
                 };
-                // The local snapshot stays valid whether or not the store can
-                // be read; only prolonged inability to confirm agreement
-                // withdraws this instance.
-                self.store_failure(reason, format!("{error:#}"), true);
+                // A readable but invalid durable document is an authority
+                // disagreement, not a transient inability to reach the store.
+                self.store_failure(reason, format!("{error:#}"), error.is_transport());
                 return Err(error.into());
             }
         };
@@ -370,6 +369,10 @@ impl Manager {
     /// the current document a CAS conflict returned — and activate it when
     /// it is newer. The caller holds `writes`.
     async fn reconcile_stored(&self, stored: crate::config_store::Stored) -> anyhow::Result<bool> {
+        if let Err(error) = crate::config_store::ensure_reader_compatibility(&stored.config) {
+            self.store_failure("invalid", format!("{error:#}"), false);
+            return Err(error.into());
+        }
         // A fresh attachment (first poll of a generation that inherited its
         // snapshot without an epoch) adopts the store's document like a fresh
         // start would, without comparing revisions across unknown histories.
@@ -534,6 +537,10 @@ impl Manager {
         persist: bool,
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> anyhow::Result<Config> {
+        if self.config_store.is_some() {
+            crate::config_store::ensure_reader_compatibility(&config)?;
+        }
+
         anyhow::ensure!(!self.stopping.load(Ordering::Acquire), "server is draining");
         if persist && let Some(store) = &self.config_store {
             // A precondition ahead of this instance (read from another
@@ -1330,10 +1337,13 @@ impl Admin {
                             "route_id": runtime.route.id,
                             "backend_index": backend_index,
                             "address": address.address(),
+                            "member_id": address.id(),
                             "match_host": match_host,
                             "listen": null,
                             "balance_mode": runtime.route.balance.mode,
-                            "weight": runtime.route.balance.weights.get(backend_index).copied().unwrap_or(1),
+                            "weight": if address.id().is_some() { address.weight() } else {
+                                runtime.route.balance.weights.get(backend_index).copied().unwrap_or(1)
+                            },
                             "enabled": runtime.route.enabled,
                             "available": runtime.route.enabled && state.available,
                             "health_mode": state.health_mode,
@@ -1373,10 +1383,11 @@ impl Admin {
                             "route_id": route.id,
                             "backend_index": backend_index,
                             "address": address.address(),
+                            "member_id": address.id(),
                             "match_host": null,
                             "listen": route.listen.to_string(),
                             "balance_mode": "round_robin",
-                            "weight": 1,
+                            "weight": address.weight(),
                             "enabled": route.enabled,
                             "available": route.enabled && health.as_ref().is_none_or(|state| state.available),
                             "health_mode": if health.is_some() { "active_tcp" } else { "unmonitored" },

@@ -823,12 +823,8 @@ impl Config {
                 "route {} needs 1..128 backends",
                 r.id
             );
-            let backend_kind =
-                crate::pool_member::validate_backends(&r.backends, &r.balance.weights)?;
-            ensure!(
-                backend_kind == crate::pool_member::BackendKind::Legacy,
-                "named pool members are not activated until lifecycle admission is installed"
-            );
+            crate::pool_member::validate_backends(&r.backends, &r.balance.weights)?;
+            validate_serving_members(&r.backends)?;
             ensure!(
                 r.deny_cidrs.len() <= 1024 && r.headers.len() <= 64 && r.json.len() <= 64,
                 "too many route conditions"
@@ -947,11 +943,8 @@ impl Config {
                 !r.backends.is_empty() && r.backends.len() <= 128,
                 "TCP route needs 1..128 backends"
             );
-            let backend_kind = crate::pool_member::validate_backends(&r.backends, &[])?;
-            ensure!(
-                backend_kind == crate::pool_member::BackendKind::Legacy,
-                "named pool members are not activated until lifecycle admission is installed"
-            );
+            crate::pool_member::validate_backends(&r.backends, &[])?;
+            validate_serving_members(&r.backends)?;
             ensure!(r.deny_cidrs.len() <= 1024, "too many CIDRs");
             for b in &r.backends {
                 let b = b.address();
@@ -1059,6 +1052,85 @@ pub struct Snapshot {
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
     pub tcp_health: std::collections::HashMap<String, std::sync::Arc<crate::tcp_health::TcpHealth>>,
 }
+fn named_backends(backends: &[crate::pool_member::Backend]) -> bool {
+    backends
+        .first()
+        .is_some_and(|backend| backend.id().is_some())
+}
+
+fn validate_serving_members(backends: &[crate::pool_member::Backend]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        backends.iter().all(|backend| match backend {
+            crate::pool_member::Backend::Legacy(_) => true,
+            crate::pool_member::Backend::Member(member) =>
+                member.desired_state == crate::pool_member::DesiredState::Serving,
+        }),
+        "draining and maintenance members require lifecycle publication support"
+    );
+    Ok(())
+}
+
+fn stable_backend_mapping(
+    current: &[crate::pool_member::Backend],
+    previous: &[crate::pool_member::Backend],
+) -> Vec<Option<usize>> {
+    let old: std::collections::HashMap<_, _> = previous
+        .iter()
+        .enumerate()
+        .filter_map(|(index, backend)| backend.id().map(|id| (id, (index, backend.address()))))
+        .collect();
+    current
+        .iter()
+        .map(|backend| {
+            backend
+                .id()
+                .and_then(|id| old.get(id))
+                .filter(|(_, address)| *address == backend.address())
+                .map(|(index, _)| *index)
+        })
+        .collect()
+}
+
+fn prepare_http_balancer(
+    route: &HttpRoute,
+    previous: Option<&Snapshot>,
+    trust: &std::collections::HashMap<String, [u8; 32]>,
+) -> std::sync::Arc<crate::balance::Balancer> {
+    let named = named_backends(&route.backends);
+    let mut balance = route.balance.clone();
+    if named && route.backends.iter().any(|backend| backend.weight() != 1) {
+        balance.weights = route
+            .backends
+            .iter()
+            .map(|backend| backend.weight())
+            .collect();
+    }
+    if let Some(snapshot) = previous
+        && let Some(old) = snapshot
+            .http
+            .iter()
+            .find(|runtime| runtime.route.id == route.id)
+    {
+        let transport_matches = old.route.enabled == route.enabled
+            && old.route.upstream == route.upstream
+            && snapshot.upstream_trust.get(&route.id) == trust.get(&route.id);
+        if old.route.backends == route.backends
+            && old.route.balance == route.balance
+            && (!(named || route.balance.active_health.is_some()) || transport_matches)
+        {
+            return old.balancer.clone();
+        }
+        if named && named_backends(&old.route.backends) && transport_matches {
+            return std::sync::Arc::new(crate::balance::Balancer::with_reused_nodes(
+                balance,
+                &old.balancer,
+                &stable_backend_mapping(&route.backends, &old.route.backends),
+            ));
+        }
+    }
+    std::sync::Arc::new(crate::balance::Balancer::new(balance, route.backends.len()))
+}
+
 impl Snapshot {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         Self::build(config, None)
@@ -1115,27 +1187,7 @@ impl Snapshot {
                 std::sync::Arc::new(HttpRuntime {
                     host_regex: regexes.http.remove(&route.id),
                     admission: admissions[&route.id].clone(),
-                    balancer: previous
-                        .and_then(|old| {
-                            let active_health = route.balance.active_health.is_some();
-                            old.http.iter().find(|runtime| {
-                                runtime.route.id == route.id
-                                    && runtime.route.backends == route.backends
-                                    && runtime.route.balance == route.balance
-                                    && (!active_health
-                                        || (runtime.route.enabled == route.enabled
-                                            && runtime.route.upstream == route.upstream
-                                            && old.upstream_trust.get(&route.id)
-                                                == upstream_trust.get(&route.id)))
-                            })
-                        })
-                        .map(|runtime| runtime.balancer.clone())
-                        .unwrap_or_else(|| {
-                            std::sync::Arc::new(crate::balance::Balancer::new(
-                                route.balance.clone(),
-                                route.backends.len(),
-                            ))
-                        }),
+                    balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
                     response_transform: route.response_transform.clone().map(std::sync::Arc::new),
                     basic_auth: route
@@ -1168,28 +1220,40 @@ impl Snapshot {
             let Some(health) = &route.health else {
                 continue;
             };
-            let reused = previous_tcp_routes
-                .get(route.id.as_str())
-                .filter(|old| {
-                    old.backends == route.backends
-                        && old.health == route.health
-                        && old.upstream == route.upstream
-                        && old.enabled == route.enabled
-                        && previous.is_some_and(|previous| {
-                            previous.upstream_trust.get(&route.id) == upstream_trust.get(&route.id)
-                        })
-                })
-                .and_then(|_| previous?.tcp_health.get(&route.id))
-                .cloned();
-            tcp_health.insert(
-                route.id.clone(),
-                reused.unwrap_or_else(|| {
-                    std::sync::Arc::new(crate::tcp_health::TcpHealth::new(
+            let old_route = previous_tcp_routes.get(route.id.as_str()).copied();
+            let compatible = old_route.is_some_and(|old| {
+                old.upstream == route.upstream
+                    && old.enabled == route.enabled
+                    && previous.is_some_and(|old| {
+                        old.upstream_trust.get(&route.id) == upstream_trust.get(&route.id)
+                    })
+            });
+            let old_health = previous.and_then(|old| old.tcp_health.get(&route.id));
+            let state = match (old_route, old_health) {
+                (Some(old), Some(state))
+                    if compatible
+                        && old.backends == route.backends
+                        && old.health == route.health =>
+                {
+                    state.clone()
+                }
+                (Some(old), Some(state))
+                    if compatible
+                        && named_backends(&old.backends)
+                        && named_backends(&route.backends) =>
+                {
+                    std::sync::Arc::new(crate::tcp_health::TcpHealth::with_reused_nodes(
                         health.clone(),
-                        route.backends.len(),
+                        state,
+                        &stable_backend_mapping(&route.backends, &old.backends),
                     ))
-                }),
-            );
+                }
+                _ => std::sync::Arc::new(crate::tcp_health::TcpHealth::new(
+                    health.clone(),
+                    route.backends.len(),
+                )),
+            };
+            tcp_health.insert(route.id.clone(), state);
         }
         let cache = config
             .cache
@@ -1633,9 +1697,14 @@ mod tests {
         let original_ca =
             rcgen::generate_simple_self_signed(vec!["original.local".into()]).unwrap();
         let rotated_ca = rcgen::generate_simple_self_signed(vec!["rotated.local".into()]).unwrap();
-        for initial_state in ["healthy", "checking"] {
+        for (initial_state, named) in [
+            ("healthy", false),
+            ("checking", false),
+            ("healthy", true),
+            ("checking", true),
+        ] {
             std::fs::write(&path, original_ca.cert.pem()).unwrap();
-            let config: Config = serde_json::from_value(serde_json::json!({
+            let mut config: Config = serde_json::from_value(serde_json::json!({
                 "http":[{"id":"web", "backends":["https://127.0.0.1:8080"],
                     "upstream":{"tls":{"ca_file":path}},
                     "balance":{"active_health":{
@@ -1654,6 +1723,24 @@ mod tests {
                 }]
             }))
             .unwrap();
+            if named {
+                use crate::pool_member::{Backend, DesiredState, PoolMember};
+                for backends in [&mut config.http[0].backends, &mut config.tcp[0].backends] {
+                    let address = backends[0].address().to_owned();
+                    backends[0] = Backend::Member(PoolMember {
+                        id: "first".into(),
+                        address: address.clone(),
+                        weight: 1,
+                        desired_state: DesiredState::Serving,
+                    });
+                    backends.push(Backend::Member(PoolMember {
+                        id: "second".into(),
+                        address: address.replace("8080", "9080").replace("8081", "9081"),
+                        weight: 1,
+                        desired_state: DesiredState::Serving,
+                    }));
+                }
+            }
             let first = Snapshot::new(config.clone()).unwrap();
             let web = &first.http[0].balancer;
             let stream = &first.tcp_health["stream"];
@@ -1673,7 +1760,28 @@ mod tests {
             // Same path and unchanged JSON, but new trust: both protocols get
             // fresh observations, without touching live state during preview.
             std::fs::write(&path, rotated_ca.cert.pem()).unwrap();
+            if named {
+                config.http[0].backends.reverse();
+                config.tcp[0].backends.reverse();
+            }
             let rotated = Snapshot::replace(config.clone(), &identical).unwrap();
+            if named {
+                assert_eq!(
+                    rotated.http[0]
+                        .balancer
+                        .backend_state(1)
+                        .unwrap()
+                        .probe_observed,
+                    Some(false)
+                );
+                assert!(
+                    !rotated.tcp_health["stream"]
+                        .backend_state(1)
+                        .unwrap()
+                        .probe_observed
+                );
+            }
+
             assert!(!std::sync::Arc::ptr_eq(web, &rotated.http[0].balancer));
             assert!(!std::sync::Arc::ptr_eq(
                 stream,

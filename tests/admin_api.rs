@@ -2237,18 +2237,21 @@ async fn shared_store_transport_failures_are_tolerated_for_the_grace_window() {
     let report = manager.store_health.report();
     assert!(report.degraded);
     assert_eq!(report.reason, Some("missing"));
-    // An unreadable store (path is a directory) is a transport-class failure too.
-    std::fs::create_dir(&state_path).unwrap();
-    assert!(manager.reload_file().await.is_err());
-    assert!(manager.ready.load(Ordering::Acquire));
-    assert!(matches!(
-        manager.store_health.report().reason,
-        Some("unavailable" | "invalid")
-    ));
-    // The grace window expires without a confirmation: withdrawn.
+    // The missing-store grace expires without a confirmation.
     tokio::time::sleep(std::time::Duration::from_millis(750)).await;
     assert!(manager.reload_file().await.is_err());
     assert!(!manager.ready.load(Ordering::Acquire));
+    std::fs::write(&state_path, &bytes).unwrap();
+    assert!(!manager.reload_file().await.unwrap());
+    assert!(manager.ready.load(Ordering::Acquire));
+    // A directory is readable metadata proving this is not a config file,
+    // not a transient inability to contact the authority.
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir(&state_path).unwrap();
+    assert!(manager.reload_file().await.is_err());
+    assert!(!manager.ready.load(Ordering::Acquire));
+    assert_eq!(manager.store_health.report().reason, Some("invalid"));
+    assert!(!manager.store_health.report().degraded);
     // Recovery on the first confirming poll.
     std::fs::remove_dir(&state_path).unwrap();
     std::fs::write(&state_path, &bytes).unwrap();

@@ -301,6 +301,28 @@ impl Balancer {
             total_weight,
         }
     }
+    /// Construct a selector over compatible generation nodes. Mapping is by
+    /// validated stable identity at the snapshot boundary, never array position.
+    /// Policy changes get fresh health; old leases retain their original node.
+    pub fn with_reused_nodes(
+        config: BalanceConfig,
+        previous: &Self,
+        mapping: &[Option<usize>],
+    ) -> Self {
+        let compatible = config.health == previous.config.health
+            && config.active_health == previous.config.active_health
+            && config.passive_health == previous.config.passive_health;
+        let mut next = Self::new(config, mapping.len());
+        if compatible {
+            for (node, old_index) in next.nodes.iter_mut().zip(mapping) {
+                if let Some(old) = old_index.and_then(|index| previous.nodes.get(index)) {
+                    *node = old.clone();
+                }
+            }
+        }
+        next
+    }
+
     pub fn available(&self, index: usize) -> bool {
         self.nodes[index].active.is_open()
             && !self.nodes[index]
@@ -608,6 +630,70 @@ mod tests {
         balancer.record_active_status(0, 200);
         assert!(balancer.available(0));
     }
+    #[test]
+    fn mapped_nodes_retain_load_and_health_while_selector_weights_change() {
+        let original = Balancer::new(
+            BalanceConfig {
+                health: Some(HealthPolicy {
+                    failure_threshold: 1,
+                    cooldown_ms: 60000,
+                }),
+                ..Default::default()
+            },
+            2,
+        );
+        let lease = original.acquire(0).unwrap();
+        lease.record(false);
+        let next = Balancer::with_reused_nodes(
+            BalanceConfig {
+                mode: Mode::LeastConnections,
+                weights: vec![7, 2, 1],
+                ..original.config.clone()
+            },
+            &original,
+            &[Some(1), Some(0), None],
+        );
+        assert!(next.available(0));
+        assert!(!next.available(1));
+        assert!(next.available(2));
+        assert_eq!(next.backend_state(1).unwrap().active_requests, Some(1));
+        drop(lease);
+        assert_eq!(next.backend_state(1).unwrap().active_requests, Some(0));
+        assert!(
+            !original.available(0),
+            "preparation did not modify old health"
+        );
+    }
+
+    #[test]
+    fn changed_health_policy_and_unknown_identity_do_not_inherit_nodes() {
+        let original = Balancer::new(
+            BalanceConfig {
+                active_health: Some(active_policy()),
+                ..Default::default()
+            },
+            1,
+        );
+        original.record_active_status(0, 503);
+        original.record_active_status(0, 503);
+        assert!(!original.available(0));
+        let mut changed = original.config.clone();
+        changed.active_health.as_mut().unwrap().initial_state = InitialHealthState::Checking;
+        let next = Balancer::with_reused_nodes(changed, &original, &[Some(0)]);
+        assert_eq!(next.backend_state(0).unwrap().probe_observed, Some(false));
+        assert_eq!(
+            next.backend_state(0).unwrap().initial_check_pending,
+            Some(true)
+        );
+        original.record_active_status(0, 200);
+        assert!(!next.available(0));
+        let renamed = Balancer::with_reused_nodes(original.config.clone(), &original, &[None]);
+        assert_eq!(
+            renamed.backend_state(0).unwrap().probe_observed,
+            Some(false)
+        );
+    }
+
     #[test]
     fn round_robin_leases_count_once_and_retired_nodes_drain() {
         let balancer = Balancer::new(BalanceConfig::default(), 1);

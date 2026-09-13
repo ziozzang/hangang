@@ -229,3 +229,131 @@ async fn reorder_and_weight_change_preserve_held_stream_and_passive_health_by_id
     drop(origin_b);
     policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn named_members_cannot_bootstrap_write_or_load_shared_file_authority() {
+    use hangang::config_store::{ConfigStore, FileConfigStore, StoreError};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("shared.json");
+    let store = FileConfigStore::new(&path);
+    let named = named_config("http://127.0.0.1:8080", "http://127.0.0.1:8081", "b", false);
+    named.validate().unwrap();
+    assert!(matches!(
+        store.bootstrap(named.clone()).await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert!(
+        !path.exists(),
+        "rejected named bootstrap cannot persist a seed"
+    );
+    let legacy = Config::default();
+    let stored = store.bootstrap(legacy.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .compare_and_swap(&stored.epoch, legacy.revision, named.clone())
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.load_latest().await.unwrap().unwrap().config, legacy);
+    // Even an out-of-band writer cannot make this reader advertise support
+    // for a named shared document without a fleet capability protocol.
+    std::fs::write(&path, serde_json::to_vec(&named).unwrap()).unwrap();
+    assert!(matches!(
+        store.load_latest().await,
+        Err(StoreError::Invalid(_))
+    ));
+}
+
+#[test]
+fn named_http_weights_are_effective_after_reorder() {
+    let initial: Config = serde_json::from_value(serde_json::json!({"http":[{
+        "id":"weighted", "backends":[
+            {"id":"a","address":"http://127.0.0.1:8080","weight":3},
+            {"id":"b","address":"http://127.0.0.1:8081","weight":1}
+        ]
+    }]}))
+    .unwrap();
+    let first = Snapshot::new(initial.clone()).unwrap();
+    let mut counts = [0; 2];
+    for _ in 0..400 {
+        counts[first.http[0].balancer.select().unwrap()] += 1;
+    }
+    assert_eq!(counts, [300, 100]);
+    let mut changed = initial;
+    changed.http[0].backends.reverse();
+    let next = Snapshot::replace(changed, &first).unwrap();
+    let mut counts = [0; 2];
+    for _ in 0..400 {
+        counts[next.http[0].balancer.select().unwrap()] += 1;
+    }
+    assert_eq!(counts, [100, 300]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn named_tcp_weights_route_real_connections_and_update_live() {
+    use hangang::tcp::TcpManager;
+    use std::os::fd::OwnedFd;
+    use tokio::net::TcpStream;
+    let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_address = a.local_addr().unwrap();
+    let b_address = b.local_addr().unwrap();
+    let spawn = |listener: TcpListener, tag: u8| {
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.write_all(&[tag]).await;
+            }
+        })
+    };
+    let a_task = spawn(a, b'a');
+    let b_task = spawn(b, b'b');
+    let bound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = bound.local_addr().unwrap();
+    let config: Config = serde_json::from_value(serde_json::json!({"tcp":[{
+        "id":"stream", "listen":listen, "backends":[
+            {"id":"a","address":a_address.to_string(),"weight":3},
+            {"id":"b","address":b_address.to_string(),"weight":1}
+        ]
+    }]}))
+    .unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(config.clone()).unwrap(),
+    ));
+    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 32);
+    let prepared = manager
+        .prepare_with_inherited(&config, vec![(listen, OwnedFd::from(bound))])
+        .await
+        .unwrap();
+    manager.commit(prepared).await;
+    for phase in 0..2 {
+        let mut counts = [0; 2];
+        for _ in 0..20 {
+            let mut client =
+                tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(listen))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut tag = [0];
+            tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut tag))
+                .await
+                .unwrap()
+                .unwrap();
+            counts[usize::from(tag[0] == b'b')] += 1;
+        }
+        assert_eq!(counts, [15, 5]);
+        if phase == 0 {
+            let mut next = config.clone();
+            next.tcp[0].backends.reverse();
+            let prepared = manager.prepare(&next).await.unwrap();
+            let snapshot = Snapshot::replace(next, &active.load_full()).unwrap();
+            active.store(Arc::new(snapshot));
+            manager.commit(prepared).await;
+        }
+    }
+    manager.shutdown(Duration::ZERO).await;
+    a_task.abort();
+    b_task.abort();
+    let _ = a_task.await;
+    let _ = b_task.await;
+}
