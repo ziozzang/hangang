@@ -3,8 +3,8 @@ use hangang::{
     config::{Config, HttpRoute},
     config_store::{
         CasResult, CommitReceipt, ConfigStore, EPOCH_LEN, FileConfigStore, OperationProof,
-        OperationStamp, PostgresConfigStore, SqliteConfigStore, StoreError, Stored,
-        bootstrap_prepared,
+        OperationStamp, PostgresConfigStore, SequencedOperationStamp, SqliteConfigStore,
+        StoreError, Stored, bootstrap_prepared, canonical_operation_id,
     },
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -20,6 +20,18 @@ fn operation_stamp(expected: u64, operation_id: &str, candidate: &Config) -> Ope
             "{:x}",
             Sha256::digest(serde_json::to_vec(&committed).unwrap())
         ),
+    }
+}
+
+fn sequenced_stamp(expected: u64, sequence: u64, candidate: &Config) -> SequencedOperationStamp {
+    let authority_id = "a".repeat(32);
+    let operation_id = canonical_operation_id(&authority_id, sequence).unwrap();
+    let legacy = operation_stamp(expected, &operation_id, candidate);
+    SequencedOperationStamp {
+        authority_id,
+        acceptance_seq: sequence,
+        operation_id,
+        candidate_sha256: legacy.candidate_sha256,
     }
 }
 
@@ -878,8 +890,19 @@ async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
     );
 
     let connection = rusqlite::Connection::open(&path)?;
-    connection.execute(
+    let old_writer = connection.execute(
         "UPDATE hangang_config SET config_json=?1 WHERE singleton=1",
+        [serde_json::to_string(&config(1, "different-document"))?],
+    );
+    assert!(
+        old_writer.is_err(),
+        "the old writer cannot change a stamped document without a new generation"
+    );
+    assert!(store.load_current_operation_proof().await?.is_some());
+    // An owned corruption/restore fixture explicitly advances the new
+    // generation. This is not evidence that an obsolete writer can do so.
+    connection.execute(
+        "UPDATE hangang_config SET config_json=?1,write_generation=write_generation+1 WHERE singleton=1",
         [serde_json::to_string(&config(1, "different-document"))?],
     )?;
     assert_eq!(
@@ -887,14 +910,22 @@ async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
         None,
         "the old stamp cannot prove a different document at the same revision"
     );
-    connection.execute(
+    let old_writer = connection.execute(
         "UPDATE hangang_config SET revision=2, config_json=?1 WHERE singleton=1",
         [serde_json::to_string(&config(2, "old-sql-writer"))?],
+    );
+    assert!(
+        old_writer.is_err(),
+        "the old writer cannot advance a stamped document without a new generation"
+    );
+    connection.execute(
+        "UPDATE hangang_config SET revision=2, config_json=?1,write_generation=write_generation+1 WHERE singleton=1",
+        [serde_json::to_string(&config(2, "owned-restore-injection"))?],
     )?;
     assert_eq!(
         store.load_current_operation_proof().await?,
         None,
-        "an old SQL writer that leaves the stamp cannot claim its new revision"
+        "a directly injected replacement that leaves the stamp cannot claim its new revision"
     );
     let retained = store
         .lookup_commit_receipt(&"a".repeat(32), &"1".repeat(32))
@@ -908,12 +939,58 @@ async fn sqlite_operation_proof_rejects_corrupt_identity_and_unproven_document()
     assert_eq!(fabricated.stored_records, 1);
 
     connection.execute(
-        "UPDATE hangang_config SET operation_id='synthetic-secret-id' WHERE singleton=1",
+        "UPDATE hangang_config SET operation_id='synthetic-secret-id',write_generation=write_generation+1 WHERE singleton=1",
         [],
     )?;
     let error = store.load_current_operation_proof().await.unwrap_err();
     assert!(matches!(error, StoreError::Invalid(_)));
     assert!(!error.to_string().contains("synthetic-secret-id"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_reopen_installs_generation_guard_on_pre_v2_database() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(config(0, "initial")).await?.epoch;
+    let candidate = config(0, "stamped");
+    let stamp = operation_stamp(0, &"1".repeat(32), &candidate);
+    applied(
+        store
+            .compare_and_swap_operation(&epoch, 0, candidate, stamp)
+            .await?,
+    );
+    drop(store);
+
+    // Simulate a database opened by the previous binary: only its original
+    // NEW-only trigger is installed. The old generic writer could clear the
+    // stamp without bumping write_generation; roll that probe back locally.
+    let connection = rusqlite::Connection::open(&path)?;
+    connection
+        .execute_batch("DROP TRIGGER hangang_stamped_write_generation_v2; SAVEPOINT old_writer;")?;
+    let old_clear = connection.execute(
+        "UPDATE hangang_config SET revision=2,config_json=?1,operation_authority_id=NULL,operation_id=NULL,operation_revision=NULL,operation_sha256=NULL WHERE singleton=1",
+        [serde_json::to_string(&config(2, "obsolete-writer"))?],
+    );
+    assert!(
+        old_clear.is_ok(),
+        "fixture must reproduce the pre-v2 trigger gap"
+    );
+    connection.execute_batch("ROLLBACK TO old_writer; RELEASE old_writer;")?;
+    drop(connection);
+
+    let reopened = SqliteConfigStore::open(&path).await?;
+    let connection = rusqlite::Connection::open(&path)?;
+    let old_clear = connection.execute(
+        "UPDATE hangang_config SET revision=2,config_json=?1,operation_authority_id=NULL,operation_id=NULL,operation_revision=NULL,operation_sha256=NULL WHERE singleton=1",
+        [serde_json::to_string(&config(2, "obsolete-writer"))?],
+    );
+    assert!(
+        old_clear.is_err(),
+        "reopen must add the stronger v2 generation guard"
+    );
+    assert_eq!(reopened.load_latest().await?.unwrap().config.revision, 1);
     Ok(())
 }
 
@@ -1265,7 +1342,7 @@ async fn postgres_operation_cas_same_candidate_ids_prove_only_one_commit() -> an
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let left = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
     let right = Arc::new(PostgresConfigStore::connect_unencrypted(&url).await?);
     assert!(left.supports_operation_cas());
@@ -1416,7 +1493,7 @@ async fn postgres_receipt_insert_failure_rolls_back_configuration_and_stamp() ->
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let store = PostgresConfigStore::connect_unencrypted(&url).await?;
     let initial = store.bootstrap(config(0, "initial")).await?;
     client
@@ -1467,7 +1544,7 @@ async fn postgres_receipt_capacity_blocks_config_write_without_losing_history() 
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let store = PostgresConfigStore::connect_unencrypted(&url).await?;
     let epoch = store.bootstrap(config(0, "initial")).await?.epoch;
     let candidate_a = config(0, "A");
@@ -1536,7 +1613,7 @@ async fn postgres_retained_receipt_survives_lost_ack_and_later_winner() -> anyho
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
     let epoch = direct.bootstrap(config(0, "initial")).await?.epoch;
     let candidate_a = config(0, "A");
@@ -1609,7 +1686,7 @@ async fn postgres_lost_ack_receipt_with_failed_current_read_stays_indeterminate(
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
     let epoch = direct.bootstrap(config(0, "initial")).await?.epoch;
     let candidate = config(0, "committed-but-unreadable");
@@ -1643,13 +1720,116 @@ async fn postgres_lost_ack_receipt_with_failed_current_read_stays_indeterminate(
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_v2_lost_ack_keeps_a_receipt_after_b_becomes_current() -> anyhow::Result<()> {
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
+    assert!(direct.supports_sequenced_operation_cas());
+    let epoch = direct.bootstrap(config(0, "v2-initial")).await?.epoch;
+    let candidate_a = config(0, "v2-A");
+    let stamp_a = sequenced_stamp(0, 2, &candidate_a);
+    let candidate_b = config(0, "v2-B");
+    let stamp_b = sequenced_stamp(1, 3, &candidate_b);
+    let (upstream, _) = proxied_url(&url, "127.0.0.1:1".parse()?)?;
+    let mut proxy = losing_proxy(upstream, vec![V2_CAS_MARKER]).await?;
+    proxy.hold(LOAD_MARKER);
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    let pending_a = tokio::spawn({
+        let epoch = epoch.clone();
+        let stamp_a = stamp_a.clone();
+        async move {
+            writer
+                .compare_and_swap_operation_v2(&epoch, 0, candidate_a, stamp_a)
+                .await
+        }
+    });
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(V2_CAS_MARKER));
+    let observed_a = direct
+        .lookup_commit_receipt_v2(&stamp_a.authority_id, 2)
+        .await?;
+    assert_eq!(
+        observed_a.receipt.as_ref().map(|receipt| receipt.revision),
+        Some(1)
+    );
+    assert_eq!(
+        observed_a.high_water, 2,
+        "the first V2 sequence need not be 1"
+    );
+    proxy.gate.send_replace(true);
+    assert_eq!(next_fault(&mut proxy.held).await?, Some(LOAD_MARKER));
+    let committed_b = applied(
+        direct
+            .compare_and_swap_operation_v2(&epoch, 1, candidate_b, stamp_b.clone())
+            .await?,
+    );
+    proxy.release.send_replace(true);
+    let error = join_fault(pending_a).await?.unwrap_err();
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    assert_eq!(direct.load_latest().await?, Some(committed_b));
+    let old = direct
+        .lookup_commit_receipt_v2(&stamp_a.authority_id, 2)
+        .await?;
+    let latest = direct
+        .lookup_commit_receipt_v2(&stamp_b.authority_id, 3)
+        .await?;
+    assert_eq!(old.receipt.unwrap().stamp, stamp_a);
+    assert_eq!(latest.receipt.unwrap().stamp, stamp_b);
+    assert_eq!(old.high_water, 3);
+    assert_eq!(latest.high_water, 3);
+    assert_eq!(latest.stored_records, 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
+async fn postgres_v2_lost_ack_with_failed_current_read_remains_indeterminate() -> anyhow::Result<()>
+{
+    let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let epoch = direct.bootstrap(config(0, "v2-initial")).await?.epoch;
+    let candidate = config(0, "v2-committed-but-unreadable");
+    let stamp = sequenced_stamp(0, 2, &candidate);
+    let (upstream, _) = proxied_url(&url, "127.0.0.1:1".parse()?)?;
+    let mut proxy = losing_proxy(upstream, vec![V2_CAS_MARKER, LOAD_MARKER, LOAD_MARKER]).await?;
+    let (_, through) = proxied_url(&url, proxy.address)?;
+    let writer = PostgresConfigStore::connect_unencrypted(&through).await?;
+    proxy.gate.send_replace(true);
+    let error = writer
+        .compare_and_swap_operation_v2(&epoch, 0, candidate, stamp.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(V2_CAS_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(LOAD_MARKER));
+    assert_eq!(next_fault(&mut proxy.lost).await?, Some(LOAD_MARKER));
+    assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
+    let observed = direct
+        .lookup_commit_receipt_v2(&stamp.authority_id, 2)
+        .await?;
+    assert_eq!(observed.receipt.unwrap().stamp, stamp);
+    assert_eq!(observed.high_water, 2);
+    assert_eq!(direct.load_latest().await?.unwrap().config.revision, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: python3 tests/pg_fixture.py"]
 async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::Result<()> {
     let Ok(url) = std::env::var("HANGANG_TEST_POSTGRES_URL") else {
         return Ok(());
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config; DROP TABLE IF EXISTS hangang_sequenced_receipts; DROP TABLE IF EXISTS hangang_sequenced_authorities; DROP TABLE IF EXISTS hangang_commit_receipts; DROP TABLE IF EXISTS hangang_commit_receipt_meta;").await?;
     let direct = PostgresConfigStore::connect_unencrypted(&url).await?;
     let initial = direct.bootstrap(config(0, "initial")).await?;
     let epoch = initial.epoch.clone();
@@ -1707,10 +1887,10 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     );
 
     // A later operation commits without an acknowledgement. Before its
-    // recovery read, an older SQL writer advances the document but leaves the
-    // operation columns untouched. The stale same-ID stamp cannot prove the
-    // current document, and cannot prove that the unanswered write did not
-    // commit. This must remain Indeterminate rather than Invalid or Applied.
+    // recovery read, an obsolete SQL writer tries to advance the document
+    // while leaving the operation columns untouched. The generation trigger
+    // rejects it. An owned restore fixture then explicitly advances the
+    // generation; this does not model a compatible obsolete writer.
     drop(proxy);
     let candidate = config(0, "lost-before-old-writer");
     let third = operation_stamp(1, &"3".repeat(32), &candidate);
@@ -1730,15 +1910,21 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     assert_eq!(direct.load_latest().await?.unwrap().config.revision, 2);
     proxy.gate.send_replace(true);
     assert_eq!(next_fault(&mut proxy.held).await?, Some(LOAD_MARKER));
-    let old_writer_document = config(3, "old-writer-overwrite");
-    let changed = client
+    let injected_document = config(3, "owned-restore-injection");
+    let old_writer = client
         .execute(
             "UPDATE hangang_config SET revision=$1,config_json=$2 WHERE singleton=1 AND epoch=$3",
-            &[
-                &3_i64,
-                &serde_json::to_string(&old_writer_document)?,
-                &epoch,
-            ],
+            &[&3_i64, &serde_json::to_string(&injected_document)?, &epoch],
+        )
+        .await;
+    assert!(
+        old_writer.is_err(),
+        "obsolete stamped writer must be rejected"
+    );
+    let changed = client
+        .execute(
+            "UPDATE hangang_config SET revision=$1,config_json=$2,write_generation=write_generation+1 WHERE singleton=1 AND epoch=$3",
+            &[&3_i64, &serde_json::to_string(&injected_document)?, &epoch],
         )
         .await?;
     assert_eq!(changed, 1);
@@ -1748,7 +1934,7 @@ async fn postgres_operation_cas_lost_ack_uses_exact_current_proof() -> anyhow::R
     assert!(matches!(error, StoreError::Indeterminate(_)), "{error}");
     assert_eq!(
         direct.load_latest().await?.unwrap().config,
-        old_writer_document
+        injected_document
     );
     let retained = direct
         .lookup_commit_receipt(&"a".repeat(32), &"3".repeat(32))
@@ -2086,15 +2272,15 @@ async fn losing_proxy(
     })
 }
 
-/// Put `backup` back as the durable row without touching the epoch, the way
-/// restoring a backup taken under the same bootstrap does.
+/// Fixture-owned backup injection under the same epoch. The generation is
+/// advanced explicitly; an obsolete SQL writer does not know how to do this.
 async fn restore_same_epoch(url: &str, backup: &Stored) -> anyhow::Result<()> {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
     let revision = i64::try_from(backup.config.revision)?;
     let restored = client
         .execute(
-            "UPDATE hangang_config SET revision = $1, config_json = $2 WHERE singleton = 1 AND epoch = $3",
+            "UPDATE hangang_config SET revision = $1, config_json = $2, write_generation=write_generation+1 WHERE singleton = 1 AND epoch = $3",
             &[
                 &revision,
                 &serde_json::to_string(&backup.config)?,
@@ -2134,6 +2320,7 @@ fn proxied_url(
 
 const CAS_MARKER: &str = "UPDATE hangang_config SET revision";
 const RECEIPT_CAS_MARKER: &str = "INSERT INTO hangang_commit_receipts";
+const V2_CAS_MARKER: &str = "SELECT hangang_cas_v2";
 const LOAD_MARKER: &str = "SELECT revision,";
 const BOOTSTRAP_MARKER: &str = "INSERT INTO hangang_config(singleton";
 
