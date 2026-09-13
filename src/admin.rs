@@ -1061,6 +1061,8 @@ impl Admin {
         };
         let Some(actor) = actor else {
             let is_new = path == "/v1/status"
+                || path == "/v1/geoip/status"
+                || path == "/v1/geoip/lookup"
                 || path == "/v1/config/validate"
                 || path == "/v1/config/operations"
                 || path == "/v1/config/operations/prune"
@@ -1106,6 +1108,85 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/geoip/status" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            if req.uri().query().is_some() {
+                return Ok(problem(
+                    400,
+                    "Invalid GeoIP Query",
+                    "status does not accept query parameters",
+                ));
+            }
+            let snapshot = self.manager.active.load_full();
+            let observed = snapshot.geoip.as_ref().map(|slot| slot.status());
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            let database = observed
+                .as_ref()
+                .and_then(|status| status.database.as_ref())
+                .map(|db| {
+                    serde_json::json!({
+                        "database_type":&db.database_type,
+                        "ip_version":db.ip_version,
+                        "build_epoch_unix_seconds":db.build_epoch_unix_seconds,
+                        "expires_at_unix_seconds":db.expires_at_unix_seconds,
+                        "loaded_at_unix_ms":db.loaded_at_unix_ms,
+                        "generation_sha256":&db.generation_sha256,
+                        "file_bytes":db.file_bytes,
+                    })
+                });
+            return Ok(auth_json(
+                200,
+                &serde_json::json!({
+                    "scope":"instance",
+                    "revision":snapshot.config.revision,
+                    "configured":snapshot.config.geoip_database.is_some(),
+                    "ready":observed.as_ref().is_some_and(|status| status.ready),
+                    "error_code":observed.as_ref().and_then(|status| status.error_code),
+                    "checked_at_unix_ms":observed.as_ref().and_then(|status| status.checked_at_unix_ms),
+                    "database":database,
+                }),
+            ));
+        }
+        if path == "/v1/geoip/lookup" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let Some(ip) = geoip_lookup_query(req.uri().query()) else {
+                return Ok(problem(
+                    400,
+                    "Invalid GeoIP Query",
+                    "exactly one valid ip parameter is required",
+                ));
+            };
+            let snapshot = self.manager.active.load_full();
+            let country = snapshot
+                .geoip
+                .as_ref()
+                .and_then(|slot| slot.load())
+                .map(|db| db.lookup(ip));
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            return Ok(match country {
+                Some(Ok(code)) => auth_json(
+                    200,
+                    &serde_json::json!({
+                        "ip":ip.to_string(),
+                        "country":code.map(|code| code.as_str().to_owned()),
+                        "revision":snapshot.config.revision,
+                    }),
+                ),
+                _ => problem(
+                    503,
+                    "GeoIP Unavailable",
+                    "country database is not ready or lookup failed",
+                ),
+            });
         }
         if path == "/v1/config/commit-receipts-v2" {
             return Ok(self.handle_config_commit_receipts_v2(req, &actor).await);
@@ -2224,6 +2305,21 @@ fn viewer_allowed(path: &str, method: &hyper::Method) -> bool {
             path,
             "/v1/status" | "/v1/update/status" | "/healthz" | "/metrics"
         )
+}
+
+fn geoip_lookup_query(query: Option<&str>) -> Option<std::net::IpAddr> {
+    let query = query?;
+    if query.len() > 128 {
+        return None;
+    }
+    let mut parsed = url::Url::parse("http://localhost/").ok()?;
+    parsed.set_query(Some(query));
+    let mut pairs = parsed.query_pairs();
+    let (key, value) = pairs.next()?;
+    if key != "ip" || value.len() > 45 || pairs.next().is_some() {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn traffic_query(query: Option<&str>) -> Option<(Option<u64>, usize)> {
