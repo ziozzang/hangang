@@ -25,6 +25,7 @@ const MAX_SESSIONS: i64 = 4096;
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_SAFE_ID: i64 = 9_007_199_254_740_991;
 pub const AUDIT_CAPACITY: i64 = 100_000;
+pub const CONFIG_OPERATION_CAPACITY: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +209,118 @@ pub struct AuditPruneResult {
     pub record: AuditRecord,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStoreKind {
+    LocalFile,
+    SharedStore,
+}
+impl ConfigStoreKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local_file",
+            Self::SharedStore => "shared_store",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "local_file" => Ok(Self::LocalFile),
+            "shared_store" => Ok(Self::SharedStore),
+            _ => anyhow::bail!("invalid stored config operation store kind"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOperationState {
+    Accepted,
+    CandidateActivated,
+    Conflict,
+    Failed,
+    Indeterminate,
+}
+impl ConfigOperationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::CandidateActivated => "candidate_activated",
+            Self::Conflict => "conflict",
+            Self::Failed => "failed",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "accepted" => Ok(Self::Accepted),
+            "candidate_activated" => Ok(Self::CandidateActivated),
+            "conflict" => Ok(Self::Conflict),
+            "failed" => Ok(Self::Failed),
+            "indeterminate" => Ok(Self::Indeterminate),
+            _ => anyhow::bail!("invalid stored config operation state"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigAcceptRequest {
+    pub store_kind: ConfigStoreKind,
+    pub authority_epoch: Option<String>,
+    pub expected_revision: u64,
+    pub candidate_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigOperation {
+    pub id: i64,
+    pub operation_id: String,
+    pub authority_id: String,
+    pub actor_kind: AuditActorKind,
+    pub actor_user_id: Option<i64>,
+    pub accepted_at_unix_ms: i64,
+    pub expected_revision: u64,
+    pub candidate_sha256: String,
+    pub store_kind: ConfigStoreKind,
+    pub authority_epoch: Option<String>,
+    pub state: ConfigOperationState,
+    pub finished_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfigOperationPage {
+    pub scope: &'static str,
+    pub coverage: [&'static str; 2],
+    pub authority_id: String,
+    pub started_at_unix_ms: i64,
+    pub records: Vec<ConfigOperation>,
+    pub next_after: i64,
+    pub oldest_id: Option<i64>,
+    pub latest_id: i64,
+    pub stored_records: i64,
+    pub capacity: i64,
+    pub writes_available: bool,
+    pub server_time_unix_ms: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug)]
+pub struct ConfigOperationCapacity;
+impl std::fmt::Display for ConfigOperationCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local config operation capacity exhausted")
+    }
+}
+impl std::error::Error for ConfigOperationCapacity {}
+
+#[derive(Debug)]
+pub struct ConfigOperationConflict;
+impl std::fmt::Display for ConfigOperationConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local config operation state conflict")
+    }
+}
+impl std::error::Error for ConfigOperationConflict {}
+
 pub struct Store {
     path: PathBuf,
     password_workers: Arc<Semaphore>,
@@ -265,7 +378,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 2,
+            version <= 3,
             "administrator user database schema is newer than this binary"
         );
         if version < 2 {
@@ -348,6 +461,33 @@ impl Store {
             )?;
             transaction.execute_batch("PRAGMA user_version=2")?;
         }
+        if version < 3 {
+            transaction.execute_batch("CREATE TABLE admin_config_operation_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                authority_id TEXT NOT NULL,
+                started_at_unix_ms INTEGER NOT NULL,
+                next_id INTEGER NOT NULL DEFAULT 1,
+                stored_records INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE admin_config_operations (
+                id INTEGER PRIMARY KEY CHECK(id BETWEEN 1 AND 9007199254740991),
+                operation_id TEXT NOT NULL UNIQUE,
+                authority_id TEXT NOT NULL,
+                actor_kind TEXT NOT NULL CHECK(actor_kind IN ('system','account')),
+                actor_user_id INTEGER CHECK(actor_user_id BETWEEN 1 AND 9007199254740991),
+                accepted_at_unix_ms INTEGER NOT NULL CHECK(accepted_at_unix_ms BETWEEN 0 AND 9007199254740991),
+                expected_revision INTEGER NOT NULL CHECK(expected_revision BETWEEN 0 AND 9007199254740991),
+                candidate_sha256 TEXT NOT NULL,
+                store_kind TEXT NOT NULL CHECK(store_kind IN ('local_file','shared_store')),
+                authority_epoch TEXT,
+                state TEXT NOT NULL CHECK(state IN ('accepted','candidate_activated','conflict','failed','indeterminate')),
+                finished_at_unix_ms INTEGER CHECK(finished_at_unix_ms BETWEEN 0 AND 9007199254740991),
+                CHECK((actor_kind='system' AND actor_user_id IS NULL) OR (actor_kind='account' AND actor_user_id IS NOT NULL)),
+                CHECK((state='accepted' AND finished_at_unix_ms IS NULL) OR (state!='accepted' AND finished_at_unix_ms IS NOT NULL))
+            );")?;
+            transaction.execute("INSERT INTO admin_config_operation_meta(singleton,authority_id,started_at_unix_ms) VALUES(1,?1,?2)",params![random_hex_id()?,now_ms()?])?;
+            transaction.execute_batch("PRAGMA user_version=3")?;
+        }
         let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
@@ -378,6 +518,32 @@ impl Store {
                 ensure!(
                     record.id > pruned_through,
                     "administrator audit history crosses pruned range"
+                );
+            }
+        }
+        let (config_authority,config_started,config_next,config_count):(String,i64,i64,i64)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let (actual_config_count, max_config_id): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM admin_config_operations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(
+            valid_lower_hex(&config_authority, 32)
+                && (0..=MAX_SAFE_ID).contains(&config_started)
+                && (1..=MAX_SAFE_ID + 1).contains(&config_next)
+                && config_count == actual_config_count
+                && (0..=CONFIG_OPERATION_CAPACITY).contains(&config_count)
+                && config_next == max_config_id + 1,
+            "local config operation metadata inconsistent"
+        );
+        {
+            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations ORDER BY id")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let record = read_config_operation(row)?;
+                ensure!(
+                    record.authority_id == config_authority,
+                    "local config operation authority differs from metadata"
                 );
             }
         }
@@ -719,6 +885,98 @@ impl Store {
             Ok(AuditPruneResult{pruned_records:u64::try_from(deleted)?,record})
         }).await?
     }
+
+    /// Records local acceptance after live account authorization. This is not
+    /// a commit in the separate configuration authority and is not fleet audit.
+    pub async fn accept_config(
+        &self,
+        authority: MutationAuthority,
+        request: ConfigAcceptRequest,
+    ) -> Result<ConfigOperation> {
+        ensure!(
+            request.expected_revision <= MAX_SAFE_ID as u64,
+            "configuration revision exceeds safe local audit range"
+        );
+        ensure!(
+            valid_lower_hex(&request.candidate_sha256, 64),
+            "candidate SHA-256 needs 64 lowercase hexadecimal characters"
+        );
+        ensure!(
+            request
+                .authority_epoch
+                .as_ref()
+                .is_none_or(|epoch| valid_lower_hex(epoch, 32)),
+            "authority epoch needs 32 lowercase hexadecimal characters"
+        );
+        let operation_id = random_hex_id()?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection=connection(&path)?;
+            let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let actor_user_id=authorize_mutation(&transaction,&authority)?;
+            let (authority_id,next_id,stored_records):(String,i64,i64)=transaction.query_row("SELECT authority_id,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+            if stored_records>=CONFIG_OPERATION_CAPACITY || !(1..=MAX_SAFE_ID).contains(&next_id) {return Err(ConfigOperationCapacity.into());}
+            let record=ConfigOperation{id:next_id,operation_id,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
+            ensure!(valid_config_operation(&record),"invalid local config operation");
+            transaction.execute("INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'accepted',NULL)",params![record.id,record.operation_id,record.authority_id,record.actor_kind.as_str(),record.actor_user_id,record.accepted_at_unix_ms,i64::try_from(record.expected_revision)?,record.candidate_sha256,record.store_kind.as_str(),record.authority_epoch])?;
+            transaction.execute("UPDATE admin_config_operation_meta SET next_id=?1,stored_records=stored_records+1 WHERE singleton=1",params![next_id+1])?;
+            transaction.commit()?;
+            Ok(record)
+        }).await?
+    }
+
+    /// Trusted internal completion only. A terminal state never gets replaced;
+    /// a lost completion acknowledgement must be resolved by reading the row.
+    pub async fn finish_config(
+        &self,
+        operation_id: &str,
+        state: ConfigOperationState,
+    ) -> Result<ConfigOperation> {
+        if !valid_lower_hex(operation_id, 32) || state == ConfigOperationState::Accepted {
+            return Err(ConfigOperationConflict.into());
+        }
+        let operation_id = operation_id.to_owned();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection=connection(&path)?;
+            let transaction=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed=transaction.execute("UPDATE admin_config_operations SET state=?1,finished_at_unix_ms=?2 WHERE operation_id=?3 AND state='accepted'",params![state.as_str(),now_ms()?,operation_id])?;
+            if changed!=1 {return Err(ConfigOperationConflict.into());}
+            let record=transaction.query_row("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE operation_id=?1",params![operation_id],read_config_operation)?;
+            transaction.commit()?;
+            Ok(record)
+        }).await?
+    }
+
+    pub async fn config_operations(
+        &self,
+        authority: MutationAuthority,
+        after: i64,
+        limit: usize,
+    ) -> Result<ConfigOperationPage> {
+        ensure!(
+            (0..=MAX_SAFE_ID).contains(&after) && (1..=100).contains(&limit),
+            "invalid local config operation page bounds"
+        );
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection=connection(&path)?;
+            let transaction=connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            authorize_mutation(&transaction,&authority)?;
+            let (authority_id,started_at,next_id,stored_records):(String,i64,i64,i64)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_config_operations",[],|row|row.get(0))?;
+            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
+            let has_more=records.len()>limit;
+            records.truncate(limit);
+            let next_after=records.last().map_or(after,|record|record.id);
+            drop(statement);
+            let page=ConfigOperationPage{scope:"instance",coverage:["acceptance","local_outcome"],authority_id,started_at_unix_ms:started_at,records,next_after,oldest_id,latest_id:next_id-1,stored_records,capacity:CONFIG_OPERATION_CAPACITY,writes_available:stored_records<CONFIG_OPERATION_CAPACITY && next_id<=MAX_SAFE_ID,server_time_unix_ms:now_ms()?,has_more};
+            transaction.commit()?;
+            Ok(page)
+        }).await?
+    }
 }
 
 fn valid_session_token(token: &str) -> bool {
@@ -726,6 +984,71 @@ fn valid_session_token(token: &str) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn random_hex_id() -> Result<String> {
+    Ok(random_bytes::<16>()?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn valid_config_operation(record: &ConfigOperation) -> bool {
+    (1..=MAX_SAFE_ID).contains(&record.id)
+        && valid_lower_hex(&record.operation_id, 32)
+        && valid_lower_hex(&record.authority_id, 32)
+        && match record.actor_kind {
+            AuditActorKind::System => record.actor_user_id.is_none(),
+            AuditActorKind::Account => record
+                .actor_user_id
+                .is_some_and(|id| (1..=MAX_SAFE_ID).contains(&id)),
+        }
+        && (0..=MAX_SAFE_ID).contains(&record.accepted_at_unix_ms)
+        && record.expected_revision <= MAX_SAFE_ID as u64
+        && valid_lower_hex(&record.candidate_sha256, 64)
+        && record
+            .authority_epoch
+            .as_ref()
+            .is_none_or(|epoch| valid_lower_hex(epoch, 32))
+        && match record.state {
+            ConfigOperationState::Accepted => record.finished_at_unix_ms.is_none(),
+            _ => record
+                .finished_at_unix_ms
+                .is_some_and(|time| (0..=MAX_SAFE_ID).contains(&time)),
+        }
+}
+
+fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOperation> {
+    let expected_revision: i64 = row.get(6)?;
+    let record = ConfigOperation {
+        id: row.get(0)?,
+        operation_id: row.get(1)?,
+        authority_id: row.get(2)?,
+        actor_kind: AuditActorKind::parse(&row.get::<_, String>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        actor_user_id: row.get(4)?,
+        accepted_at_unix_ms: row.get(5)?,
+        expected_revision: u64::try_from(expected_revision)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        candidate_sha256: row.get(7)?,
+        store_kind: ConfigStoreKind::parse(&row.get::<_, String>(8)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        authority_epoch: row.get(9)?,
+        state: ConfigOperationState::parse(&row.get::<_, String>(10)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        finished_at_unix_ms: row.get(11)?,
+    };
+    if !valid_config_operation(&record) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(record)
 }
 
 fn authorize_mutation(
@@ -1033,12 +1356,192 @@ pub fn validate_password(password: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn config_request() -> ConfigAcceptRequest {
+        ConfigAcceptRequest {
+            store_kind: ConfigStoreKind::LocalFile,
+            authority_epoch: None,
+            expected_revision: 7,
+            candidate_sha256: "a".repeat(64),
+        }
+    }
+
     fn store() -> (tempfile::TempDir, Arc<Store>) {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn v2_to_v3_keeps_users_sessions_and_account_audit() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let audit_latest = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap()
+            .latest_id;
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2;").unwrap();
+        let migrated = Store::open(path.clone()).unwrap();
+        assert_eq!(
+            migrated
+                .session(login.token.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            root.id
+        );
+        assert_eq!(
+            migrated
+                .audit_page(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .latest_id,
+            audit_latest
+        );
+        let empty = migrated
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(empty.latest_id, 0);
+        assert_eq!(empty.stored_records, 0);
+        assert!(valid_lower_hex(&empty.authority_id, 32));
+        assert_eq!(
+            connection(&path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn config_acceptance_is_durable_and_fenced_by_live_session() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = store
+            .accept_config(
+                MutationAuthority::Session(login.token.clone()),
+                config_request(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.actor_kind, AuditActorKind::Account);
+        assert_eq!(accepted.actor_user_id, Some(login.user.id));
+        assert_eq!(accepted.state, ConfigOperationState::Accepted);
+        assert!(valid_lower_hex(&accepted.operation_id, 32));
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .accept_config(
+                    MutationAuthority::Session(login.token.clone()),
+                    config_request()
+                )
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        assert!(
+            store
+                .config_operations(MutationAuthority::Session(login.token), 0, 100)
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        let system = store
+            .accept_config(
+                MutationAuthority::System,
+                ConfigAcceptRequest {
+                    store_kind: ConfigStoreKind::SharedStore,
+                    authority_epoch: Some("b".repeat(32)),
+                    ..config_request()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(system.id, accepted.id + 1);
+        let path = directory.path().join("accounts.sqlite3");
+        let reopened = Store::open(path).unwrap();
+        let page = reopened
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert_eq!(page.authority_id, accepted.authority_id);
+        assert_eq!(page.records[0].operation_id, accepted.operation_id);
+        assert_eq!(page.records[1].authority_epoch, Some("b".repeat(32)));
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(!json.contains("first secure password"));
+        assert!(!json.contains("root"));
+    }
+
+    #[tokio::test]
+    async fn config_finish_is_one_way_terminal_cas() {
+        let (_directory, store) = store();
+        let accepted = store
+            .accept_config(MutationAuthority::System, config_request())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .finish_config(&accepted.operation_id, ConfigOperationState::Accepted)
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationConflict>()
+        );
+        let done = store
+            .finish_config(
+                &accepted.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.state, ConfigOperationState::CandidateActivated);
+        assert!(done.finished_at_unix_ms.is_some());
+        assert!(
+            store
+                .finish_config(&accepted.operation_id, ConfigOperationState::Failed)
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationConflict>()
+        );
+        assert!(
+            store
+                .finish_config(&"0".repeat(32), ConfigOperationState::Conflict)
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationConflict>()
+        );
+        let page = store
+            .config_operations(MutationAuthority::System, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.records[0].state,
+            ConfigOperationState::CandidateActivated
+        );
+        assert_eq!(page.coverage, ["acceptance", "local_outcome"]);
     }
 
     #[tokio::test]
@@ -1058,7 +1561,7 @@ mod tests {
         connection(&path)
             .unwrap()
             .execute_batch(
-                "DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1;",
+                "DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1;",
             )
             .unwrap();
         drop(store);
@@ -1111,7 +1614,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -1130,7 +1633,7 @@ mod tests {
             .unwrap();
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1; CREATE TABLE admin_audit_meta(dummy INTEGER);").unwrap();
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1; CREATE TABLE admin_audit_meta(dummy INTEGER);").unwrap();
         assert!(Store::open(path.clone()).is_err());
         let connection = connection(&path).unwrap();
         assert_eq!(
