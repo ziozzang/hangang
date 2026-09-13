@@ -113,6 +113,17 @@ impl TcpManager {
         self
     }
 
+    /// Resolve the same discovery view used by this instance's data plane.
+    pub fn discovered_target(
+        &self,
+        backend: &str,
+        protocol: crate::discovery::Protocol,
+    ) -> Option<crate::discovery::ResolvedTarget> {
+        self.discovery
+            .as_ref()?
+            .resolve_with_epoch(backend, protocol)
+    }
+
     /// Validate the complete config and bind only addresses which are not
     /// already active. No accept loop starts until `commit`.
     pub async fn prepare(&self, config: &Config) -> Result<Prepared> {

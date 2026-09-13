@@ -663,16 +663,6 @@ impl Config {
                 );
             }
             r.balance.validate(r.backends.len())?;
-            if r.balance.active_health.as_ref().is_some_and(|health| {
-                health.initial_state == crate::balance::InitialHealthState::Checking
-            }) {
-                ensure!(
-                    !r.backends
-                        .iter()
-                        .any(|backend| backend.address().starts_with("docker://")),
-                    "checking initial health does not support Docker backends"
-                );
-            }
             if let Some(cache) = &r.cache {
                 cache.validate()?;
                 ensure!(
@@ -1989,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn checking_rejects_docker_backend_until_probe_resolution_is_supported() {
+    fn checking_accepts_docker_backend_with_epoch_fenced_probes() {
         let mut config = route();
         config.http[0].backends = vec!["docker://api/edge/8080".into()];
         config.http[0].balance.active_health = Some(crate::balance::ActiveHealthPolicy {
@@ -2005,13 +1995,7 @@ mod tests {
             unhealthy_timeouts: 1,
             initial_state: crate::balance::InitialHealthState::Checking,
         });
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("checking initial health does not support Docker backends")
-        );
+        config.validate().unwrap();
         config.http[0]
             .balance
             .active_health

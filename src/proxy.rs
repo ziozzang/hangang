@@ -93,7 +93,7 @@ pub struct Proxy {
     requests: Arc<tokio::sync::Semaphore>,
     inspections: Arc<tokio::sync::Semaphore>,
     transformations: Arc<tokio::sync::Semaphore>,
-    discovery: Option<Arc<crate::discovery::Discovery>>,
+    discovery: Arc<arc_swap::ArcSwapOption<crate::discovery::Discovery>>,
     // Optional unauthenticated health path on the public listener, for external
     // load balancers that cannot present the admin bearer token.
     health_path: Option<Arc<str>>,
@@ -233,7 +233,13 @@ impl Proxy {
             .pool_max_idle_per_host(idle_per_host.clamp(1, 4096))
             .build(connector);
         let shutdown = CancellationToken::new();
-        crate::active_probe::spawn_monitor(active.clone(), outbound.clone(), shutdown.clone());
+        let discovery = Arc::new(arc_swap::ArcSwapOption::empty());
+        crate::active_probe::spawn_monitor_with_discovery(
+            active.clone(),
+            outbound.clone(),
+            discovery.clone(),
+            shutdown.clone(),
+        );
         Self {
             active,
             policy,
@@ -244,7 +250,7 @@ impl Proxy {
             requests: Arc::new(tokio::sync::Semaphore::new(4096)),
             inspections: Arc::new(tokio::sync::Semaphore::new(32)),
             transformations: Arc::new(tokio::sync::Semaphore::new(32)),
-            discovery: None,
+            discovery,
             health_path: None,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             allow_dot_segments: false,
@@ -644,8 +650,27 @@ impl Proxy {
         Ok(retain_request_permit(response, permit))
     }
 
-    pub fn with_discovery(mut self, discovery: Arc<crate::discovery::Discovery>) -> Self {
-        self.discovery = Some(discovery);
+    fn select_http_backend(&self, runtime: &Arc<crate::config::HttpRuntime>) -> Option<usize> {
+        runtime.balancer.select_where(|index| {
+            let backend = runtime.route.backends[index].address();
+            if !backend.starts_with("docker://") {
+                return true;
+            }
+            self.discovery
+                .load()
+                .as_ref()
+                .and_then(|discovery| {
+                    discovery.resolve_with_epoch(backend, crate::discovery::Protocol::Http)
+                })
+                .is_some_and(|target| {
+                    runtime.balancer.observe_epoch(index, target.epoch)
+                        && runtime.balancer.available_for(index, target.epoch)
+                })
+        })
+    }
+
+    pub fn with_discovery(self, discovery: Arc<crate::discovery::Discovery>) -> Self {
+        self.discovery.store(Some(discovery));
         self
     }
 
@@ -1048,7 +1073,7 @@ impl Proxy {
             }
         }
 
-        let Some(mut index) = runtime.balancer.select() else {
+        let Some(mut index) = self.select_http_backend(&runtime) else {
             return Ok(self.failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "all backends are unavailable",
@@ -1256,29 +1281,54 @@ impl Proxy {
         }
         let response_has_body = request.method() != Method::HEAD;
 
-        if !runtime.balancer.available(index) {
+        let mut docker_target = if backend.starts_with("docker://") {
+            let Some(discovery) = self.discovery.load_full() else {
+                return Ok(self.failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Docker discovery is unavailable",
+                ));
+            };
+            let Some(target) =
+                discovery.resolve_with_epoch(&backend, crate::discovery::Protocol::Http)
+            else {
+                return Ok(self.failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Docker backend is unavailable",
+                ));
+            };
+            if !runtime.balancer.observe_epoch(index, target.epoch) {
+                return Ok(self.failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Docker endpoint generation changed",
+                ));
+            }
+            Some((backend.clone(), target, discovery))
+        } else {
+            None
+        };
+        let available = match &docker_target {
+            Some((_, target, _)) => runtime.balancer.available_for(index, target.epoch),
+            None => runtime.balancer.available(index),
+        };
+        if !available {
             return Ok(self.failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "selected backend is unavailable",
             ));
         }
-        let Some(lease) = runtime.balancer.acquire(index) else {
+        let lease = match &docker_target {
+            Some((_, target, _)) => runtime.balancer.acquire_for(index, target.epoch),
+            None => runtime.balancer.acquire(index),
+        };
+        let Some(lease) = lease else {
             return Ok(self.failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "selected backend admission refused",
             ));
         };
         let mut backend_lease = Some(lease);
-        if backend.starts_with("docker://") {
-            let Some(resolved) = self.discovery.as_ref().and_then(|discovery| {
-                discovery.resolve(&backend, crate::discovery::Protocol::Http)
-            }) else {
-                return Ok(self.failure(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Docker backend is unavailable",
-                ));
-            };
-            backend = resolved;
+        if let Some((_, target, _)) = &docker_target {
+            backend = target.endpoint.clone();
         }
         let websocket = valid_websocket_request(&request);
         let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
@@ -1327,7 +1377,8 @@ impl Proxy {
             );
         }
 
-        let custom_outbound = runtime.route.upstream != Default::default()
+        let custom_outbound = docker_target.is_some()
+            || runtime.route.upstream != Default::default()
             || runtime.route.upstream_host.is_some()
             || runtime.route.preserve_host;
         let host_override: Option<String> = runtime.route.upstream_host.clone().or_else(|| {
@@ -1388,11 +1439,21 @@ impl Proxy {
                 Err((code, message)) => return Ok(response(code, message)),
             };
             let client = if custom_outbound {
-                match self.outbound.client(
-                    &runtime,
-                    &backend,
-                    snapshot.upstream_tls.get(&runtime.route.id),
-                ) {
+                let client = match &docker_target {
+                    Some((configured, target, discovery)) => self.outbound.client_for_epoch(
+                        &runtime,
+                        configured,
+                        target,
+                        Some(discovery.clone()),
+                        snapshot.upstream_tls.get(&runtime.route.id),
+                    ),
+                    None => self.outbound.client(
+                        &runtime,
+                        &backend,
+                        snapshot.upstream_tls.get(&runtime.route.id),
+                    ),
+                };
+                match client {
                     Ok(client) => Some(client),
                     Err(_) => {
                         return Ok(self.failure(
@@ -1425,6 +1486,18 @@ impl Proxy {
                     request
                 }
             };
+            if let Some((configured, target, discovery)) = &docker_target
+                && (discovery
+                    .resolve_with_epoch(configured, crate::discovery::Protocol::Http)
+                    .as_ref()
+                    != Some(target)
+                    || !runtime.balancer.available_for(index, target.epoch))
+            {
+                return Ok(self.failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Docker endpoint changed before request admission",
+                ));
+            }
             let send = async {
                 match &client {
                     Some(client) => client.request(outgoing).await,
@@ -1447,13 +1520,15 @@ impl Proxy {
                     if retryable
                         && error.is_connect()
                         && attempt < max_attempts
-                        && let Some(next) = runtime.balancer.select()
+                        && let Some(next) = self.select_http_backend(&runtime)
                     {
                         let candidate = runtime.route.backends[next].address().to_owned();
                         if !candidate.starts_with("docker://")
                             && let Some(lease) = runtime.balancer.acquire(next)
                         {
                             backend = candidate;
+                            index = next;
+                            docker_target = None;
                             backend_lease = Some(lease);
                             continue;
                         }

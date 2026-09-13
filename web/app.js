@@ -1606,7 +1606,7 @@ function httpSections(route) {
       field('Failure threshold', 'health_failure_threshold', health?.failure_threshold ?? '', { type: 'number', min: 1, max: 100, help: 'Consecutive connection failures or HTTP 5xx responses before a backend is skipped (1–100). Both legacy health fields are required together.' }),
       field('Cooldown (ms)', 'health_cooldown_ms', health?.cooldown_ms ?? '', { type: 'number', min: 10, max: 300000, help: 'How long a failed backend stays skipped, 10–300,000 ms.' }),
     ] }),
-    section({ title: 'Active health checks', configured: Boolean(activeHealth), note: 'Active probes currently work only with http:// or https:// backends; docker:// probe targets are unsupported. A checking startup keeps backends out of selection until they pass the healthy-probe threshold.', fields: [
+    section({ title: 'Active health checks', configured: Boolean(activeHealth), note: 'Active probes support HTTP, HTTPS and discovered Docker backends. A checking startup waits for healthy probes from the current endpoint generation; container replacement resets that evidence.', fields: [
       span2(field('Enable active health checks', 'active_health_enabled', Boolean(activeHealth), { checkbox: true, toggles: 'active_health', help: 'Requires a probe path and status sets; conflicts with legacy failure cooldown.' })),
       field('Initial probe state', 'active_health_initial_state', activeHealth?.initial_state || 'healthy', { group: 'active_health', select: [['healthy', 'Healthy — existing startup behavior'], ['checking', 'Checking — wait for healthy probes']], help: 'Healthy preserves existing startup behavior. Checking excludes each backend until it reaches the configured consecutive healthy-probe threshold; failures and passive reports cannot release it.' }),
       field('Probe path', 'active_health_path', activeHealth?.path ?? '', { group: 'active_health', placeholder: '/health', help: 'Required printable absolute path without query or fragment; GET is used.' }),
@@ -1959,8 +1959,6 @@ function routeFromForm() {
       if (initial === 'checking') active.initial_state = 'checking';
       else if (initial === 'healthy') delete active.initial_state;
       else throw new Error(t('Select a valid initial probe state'));
-      if (initial === 'checking' && route.backends.some((backend) => backendAddress(backend).startsWith('docker://')))
-        throw new Error(t('Checking startup does not support docker:// backends; use HTTP or HTTPS backends'));
       active.path = text('active_health_path');
       if (active.path.length > 256 || !/^\/[\x21-\x7e]*$/.test(active.path) || /[?#]/.test(active.path)) throw new Error(t('Probe path must be a printable absolute path without query or fragment'));
       active.host = optionalText('active_health_host');

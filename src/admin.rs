@@ -1362,10 +1362,35 @@ impl Admin {
                         break;
                     }
                     if position >= offset && rows.len() < limit {
-                        let state = runtime
+                        let mut state = runtime
                             .balancer
                             .backend_state(backend_index)
                             .expect("prepared HTTP backend state");
+                        if address.address().starts_with("docker://") {
+                            let current = self
+                                .manager
+                                .tcp
+                                .discovered_target(
+                                    address.address(),
+                                    crate::discovery::Protocol::Http,
+                                )
+                                .and_then(|target| {
+                                    runtime
+                                        .balancer
+                                        .backend_state_for(backend_index, target.epoch)
+                                });
+                            if let Some(current) = current {
+                                state = current;
+                            } else {
+                                state.available = false;
+                                state.probe_observed = state.probe_observed.map(|_| false);
+                                state.initial_check_pending =
+                                    runtime.route.balance.active_health.as_ref().map(|policy| {
+                                        policy.initial_state
+                                            == crate::balance::InitialHealthState::Checking
+                                    });
+                            }
+                        }
                         rows.push(serde_json::json!({
                             "protocol": "http",
                             "route_id": runtime.route.id,

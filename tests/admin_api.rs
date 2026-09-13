@@ -3038,3 +3038,47 @@ async fn desired_member_state_publishes_only_after_save_and_reports_current_gate
     manager.tcp.shutdown(std::time::Duration::ZERO).await;
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn operations_do_not_reuse_old_http_probe_evidence_when_docker_resolution_is_missing() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "http":[{"id":"dynamic", "backends":["docker://app/edge/8080"],
+        "balance":{"active_health":{"initial_state":"checking", "path":"/ready",
+            "interval_ms":1000, "timeout_ms":100, "healthy_statuses":[200],
+            "unhealthy_statuses":[503], "healthy_successes":1,
+            "unhealthy_http_failures":1, "unhealthy_tcp_failures":1, "unhealthy_timeouts":1}}}]
+    }))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (address, manager) = server_on(
+        dir.path().join("state.json"),
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let old = manager.active.load_full();
+    old.http[0].balancer.observe_epoch(0, 7);
+    old.http[0].balancer.record_active_status_for(0, 7, 200);
+    assert!(old.http[0].balancer.available_for(0, 7));
+    let (status, _, body) = request(address, "GET", "/v1/operations", None, None).await;
+    assert_eq!(status, 200);
+    let data = json(&body);
+    let row = &data["rows"][0];
+    assert_eq!(row["available"], false);
+    assert_eq!(row["probe_observed"], false);
+    assert_eq!(row["initial_check_pending"], true);
+    assert_eq!(
+        row["admission_open"], true,
+        "configured member gate is distinct from discovery"
+    );
+    assert_eq!(row["active_admissions"], 0);
+    assert!(
+        old.http[0].balancer.available_for(0, 7),
+        "observation must not mutate old health"
+    );
+    manager.tcp.shutdown(std::time::Duration::ZERO).await;
+    manager.policy.shutdown().await;
+}

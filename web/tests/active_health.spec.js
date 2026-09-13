@@ -119,22 +119,24 @@ test('native controls create checking active probes and passive checks with vali
   });
 });
 
-test('checking with Docker backends is blocked locally and explained in both languages', async ({ page }) => {
-  const configured = structuredClone(route);
-  configured.backends = ['docker://api/edge/8080'];
-  configured.balance.active_health.initial_state = 'healthy';
-  const writes = await fixture(page, configured);
-  await openEdit(page);
-  await expand(page, 'Active health checks');
-  await expect(page.locator('#route-dialog')).toContainText('docker:// probe targets are unsupported');
-  await page.locator('#route-field-active_health_initial_state').selectOption('checking');
-  await page.getByRole('button', { name: 'Save route' }).click();
-  await expect(page.locator('#route-message')).toContainText('Checking startup does not support docker:// backends');
-  expect(writes).toHaveLength(0);
-  await page.locator('#locale-select-route').selectOption('ko');
-  await page.getByRole('button', { name: '경로 저장' }).click();
-  await expect(page.locator('#route-message')).toContainText('docker:// 백엔드를 지원하지 않습니다');
-});
+for (const locale of ['en', 'ko']) {
+  test(`Docker checking configuration saves with endpoint generation guidance (${locale})`, async ({ page }) => {
+    const configured = structuredClone(route);
+    configured.backends = ['docker://api/edge/8080'];
+    configured.balance.active_health.initial_state = 'healthy';
+    const writes = await fixture(page, configured);
+    await openEdit(page);
+    await expand(page, 'Active health checks');
+    if (locale === 'ko') await page.locator('#locale-select-route').selectOption('ko');
+    await expect(page.locator('#route-dialog')).toContainText(locale === 'ko' ? '컨테이너 교체 시 이전 정상 판정은 초기화됩니다' : 'container replacement resets that evidence');
+    await page.locator('#route-field-active_health_initial_state').selectOption('checking');
+    await page.getByRole('button', { name: locale === 'ko' ? '경로 저장' : 'Save route', exact: true }).click();
+    await expect(page.locator('#route-dialog')).toBeHidden();
+    expect(writes).toHaveLength(1);
+    expect(writes[0].backends).toEqual(['docker://api/edge/8080']);
+    expect(writes[0].balance.active_health.initial_state).toBe('checking');
+  });
+}
 
 test('native validation blocks cooldown conflict, overlapping statuses and timeout longer than interval', async ({ page }) => {
   const configured = structuredClone(route);
