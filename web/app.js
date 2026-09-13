@@ -55,6 +55,7 @@ const state = {
   storeEpoch: null,
   /** Why the fleet-settings controls could not be mirrored into the document; blocks validate/apply. */
   settingsError: null,
+  geoipError: null,
   certificateDirty: false,
   certificateInventory: null,
   certificateInventoryOffset: 0,
@@ -394,6 +395,7 @@ function scrubRenderedData() {
   $('#cache-generation-input').value = '';
   $('#cache-generation-input').setAttribute('aria-invalid', 'false');
   showSettings(undefined);
+  showGeoIpSource(undefined);
   for (const key of SETTINGS_FIELDS) $(`#setting-active-${key}`).textContent = '—';
   $('#config-diff').textContent = t('Load the active configuration to compare changes.');
   $('#preview-count').textContent = t('No changes');
@@ -425,6 +427,7 @@ function logout(reason = '') {
   state.configurationSource = null;
   state.storeEpoch = null;
   state.settingsError = null;
+  state.geoipError = null;
   state.certificateDirty = false;
   state.certificateInventory = null;
   state.certificateInventoryOffset = 0;
@@ -1340,6 +1343,7 @@ function rootForRoute(type) { return $(`#${type}-routes`); }
 function routeSummaryTags(type, route) {
   const tags = [];
   if (route.enabled === false) tags.push(t('Disabled'));
+  if (route.country_policy) tags.push(t(route.country_policy.enforce === false ? 'GeoIP configured, not enforced' : 'GeoIP country admission'));
   if (type === 'http') {
     if (['public', 'application', 'protected'].includes(route.access_mode)) tags.push(t('Access: {mode}', { mode: t(route.access_mode) }));
     if (route.require_tls) tags.push(t('TLS required'));
@@ -1724,6 +1728,54 @@ function languagePolicySection(route) {
     ] });
 }
 
+const COUNTRY_CODE = /^[A-Z]{2}$/;
+function validateCountryPolicy(policy) {
+  if (!isObject(policy) || !['allow', 'deny'].includes(policy.on_unknown)
+    || (policy.enforce !== undefined && typeof policy.enforce !== 'boolean')
+    || Object.keys(policy).some((key) => !['allow', 'deny', 'on_unknown', 'enforce'].includes(key))) {
+    throw new Error(t('Country policy needs an unknown-country action and valid enforcement flag'));
+  }
+  const lists = ['allow', 'deny'].map((name) => {
+    const codes = policy[name] === undefined ? [] : policy[name];
+    if (!Array.isArray(codes) || codes.some((code) => typeof code !== 'string'))
+      throw new Error(t('Country allow and deny lists must contain country codes'));
+    if (codes.some((code) => !COUNTRY_CODE.test(code)))
+      throw new Error(t('Country codes must be two uppercase ASCII letters'));
+    if (new Set(codes).size !== codes.length)
+      throw new Error(t('Country codes must be unique within each list'));
+    return codes;
+  });
+  if (lists[0].length + lists[1].length < 1 || lists[0].length + lists[1].length > 256)
+    throw new Error(t('Country policy needs 1–256 total allow and deny codes'));
+  if (lists[0].length && policy.on_unknown === 'allow')
+    throw new Error(t('Unknown countries cannot be allowed with a country allowlist'));
+  return policy;
+}
+
+function updateCountryPolicyControls(form) {
+  const action = form.elements.country_policy_action;
+  if (!action) return;
+  for (const control of action.closest('details')?.querySelectorAll('[data-group="country_policy"]') || [])
+    control.disabled = action.value !== 'configured';
+}
+
+function countryPolicySection(route) {
+  const policy = isObject(route.country_policy) ? route.country_policy : null;
+  const action = field('Country policy action', 'country_policy_action', policy ? 'configured' : 'none', {
+    select: [['none', 'No country policy'], ['configured', 'Configure country policy'], ['remove', 'Remove country policy']],
+    help: 'Select Remove to delete a configured policy. Enforcement Off preserves valid rules without applying them.',
+  });
+  action.querySelector('select').addEventListener('change', () => updateCountryPolicyControls($('#route-form')));
+  return section({ title: 'GeoIP country policy', configured: Boolean(policy),
+    note: 'Countries come from an offline database file whose path is published in configuration and resolved locally on each node. An unavailable or stale database denies enforced routes; unknown addresses use the explicit action. This is route admission, not identity or a live location guarantee. Routes sharing one protected resource ID need the same country policy.', fields: [
+      span2(action),
+      field('Unknown country', 'country_policy_on_unknown', policy?.on_unknown ?? 'deny', { group: 'country_policy', select: [['deny', 'Deny unknown country'], ['allow', 'Allow unknown country']], help: 'Private, unmapped and unrepresented addresses are unknown after a successful lookup. Database failures are never treated as unknown.' }),
+      span2(field('Allow country codes', 'country_policy_allow', Array.isArray(policy?.allow) ? policy.allow.join('\n') : '', { group: 'country_policy', textarea: true, help: 'One uppercase two-letter country code per line. An allowlist excludes every other known country; a denial wins if a code appears in both lists.' })),
+      span2(field('Deny country codes', 'country_policy_deny', Array.isArray(policy?.deny) ? policy.deny.join('\n') : '', { group: 'country_policy', textarea: true, help: 'One uppercase two-letter country code per line. At least one allow or deny code is required; 256 combined maximum.' })),
+      span2(field('Enforce country policy', 'country_policy_enforce', policy?.enforce !== false, { group: 'country_policy', checkbox: true, help: 'Off retains valid rules. Enforced rules require a GeoIP database source in the published configuration.' })),
+    ] });
+}
+
 function updateJwtControls(form) {
   const enabled = form.elements['jwt_auth_enabled']?.checked;
   const source = form.elements['jwt_key_source']?.value;
@@ -1945,6 +1997,7 @@ function httpSections(route) {
     workloadAuthSection(route),
     resourcePolicySection(route),
     languagePolicySection(route),
+    countryPolicySection(route),
     section({ title: 'Response headers', configured: Boolean(Object.keys(route.response_set_headers || {}).length || (route.response_remove_headers || []).length), note: 'Streaming-safe header edits applied to every upstream response head; framing and hop-by-hop names are rejected.', fields: [
       field('Set response headers', 'response_set_headers', pairsToLines(route.response_set_headers), { textarea: true, help: 'One name: value per line; replaces an existing header of the same name.' }),
       field('Remove response headers', 'response_remove_headers', (route.response_remove_headers || []).join('\n'), { textarea: true, help: 'One header name per line, for example server.' }),
@@ -1981,6 +2034,7 @@ function tcpSections(route) {
       field('ClientHello size limit (bytes)', 'sni_max_client_hello_bytes', sni?.max_client_hello_bytes ?? '', { type: 'number', min: 1, max: 1048576, placeholder: '65536', help: '1–1,048,576; routes sharing a listener need identical limits.' }),
       field('ClientHello timeout (ms)', 'sni_hello_timeout_ms', sni?.hello_timeout_ms ?? '', { type: 'number', min: 1, max: 30000, placeholder: '3000', help: '1–30,000 ms to receive the ClientHello.' }),
     ] }),
+    countryPolicySection(route),
     section({ title: 'Inbound mutual TLS', configured: Boolean(inboundTls), note: 'Terminate TLS on this TCP listener and require a client certificate with an exact allowed SPIFFE URI SAN before connecting upstream. Configure server certificate and trust files by absolute path; do not paste PEM or private keys. Cannot be combined with SNI passthrough.', fields: [
       span2(field('Require inbound client certificate', 'inbound_tls_enabled', Boolean(inboundTls), { checkbox: true, toggles: 'inbound_tls', help: 'Enables TLS termination and client-certificate verification on this dedicated listener. Empty or disabled preserves TCP passthrough. Disable and save an active route before removing inbound mTLS from its listener.' })),
       field('Server certificate file', 'inbound_tls_cert_file', inboundTls?.cert_file ?? '', { group: 'inbound_tls', placeholder: '/etc/hangang/server.crt', help: 'Absolute path to the public server certificate file.' }),
@@ -2113,6 +2167,7 @@ function applyGroupToggles(form) {
   }
   updateResourcePolicyControls(form);
   updateLanguagePolicyControls(form);
+  updateCountryPolicyControls(form);
   updateJwtControls(form);
 }
 
@@ -2296,6 +2351,7 @@ function routeFromForm() {
   if (type === 'http' && route.language_policy !== undefined && route.language_policy !== null) {
     validateLanguagePolicy(route.language_policy);
   }
+  if (route.country_policy !== undefined && route.country_policy !== null) validateCountryPolicy(route.country_policy);
   if (type === 'http' && route.jwt_auth !== undefined && route.jwt_auth !== null &&
       (!isObject(route.jwt_auth) || !isObject(route.jwt_auth.verification) || !isObject(route.jwt_auth.keys))) {
     throw new Error(t('Advanced JWT JSON must contain verification and keys objects'));
@@ -2322,6 +2378,24 @@ function routeFromForm() {
   route.deny_cidrs = lines('deny_cidrs');
   if (route.deny_cidrs.length > 1024) throw new Error(t('At most 1,024 denied CIDRs are allowed'));
   for (const cidr of route.deny_cidrs) if (!/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr)) throw new Error(t('Denied CIDR must be address/prefix: {cidr}', { cidr }));
+
+  const countryAction = raw('country_policy_action');
+  const originalCountry = isObject(state.editing.value.country_policy);
+  if (originalCountry && countryAction === 'none') throw new Error(t('Use Remove country policy to delete an existing policy'));
+  if (countryAction === 'none' || countryAction === 'remove') delete route.country_policy;
+  else if (countryAction === 'configured') {
+    const previous = isObject(route.country_policy) ? route.country_policy : {};
+    const country = {
+      ...previous,
+      allow: lines('country_policy_allow'),
+      deny: lines('country_policy_deny'),
+      on_unknown: raw('country_policy_on_unknown'),
+    };
+    if (!checked('country_policy_enforce')) country.enforce = false;
+    else if (Object.hasOwn(previous, 'enforce')) country.enforce = true;
+    else delete country.enforce;
+    route.country_policy = validateCountryPolicy(country);
+  } else throw new Error(t('Choose a valid country policy action'));
 
   const upstream = isObject(route.upstream) ? route.upstream : {};
   upstream.connect_address = optionalText('connect_address');
@@ -2763,6 +2837,14 @@ function syncRouteControlsFromJson() {
     form.elements['language_policy_deny'].value = Array.isArray(policy?.deny) ? policy.deny.join('\n') : '';
     form.elements['language_policy_on_missing'].value = policy?.on_missing ?? 'deny';
     form.elements['language_policy_enforce'].checked = policy?.enforce !== false;
+  }
+  if (form.elements.country_policy_action && (draft.country_policy === null || draft.country_policy === undefined || isObject(draft.country_policy))) {
+    const policy = isObject(draft.country_policy) ? draft.country_policy : null;
+    form.elements.country_policy_action.value = policy ? 'configured' : 'none';
+    form.elements.country_policy_allow.value = Array.isArray(policy?.allow) ? policy.allow.join('\n') : '';
+    form.elements.country_policy_deny.value = Array.isArray(policy?.deny) ? policy.deny.join('\n') : '';
+    form.elements.country_policy_on_unknown.value = policy?.on_unknown ?? 'deny';
+    form.elements.country_policy_enforce.checked = policy?.enforce !== false;
   }
   if (form.elements['tcp_health_enabled'] && (draft.health === null || draft.health === undefined || isObject(draft.health))) {
     const health = isObject(draft.health) ? draft.health : null;
@@ -3405,6 +3487,7 @@ function showConfigDocument(data) {
   editor.value = JSON.stringify(data, null, 2);
   editor.setAttribute('aria-invalid', 'false');
   showSettings(isObject(data) ? data.settings : undefined);
+  showGeoIpSource(isObject(data) ? data.geoip_database : undefined);
   renderWorkloadListeners(data);
 }
 
@@ -3417,7 +3500,81 @@ function configInput() { state.configDirty = true; $('#config-dirty').hidden = f
 /** A hand-edited document drives the fleet-settings controls (the reverse direction is syncSettingsToDocument). */
 function configEditorInput() {
   configInput();
-  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) { showSettings(value.settings); renderWorkloadListeners(value); } } catch (_) { /* mid-edit; the controls keep their values */ }
+  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) { showSettings(value.settings); showGeoIpSource(value.geoip_database); renderWorkloadListeners(value); } } catch (_) { /* mid-edit; the controls keep their values */ }
+}
+
+function ensureGeoIpPanel() {
+  if ($('#geoip-section')) return;
+  const panel = document.createElement('details'); panel.className = 'form-section'; panel.id = 'geoip-section';
+  const summary = document.createElement('summary'); const title = document.createElement('span'); title.className = 'section-title'; title.id = 'geoip-title'; copy(title, 'GeoIP database source'); summary.append(title);
+  const form = document.createElement('form'); form.id = 'geoip-form'; form.className = 'form-grid'; form.setAttribute('aria-labelledby', 'geoip-title');
+  const note = document.createElement('p'); note.className = 'section-note'; copy(note, 'The path is read separately on each node from a local offline country database. Publishing a path does not prove this instance or other nodes loaded a fresh database. An unavailable or stale source closes enforced country admission. No per-request network lookup is used.'); form.append(note);
+  const add = (label, name, { type = 'text', min, max, help, options } = {}) => {
+    const wrap = document.createElement('div'); wrap.className = 'field';
+    const title = document.createElement('label'); title.htmlFor = `geoip-${name}`; copy(title, label);
+    const control = document.createElement(options ? 'select' : 'input'); control.id = title.htmlFor; control.name = name;
+    if (options) for (const [value, text] of options) { const option = document.createElement('option'); option.value = value; copy(option, text); control.append(option); }
+    else control.type = type;
+    if (min !== undefined) control.min = String(min); if (max !== undefined) control.max = String(max);
+    if (help) { const hint = document.createElement('span'); hint.className = 'field-help-inline'; copy(hint, help); wrap.append(title, control, hint); }
+    else wrap.append(title, control);
+    form.append(wrap); return control;
+  };
+  add('Database action', 'action', { options: [['none', 'No GeoIP source'], ['configured', 'Configure GeoIP source'], ['remove', 'Remove GeoIP source']], help: 'Remove clears the source when the full document is applied. Turn off enforced route country policies first.' });
+  add('Country database file', 'file', { help: 'Absolute normalized file path on every node, such as /var/lib/hangang/GeoIP2-Country.mmdb. Database bytes and license keys are never entered here.' });
+  add('Maximum database bytes', 'max_file_bytes', { type: 'number', min: 1, max: 67108864, help: '1–67,108,864 bytes; default 33,554,432 (32 MiB).' });
+  add('Maximum database age (days)', 'max_age_days', { type: 'number', min: 1, max: 90, help: '1–90 days; default 14. Stale databases close enforced admission.' });
+  add('Reload interval (seconds)', 'reload_interval_seconds', { type: 'number', min: 1, max: 3600, help: '1–3,600 seconds; default 30. Reload verification is local to this instance.' });
+  const result = document.createElement('div'); result.id = 'geoip-message'; result.className = 'inline-message span-2'; result.setAttribute('aria-live', 'polite'); form.append(result);
+  form.addEventListener('submit', (event) => event.preventDefault());
+  form.addEventListener('input', syncGeoIpToDocument); form.addEventListener('change', syncGeoIpToDocument);
+  panel.append(summary, form); $('#settings-section').after(panel);
+}
+
+function updateGeoIpControls() {
+  const form = $('#geoip-form');
+  const configured = form.elements.action.value === 'configured';
+  for (const name of ['file', 'max_file_bytes', 'max_age_days', 'reload_interval_seconds']) form.elements[name].disabled = !configured;
+}
+
+function showGeoIpSource(source) {
+  ensureGeoIpPanel();
+  const form = $('#geoip-form'); const value = isObject(source) ? source : null;
+  form.elements.action.value = value ? 'configured' : 'none';
+  form.elements.file.value = value?.file ?? '';
+  form.elements.max_file_bytes.value = value?.max_file_bytes ?? 33554432;
+  form.elements.max_age_days.value = value?.max_age_days ?? 14;
+  form.elements.reload_interval_seconds.value = value?.reload_interval_seconds ?? 30;
+  updateGeoIpControls(); state.geoipError = null; message($('#geoip-message'));
+}
+
+function geoIpSourceFromForm(form) {
+  const file = form.elements.file.value.trim();
+  if (!validInboundTlsPath(file)) throw new Error(t('GeoIP database file must be an absolute normalized path'));
+  const integer = (name, minimum, maximum) => {
+    const raw = form.elements[name].value.trim(); const number = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(number) || number < minimum || number > maximum)
+      throw new Error(t('{field} must be {minimum}–{maximum}', { field: t(form.elements[name].previousElementSibling?.dataset.appI18n ?? name), minimum: formatNumber(minimum), maximum: formatNumber(maximum) }));
+    return number;
+  };
+  return { file, max_file_bytes: integer('max_file_bytes', 1, 67108864), max_age_days: integer('max_age_days', 1, 90), reload_interval_seconds: integer('reload_interval_seconds', 1, 3600) };
+}
+
+function syncGeoIpToDocument() {
+  const form = $('#geoip-form'); updateGeoIpControls();
+  try {
+    const draft = parseConfigEditor();
+    if (!isObject(draft)) throw new Error(t('the JSON document must be an object'));
+    if (draft.geoip_database !== undefined && draft.geoip_database !== null && !isObject(draft.geoip_database))
+      throw new Error(t('Advanced GeoIP source must be an object or null'));
+    const action = form.elements.action.value;
+    if (isObject(draft.geoip_database) && action === 'none') throw new Error(t('Use Remove GeoIP source to delete an existing source'));
+    if (action === 'configured') draft.geoip_database = geoIpSourceFromForm(form);
+    else if (action === 'remove' || action === 'none') delete draft.geoip_database;
+    else throw new Error(t('Choose a valid GeoIP database action'));
+    $('#config-editor').value = JSON.stringify(draft, null, 2);
+    state.geoipError = null; message($('#geoip-message')); configInput(); updateConfigPreview();
+  } catch (error) { state.geoipError = error.message; message($('#geoip-message'), error.message, 'error'); }
 }
 
 const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path'];
@@ -3520,6 +3677,7 @@ function formatConfig() { try { $('#config-editor').value = JSON.stringify(parse
 async function validateConfig() {
   const button = $('#validate-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
+  if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   setBusy(button, true, t('Validating…'));
   try { const { data } = await api('/v1/config/validate', { method: 'POST', json: value }); message($('#config-message'), t('Valid configuration{revision}.', { revision: data?.revision !== undefined ? t(' for revision {revision}', { revision: data.revision }) : '' }), 'success'); }
   catch (error) { message($('#config-message'), error.message, 'error'); }
@@ -3546,6 +3704,7 @@ function compact(value) { const text = JSON.stringify(value); return text && tex
 async function applyConfig() {
   const button = $('#apply-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
+  if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   if (!state.configEtag) return message($('#config-message'), t('Reload the active configuration before applying changes.'), 'error');
   updateConfigPreview(); setBusy(button, true, t('Applying…'));
   try {
