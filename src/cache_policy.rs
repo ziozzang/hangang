@@ -468,6 +468,16 @@ mod tests {
             !route_eligible(&route),
             "defensive eligibility rejects an invalid unprotected resource policy"
         );
+        route.resource_policy = None;
+        route.workload_auth = Some(crate::workload_auth::Policy {
+            listener_ids: vec!["edge".into()],
+            allowed_uri_sans: vec!["spiffe://example.org/ns/test/sa/client".into()],
+            identity_header: None,
+        });
+        assert!(
+            !route_eligible(&route),
+            "a workload route never reads or writes the shared response cache"
+        );
     }
 
     #[test]
