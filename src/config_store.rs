@@ -124,6 +124,31 @@ pub struct SequencedReceiptObservation {
     pub writes_available: bool,
 }
 
+/// A stable prefix of one authority's sequenced receipts. New receipts may
+/// advance the live high-water mark without changing this export boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SequencedReceiptSnapshot {
+    pub high_water: u64,
+    /// Changes on future explicit retention, never on ordinary append.
+    pub retention_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SequencedReceiptPage {
+    pub receipts: Vec<SequencedCommitReceipt>,
+    pub snapshot: SequencedReceiptSnapshot,
+    pub next_after: u64,
+    pub has_more: bool,
+}
+
+/// A valid export cursor became stale because retained history changed or
+/// the authority high-water mark moved backwards (for example, a restore).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum SequencedReceiptPageResult {
+    Page(SequencedReceiptPage),
+    SnapshotChanged,
+}
+
 /// Why a store operation failed. Callers use the distinction for readiness
 /// policy: a transport failure leaves the local snapshot valid, invalid
 /// content does not, and an indeterminate mutation must be re-read.
@@ -279,6 +304,17 @@ pub trait ConfigStore: Send + Sync {
     ) -> StoreResult<SequencedReceiptObservation> {
         Err(StoreError::Invalid(anyhow!(
             "sequenced commit receipts are unsupported by this store"
+        )))
+    }
+    async fn list_commit_receipts_v2(
+        &self,
+        _authority_id: &str,
+        _after_seq: u64,
+        _snapshot: Option<SequencedReceiptSnapshot>,
+        _limit: usize,
+    ) -> StoreResult<SequencedReceiptPageResult> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced receipt export is unsupported by this store"
         )))
     }
     /// ACME HTTP-01 sharing: every instance behind a load balancer can answer
