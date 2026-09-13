@@ -1016,6 +1016,17 @@ impl Proxy {
         }) {
             return Ok(response(403, "resource namespace refused"));
         }
+        if workload_evidence.is_some() && runtime.workload_auth.is_none() {
+            // A dedicated workload listener never exposes ordinary public or
+            // legacy routes merely because the client has a valid certificate.
+            self.metrics
+                .workload_auth_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(response(
+                403,
+                "route is not bound to this workload listener",
+            ));
+        }
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.chars().take(128).collect());
         }
