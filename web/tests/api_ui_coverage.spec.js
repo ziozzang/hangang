@@ -54,6 +54,8 @@ const coverage = new Map([
   ['POST /v1/users', ['#create-user-form', 'app', "api('/v1/users', { method: 'POST'"]],
   ['PUT /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
   ['DELETE /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
+  ['GET /v1/audit/users', ['#view-audit', 'app', '/v1/audit/users?after=']],
+  ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
 ]);
 
 test('every OpenAPI operation has a concrete console surface and caller', async ({ page }) => {

@@ -39,6 +39,7 @@
 <a class="nav-link" data-admin-only="" data-view="security" href="#security"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z M8 12l3 3 5-6"></path></svg></span><bdi data-i18n="Security">Security</bdi></a><a class="nav-link" data-admin-only="" data-view="certificates" href="#certificates"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M7 11V8a5 5 0 0 1 10 0v3 M5 11h14v10H5z M12 15v3"></path></svg></span><bdi data-i18n="Certificates">Certificates</bdi></a>
 <p class="nav-group-label" data-admin-only="" data-i18n="MANAGE">MANAGE</p><a class="nav-link" data-admin-only="" data-view="config" href="#config"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 5h14 M5 12h14 M5 19h14 M9 2v6 M15 9v6 M9 16v6"></path></svg></span><bdi data-i18n="Configuration">Configuration</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="users" href="#users"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-3c0-6 14-6 14 0v3 M17 4c5 0 5 7 0 7 M19 14c3 1 3 4 3 7"></path></svg></span><bdi data-i18n="Users">Users</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="audit" href="#audit"><span aria-hidden="true">≡</span><bdi data-i18n="Account audit">Account audit</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="utilities" href="#utilities"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M14 4a6 6 0 0 0-7 7L3 15l6 6 4-4a6 6 0 0 0 7-7l-4 3-4-4z"></path></svg></span><bdi data-i18n="Utilities">Utilities</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="docs" href="#docs"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"></path></svg></span><bdi data-i18n="API reference">API reference</bdi></a>
 </nav>
@@ -289,6 +290,16 @@
 <div class="inline-message" id="users-message" role="status"></div>
 </div>
 <div aria-live="polite" class="user-list" id="user-list"></div>
+</section>
+<section aria-labelledby="audit-title" class="view" hidden="" id="view-audit">
+<div class="page-head"><div><p class="eyebrow" data-i18n="Instance audit">Instance audit</p><h1 data-i18n="Account audit" id="audit-title">Account audit</h1><p data-i18n="Durable successful account changes on this instance only.">Durable successful account changes on this instance only.</p></div><button class="button button-secondary" data-i18n="Refresh" id="audit-refresh" type="button">Refresh</button></div>
+<p class="operations-caution" data-i18n="Coverage: bootstrap, create, update, delete and prune. Login, logout, rejected attempts, configuration, Docker, cache, updates and other instances are not covered.">Coverage: bootstrap, create, update, delete and prune. Login, logout, rejected attempts, configuration, Docker, cache, updates and other instances are not covered.</p>
+<div class="inline-message" id="audit-message" role="status" aria-live="polite"></div>
+<div class="panel audit-panel">
+<div class="section-heading"><div><h2 data-i18n="Stored account events">Stored account events</h2><p id="audit-meta"></p></div><div class="button-row"><button class="button button-secondary" data-i18n="Export current page JSON" disabled="" id="audit-export" type="button">Export current page JSON</button><button class="button button-danger" data-i18n="Prune through this page" disabled="" id="audit-prune" type="button">Prune through this page</button></div></div>
+<div class="audit-table-wrap"><table class="audit-table"><thead><tr><th data-i18n="Sequence">Sequence</th><th data-i18n="Time">Time</th><th data-i18n="Action">Action</th><th data-i18n="Actor">Actor</th><th data-i18n="Target">Target</th><th data-i18n="Change">Change</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
+<div class="audit-pagination"><span id="audit-page-state"></span><button class="button button-secondary" data-i18n="Previous" disabled="" id="audit-previous" type="button">Previous</button><button class="button button-secondary" data-i18n="Next" disabled="" id="audit-next" type="button">Next</button></div>
+</div>
 </section>
 </main>
 </div>

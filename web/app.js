@@ -68,6 +68,7 @@ const state = {
   openapi: null,
   lastStatus: null,
   lastUpdateStatus: null,
+  audit: { page: null, after: 0, previous: [], sequence: 0, error: null, notice: null },
 };
 
 /** Tag generated copy so a locale change can update it without rebuilding editable controls. */
@@ -101,6 +102,7 @@ function refreshAppCopy() {
   if (state.openapi) renderDocs(state.openapi);
   refreshOperationsCopy();
   refreshDockerCopy();
+  if (state.audit.page || state.audit.error) renderAudit();
   if ($('#route-dialog').open && $('#route-form').dataset.invalidNative) {
     try { routeFromForm(); delete $('#route-form').dataset.invalidNative; message($('#route-message')); }
     catch (error) { $('#route-form').dataset.invalidNative = error.message; message($('#route-message'), error.message, 'error'); }
@@ -363,6 +365,7 @@ function scrubRenderedData() {
   resetConsole();
   resetOperations();
   resetDockerPanel();
+  resetAudit();
   destroyLuaEditors();
   for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog']) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
   state.editing = null;
@@ -514,7 +517,7 @@ async function login(event) {
 
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
-  return ['status', 'http', 'tcp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
+  return ['status', 'http', 'tcp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 
 async function switchView() {
@@ -524,6 +527,7 @@ async function switchView() {
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
   state.view = name;
+  if (name !== 'audit') state.audit.sequence += 1;
   $$('.view').forEach((view) => {
     const active = view.id === `view-${name}`;
     view.hidden = !active;
@@ -549,6 +553,7 @@ async function loadView(name, quiet = false) {
       startWorkloadMaterialPolling();
     }
     if (name === 'users' && isAdmin()) await loadUsers();
+    if (name === 'audit' && isAdmin()) await loadAudit(0, []);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'security' && isAdmin()) { const latest = await api('/v1/config'); renderSecurity(latest.data); }
@@ -721,7 +726,10 @@ async function verifySession() {
     if (isAdmin() && data.user.role !== 'admin') return logout(t('Your session is no longer authorized.'));
     state.user = data.user;
     updateAccess();
-    if (!isAdmin() && state.view !== 'status') location.hash = '#status';
+    if (!isAdmin()) {
+      resetAudit();
+      if (state.view !== 'status') location.hash = '#status';
+    }
     message(result, t('Session valid: {username} · {role}', { username: data.user.username, role: t(data.user.role) }), 'success');
   } catch (error) {
     if (error instanceof StaleSessionError) return;
@@ -3511,6 +3519,147 @@ async function loadUsers() {
   if (!list.childElementCount) list.append(emptyNode('No users', 'Create an account above.'));
 }
 
+function resetAudit() {
+  state.audit.sequence += 1;
+  state.audit.page = null;
+  state.audit.after = 0;
+  state.audit.previous = [];
+  state.audit.error = null;
+  state.audit.notice = null;
+  $('#audit-rows').replaceChildren();
+  $('#audit-meta').textContent = '';
+  $('#audit-page-state').textContent = '';
+  message($('#audit-message'));
+  for (const id of ['audit-export', 'audit-prune', 'audit-previous', 'audit-next']) $(`#${id}`).disabled = true;
+}
+
+function auditDate(unixMs) {
+  if (!Number.isSafeInteger(unixMs) || unixMs < 0 || !Number.isFinite(new Date(unixMs).getTime())) return t('Unknown');
+  return new Intl.DateTimeFormat(getLocale() === 'ko' ? 'ko-KR' : 'en-US', {
+    year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short',
+  }).format(new Date(unixMs));
+}
+
+function auditActor(record) {
+  if (record.actor_kind === 'system') return t('System authority');
+  return Number.isSafeInteger(record.actor_user_id) ? t('Account #{id}', { id: record.actor_user_id }) : t('Unknown actor');
+}
+
+function auditChange(record) {
+  const parts = [];
+  if (record.before) parts.push(t('Before: {role}, {state}', { role: t(record.before.role), state: record.before.enabled ? t('enabled') : t('disabled') }));
+  if (record.after) parts.push(t('After: {role}, {state}', { role: t(record.after.role), state: record.after.enabled ? t('enabled') : t('disabled') }));
+  if (record.password_changed) parts.push(t('Password changed'));
+  if (Number.isSafeInteger(record.affected_count)) parts.push(t('{count} records pruned', { count: formatNumber(record.affected_count) }));
+  if (Number.isSafeInteger(record.through_id)) parts.push(t('Through #{id}', { id: record.through_id }));
+  return parts.join(' · ') || t('No role or enabled-state change');
+}
+
+function renderAudit() {
+  const audit = state.audit;
+  const page = audit.page;
+  const rows = $('#audit-rows'); rows.replaceChildren();
+  if (!page) {
+    $('#audit-meta').textContent = audit.error ? t('Audit unavailable; no history is shown.') : '';
+    $('#audit-page-state').textContent = '';
+    if (audit.error) message($('#audit-message'), audit.error, 'error');
+  } else {
+    message($('#audit-message'));
+    const scope = page.scope === 'instance' ? t('This instance only') : t('Unknown scope');
+    const coverage = Array.isArray(page.coverage) ? page.coverage.join(', ') : t('Unknown');
+    $('#audit-meta').textContent = t('{scope} · Covers: {coverage} · Audit began: {started} · Stored: {stored}/{capacity} · Server observed: {observed} · Writes: {writes}', {
+      scope, coverage, stored: formatNumber(page.stored_records), capacity: formatNumber(page.capacity),
+      started: auditDate(page.started_at_unix_ms), observed: auditDate(page.server_time_unix_ms), writes: page.writes_available ? t('available') : t('blocked'),
+    });
+    const notices = [];
+    if (audit.notice) notices.push(audit.notice);
+    if (page.truncated || page.pruned_through > 0) notices.push(t('Earlier records were pruned; this page is not the complete history.'));
+    if (!page.writes_available) notices.push(t('Account changes are blocked while audit storage is full or unavailable. Export needed records before pruning.'));
+    if (notices.length) message($('#audit-message'), notices.join(' '), page.writes_available && !audit.notice ? 'warning' : 'error');
+    for (const record of page.records) {
+      const tr = document.createElement('tr');
+      const values = [record.id, auditDate(record.time_unix_ms), t(`Audit ${record.action}`), auditActor(record),
+        Number.isSafeInteger(record.target_user_id) ? `#${record.target_user_id}` : '—', auditChange(record)];
+      for (const value of values) { const td = document.createElement('td'); td.textContent = String(value); tr.append(td); }
+      rows.append(tr);
+    }
+    if (!page.records.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 6; td.className = 'audit-empty'; td.textContent = t('No account audit records on this page.'); tr.append(td); rows.append(tr); }
+    $('#audit-page-state').textContent = t('Page {page} · latest sequence #{latest}', { page: audit.previous.length + 1, latest: page.latest_id });
+  }
+  $('#audit-export').disabled = !page?.records?.length;
+  $('#audit-prune').disabled = !page?.records?.length || !Number.isSafeInteger(page.latest_id);
+  $('#audit-previous').disabled = !audit.previous.length || !page;
+  $('#audit-next').disabled = !page?.has_more || !page.records.length || audit.previous.length >= 63;
+}
+
+async function loadAudit(after = 0, previous = []) {
+  if (!isAdmin() || !state.token) { resetAudit(); return; }
+  const sequence = ++state.audit.sequence;
+  state.audit.page = null;
+  state.audit.error = null;
+  state.audit.notice = null;
+  renderAudit();
+  try {
+    const { data } = await api(`/v1/audit/users?after=${after}&limit=100`);
+    if (sequence !== state.audit.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
+      !['bootstrap', 'create', 'update', 'delete', 'prune'].every((action) => data.coverage.includes(action)) ||
+      !Array.isArray(data.records) || data.records.length > 100 ||
+      !Number.isSafeInteger(data.latest_id) || !Number.isSafeInteger(data.next_after) ||
+      !Number.isSafeInteger(data.stored_records) || !Number.isSafeInteger(data.capacity) ||
+      !Number.isSafeInteger(data.started_at_unix_ms) || !Number.isSafeInteger(data.server_time_unix_ms) || typeof data.writes_available !== 'boolean' ||
+      typeof data.has_more !== 'boolean' ||
+      data.records.some((record, index) => !isObject(record) || !Number.isSafeInteger(record.id) || record.id <= (index ? data.records[index - 1].id : after)))
+      throw new Error(t('Account audit response is invalid.'));
+    state.audit.page = data;
+    state.audit.after = after;
+    state.audit.previous = previous;
+    renderAudit();
+  } catch (error) {
+    if (sequence !== state.audit.sequence) return;
+    if (error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    state.audit.error = error.message;
+    renderAudit();
+  }
+}
+
+function exportAuditPage() {
+  const page = state.audit.page;
+  if (!isAdmin() || !page?.records?.length) return;
+  const exportDocument = { scope: 'instance', coverage: page.coverage, exported_page_after: state.audit.after,
+    started_at_unix_ms: page.started_at_unix_ms, oldest_id: page.oldest_id, latest_id_at_read: page.latest_id,
+    pruned_through: page.pruned_through, truncated: page.truncated, has_more: page.has_more,
+    server_time_unix_ms: page.server_time_unix_ms, records: page.records };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(exportDocument, null, 2)], { type: 'application/json' }));
+  try {
+    const link = window.document.createElement('a');
+    link.href = url; link.download = `hangang-account-audit-page-${state.audit.after}.json`;
+    window.document.body.append(link); link.click(); link.remove();
+  } finally { setTimeout(() => URL.revokeObjectURL(url), 1000); }
+}
+
+async function pruneAuditPage() {
+  const page = state.audit.page;
+  if (!isAdmin() || !page?.records?.length) return;
+  const throughId = page.records.at(-1).id;
+  const expectedLatest = page.latest_id;
+  const sequence = state.audit.sequence;
+  const accepted = await confirmDialog({ title: t('Permanently prune account audit records?'),
+    body: t('Archive all records through #{id} first, including earlier pages. They will be permanently removed on this instance. A retained prune event records the action. This does not affect other instances.', { id: throughId }),
+    accept: t('Permanently prune') });
+  if (!accepted || sequence !== state.audit.sequence || page !== state.audit.page || !isAdmin() || !state.token) return;
+  const button = $('#audit-prune'); setBusy(button, true, t('Pruning…'));
+  try {
+    await api('/v1/audit/users/prune', { method: 'POST', json: { through_id: throughId, expected_latest_id: expectedLatest } });
+    await loadAudit(0, []);
+  } catch (error) {
+    if (error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    state.audit.notice = error.status === 409 ? t('Audit changed; refresh before deciding whether to prune. No automatic retry was made.') : error.message;
+  } finally { setBusy(button, false); renderAudit(); }
+}
+
 async function createUser(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -3576,6 +3725,20 @@ $('#utility-hash-form').addEventListener('submit', generateUtilityCredential);
 $('#utility-copy-credential').addEventListener('click', copyUtilityCredential);
 $('#verify-session').addEventListener('click', verifySession);
 $('#refresh-users').addEventListener('click', () => loadUsers().catch((error) => message($('#users-message'), error.message, 'error')));
+$('#audit-refresh').addEventListener('click', () => loadAudit(0, []));
+$('#audit-previous').addEventListener('click', () => {
+  const previous = state.audit.previous.slice();
+  if (!previous.length) return;
+  const after = previous.pop();
+  loadAudit(after, previous);
+});
+$('#audit-next').addEventListener('click', () => {
+  const page = state.audit.page;
+  if (!page?.has_more || !page.records.length || state.audit.previous.length >= 63) return;
+  loadAudit(page.next_after, [...state.audit.previous, state.audit.after]);
+});
+$('#audit-export').addEventListener('click', exportAuditPage);
+$('#audit-prune').addEventListener('click', pruneAuditPage);
 $('#toggle-token').addEventListener('click', () => { const input = $('#token-input'); input.type = input.type === 'password' ? 'text' : 'password'; refreshTokenToggle(); });
 $('#logout-button').addEventListener('click', () => logout());
 $('#refresh-security').addEventListener('click', () => loadView('security'));
