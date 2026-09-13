@@ -156,7 +156,10 @@ impl Prepared {
             let crls = rustls_pemfile::crls(&mut Cursor::new(bytes))
                 .collect::<std::io::Result<Vec<CertificateRevocationListDer<'static>>>>()
                 .context("invalid mTLS client CRL PEM")?;
-            ensure!(!crls.is_empty(), "mTLS client CRL file is empty");
+            ensure!(
+                !crls.is_empty() && crls.len() <= 16,
+                "mTLS client CRL file must contain 1..=16 lists"
+            );
             for crl in &crls {
                 let (remaining, parsed) = x509_parser::parse_x509_crl(crl.as_ref())
                     .map_err(|_| anyhow!("invalid mTLS client CRL"))?;
@@ -167,6 +170,12 @@ impl Prepared {
                     .timestamp();
                 let next_update =
                     u64::try_from(next_update).context("mTLS client CRL has invalid nextUpdate")?;
+                let this_update = u64::try_from(parsed.last_update().timestamp())
+                    .context("mTLS client CRL has invalid thisUpdate")?;
+                ensure!(
+                    this_update <= now && this_update < next_update,
+                    "mTLS client CRL is not currently valid"
+                );
                 ensure!(next_update > now, "mTLS client CRL has expired");
                 crl_expires_at =
                     Some(crl_expires_at.map_or(next_update, |old: u64| old.min(next_update)));
@@ -531,5 +540,166 @@ mod tests {
         .unwrap();
         std::fs::write(&crl_path, expired.pem().unwrap()).unwrap();
         assert!(Prepared::load(&policy).is_err());
+        let future = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2100, 1, 1),
+            next_update: rcgen::date_time_ymd(2101, 1, 1),
+            crl_number: 2u64.into(),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
+        std::fs::write(&crl_path, future.pem().unwrap()).unwrap();
+        assert!(Prepared::load(&policy).is_err());
+    }
+
+    fn handshake_fixture() -> (
+        tempfile::TempDir,
+        Policy,
+        tokio_rustls::TlsConnector,
+        String,
+    ) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = rcgen::generate_simple_self_signed(vec!["server.example.org".into()]).unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let mut client_params = CertificateParams::default();
+        client_params.serial_number = Some(42u64.into());
+        client_params.subject_alt_names = vec![SanType::URI(ID.try_into().unwrap())];
+        client_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = KeyPair::generate().unwrap();
+        let client = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        let mut crl_params = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(2035, 1, 1),
+            crl_number: 1u64.into(),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let valid_crl = crl_params.signed_by(&issuer).unwrap();
+        crl_params.revoked_certs.push(rcgen::RevokedCertParams {
+            serial_number: 42u64.into(),
+            revocation_time: rcgen::date_time_ymd(2021, 1, 1),
+            reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        });
+        crl_params.crl_number = 2u64.into();
+        let revoked_crl = crl_params.signed_by(&issuer).unwrap();
+
+        std::fs::write(dir.path().join("server.pem"), server.cert.pem()).unwrap();
+        std::fs::write(
+            dir.path().join("server.key"),
+            server.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(dir.path().join("ca.crl"), valid_crl.pem().unwrap()).unwrap();
+        let policy = Policy {
+            cert_file: dir.path().join("server.pem"),
+            key_file: dir.path().join("server.key"),
+            client_ca_file: dir.path().join("ca.pem"),
+            client_crl_file: Some(dir.path().join("ca.crl")),
+            allowed_uri_sans: vec![ID.to_owned()],
+            handshake_timeout_ms: 5_000,
+        };
+
+        let mut roots = RootCertStore::empty();
+        roots.add(server.cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![client.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
+        )
+        .unwrap();
+        (
+            dir,
+            policy,
+            tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            revoked_crl.pem().unwrap(),
+        )
+    }
+
+    async fn duplex_handshake(
+        prepared: &Prepared,
+        connector: &tokio_rustls::TlsConnector,
+    ) -> Result<Identity> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(prepared.server_config.clone());
+        let server_task = async {
+            let stream = acceptor.accept(server).await?;
+            let certs = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .context("rustls accepted a peer without certificates")?;
+            prepared.authorize_peer(certs)
+        };
+        let client_task = connector.connect(
+            rustls::pki_types::ServerName::try_from("server.example.org").unwrap(),
+            client,
+        );
+        let (server_result, _client_result) = tokio::join!(server_task, client_task);
+        server_result
+    }
+
+    #[tokio::test]
+    async fn real_tls_handshake_accepts_unrevoked_and_rejects_revoked_client() {
+        let (_dir, policy, connector, revoked_crl) = handshake_fixture();
+        let allowed = Prepared::load(&policy).unwrap();
+        let identity = duplex_handshake(&allowed, &connector).await.unwrap();
+        assert_eq!(identity.uri, ID);
+
+        // Reuse the very same client connector. A renewed server generation
+        // that revokes this certificate must not be bypassed by resumption.
+        std::fs::write(policy.client_crl_file.as_ref().unwrap(), revoked_crl).unwrap();
+        let revoked = Prepared::load(&policy).unwrap();
+        assert_ne!(allowed.fingerprint(), revoked.fingerprint());
+        assert!(duplex_handshake(&revoked, &connector).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn crl_from_another_ca_never_authorizes_peer() {
+        let (_dir, policy, connector, _) = handshake_fixture();
+        let mut other_ca = CertificateParams::default();
+        other_ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        other_ca.key_usages = vec![rcgen::KeyUsagePurpose::CrlSign];
+        let other_key = KeyPair::generate().unwrap();
+        let other_issuer = rcgen::Issuer::from_params(&other_ca, &other_key);
+        let unrelated_crl = rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(2035, 1, 1),
+            crl_number: 1u64.into(),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&other_issuer)
+        .unwrap();
+        std::fs::write(
+            policy.client_crl_file.as_ref().unwrap(),
+            unrelated_crl.pem().unwrap(),
+        )
+        .unwrap();
+        if let Ok(prepared) = Prepared::load(&policy) {
+            assert!(duplex_handshake(&prepared, &connector).await.is_err());
+        }
     }
 }
