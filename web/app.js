@@ -1494,6 +1494,56 @@ function backendFields(type, route) {
   return editor;
 }
 
+let resourceRuleSequence = 0;
+function resourceRuleRow(rule = {}) {
+  if (!isObject(rule)) rule = {};
+  const row = document.createElement('div'); row.className = 'resource-rule-row';
+  const number = ++resourceRuleSequence;
+  const subjects = field('Allowed subjects', `resource_subjects_${number}`, Array.isArray(rule.subjects) ? rule.subjects.join('\n') : '', { textarea: true, help: 'Exact principal subjects, one per line (1–32). No wildcard or whitespace trimming.' });
+  const methods = field('Allowed methods', `resource_methods_${number}`, Array.isArray(rule.methods) ? rule.methods.join('\n') : '', { textarea: true, help: 'Uppercase HTTP methods, one per line (1–16), or * alone for every method.' });
+  subjects.querySelector('textarea').classList.add('resource-rule-subjects');
+  methods.querySelector('textarea').classList.add('resource-rule-methods');
+  const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet resource-rule-remove'; copy(remove, 'Remove allow rule');
+  remove.addEventListener('click', () => { row.remove(); syncRouteJsonFromForm(); });
+  row.append(subjects, methods, remove);
+  return row;
+}
+
+function updateResourcePolicyControls(form) {
+  const action = form.elements['resource_policy_action'];
+  if (!action) return;
+  const configured = action.value === 'configured';
+  const section = action.closest('details');
+  section?.querySelector('.resource-rule-editor')?.toggleAttribute('hidden', !configured);
+  for (const control of section?.querySelectorAll('[data-group="resource_policy"]') || []) control.disabled = !configured;
+}
+
+function resourcePolicySection(route) {
+  const policy = isObject(route.resource_policy) ? route.resource_policy : null;
+  const principal = isObject(policy?.principal) ? policy.principal : {};
+  const action = field('Resource policy action', 'resource_policy_action', policy ? 'configured' : 'none', {
+    select: [['none', 'No resource policy'], ['configured', 'Configure resource policy'], ['remove', 'Remove resource policy']],
+    help: 'To remove an enforced policy, first save it with enforcement off. Reopen the route and remove it in a second revision. A disabled route retains this guard.',
+  });
+  const rules = document.createElement('div'); rules.className = 'resource-rule-editor span-2';
+  const note = document.createElement('p'); note.className = 'field-help-inline'; copy(note, 'Allow rules match exact subjects and HTTP methods. An empty list denies every request while enforced. The resource ID and authenticator must agree across routes sharing this ID.');
+  const list = document.createElement('div'); list.className = 'resource-rule-list';
+  if (Array.isArray(policy?.allow)) list.append(...policy.allow.slice(0, 33).map(resourceRuleRow));
+  const add = document.createElement('button'); add.type = 'button'; add.className = 'button button-quiet resource-rule-add'; copy(add, 'Add allow rule');
+  add.addEventListener('click', () => { list.append(resourceRuleRow()); syncRouteJsonFromForm(); });
+  rules.append(note, list, add);
+  action.querySelector('select').addEventListener('change', () => updateResourcePolicyControls($('#route-form')));
+  return section({ title: 'Resource authorization', configured: Boolean(policy),
+    note: 'Protect one resource namespace using a Basic username or one copied external identity header. Matching is exact and deny-by-default. Moving an enforced host/path scope requires preserving its old scope or first saving enforcement Off. This is an instance route policy, not device identity or a fleet authorization result.', fields: [
+      span2(action),
+      field('Resource ID', 'resource_policy_id', policy?.resource_id ?? '', { group: 'resource_policy', maxlength: 128, help: 'Opaque ASCII ID, 1–128 characters. Routes sharing it must keep the same policy and authenticator.' }),
+      field('Enforce resource policy', 'resource_policy_enforce', policy?.enforce !== false, { group: 'resource_policy', checkbox: true, help: 'Off keeps the policy configured without namespace or subject enforcement; gateway authentication still runs. Save Off before removing a previously enforced policy.' }),
+      field('Principal source', 'resource_policy_source', principal.source ?? 'basic', { group: 'resource_policy', select: [['basic', 'Basic username'], ['external', 'External identity header']], help: 'Requires Protected access and the matching gateway authenticator.' }),
+      field('External subject header', 'resource_policy_subject_header', principal.subject_header ?? '', { group: 'resource_policy', maxlength: 128, placeholder: 'x-forwarded-user', help: 'For External only: exact header copied from a successful authorization response onto the upstream request. It must be configured in Identity response headers.' }),
+      rules,
+    ] });
+}
+
 function upstreamSection(type, route) {
   const upstream = isObject(route.upstream) ? route.upstream : {};
   const socks = isObject(upstream.socks5) ? upstream.socks5 : {};
@@ -1650,6 +1700,7 @@ function httpSections(route) {
       field('Identity header', 'basic_auth_identity_header', basic?.identity_header || '', { placeholder: 'x-authenticated-user', help: 'Optional request header set to the authenticated username for the upstream.' }),
       span2(field('Hide credentials from the upstream', 'basic_auth_hide_credentials', Boolean(basic?.hide_credentials), { checkbox: true, help: 'Removes the Authorization header before forwarding.' })),
     ] }),
+    resourcePolicySection(route),
     section({ title: 'Response headers', configured: Boolean(Object.keys(route.response_set_headers || {}).length || (route.response_remove_headers || []).length), note: 'Streaming-safe header edits applied to every upstream response head; framing and hop-by-hop names are rejected.', fields: [
       field('Set response headers', 'response_set_headers', pairsToLines(route.response_set_headers), { textarea: true, help: 'One name: value per line; replaces an existing header of the same name.' }),
       field('Remove response headers', 'response_remove_headers', (route.response_remove_headers || []).join('\n'), { textarea: true, help: 'One header name per line, for example server.' }),
@@ -1806,6 +1857,7 @@ function applyGroupToggles(form) {
       luaEditors.get(control)?.editor.setDisabled(control.disabled);
     }
   }
+  updateResourcePolicyControls(form);
 }
 
 function nonemptyLines(value) { return value.split('\n').map((v) => v.trim()).filter(Boolean); }
@@ -1866,6 +1918,18 @@ function routeFromForm() {
     const advanced = JSON.parse($('#route-json').value);
     if (isObject(advanced)) route = advanced;
   } catch (_) { /* native fields can repair the generated JSON */ }
+  if (type === 'http' && route.resource_policy !== undefined && route.resource_policy !== null) {
+    const policy = route.resource_policy;
+    if (!isObject(policy) || typeof policy.resource_id !== 'string' || (policy.enforce !== undefined && typeof policy.enforce !== 'boolean')
+      || !isObject(policy.principal) || typeof policy.principal.source !== 'string' || !Array.isArray(policy.allow)
+      || policy.allow.length > 32
+      || !policy.allow.every((rule) => isObject(rule) && Array.isArray(rule.subjects) && rule.subjects.length <= 32
+        && rule.subjects.every((value) => typeof value === 'string' && value.length <= 255)
+        && Array.isArray(rule.methods) && rule.methods.length <= 16
+        && rule.methods.every((value) => typeof value === 'string' && value.length <= 32))) {
+      throw new Error(t('Advanced resource policy JSON must contain an ID, principal and allow-rule arrays'));
+    }
+  }
   const raw = (name) => form.elements[name].value;
   const text = (name) => raw(name).trim();
   const optionalText = (name) => text(name) || null;
@@ -2034,6 +2098,65 @@ function routeFromForm() {
       throw new Error(t('{mode} access cannot configure gateway Basic or external authorization', { mode: t(accessMode) }));
     }
 
+    const policyAction = raw('resource_policy_action');
+    const originalPolicy = isObject(state.editing.value.resource_policy) ? state.editing.value.resource_policy : null;
+    if (originalPolicy?.enforce !== false && originalPolicy && policyAction !== 'configured') {
+      throw new Error(t('Save enforcement Off first, then reopen the route to remove its policy'));
+    }
+    if (originalPolicy && policyAction === 'none') throw new Error(t('Use Remove resource policy to delete an existing policy'));
+    if (policyAction === 'none' || policyAction === 'remove') {
+      delete route.resource_policy;
+    } else if (policyAction === 'configured') {
+      if (accessMode !== 'protected') throw new Error(t('Resource authorization requires Protected access'));
+      if (route.auth?.terminal_response === true) throw new Error(t('Resource authorization cannot use terminal external authorization responses'));
+      const resourceId = raw('resource_policy_id');
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(resourceId)) throw new Error(t('Resource ID must be 1–128 ASCII letters, digits, dots, underscores, colons or dashes'));
+      const source = raw('resource_policy_source');
+      const subjectHeader = raw('resource_policy_subject_header');
+      let principal;
+      if (source === 'basic') {
+        if (!route.basic_auth) throw new Error(t('Basic principal source requires Basic authentication'));
+        if (subjectHeader) throw new Error(t('Clear the external subject header when using a Basic principal'));
+        principal = { source: 'basic' };
+      } else if (source === 'external') {
+        if (!route.auth) throw new Error(t('External principal source requires external authorization'));
+        if (!HEADER_NAME.test(subjectHeader) || new TextEncoder().encode(subjectHeader).length > 128) throw new Error(t('External subject header must be a valid header name of at most 128 bytes'));
+        if (!authResponse.some((name) => name.toLowerCase() === subjectHeader.toLowerCase())) throw new Error(t('External subject header must be in Identity response headers'));
+        principal = { source: 'external', subject_header: subjectHeader };
+      } else throw new Error(t('Choose a valid principal source'));
+      const ruleRows = [...form.querySelectorAll('.resource-rule-row')];
+      if (ruleRows.length > 32) throw new Error(t('At most 32 resource allow rules are allowed'));
+      let entries = 0; let textBytes = resourceId.length;
+      const allow = ruleRows.map((row) => {
+        const subjects = row.querySelector('.resource-rule-subjects').value.split('\n').filter((value) => value !== '');
+        const methods = row.querySelector('.resource-rule-methods').value.split('\n').filter((value) => value !== '');
+        if (!subjects.length || subjects.length > 32) throw new Error(t('Each allow rule needs 1–32 subjects'));
+        if (!methods.length || methods.length > 16) throw new Error(t('Each allow rule needs 1–16 methods'));
+        if (new Set(subjects).size !== subjects.length) throw new Error(t('Subjects must be unique within each allow rule'));
+        if (new Set(methods).size !== methods.length) throw new Error(t('Methods must be unique within each allow rule'));
+        for (const subject of subjects) {
+          const bytes = new TextEncoder().encode(subject).length;
+          if (subject !== subject.trim() || /\p{Cc}/u.test(subject) || bytes < 1 || bytes > 255) throw new Error(t('Subjects must be exact 1–255 byte UTF-8 strings without surrounding whitespace or controls'));
+          if (source === 'external' && subject.includes(',')) throw new Error(t('External subjects cannot contain commas'));
+          textBytes += bytes;
+        }
+        for (const method of methods) {
+          if (!/^(?:\*|[A-Z0-9-]{1,32})$/.test(method)) throw new Error(t('Methods must be uppercase ASCII tokens of at most 32 characters or * alone'));
+          textBytes += method.length;
+        }
+        if (methods.includes('*') && methods.length !== 1) throw new Error(t('The * method must be the only method in its rule'));
+        entries += subjects.length + methods.length;
+        return { subjects, methods };
+      });
+      if (entries > 512 || textBytes > 32768) throw new Error(t('Resource allow rules exceed the aggregate size limit'));
+      const previous = isObject(route.resource_policy) ? route.resource_policy : {};
+      const policy = { ...previous, resource_id: resourceId, principal, allow };
+      if (!checked('resource_policy_enforce')) policy.enforce = false;
+      else if (Object.hasOwn(previous, 'enforce')) policy.enforce = true;
+      else delete policy.enforce;
+      route.resource_policy = policy;
+    } else throw new Error(t('Choose a valid resource policy action'));
+
     route.response_set_headers = parseHeaderLines(raw('response_set_headers'), 'Response header');
     route.response_remove_headers = headerNames(lines('response_remove_headers'), 'Removed response header');
 
@@ -2117,6 +2240,17 @@ function syncRouteControlsFromJson() {
   if (!isObject(draft)) return;
   syncBackendControlsFromJson(draft);
   const form = $('#route-form');
+  if (form.elements['resource_policy_action'] && (draft.resource_policy === null || draft.resource_policy === undefined || isObject(draft.resource_policy))) {
+    const policy = isObject(draft.resource_policy) ? draft.resource_policy : null;
+    const principal = isObject(policy?.principal) ? policy.principal : {};
+    form.elements['resource_policy_action'].value = policy ? 'configured' : 'none';
+    form.elements['resource_policy_id'].value = policy?.resource_id ?? '';
+    form.elements['resource_policy_enforce'].checked = policy?.enforce !== false;
+    form.elements['resource_policy_source'].value = principal.source ?? 'basic';
+    form.elements['resource_policy_subject_header'].value = principal.subject_header ?? '';
+    const allow = Array.isArray(policy?.allow) ? policy.allow : [];
+    form.querySelector('.resource-rule-list').replaceChildren(...allow.slice(0, 33).map(resourceRuleRow));
+  }
   if (form.elements['tcp_health_enabled'] && (draft.health === null || draft.health === undefined || isObject(draft.health))) {
     const health = isObject(draft.health) ? draft.health : null;
     form.elements['tcp_health_enabled'].checked = Boolean(health);

@@ -196,4 +196,10 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 .backend-member-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(180px, 2fr) minmax(85px, .7fr) minmax(125px, 1fr) auto; align-items: end; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
 .backend-member-row .field { min-width: 0; }
 .backend-member-row .backend-member-remove { align-self: end; }
+.resource-rule-editor { min-width: 0; }
+.resource-rule-editor > .field-help-inline { display: block; margin-bottom: 10px; }
+.resource-rule-list { display: grid; gap: 10px; margin-bottom: 10px; }
+.resource-rule-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
+.resource-rule-row .field { min-width: 0; }
+@media (max-width: 720px) { .resource-rule-row { grid-template-columns: 1fr; } }
 @media (max-width: 900px) { .backend-member-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .backend-member-row .field:nth-child(2) { grid-column: 1 / -1; grid-row: 2; } }
