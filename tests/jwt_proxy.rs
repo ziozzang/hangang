@@ -570,6 +570,60 @@ async fn held_event_origin() -> (SocketAddr, JoinHandle<()>) {
     (address, task)
 }
 
+async fn revocation_origin() -> (SocketAddr, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0u8; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() < 8192);
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                captured.lock().unwrap().push(first_line.clone());
+                if first_line.contains("/events ") {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n7\r\ndata:x\n\r\n").await.unwrap();
+                    std::future::pending::<()>().await;
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin").await.unwrap();
+                }
+            });
+        }
+    });
+    (address, seen, task)
+}
+
+async fn open_held_event(front: SocketAddr, path: &str, bearer: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(front).await.unwrap();
+    stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: jwt.test\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !response.windows(7).any(|part| part == b"data:x\n") {
+            let mut buffer = [0u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "held event closed before the first event");
+            response.extend_from_slice(&buffer[..count]);
+            assert!(response.len() < 8192);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    stream
+}
+
 async fn held_upload_origin() -> (
     SocketAddr,
     tokio::sync::mpsc::UnboundedReceiver<bool>,
@@ -958,4 +1012,107 @@ async fn retiring_one_jwt_route_does_not_close_an_unrelated_http2_stream() {
     gateway.shutdown().await;
     stream_task.abort();
     other_task.abort();
+}
+
+#[tokio::test]
+async fn publishing_jti_revocation_retires_only_its_route_and_can_be_undone() {
+    let (upstream, seen, upstream_task) = revocation_origin().await;
+    let route_a = jwt_route(upstream);
+    let mut route_b = jwt_route(upstream);
+    route_b["id"] = json!("other");
+    route_b["path_prefix"] = json!("/other");
+    route_b["resource_policy"]["resource_id"] = json!("other-data");
+    let gateway = lease_gateway(vec![route_a.clone(), route_b.clone()]).await;
+    let mut payload = claims();
+    payload["jti"] = json!("blocked");
+    let blocked = token(
+        json!({"typ":"at+jwt", "alg":"EdDSA", "kid":"fixture-key"}),
+        payload.clone(),
+    );
+    payload["jti"] = json!("blocked-extra");
+    let different = token(
+        json!({"typ":"at+jwt", "alg":"EdDSA", "kid":"fixture-key"}),
+        payload,
+    );
+    let mut retired_stream = open_held_event(gateway.address, "/secure/events", &blocked).await;
+    let mut same_route_different_token =
+        open_held_event(gateway.address, "/secure/events", &different).await;
+    let mut unaffected_stream = open_held_event(gateway.address, "/other/events", &blocked).await;
+    let mut denied_route = route_a.clone();
+    denied_route["jwt_auth"]["verification"]["revocation"] = json!({"token_ids":["blocked"]});
+    gateway.publish(vec![denied_route, route_b.clone()]);
+    expect_closed(&mut retired_stream, "revoked route's held SSE").await;
+    expect_closed(
+        &mut same_route_different_token,
+        "same route's non-denied held SSE after policy publication",
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), unaffected_stream.read_u8())
+            .await
+            .is_err(),
+        "unrelated route's held SSE was retired"
+    );
+
+    let before_denied = seen.lock().unwrap().len();
+    assert_eq!(
+        request(gateway.address, "/secure/records", Some(&blocked), &[]).await,
+        401
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before_denied,
+        "revoked JTI reached the origin"
+    );
+    assert_eq!(
+        request(gateway.address, "/secure/records", Some(&different), &[]).await,
+        200,
+        "JTI denial must be an exact match"
+    );
+    assert_eq!(
+        request(gateway.address, "/other/records", Some(&blocked), &[]).await,
+        200,
+        "revocation in one route must not affect another route"
+    );
+
+    gateway.publish(vec![route_a, route_b]);
+    assert_eq!(
+        request(gateway.address, "/secure/records", Some(&blocked), &[]).await,
+        200,
+        "removing the deny entry intentionally permits an unexpired token again"
+    );
+    gateway.shutdown().await;
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn issued_before_uses_strict_iat_cutoff_even_with_jwt_leeway() {
+    let (upstream, seen, upstream_task) = origin().await;
+    let cutoff = now() - 10;
+    let mut route = jwt_route(upstream);
+    route["jwt_auth"]["verification"]["leeway_seconds"] = json!(60);
+    route["jwt_auth"]["verification"]["revocation"] = json!({"issued_before":cutoff});
+    let (front, policy, front_task) = gateway(vec![route]).await;
+    let header = json!({"typ":"at+jwt", "alg":"EdDSA", "kid":"fixture-key"});
+    let mut payload = claims();
+    payload["iat"] = json!(cutoff - 1);
+    payload["jti"] = json!("before");
+    let before = token(header.clone(), payload.clone());
+    payload["iat"] = json!(cutoff);
+    payload["jti"] = json!("boundary");
+    let boundary = token(header, payload);
+    assert_eq!(
+        request(front, "/secure/records", Some(&before), &[]).await,
+        401
+    );
+    assert!(seen.lock().unwrap().is_empty(), "old iat reached origin");
+    assert_eq!(
+        request(front, "/secure/records", Some(&boundary), &[]).await,
+        200,
+        "iat equal to issued_before must remain valid"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
 }
