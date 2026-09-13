@@ -2823,3 +2823,50 @@ async fn operations_tcp_member_streams_remain_distinct_from_http_requests() {
         0
     );
 }
+
+#[tokio::test]
+async fn failed_save_keeps_member_gates_open_and_successful_removal_retires_them() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "http":[{"id":"http", "backends":[{"id":"a", "address":"http://127.0.0.1:18001"}]}],
+        "tcp":[{"id":"tcp", "listen":"127.0.0.1:19001", "backends":[{"id":"a", "address":"127.0.0.1:18002"}]}]
+    })).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let (_, manager) = server_on(
+        path.clone(),
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let old = manager.active.load_full();
+    let http = old.http[0].balancer.clone();
+    let http_owner = http.acquire(0).unwrap();
+    let tcp = old.tcp_member_admissions["tcp"][0].clone();
+    let tcp_owner = tcp.lease().unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(manager.apply(Config::default(), 0).await.is_err());
+    assert_eq!(manager.active.load().config.revision, 0);
+    assert!(http.available(0));
+    assert!(tcp.is_open());
+    assert_eq!(tcp.active(), 1);
+    std::fs::remove_dir(&path).unwrap();
+    assert_eq!(
+        manager.apply(Config::default(), 0).await.unwrap().revision,
+        1
+    );
+    assert!(!http.available(0));
+    assert!(http.acquire(0).is_none());
+    assert!(!tcp.is_open());
+    assert!(tcp.lease().is_none());
+    assert_eq!(tcp.active(), 1, "retirement must preserve old ownership");
+    assert_eq!(http.backend_state(0).unwrap().active_requests, Some(1));
+    drop(http_owner);
+    drop(tcp_owner);
+    assert_eq!(tcp.active(), 0);
+    assert_eq!(http.backend_state(0).unwrap().active_requests, Some(0));
+    manager.tcp.shutdown(std::time::Duration::ZERO).await;
+    manager.policy.shutdown().await;
+}

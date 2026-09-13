@@ -1032,7 +1032,14 @@ pub struct HttpRuntime {
     pub response_transform: Option<std::sync::Arc<crate::transform::BodyTransform>>,
     pub basic_auth: Option<crate::basic_auth::Prepared>,
 }
+#[derive(Default)]
+struct PublicationRetirements {
+    http: Vec<crate::balance::BackendRetirement>,
+    tcp: Vec<std::sync::Arc<crate::member_admission::MemberAdmission>>,
+}
+
 pub struct Snapshot {
+    retirements: std::sync::Mutex<PublicationRetirements>,
     pub settings: std::sync::Arc<PreparedSettings>,
     /// Header names used by any declarative HTTP route predicate. Incoming
     /// duplicates for these names are rejected before routing so the selected
@@ -1122,7 +1129,7 @@ fn prepare_http_balancer(
             && snapshot.upstream_trust.get(&route.id) == trust.get(&route.id);
         if old.route.backends == route.backends
             && old.route.balance == route.balance
-            && (!(named || route.balance.active_health.is_some()) || transport_matches)
+            && transport_matches
         {
             return old.balancer.clone();
         }
@@ -1144,9 +1151,57 @@ impl Snapshot {
     pub fn replace(config: Config, previous: &Self) -> anyhow::Result<Self> {
         Self::build(config, Some(previous))
     }
+    /// Reset runtime/cache history while still retiring the replaced generation
+    /// at publication. Used when attaching to a fresh authority epoch.
+    pub fn replace_fresh(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        config.validate_transition_from(&previous.config)?;
+        let mut next = Self::new(config)?;
+        next.retirements = std::sync::Mutex::new(next.retirements_from(previous));
+        Ok(next)
+    }
+
+    fn retirements_from(&self, previous: &Self) -> PublicationRetirements {
+        let mut plan = PublicationRetirements::default();
+        let successors: std::collections::HashMap<_, _> = self
+            .http
+            .iter()
+            .map(|next| (next.route.id.as_str(), next.balancer.as_ref()))
+            .collect();
+        for old in &previous.http {
+            let successor = successors.get(old.route.id.as_str()).copied();
+            plan.http.extend(old.balancer.retirements(successor));
+        }
+        for (route, gates) in &previous.tcp_member_admissions {
+            let successor = self.tcp_member_admissions.get(route);
+            plan.tcp.extend(
+                gates
+                    .iter()
+                    .filter(|old| {
+                        !successor.is_some_and(|gates| {
+                            gates.iter().any(|next| std::sync::Arc::ptr_eq(old, next))
+                        })
+                    })
+                    .cloned(),
+            );
+        }
+        plan
+    }
+
     /// Side effects that belong to publication, not preparation: call once
     /// immediately before this snapshot becomes visible. Idempotent.
     pub fn activated(&self) {
+        // Keep the lock through retirement: concurrent idempotent callers must
+        // not return while another caller is still closing predecessor gates.
+        let mut retirements = self
+            .retirements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for old in retirements.http.drain(..) {
+            old.retire();
+        }
+        for old in retirements.tcp.drain(..) {
+            old.retire();
+        }
         if let (Some(runtime), Some(settings)) = (&self.cache, &self.config.cache) {
             runtime.adopt_generation(settings.generation);
         }
@@ -1362,7 +1417,8 @@ impl Snapshot {
                 },
             )
         };
-        Ok(Self {
+        let mut next = Self {
+            retirements: Default::default(),
             settings,
             http_match_headers,
             sni_regex: regexes.sni,
@@ -1376,7 +1432,11 @@ impl Snapshot {
             tcp_member_activity,
             tcp_member_admissions,
             admissions,
-        })
+        };
+        if let Some(previous) = previous {
+            next.retirements = std::sync::Mutex::new(next.retirements_from(previous));
+        }
+        Ok(next)
     }
 }
 

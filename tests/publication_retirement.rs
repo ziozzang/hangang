@@ -245,3 +245,33 @@ fn draining_member_is_still_rejected_until_lifecycle_publication_is_supported() 
     .unwrap();
     assert!(Snapshot::new(config).is_err());
 }
+
+#[test]
+fn fresh_authority_history_retires_old_gates_without_reusing_cache_or_health() {
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "cache": {},
+        "http":[{"id":"h", "backends":["http://127.0.0.1:18001"]}],
+        "tcp":[{"id":"t", "listen":"127.0.0.1:19001", "backends":["127.0.0.1:18002"]}]
+    }))
+    .unwrap();
+    let old = Snapshot::new(config.clone()).unwrap();
+    let http = old.http[0].balancer.clone();
+    let tcp = old.tcp_member_admissions["t"][0].clone();
+    let candidate = Snapshot::replace_fresh(config.clone(), &old).unwrap();
+    assert!(!Arc::ptr_eq(
+        old.cache.as_ref().unwrap(),
+        candidate.cache.as_ref().unwrap()
+    ));
+    assert!(!Arc::ptr_eq(&http, &candidate.http[0].balancer));
+    assert!(!Arc::ptr_eq(&tcp, &candidate.tcp_member_admissions["t"][0]));
+    drop(candidate);
+    assert!(http.available(0));
+    assert!(tcp.is_open());
+    let next = Snapshot::replace_fresh(config, &old).unwrap();
+    next.activated();
+    next.activated();
+    assert!(!http.available(0));
+    assert!(!tcp.is_open());
+    assert!(next.http[0].balancer.available(0));
+    assert!(next.tcp_member_admissions["t"][0].is_open());
+}

@@ -185,10 +185,8 @@ pub struct Balancer {
 }
 /// An old generation selected for retirement after durable publication.
 /// Constructing or dropping this handle never changes admission state.
-#[allow(dead_code)] // Used by the snapshot publication step that follows this isolated slice.
 pub(crate) struct BackendRetirement(Arc<Node>);
 
-#[allow(dead_code)]
 impl BackendRetirement {
     pub(crate) fn retire(&self) {
         self.0.active.retire();
@@ -337,7 +335,6 @@ impl Balancer {
     /// Collect old nodes absent from the successor by pointer identity. This
     /// is preparation-only: the caller retires them after the publication
     /// boundary, never while validating or building a candidate snapshot.
-    #[allow(dead_code)]
     pub(crate) fn retirements(&self, successor: Option<&Self>) -> Vec<BackendRetirement> {
         self.nodes
             .iter()

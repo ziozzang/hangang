@@ -82,6 +82,7 @@ async fn manager(config: Config, bound: StdTcpListener) -> (Arc<ArcSwap<Snapshot
 async fn publish(manager: &TcpManager, active: &Arc<ArcSwap<Snapshot>>, next: Config) {
     let prepared = manager.prepare(&next).await.unwrap();
     let replacement = Snapshot::replace(next, &active.load_full()).unwrap();
+    replacement.activated();
     active.store(Arc::new(replacement));
     manager.commit(prepared).await;
 }

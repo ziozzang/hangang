@@ -3814,10 +3814,8 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
         basic_auth: Some(hangang::basic_auth::prepare(&basic).unwrap()),
         route: rejected,
     };
-    let snapshot = Snapshot {
-        http: vec![Arc::new(runtime)],
-        ..valid
-    };
+    let mut snapshot = valid;
+    snapshot.http = vec![Arc::new(runtime)];
     let active = Arc::new(ArcSwap::from_pointee(snapshot));
     let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 1));
     let proxy = Proxy::new(active, policy.clone(), Arc::new(Metrics::default()));

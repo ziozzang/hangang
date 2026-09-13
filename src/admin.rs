@@ -459,7 +459,11 @@ impl Manager {
             // belongs to another history and must not be carried over.
             let next = if fresh {
                 let config = config.clone();
-                tokio::task::spawn_blocking(move || Snapshot::new(config).map(Arc::new)).await??
+                let current = current.clone();
+                tokio::task::spawn_blocking(move || {
+                    Snapshot::replace_fresh(config, &current).map(Arc::new)
+                })
+                .await??
             } else {
                 self.prepare_snapshot(config.clone()).await?
             };
