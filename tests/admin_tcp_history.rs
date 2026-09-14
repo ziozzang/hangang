@@ -562,7 +562,7 @@ async fn demoted_administrator_stream_expires_and_clears_ip_bearing_history() {
         )
         .await
         .status(),
-        403,
+        401,
     );
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
