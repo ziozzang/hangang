@@ -1299,7 +1299,7 @@ impl SqliteConfigStore {
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let store = Self { path: path.into() };
         store
-            .with_connection(Access::Read, |_| Ok(()))
+            .with_connection(Access::Read, sqlite_validate_receipt_linkage)
             .await
             .map_err(StoreError::into_inner)?;
         Ok(store)
@@ -2153,6 +2153,36 @@ fn sqlite_receipt_schema_ready(connection: &rusqlite::Connection) -> StoreResult
     if !(0..=100_000).contains(&count) {
         return Err(StoreError::Invalid(anyhow!(
             "invalid receipt release evidence count"
+        )));
+    }
+    Ok(())
+}
+
+/// The expensive physical scan is deliberately restricted to store open,
+/// never the per-request `with_connection` path. It is bounded at capacity+1.
+fn sqlite_validate_receipt_linkage(connection: &mut rusqlite::Connection) -> StoreResult<()> {
+    let (receipts, releases, recorded, inconsistent): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_sequenced_receipts LIMIT 100001)),
+               (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_receipt_releases LIMIT 100001)),
+               (SELECT stored_records FROM hangang_receipt_release_meta WHERE singleton=1),
+               EXISTS(SELECT 1 FROM hangang_sequenced_receipts s
+                 LEFT JOIN hangang_receipt_releases r
+                   ON r.authority_id=s.authority_id AND r.acceptance_seq=s.acceptance_seq
+                 WHERE (s.unresolved_pin=0 AND (r.release_id IS NULL
+                   OR r.operation_id IS NOT s.operation_id OR r.epoch IS NOT s.epoch
+                   OR r.revision IS NOT s.revision
+                   OR r.candidate_sha256 IS NOT s.candidate_sha256))
+                    OR (s.unresolved_pin=1 AND r.release_id IS NOT NULL)
+                 LIMIT 1)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sqlite_error)?;
+    if receipts > 100_000 || releases > 100_000 || recorded != releases || inconsistent != 0 {
+        return Err(StoreError::Invalid(anyhow!(
+            "sequenced receipt pin evidence is inconsistent"
         )));
     }
     Ok(())
@@ -3178,6 +3208,46 @@ impl PostgresConfigStore {
                         .context("migrate PostgreSQL receipt pin schema"),
                 )
             })?;
+        // Bounded scan on connection establishment only, never per request.
+        // A restored unpinned receipt without its release proof is invalid.
+        let validation = postgres_timeout(client.query_one(
+            "SELECT
+               (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_sequenced_receipts LIMIT 100001) s),
+               (SELECT COUNT(*) FROM (SELECT 1 FROM hangang_receipt_releases LIMIT 100001) r),
+               (SELECT stored_records FROM hangang_receipt_release_meta WHERE singleton=1),
+               EXISTS(SELECT 1 FROM hangang_sequenced_receipts s
+                 LEFT JOIN hangang_receipt_releases r
+                   ON r.authority_id=s.authority_id AND r.acceptance_seq=s.acceptance_seq
+                 WHERE (s.unresolved_pin=FALSE AND (r.release_id IS NULL
+                   OR r.operation_id IS DISTINCT FROM s.operation_id
+                   OR r.epoch IS DISTINCT FROM s.epoch
+                   OR r.revision IS DISTINCT FROM s.revision
+                   OR r.candidate_sha256 IS DISTINCT FROM s.candidate_sha256))
+                    OR (s.unresolved_pin=TRUE AND r.release_id IS NOT NULL)
+                 LIMIT 1)",
+            &[],
+        ))
+        .await
+        .map_err(|failure| {
+            StoreError::Unavailable(
+                failure
+                    .error
+                    .context("validate PostgreSQL receipt pin linkage"),
+            )
+        })?;
+        let receipt_count: i64 = postgres_column(&validation, 0)?;
+        let release_count: i64 = postgres_column(&validation, 1)?;
+        let recorded: i64 = postgres_column(&validation, 2)?;
+        let inconsistent: bool = postgres_column(&validation, 3)?;
+        if receipt_count > 100_000
+            || release_count > 100_000
+            || recorded != release_count
+            || inconsistent
+        {
+            return Err(StoreError::Invalid(anyhow!(
+                "sequenced receipt pin evidence is inconsistent"
+            )));
+        }
         let client = Arc::new(client);
         *cached = Some(client.clone());
         Ok(client)

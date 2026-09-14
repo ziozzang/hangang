@@ -330,6 +330,36 @@ async fn sqlite_versioned_schema_refuses_lost_release_ledger() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn sqlite_open_rejects_unpinned_receipt_without_release_evidence() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("orphan-pin.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    drop(store);
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(
+        "DROP TRIGGER hangang_sequenced_pin_release_guard;
+         UPDATE hangang_sequenced_receipts SET unresolved_pin=0 WHERE acceptance_seq=2;
+         CREATE TRIGGER hangang_sequenced_pin_release_guard
+         BEFORE UPDATE OF unresolved_pin ON hangang_sequenced_receipts
+         WHEN OLD.unresolved_pin=1 AND NEW.unresolved_pin=0
+          AND NOT EXISTS(SELECT 1 FROM hangang_receipt_releases r
+            WHERE r.authority_id=NEW.authority_id AND r.acceptance_seq=NEW.acceptance_seq
+              AND r.operation_id=NEW.operation_id AND r.epoch=NEW.epoch
+              AND r.revision=NEW.revision AND r.candidate_sha256=NEW.candidate_sha256)
+         BEGIN SELECT RAISE(ABORT,'receipt release evidence missing'); END;",
+    )?;
+    assert!(SqliteConfigStore::open(&path).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn sqlite_legacy_receipts_backfill_and_failed_migration_rolls_back() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("legacy-pins.db");
@@ -600,7 +630,9 @@ async fn postgres_pin_guard_survives_legacy_cas_replacement_and_release_is_durab
     let reconnected = PostgresConfigStore::connect_unencrypted(&url).await?;
     let legacy_id = canonical_operation_id(AUTHORITY, 3)?;
     client.batch_execute(
-        "CREATE OR REPLACE FUNCTION hangang_cas_v2(BIGINT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,TEXT)
+        "CREATE OR REPLACE FUNCTION hangang_cas_v2(
+           p_revision BIGINT,p_encoded TEXT,p_authority TEXT,p_operation TEXT,
+           p_digest TEXT,p_sequence BIGINT,p_expected BIGINT,p_epoch TEXT)
          RETURNS BOOLEAN LANGUAGE plpgsql AS $$ BEGIN
            INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
            VALUES($3,$6,$4,$8,$1,$5);
@@ -757,6 +789,38 @@ async fn postgres_versioned_schema_refuses_lost_release_ledger() -> anyhow::Resu
             .await
             .is_err(),
         "version 2 must not recreate missing evidence"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: HANGANG_PG_TEST_TARGET=sequenced_store python3 tests/pg_fixture.py"]
+async fn postgres_connect_rejects_unpinned_receipt_without_release_evidence() -> anyhow::Result<()>
+{
+    let Some((store, client)) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    client
+        .batch_execute(
+            "DROP TRIGGER hangang_sequenced_pin_release_guard ON hangang_sequenced_receipts;
+         UPDATE hangang_sequenced_receipts SET unresolved_pin=FALSE WHERE acceptance_seq=2;
+         CREATE TRIGGER hangang_sequenced_pin_release_guard
+           BEFORE UPDATE OF unresolved_pin ON hangang_sequenced_receipts FOR EACH ROW
+           EXECUTE FUNCTION hangang_sequenced_pin_release_guard_fn();",
+        )
+        .await?;
+    let url = std::env::var("HANGANG_TEST_POSTGRES_URL")?;
+    assert!(
+        PostgresConfigStore::connect_unencrypted(&url)
+            .await
+            .is_err()
     );
     Ok(())
 }
