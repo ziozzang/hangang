@@ -41,14 +41,9 @@ impl Evidence {
     }
     pub fn current(&self, snapshot: &Snapshot) -> bool {
         snapshot
-            .config
-            .public_http
-            .iter()
-            .any(|listener| listener.enabled && listener == &self.0.listener)
-            && snapshot
-                .public_http_generations
-                .get(&self.0.listener.id)
-                .is_some_and(|generation| Arc::ptr_eq(generation, &self.0.generation))
+            .public_http_generations
+            .get(&self.0.listener.id)
+            .is_some_and(|generation| Arc::ptr_eq(generation, &self.0.generation))
             && match &self.0.tls_slot {
                 Some(slot) => snapshot
                     .public_http_tls
@@ -195,8 +190,7 @@ pub async fn serve(
     drop(snapshot);
     let tls = tls_slot.is_some();
     if let Some(slot) = tls_slot {
-        let Ok(handshake_permit) = crate::tcp::workload_handshake_admission().try_acquire_owned()
-        else {
+        let Ok(handshake_permit) = public_handshake_admission().try_acquire_owned() else {
             reject();
             return;
         };
@@ -242,6 +236,12 @@ pub async fn serve(
         )
         .await;
     }
+}
+
+fn public_handshake_admission() -> Arc<tokio::sync::Semaphore> {
+    static ADMISSION: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+    ADMISSION.clone()
 }
 
 #[allow(clippy::too_many_arguments)]
