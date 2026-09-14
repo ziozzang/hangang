@@ -19,6 +19,26 @@ let dropped = 0;
 let securitySummary = null;
 let trafficSummary = null;
 let metricsSummary = null;
+let tcpActive = [];
+let tcpRecent = [];
+let tcpActiveBatch = null;
+let tcpRecentBatch = null;
+let tcpProcess = null;
+let tcpPaused = false;
+let tcpFrozenActive = null;
+let tcpFrozenRecent = null;
+let tcpFrozenActiveBatch = null;
+let tcpFrozenRecentBatch = null;
+let tcpFrozenPage = 1;
+let tcpActivePageAfter = null;
+let tcpActivePage = 1;
+let tcpStreamVersion = 0;
+let tcpActiveRequestVersion = 0;
+let tcpRecentRequestVersion = 0;
+let tcpRefresh = null;
+let tcpFirstPage = null;
+let tcpNextPage = null;
+const tcpFetches = new Set();
 const localizedDisplays = new Map();
 function display(selector, value) {
   const el = $(selector);
@@ -37,6 +57,7 @@ export function stopLive() {
   localizedDisplays.clear();
   trafficSummary = null;
   streamGeneration += 1;
+  resetTcpHistory();
   streamAbort?.abort(); streamAbort = null;
   clearTimeout(reconnectTimer); reconnectTimer = null;
   clearInterval(expiryTimer); expiryTimer = null;
@@ -59,6 +80,9 @@ export function resetConsole() {
   display('#activity-count', () => t("Waiting for request metadata")); display('#activity-updated', () => '—'); $('#activity-search').value = '';
   display('#activity-pause', () => t("Pause view")); $('#activity-pause').setAttribute('aria-pressed', 'false');
   display('#activity-note', () => t("Only this instance. Buffered records expire automatically."));
+  $('#tcp-active-filter').value = ''; $('#tcp-recent-filter').value = '';
+  tcpPaused = false; $('#tcp-history-pause').setAttribute('aria-pressed', 'false');
+  display('#tcp-history-pause', () => t('Pause TCP view'));
   $('#prometheus-rows').replaceChildren(); $('#geoip-metrics')?.remove(); $('#security-content').replaceChildren();
   display('#overview-health', () => t("Connecting to gateway")); display('#overview-detail', () => t("Waiting for runtime telemetry")); display('#flow-mode', () => t("Waiting"));
   if ($('#command-dialog').open) $('#command-dialog').close();
@@ -73,6 +97,7 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
   let failures = 0;
   expiryTimer = setInterval(() => {
     renderActivity();
+    renderTcpHistory();
     if (connected && !isLive()) { connected = false; setStream(() => t("Stream delayed · reconnecting"), true); streamAbort?.abort(); }
   }, 1000);
   if (admin) {
@@ -82,6 +107,10 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
         if (!response.ok) return;
         const body = await response.json(); if (active()) recordTraffic(body);
       }).catch(() => {});
+    tcpRefresh = () => fetchTcpHistory(token, onUnauthorized, active);
+    tcpFirstPage = () => fetchTcpActive(token, onUnauthorized, active);
+    tcpNextPage = () => fetchTcpActive(token, onUnauthorized, active, tcpActiveBatch?.next_after ?? null);
+    tcpRefresh();
   }
   const connect = async () => {
     if (!active()) return;
@@ -89,6 +118,7 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
     connected = false; previous = null;
     setStream(() => failures ? t("Reconnecting · polling fallback") : t("Connecting live stream"), Boolean(failures));
     let reader;
+    let tcpCaughtUp = false;
     let deadline = setTimeout(() => controller.abort(), 8000);
     try {
       const response = await fetch('/v1/events', { headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' }, cache: 'no-store', signal: controller.signal });
@@ -120,7 +150,19 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
           if (event === 'status') {
             clearTimeout(deadline); deadline = setTimeout(() => controller.abort(), 8000);
             connected = true; lastStreamSample = Date.now(); failures = 0; setStream(() => t("Live · SSE · 1s")); onStatus(data);
+            // The SSE completion cursor starts at stream connection time. One
+            // bounded latest-page read closes the initial GET/connect window.
+            if (admin && active() && !tcpCaughtUp) {
+              tcpCaughtUp = true;
+              fetchTcpPage('/v1/connections/tcp/recent?limit=128', token, onUnauthorized, active,
+                batch => recordTcpRecent(batch, false), 'recent', true);
+            }
           } else if (event === 'traffic' && admin) recordTraffic(data);
+          else if (event === 'tcp_connections' && admin) {
+            tcpStreamVersion += 1;
+            if (data?.active && tcpActivePageAfter === null) recordTcpActive(data.active);
+            if (data?.recent) recordTcpRecent(data.recent, false);
+          }
         }
       }
     } catch (_) { /* Preserve data and clearly identify fallback; never display transport secrets. */ }
@@ -140,6 +182,7 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
 export function recordStatus(data) {
   const metrics = data.metrics || {};
   const instance = data.instance?.id || `${data.process_id ?? ''}:${data.version ?? ''}`;
+  if (tcpProcess && data.instance?.id && tcpProcess !== data.instance.id) resetTcpHistory(true);
   const now = Date.now();
   const uptime = Number(data.uptime_seconds);
   if (previous && (instance !== previous.instance || uptime < previous.uptime || Number(metrics.requests_total) < Number(previous.metrics.requests_total))) {
@@ -260,6 +303,176 @@ function recordTraffic(batch) {
   trafficSummary = { gap: Boolean(batch.gap), updated: Date.now() };
   renderTrafficSummary();
   renderActivity();
+}
+
+const tcpPhases = new Set(['accepted', 'inspecting', 'authenticating', 'dialing', 'forwarding']);
+const tcpOutcomes = new Set(['eof', 'idle_timeout', 'shutdown', 'identity_revoked', 'interrupted', 'no_route', 'ip_denied', 'capacity', 'sni_rejected', 'sni_timeout', 'country_denied', 'country_unavailable', 'mtls_rejected', 'no_backend', 'member_unavailable', 'dial_failed', 'endpoint_changed', 'io_error']);
+const tcpPhaseLabels = { accepted: 'Accepted', inspecting: 'Inspecting', authenticating: 'Authenticating', dialing: 'Dialing', forwarding: 'Forwarding' };
+const tcpOutcomeLabels = { eof: 'Normal EOF', idle_timeout: 'Idle timeout', shutdown: 'Shutdown', identity_revoked: 'Identity revoked', interrupted: 'Interrupted', no_route: 'No route', ip_denied: 'IP denied', capacity: 'Capacity rejected', sni_rejected: 'SNI rejected', sni_timeout: 'SNI timeout', country_denied: 'Country denied', country_unavailable: 'Country unavailable', mtls_rejected: 'mTLS rejected', no_backend: 'No backend', member_unavailable: 'Member unavailable', dial_failed: 'Dial failed', endpoint_changed: 'Endpoint changed', io_error: 'I/O error' };
+const decimalU64 = (value) => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 18446744073709551615n;
+const safeCount = (value) => decimalU64(value)
+  ? new Intl.NumberFormat(getLocale() === 'ko' ? 'ko-KR' : 'en-US').format(BigInt(value))
+  : Number.isSafeInteger(value) && value >= 0 ? number(value) : '—';
+const tcpText = (value, limit) => value == null ? null : typeof value === 'string' && value.length <= limit ? value : null;
+const tcpTime = (value) => Number.isSafeInteger(value) && value >= 0;
+const tcpBytes = (value) => decimalU64(value) ? new Intl.NumberFormat(getLocale() === 'ko' ? 'ko-KR' : 'en-US').format(BigInt(value)) : '—';
+function tcpRecord(value, recent) {
+  if (!value || typeof value !== 'object' || !decimalU64(value.connection_id) || value.connection_id === '0'
+    || !tcpTime(value.started_at_unix_ms) || !tcpText(value.peer_ip, 64) || !Number.isInteger(value.peer_port)
+    || value.peer_port < 0 || value.peer_port > 65535 || !tcpText(value.listen, 256)
+    || !tcpPhases.has(value.phase) || !decimalU64(value.bytes_upstream) || !decimalU64(value.bytes_downstream)
+    || (value.route_id != null && tcpText(value.route_id, 128) == null)
+    || (value.member_id != null && tcpText(value.member_id, 128) == null)) return null;
+  if (recent) {
+    if (!decimalU64(value.event_id) || value.event_id === '0' || !tcpTime(value.ended_at_unix_ms)
+      || !tcpTime(value.duration_ms) || !tcpOutcomes.has(value.outcome)) return null;
+  } else if (!tcpTime(value.elapsed_ms)) return null;
+  return value;
+}
+function resetTcpHistory(keepRefresh = false) {
+  for (const controller of tcpFetches) controller.abort(); tcpFetches.clear();
+  tcpActiveRequestVersion += 1; tcpRecentRequestVersion += 1;
+  tcpActive = []; tcpRecent = []; tcpActiveBatch = null; tcpRecentBatch = null; tcpProcess = null;
+  tcpActivePageAfter = null; tcpActivePage = 1; tcpFrozenActive = null; tcpFrozenRecent = null;
+  tcpFrozenActiveBatch = null; tcpFrozenRecentBatch = null; tcpFrozenPage = 1;
+  tcpPaused = false; $('#tcp-history-pause').setAttribute('aria-pressed', 'false');
+  display('#tcp-history-pause', () => t('Pause TCP view'));
+  $('#tcp-active-filter').value = ''; $('#tcp-recent-filter').value = '';
+  tcpStreamVersion += 1;
+  if (!keepRefresh) { tcpRefresh = null; tcpFirstPage = null; tcpNextPage = null; }
+  $('#tcp-active-rows').replaceChildren(); $('#tcp-recent-rows').replaceChildren();
+  display('#tcp-active-note', () => t('TCP active history cleared.'));
+  display('#tcp-recent-note', () => t('TCP recent history cleared.'));
+  $('#tcp-active-first').hidden = true; $('#tcp-active-next').hidden = true;
+}
+function tcpProcessMatches(process) {
+  if (typeof process !== 'string' || !/^[0-9a-f]{16}$/.test(process)) return false;
+  if (tcpProcess && tcpProcess !== process) resetTcpHistory(true);
+  tcpProcess = process;
+  return true;
+}
+function recordTcpActive(batch, pageAfter = null) {
+  if (!batch || !tcpProcessMatches(batch.process_id) || !Array.isArray(batch.records)
+    || batch.records.length > 128 || batch.best_effort !== true || !tcpTime(batch.server_time_unix_ms)
+    || !decimalU64(batch.next_after) || !decimalU64(batch.latest_connection_id)) return;
+  const rows = batch.records.map(value => tcpRecord(value, false));
+  if (rows.some(value => !value)) return;
+  tcpActive = rows;
+  tcpActiveBatch = { ...batch, updatedAt: performance.now() };
+  tcpActivePageAfter = pageAfter;
+  if (pageAfter === null) tcpActivePage = 1;
+  else tcpActivePage += 1;
+  renderTcpHistory();
+}
+function recordTcpRecent(batch, replace) {
+  if (!batch || !tcpProcessMatches(batch.process_id) || !Array.isArray(batch.records)
+    || batch.records.length > 128 || !tcpTime(batch.server_time_unix_ms)
+    || !decimalU64(batch.next_after) || !decimalU64(batch.latest_event_id)) return;
+  const retention = Math.max(1, Math.min(3600, Number(batch.retention_seconds) || 60));
+  const receivedAt = performance.now();
+  const rows = batch.records.map(value => tcpRecord(value, true));
+  if (rows.some(value => !value)) return;
+  const merged = new Map((replace ? [] : tcpRecent).map(value => [value.event_id, value]));
+  for (const row of rows) {
+    const age = Math.max(0, batch.server_time_unix_ms - row.ended_at_unix_ms);
+    const expiry = receivedAt + Math.max(0, retention * 1000 - age);
+    const previous = merged.get(row.event_id);
+    merged.set(row.event_id, { ...row, expiresAt: previous ? Math.min(previous.expiresAt, expiry) : expiry });
+  }
+  tcpRecent = [...merged.values()].sort((a, b) => BigInt(a.event_id) > BigInt(b.event_id) ? -1 : 1).slice(0, 256);
+  tcpRecentBatch = { ...batch, retention, updatedAt: receivedAt };
+  renderTcpHistory();
+}
+async function fetchTcpPage(path, token, onUnauthorized, active, onBatch, requestKind, manualPage = false) {
+  const controller = new AbortController(); tcpFetches.add(controller);
+  const generation = requestKind === 'active' ? ++tcpActiveRequestVersion : ++tcpRecentRequestVersion;
+  const streamVersion = tcpStreamVersion;
+  const requestedProcess = tcpProcess;
+  try {
+    const response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal: controller.signal });
+    if (!active() || controller.signal.aborted) return;
+    if (response.status === 401 || response.status === 403) { resetTcpHistory(); onUnauthorized(); return; }
+    const current = requestKind === 'active' ? tcpActiveRequestVersion : tcpRecentRequestVersion;
+    if (generation !== current) return;
+    if (response.status === 404) {
+      display(requestKind === 'active' ? '#tcp-active-note' : '#tcp-recent-note', () => t('TCP history is unavailable on this server.'));
+      return;
+    }
+    if (!response.ok) throw new Error('TCP history unavailable');
+    const batch = await response.json();
+    // Manual pages and the one-time catch-up may outlive an SSE incarnation
+    // change. Never let their old process ID replace a newer live process.
+    if (requestedProcess !== tcpProcess && (requestedProcess !== null || batch?.process_id !== tcpProcess)) return;
+    if (active() && !controller.signal.aborted && generation === (requestKind === 'active' ? tcpActiveRequestVersion : tcpRecentRequestVersion)
+      && (manualPage || streamVersion === tcpStreamVersion)) onBatch(batch);
+  } catch (_) {
+    if (active() && !controller.signal.aborted) display(requestKind === 'active' ? '#tcp-active-note' : '#tcp-recent-note', () => t('TCP history could not be refreshed. Displayed records may be stale.'));
+  } finally { tcpFetches.delete(controller); }
+}
+function fetchTcpActive(token, onUnauthorized, active, after = null) {
+  if (after !== null && !decimalU64(after)) return;
+  const query = after === null ? '?limit=128' : `?after=${after}&limit=128`;
+  return fetchTcpPage(`/v1/connections/tcp/active${query}`, token, onUnauthorized, active,
+    batch => recordTcpActive(batch, after), 'active', after !== null);
+}
+function fetchTcpHistory(token, onUnauthorized, active) {
+  return Promise.all([
+    fetchTcpActive(token, onUnauthorized, active),
+    fetchTcpPage('/v1/connections/tcp/recent?limit=128', token, onUnauthorized, active,
+      batch => recordTcpRecent(batch, true), 'recent'),
+  ]);
+}
+function tcpFieldFilter(row, query, kind) {
+  const country = countryObservation(row).country;
+  if (query.startsWith('country:')) return country?.toLowerCase() === query.slice(8).trim();
+  if (query.startsWith('phase:')) return row.phase === query.slice(6).trim();
+  if (query.startsWith('outcome:')) return kind === 'recent' && row.outcome === query.slice(8).trim();
+  return [row.peer_ip, row.listen, row.route_id, row.member_id, row.phase, row.outcome, country, countryLabel(countryObservation(row))]
+    .join(' ').toLowerCase().includes(query);
+}
+function tcpRow(record, recent) {
+  const tr = document.createElement('tr'); tr.dataset.id = recent ? record.event_id : record.connection_id;
+  const cell = value => { const td = document.createElement('td'); td.textContent = value; tr.append(td); return td; };
+  cell(recent ? new Date(record.ended_at_unix_ms).toLocaleTimeString(getLocale() === 'ko' ? 'ko-KR' : 'en-US') : `#${record.connection_id}`);
+  cell(t(recent ? tcpOutcomeLabels[record.outcome] : tcpPhaseLabels[record.phase]));
+  const peer = cell(`${record.peer_ip.includes(':') ? `[${record.peer_ip}]` : record.peer_ip}:${record.peer_port}`);
+  const country = document.createElement('small'); country.textContent = countryLabel(countryObservation(record)); peer.append(country);
+  cell([record.route_id, record.member_id].filter(Boolean).join(' / ') || '—');
+  cell(record.listen);
+  const duration = recent ? record.duration_ms : record.elapsed_ms;
+  const bytes = cell(t('{duration} ms · upstream {up} B · downstream {down} B', {
+    duration: number(duration), up: tcpBytes(record.bytes_upstream), down: tcpBytes(record.bytes_downstream),
+  }));
+  bytes.title = t('Bytes delivered toward upstream/downstream; no wire overhead.');
+  return tr;
+}
+function renderTcpHistory() {
+  tcpRecent = tcpRecent.filter(row => performance.now() < row.expiresAt);
+  if (tcpFrozenRecent) tcpFrozenRecent = tcpFrozenRecent.filter(row => performance.now() < row.expiresAt);
+  const activeRows = tcpFrozenActive || tcpActive;
+  const recentRows = tcpFrozenRecent || tcpRecent;
+  const activeMeta = tcpFrozenActiveBatch || tcpActiveBatch;
+  const recentMeta = tcpFrozenRecentBatch || tcpRecentBatch;
+  const activeQuery = $('#tcp-active-filter').value.trim().toLowerCase();
+  const recentQuery = $('#tcp-recent-filter').value.trim().toLowerCase();
+  const shownActive = activeRows.filter(row => tcpFieldFilter(row, activeQuery, 'active'));
+  const shownRecent = recentRows.filter(row => tcpFieldFilter(row, recentQuery, 'recent'));
+  $('#tcp-active-rows').replaceChildren(...shownActive.map(row => tcpRow(row, false)));
+  $('#tcp-recent-rows').replaceChildren(...shownRecent.map(row => tcpRow(row, true)));
+  if (activeMeta) display('#tcp-active-note', () => t('Page {page} · showing {shown} of {tracked} tracked (capacity {capacity}) · {untracked} untracked at sample · {omitted} omitted total · best-effort{stale}', {
+    page: number(tcpPaused ? tcpFrozenPage : tcpActivePage), shown: number(shownActive.length), tracked: safeCount(activeMeta.active_tracked),
+    capacity: safeCount(activeMeta.capacity), untracked: safeCount(activeMeta.active_untracked), omitted: safeCount(activeMeta.omitted_total),
+    stale: tcpPaused ? t(' · paused snapshot') : !isLive() || tcpActivePageAfter !== null ? t(' · snapshot may be stale') : '',
+  }));
+  if (recentMeta) display('#tcp-recent-note', () => t('Latest bounded view: {shown} recent · up to {seconds}s · {dropped} expired/evicted · {omitted} omitted{gap}{stale}', {
+    shown: number(shownRecent.length), seconds: number(recentMeta.retention),
+    dropped: safeCount(recentMeta.dropped_total), omitted: safeCount(recentMeta.omitted_total),
+    gap: recentMeta.gap ? t(' · cursor gap') : '', stale: tcpPaused ? t(' · paused snapshot') : !isLive() ? t(' · stream delayed') : '',
+  }));
+  $('#tcp-active-first').hidden = tcpActivePageAfter === null;
+  $('#tcp-active-next').hidden = !tcpActiveBatch || tcpActive.length < 128 ||
+    (Number.isSafeInteger(tcpActiveBatch.active_tracked) && tcpActiveBatch.active_tracked <= tcpActivePage * 128);
+  $('#tcp-active-first').disabled = tcpPaused; $('#tcp-active-next').disabled = tcpPaused;
 }
 function renderTrafficSummary() {
   if (!trafficSummary) return;
@@ -421,6 +634,22 @@ $('#command-search').addEventListener('keydown',(event) => {
 document.addEventListener('keydown',(event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); openCommands(); } });
 $('#activity-search').addEventListener('input',renderActivity);
 $('#activity-pause').addEventListener('click',() => { paused = !paused; display('#activity-pause', () => paused ? t("Resume view") : t("Pause view")); $('#activity-pause').setAttribute('aria-pressed',String(paused)); renderActivity(); });
+$('#tcp-active-filter').addEventListener('input', renderTcpHistory);
+$('#tcp-recent-filter').addEventListener('input', renderTcpHistory);
+$('#tcp-history-refresh').addEventListener('click', () => tcpRefresh?.());
+$('#tcp-active-first').addEventListener('click', () => tcpFirstPage?.());
+$('#tcp-active-next').addEventListener('click', () => tcpNextPage?.());
+$('#tcp-history-pause').addEventListener('click', () => {
+  tcpPaused = !tcpPaused;
+  tcpFrozenActive = tcpPaused ? tcpActive.slice() : null;
+  tcpFrozenRecent = tcpPaused ? tcpRecent.slice() : null;
+  tcpFrozenActiveBatch = tcpPaused ? tcpActiveBatch : null;
+  tcpFrozenRecentBatch = tcpPaused ? tcpRecentBatch : null;
+  tcpFrozenPage = tcpActivePage;
+  display('#tcp-history-pause', () => t(tcpPaused ? 'Resume TCP view' : 'Pause TCP view'));
+  $('#tcp-history-pause').setAttribute('aria-pressed', String(tcpPaused));
+  renderTcpHistory();
+});
 
 window.addEventListener('hangang:localechange', () => {
   for (const [selector, value] of localizedDisplays) { const el = $(selector); if (el) el.textContent = value(); }
@@ -428,6 +657,7 @@ window.addEventListener('hangang:localechange', () => {
   if (expiryTimer) renderActivity();
   renderSecuritySummary();
   if (metricsSummary) { renderPrometheus(metricsSummary.metrics, metricsSummary.rates); renderGeoMetrics(metricsSummary.geoip); }
+  renderTcpHistory();
   applyTheme(document.documentElement.dataset.theme || 'light');
   if ($('#command-dialog').open) renderCommands();
 });

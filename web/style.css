@@ -220,3 +220,13 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 @media(max-width:700px) { .config-proof-panel .section-heading { flex-direction: column; align-items: stretch; }.config-proof-fields { grid-template-columns: 1fr; gap: 3px; }.config-proof-fields dd { margin-bottom: 8px; } }
 @media(max-width:900px) { .config-receipt-form { grid-template-columns: 1fr; align-items: stretch; }.config-receipt-form .button { grid-column: 1; } }
 @media(max-width:700px) { .audit-panel .section-heading { flex-direction: column; align-items: stretch; }.audit-panel .section-heading .button-row { justify-content: flex-start; }.audit-pagination { flex-wrap: wrap; }.audit-pagination span { width: 100%; } }
+.tcp-history-panel { margin-top: 20px; overflow: hidden; }
+.tcp-history-group + .tcp-history-group { border-top: 1px solid var(--line); }
+.tcp-history-group .activity-toolbar h3 { margin: 0; font-size: 12px; }
+.tcp-history-note { margin: 0; padding: 0 20px 12px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.tcp-history-table { min-width: 900px; }
+.tcp-history-table td { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+.tcp-history-table td small { display: block; }
+.tcp-history-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; }
+.tcp-history-actions [hidden] { display: none; }
+@media(max-width:700px) { .tcp-history-panel .section-heading { align-items: flex-start; }.tcp-history-panel .activity-toolbar { flex-wrap: wrap; }.tcp-history-panel .activity-search { width: 100%; } }

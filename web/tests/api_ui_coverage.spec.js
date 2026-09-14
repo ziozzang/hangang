@@ -22,6 +22,8 @@ const coverage = new Map([
   ['POST /v1/cache/purge', ['#purge-cache', 'app', "api('/v1/cache/purge'"]],
   ['GET /v1/events', ['#stream-state', 'console', "fetch('/v1/events'"]],
   ['GET /v1/traffic', ['#activity-panel', 'console', "fetch('/v1/traffic?limit=128'"]],
+  ['GET /v1/connections/tcp/active', ['#tcp-active-rows', 'console', '/v1/connections/tcp/active${query}']],
+  ['GET /v1/connections/tcp/recent', ['#tcp-recent-rows', 'console', '/v1/connections/tcp/recent?limit=128']],
   ['GET /v1/operations', ['#view-operations', 'operations', '/v1/operations?offset=']],
   ['GET /v1/retired-members', ['#retired-rows', 'operations', '/v1/retired-members?offset=']],
   ['GET /v1/status', ['#view-status', 'app', "api('/v1/status'"]],
