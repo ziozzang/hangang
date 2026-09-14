@@ -90,6 +90,7 @@ test('active and recent TCP panels preserve 64-bit values, filter and localize d
   await expect(page.locator('#tcp-recent-rows img')).toHaveCount(0);
   expect(await page.evaluate(() => window.__tcpInjected)).toBeUndefined();
   await expect(page.locator('#tcp-recent-note')).toContainText('cursor gap');
+  await expect(page.locator('#tcp-recent-note')).toContainText('unknown intentionally filtered completions');
   await page.locator('#tcp-active-filter').fill('phase:forwarding');
   await expect(page.locator('#tcp-active-rows tr')).toHaveCount(1);
   await page.locator('#tcp-active-filter').fill('country:us');
@@ -102,6 +103,63 @@ test('active and recent TCP panels preserve 64-bit values, filter and localize d
   expect(calls.filter(call => call.path.startsWith('/v1/connections/tcp/'))).toHaveLength(2);
   expect(calls.find(call => call.path.endsWith('/active')).headers.authorization).toBe(`Bearer ${token}`);
   expect(calls.some(call => call.search.includes(token))).toBe(false);
+});
+
+test('TCP completion coverage and revision distinguish filtering, eviction and untracked admission', async ({ page }) => {
+  await fixture(page, { active: activeBatch([activeRecord('1')], { omitted_total: '3' }),
+    recent: recentBatch([recentRecord('2', { policy_revision: '9007199254740993' })],
+      { dropped_total: '4', omitted_total: '3', filtered_total: '5' }) });
+  await expect(page.locator('#tcp-active-note')).toContainText('active visibility is unfiltered');
+  await expect(page.locator('#tcp-recent-note')).toContainText('4 expired/evicted');
+  await expect(page.locator('#tcp-recent-note')).toContainText('3 untracked omissions');
+  await expect(page.locator('#tcp-recent-note')).toContainText('5 intentionally filtered completions');
+  await expect(page.locator('#tcp-recent-rows')).toContainText('Recording policy revision #9007199254740993');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#tcp-recent-note')).toContainText('의도적으로 생략된 완료 5개');
+  await expect(page.locator('#tcp-history-scope')).toContainText('완전하거나 영구적인 감사 이력이 아닙니다');
+});
+
+test('missing or malformed TCP completion metadata is unknown, never rounded or displayed as zero', async ({ page }) => {
+  await fixture(page, { recent: recentBatch([
+    recentRecord('1', { policy_revision: '7\n' }), recentRecord('2', { policy_revision: '18446744073709551616' }),
+    recentRecord('3'),
+  ], { filtered_total: '5\n' }) });
+  await expect(page.locator('#tcp-recent-note')).toContainText('unknown intentionally filtered completions');
+  await expect(page.locator('#tcp-recent-rows')).toContainText('Recording policy revision unreported');
+  await expect(page.locator('#tcp-recent-rows')).not.toContainText('revision #7');
+  await expect(page.locator('#tcp-recent-rows')).not.toContainText('18446744073709551616');
+});
+
+test('drop-only empty SSE batch updates TCP filtered count without inventing a completion', async ({ page }) => {
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  await fixture(page, { recent: recentBatch([], { filtered_total: '0' }),
+    stream: async route => { await gate; return route.fulfill({ contentType: 'text/event-stream', body:
+      event('status', { revision: 1, http_routes: 0, tcp_routes: 1, uptime_seconds: 11,
+        instance: { id: processId }, state: { ready: true }, metrics: { requests_total: 1, active_connections: 0 } }) +
+      event('tcp_connections', { active: activeBatch([]), recent: recentBatch([], { filtered_total: '9' }) }) }); } });
+  await expect(page.locator('#tcp-recent-note')).toContainText('0 intentionally filtered completions');
+  release();
+  await expect(page.locator('#tcp-recent-note')).toContainText('9 intentionally filtered completions');
+  await expect(page.locator('#tcp-recent-rows tr')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.locator('#tcp-recent-note')).toContainText('cleared');
+});
+
+test('delayed recent completion response cannot restore filtered count or rows after logout', async ({ page }) => {
+  let release, arrived;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = new Promise(resolve => { arrived = resolve; });
+  await fixture(page, { recentHandler: async route => {
+    arrived(); await gate;
+    return route.fulfill({ json: recentBatch([recentRecord('8', { policy_revision: '7' })], { filtered_total: '12' }) });
+  } });
+  await seen;
+  await page.getByRole('button', { name: 'Log out' }).click();
+  release();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#tcp-recent-rows tr')).toHaveCount(0);
+  await expect(page.locator('#tcp-recent-note')).toContainText('cleared');
+  await expect(page.locator('#tcp-recent-note')).not.toContainText('12');
 });
 
 test('maximum 64-bit byte values wrap visibly on desktop and narrow screens', async ({ page }) => {

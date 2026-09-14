@@ -340,7 +340,7 @@ const tcpPhases = new Set(['accepted', 'inspecting', 'authenticating', 'dialing'
 const tcpOutcomes = new Set(['eof', 'idle_timeout', 'shutdown', 'identity_revoked', 'interrupted', 'no_route', 'ip_denied', 'capacity', 'sni_rejected', 'sni_timeout', 'country_denied', 'country_unavailable', 'mtls_rejected', 'no_backend', 'member_unavailable', 'dial_failed', 'endpoint_changed', 'io_error']);
 const tcpPhaseLabels = { accepted: 'Accepted', inspecting: 'Inspecting', authenticating: 'Authenticating', dialing: 'Dialing', forwarding: 'Forwarding' };
 const tcpOutcomeLabels = { eof: 'Normal EOF', idle_timeout: 'Idle timeout', shutdown: 'Shutdown', identity_revoked: 'Identity revoked', interrupted: 'Interrupted', no_route: 'No route', ip_denied: 'IP denied', capacity: 'Capacity rejected', sni_rejected: 'SNI rejected', sni_timeout: 'SNI timeout', country_denied: 'Country denied', country_unavailable: 'Country unavailable', mtls_rejected: 'mTLS rejected', no_backend: 'No backend', member_unavailable: 'Member unavailable', dial_failed: 'Dial failed', endpoint_changed: 'Endpoint changed', io_error: 'I/O error' };
-const decimalU64 = (value) => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 18446744073709551615n;
+const decimalU64 = (value) => typeof value === 'string' && /^(?:0|[1-9][0-9]{0,19})$(?![\s\S])/.test(value) && BigInt(value) <= 18446744073709551615n;
 const safeCount = (value) => decimalU64(value)
   ? new Intl.NumberFormat(getLocale() === 'ko' ? 'ko-KR' : 'en-US').format(BigInt(value))
   : Number.isSafeInteger(value) && value >= 0 ? number(value) : '—';
@@ -358,7 +358,7 @@ function tcpRecord(value, recent) {
     if (!decimalU64(value.event_id) || value.event_id === '0' || !tcpTime(value.ended_at_unix_ms)
       || !tcpTime(value.duration_ms) || !tcpOutcomes.has(value.outcome)) return null;
   } else if (!tcpTime(value.elapsed_ms)) return null;
-  return value;
+  return recent ? { ...value, policy_revision: decimalU64(value.policy_revision) ? value.policy_revision : null } : value;
 }
 function resetTcpHistory(keepRefresh = false) {
   for (const controller of tcpFetches) controller.abort(); tcpFetches.clear();
@@ -411,7 +411,8 @@ function recordTcpRecent(batch, replace) {
     merged.set(row.event_id, { ...row, expiresAt: previous ? Math.min(previous.expiresAt, expiry) : expiry });
   }
   tcpRecent = [...merged.values()].sort((a, b) => BigInt(a.event_id) > BigInt(b.event_id) ? -1 : 1).slice(0, 256);
-  tcpRecentBatch = { ...batch, retention, updatedAt: receivedAt };
+  tcpRecentBatch = { ...batch, filtered_total: decimalU64(batch.filtered_total) ? batch.filtered_total : null,
+    retention, updatedAt: receivedAt };
   renderTcpHistory();
 }
 async function fetchTcpPage(path, token, onUnauthorized, active, onBatch, requestKind, manualPage = false) {
@@ -469,7 +470,11 @@ function tcpRow(record, recent) {
   const peer = cell(`${record.peer_ip.includes(':') ? `[${record.peer_ip}]` : record.peer_ip}:${record.peer_port}`);
   const country = document.createElement('small'); country.textContent = countryLabel(countryObservation(record)); peer.append(country);
   cell([record.route_id, record.member_id].filter(Boolean).join(' / ') || '—');
-  cell(record.listen);
+  const listen = cell(record.listen);
+  if (recent) { const revision = document.createElement('small');
+    revision.textContent = record.policy_revision === null ? t('Recording policy revision unreported')
+      : t('Recording policy revision #{revision}', { revision: record.policy_revision });
+    listen.append(revision); }
   const duration = recent ? record.duration_ms : record.elapsed_ms;
   const bytes = cell(t('{duration} ms · upstream {up} B · downstream {down} B', {
     duration: number(duration), up: tcpBytes(record.bytes_upstream), down: tcpBytes(record.bytes_downstream),
@@ -490,14 +495,15 @@ function renderTcpHistory() {
   const shownRecent = recentRows.filter(row => tcpFieldFilter(row, recentQuery, 'recent'));
   $('#tcp-active-rows').replaceChildren(...shownActive.map(row => tcpRow(row, false)));
   $('#tcp-recent-rows').replaceChildren(...shownRecent.map(row => tcpRow(row, true)));
-  if (activeMeta) display('#tcp-active-note', () => t('Page {page} · showing {shown} of {tracked} tracked (capacity {capacity}) · {untracked} untracked at sample · {omitted} omitted total · best-effort{stale}', {
+  if (activeMeta) display('#tcp-active-note', () => t('Page {page} · showing {shown} of {tracked} tracked (capacity {capacity}) · {untracked} untracked at sample · {omitted} omitted total · best-effort · active visibility is unfiltered{stale}', {
     page: number(tcpPaused ? tcpFrozenPage : tcpActivePage), shown: number(shownActive.length), tracked: safeCount(activeMeta.active_tracked),
     capacity: safeCount(activeMeta.capacity), untracked: safeCount(activeMeta.active_untracked), omitted: safeCount(activeMeta.omitted_total),
     stale: tcpPaused ? t(' · paused snapshot') : !isLive() || tcpActivePageAfter !== null ? t(' · snapshot may be stale') : '',
   }));
-  if (recentMeta) display('#tcp-recent-note', () => t('Latest bounded view: {shown} recent · up to {seconds}s · {dropped} expired/evicted · {omitted} omitted{gap}{stale}', {
+  if (recentMeta) display('#tcp-recent-note', () => t('Latest bounded view: {shown} recent · up to {seconds}s · {dropped} expired/evicted · {omitted} untracked omissions · {filtered} intentionally filtered completions{gap}{stale}', {
     shown: number(shownRecent.length), seconds: number(recentMeta.retention),
     dropped: safeCount(recentMeta.dropped_total), omitted: safeCount(recentMeta.omitted_total),
+    filtered: recentMeta.filtered_total === null ? t('unknown') : safeCount(recentMeta.filtered_total),
     gap: recentMeta.gap ? t(' · cursor gap') : '', stale: tcpPaused ? t(' · paused snapshot') : !isLive() ? t(' · stream delayed') : '',
   }));
   $('#tcp-active-first').hidden = tcpActivePageAfter === null;

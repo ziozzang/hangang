@@ -57,6 +57,8 @@ const state = {
   settingsError: null,
   httpRecordingError: null,
   httpRecordingDraft: null,
+  tcpRecordingError: null,
+  tcpRecordingDraft: null,
   geoipError: null,
   geoipRuntime: { status: null, lookup: null, statusError: null, lookupError: null, statusSequence: 0, lookupSequence: 0, statusAbort: null, lookupAbort: null },
   certificateDirty: false,
@@ -110,6 +112,7 @@ function refreshAppCopy() {
   if (state.certificateInventory) renderCertificateInventory(state.certificateInventory);
   if (state.config) { showCertificateScopes(state.config); if ($('#certificate-list').children.length) renderCertificates(certificatesForScope(state.config, state.certificateScope)); }
   if ($('#http-recording-section')) renderHttpRecording();
+  if ($('#tcp-recording-section')) renderTcpRecording();
   if (state.config) updateConfigPreview();
   renderGeoIpStatus();
   renderGeoIpLookup();
@@ -442,6 +445,8 @@ function logout(reason = '') {
   state.settingsError = null;
   state.httpRecordingError = null;
   state.httpRecordingDraft = null;
+  state.tcpRecordingError = null;
+  state.tcpRecordingDraft = null;
   state.geoipError = null;
   state.certificateDirty = false;
   state.certificateScope = 'default';
@@ -4090,6 +4095,133 @@ function syncHttpRecordingToDocument() {
   } catch (error) { state.httpRecordingError = error.message; message($('#http-recording-message'), error.message, 'error'); }
 }
 
+const TCP_RECORDING_FIELDS = ['listen_addresses', 'peer_cidrs', 'route_ids', 'outcomes'];
+const TCP_RECORDING_OUTCOMES = new Set(['eof', 'idle_timeout', 'shutdown', 'identity_revoked', 'interrupted', 'no_route', 'ip_denied', 'capacity', 'sni_rejected', 'sni_timeout', 'country_denied', 'country_unavailable', 'mtls_rejected', 'no_backend', 'member_unavailable', 'dial_failed', 'endpoint_changed', 'io_error']);
+function tcpRecordingDraftFromWire(policy) {
+  const bad = () => { throw new Error(t('TCP completion recording policy in JSON is invalid; edit the document or replace the policy.')); };
+  if (!isObject(policy) || Object.keys(policy).some(key => !['default_action', 'rules'].includes(key)) ||
+    !['record', 'drop'].includes(policy.default_action ?? 'record') || !Array.isArray(policy.rules ?? []) || (policy.rules ?? []).length > 64) bad();
+  return { default_action: policy.default_action ?? 'record', rules: (policy.rules ?? []).map(rule => {
+    if (!isObject(rule) || Object.keys(rule).some(key => !['id', 'action', 'match'].includes(key)) ||
+      !isObject(rule.match) || Object.keys(rule.match).some(key => ![...TCP_RECORDING_FIELDS, 'route_matched'].includes(key)) ||
+      typeof rule.id !== 'string' || !['record', 'drop'].includes(rule.action)) bad();
+    for (const key of TCP_RECORDING_FIELDS) if (rule.match[key] !== undefined && !Array.isArray(rule.match[key])) bad();
+    if (rule.match.route_matched != null && typeof rule.match.route_matched !== 'boolean') bad();
+    for (const key of TCP_RECORDING_FIELDS) if ((rule.match[key] ?? []).some(value => typeof value !== 'string')) bad();
+    return { id: rule.id, action: rule.action,
+      listen_addresses: (rule.match.listen_addresses ?? []).join('\n'), peer_cidrs: (rule.match.peer_cidrs ?? []).join('\n'),
+      route_ids: (rule.match.route_ids ?? []).join('\n'), outcomes: (rule.match.outcomes ?? []).join('\n'),
+      route_matched: rule.match.route_matched == null ? '' : String(rule.match.route_matched) };
+  }) };
+}
+function tcpRecordingAddress(value) {
+  const bracketed = /^\[([^\]]+)\]:(\d{1,5})$/.exec(value);
+  const ipv4 = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value);
+  if (bracketed) {
+    const scoped = /^([0-9a-fA-F:.]+)(?:%(\d+))?$/.exec(bracketed[1]);
+    if (!scoped || !scoped[1].includes(':') || (scoped[2] && (scoped[2].length > 10 || Number(scoped[2]) > 4294967295))) return false;
+    try { new URL(`http://[${scoped[1]}]/`); } catch { return false; }
+    return Number(bracketed[2]) > 0 && Number(bracketed[2]) <= 65535;
+  }
+  return !!ipv4 && ipv4[1].split('.').every(part => Number(part) <= 255) && Number(ipv4[2]) > 0 && Number(ipv4[2]) <= 65535;
+}
+function tcpRecordingPolicyFromDraft(draft) {
+  if (!draft || !['record', 'drop'].includes(draft.default_action) || draft.rules.length > 64)
+    throw new Error(t('Use at most 64 TCP completion recording rules.'));
+  const ids = new Set();
+  const lines = (raw, label, valid) => { const values = recordingLines(raw);
+    if (values.length > 64 || values.some(value => !valid(value)))
+      throw new Error(t('Invalid {field}; use at most 64 entries.', { field: t(label) }));
+    return values; };
+  const rules = draft.rules.map(rule => {
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(rule.id) || ids.has(rule.id) || !['record', 'drop'].includes(rule.action))
+      throw new Error(t('TCP recording rule IDs must be unique ASCII names of 1–64 characters.'));
+    ids.add(rule.id);
+    const match = {
+      listen_addresses: lines(rule.listen_addresses, 'Listen addresses', tcpRecordingAddress),
+      peer_cidrs: lines(rule.peer_cidrs, 'Peer CIDRs', recordingCidr),
+      route_ids: lines(rule.route_ids, 'Route IDs', value => /^[A-Za-z0-9._-]{1,128}$/.test(value)),
+      outcomes: lines(rule.outcomes, 'Outcomes', value => TCP_RECORDING_OUTCOMES.has(value)),
+    };
+    if (rule.route_matched === 'true') match.route_matched = true;
+    else if (rule.route_matched === 'false') {
+      if (match.route_ids.length) throw new Error(t('Unmatched routes cannot also match specific route IDs.'));
+      match.route_matched = false;
+    } else if (rule.route_matched !== '') throw new Error(t('Invalid route matching value.'));
+    return { id: rule.id, action: rule.action, match };
+  });
+  const policy = { default_action: draft.default_action, rules };
+  const expanded = { default_action: policy.default_action, rules: policy.rules.map(rule => ({
+    ...rule, match: { ...rule.match, route_matched: rule.match.route_matched ?? null },
+  })) };
+  if (new TextEncoder().encode(JSON.stringify(expanded)).length > 65_536)
+    throw new Error(t('TCP completion recording policy exceeds the 64 KiB encoded limit.'));
+  return policy;
+}
+function showTcpRecording(policy) {
+  try {
+    state.tcpRecordingDraft = policy == null ? null : tcpRecordingDraftFromWire(policy);
+    if (state.tcpRecordingDraft) tcpRecordingPolicyFromDraft(state.tcpRecordingDraft);
+    state.tcpRecordingError = null;
+  } catch (error) { state.tcpRecordingDraft = null; state.tcpRecordingError = error.message; }
+  renderTcpRecording();
+}
+function renderTcpRecording() {
+  const draft = state.tcpRecordingDraft;
+  $('#tcp-recording-enabled').checked = !!draft;
+  $('#tcp-recording-default').disabled = !draft;
+  $('#tcp-recording-add').disabled = !draft || draft.rules.length >= 64;
+  $('#tcp-recording-state').hidden = !draft;
+  if (draft) $('#tcp-recording-default').value = draft.default_action;
+  message($('#tcp-recording-message'), state.tcpRecordingError || (draft ? '' : t('No explicit TCP completion recording policy; raw TCP completions are recorded by default.')),
+    state.tcpRecordingError ? 'error' : '');
+  const root = $('#tcp-recording-rules'); root.replaceChildren();
+  if (!draft) return;
+  for (const [index, rule] of draft.rules.entries()) {
+    const card = document.createElement('div'); card.className = 'panel user-card form-grid';
+    const heading = document.createElement('h3'); heading.className = 'span-2'; copy(heading, 'TCP completion rule {number}', { number: index + 1 }); card.append(heading);
+    const field = (labelText, value, onInput, { area = false, options = null } = {}) => {
+      const wrap = document.createElement('div'); wrap.className = 'field'; const label = document.createElement('label'); copy(label, labelText);
+      const input = options ? document.createElement('select') : area ? document.createElement('textarea') : document.createElement('input');
+      if (!area && !options) input.type = 'text'; if (area) input.rows = 2;
+      if (options) for (const [optionValue, text] of options) { const option = document.createElement('option'); option.value = optionValue; copy(option, text); input.append(option); }
+      input.value = value; input.addEventListener(options ? 'change' : 'input', () => { onInput(input.value); syncTcpRecordingToDocument(); });
+      label.append(input); wrap.append(label); card.append(wrap);
+    };
+    field('Rule ID', rule.id, value => { rule.id = value; });
+    field('Action', rule.action, value => { rule.action = value; }, { options: [['record', 'Record'], ['drop', 'Drop']] });
+    field('Listen addresses (one IP:port per line)', rule.listen_addresses, value => { rule.listen_addresses = value; }, { area: true });
+    field('Peer CIDRs (one per line)', rule.peer_cidrs, value => { rule.peer_cidrs = value; }, { area: true });
+    field('Route IDs (one per line)', rule.route_ids, value => { rule.route_ids = value; }, { area: true });
+    field('Route matching', rule.route_matched, value => { rule.route_matched = value; },
+      { options: [['', 'Any route state'], ['true', 'Matched route only'], ['false', 'Unmatched only']] });
+    field('Outcomes (one code per line)', rule.outcomes, value => { rule.outcomes = value; }, { area: true });
+    const actions = document.createElement('div'); actions.className = 'button-row span-2';
+    for (const [label, offset] of [['Move up', -1], ['Move down', 1]]) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-secondary'; copy(button, label);
+      button.disabled = index + offset < 0 || index + offset >= draft.rules.length;
+      button.addEventListener('click', () => { [draft.rules[index], draft.rules[index + offset]] = [draft.rules[index + offset], draft.rules[index]];
+        renderTcpRecording(); syncTcpRecordingToDocument(); }); actions.append(button);
+    }
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove rule');
+    remove.addEventListener('click', () => { draft.rules.splice(index, 1); renderTcpRecording(); syncTcpRecordingToDocument(); }); actions.append(remove);
+    card.append(actions); root.append(card);
+  }
+}
+function syncTcpRecordingToDocument() {
+  try {
+    const document = parseConfigEditor();
+    if (!isObject(document) || (document.settings != null && !isObject(document.settings)))
+      throw new Error(t('The configuration settings block must be an object.'));
+    const settings = { ...(document.settings ?? {}) };
+    if (state.tcpRecordingDraft) settings.tcp_recent_recording = tcpRecordingPolicyFromDraft(state.tcpRecordingDraft);
+    else delete settings.tcp_recent_recording;
+    if (Object.keys(settings).length) document.settings = settings; else delete document.settings;
+    $('#config-editor').value = JSON.stringify(document, null, 2);
+    state.tcpRecordingError = null; message($('#tcp-recording-message')); configInput(); updateConfigPreview();
+  } catch (error) { state.tcpRecordingError = error.message; message($('#tcp-recording-message'), error.message, 'error'); }
+}
+
 const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
@@ -4109,6 +4241,7 @@ function showSettings(settings) {
   state.settingsError = null;
   message($('#settings-message'));
   showHttpRecording(value.http_recording);
+  showTcpRecording(value.tcp_recent_recording);
 }
 
 /** Read the fleet-settings controls into a `settings` object ({} when every field inherits); throws on an invalid draft. */
@@ -4195,6 +4328,7 @@ async function validateConfig() {
   const button = $('#validate-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
   if (state.httpRecordingError) return message($('#config-message'), t('HTTP recording: {detail}', { detail: state.httpRecordingError }), 'error');
+  if (state.tcpRecordingError) return message($('#config-message'), t('TCP completion recording: {detail}', { detail: state.tcpRecordingError }), 'error');
   if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   setBusy(button, true, t('Validating…'));
   try { const { data } = await api('/v1/config/validate', { method: 'POST', json: value }); message($('#config-message'), t('Valid configuration{revision}.', { revision: data?.revision !== undefined ? t(' for revision {revision}', { revision: data.revision }) : '' }), 'success'); }
@@ -4223,6 +4357,7 @@ async function applyConfig() {
   const button = $('#apply-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
   if (state.httpRecordingError) return message($('#config-message'), t('HTTP recording: {detail}', { detail: state.httpRecordingError }), 'error');
+  if (state.tcpRecordingError) return message($('#config-message'), t('TCP completion recording: {detail}', { detail: state.tcpRecordingError }), 'error');
   if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   if (!state.configEtag) return message($('#config-message'), t('Reload the active configuration before applying changes.'), 'error');
   updateConfigPreview(); setBusy(button, true, t('Applying…'));
@@ -5576,6 +5711,24 @@ $('#http-recording-add').addEventListener('click', () => {
   draft.rules.push({ id: `rule-${number}`, action: 'record', methods: '', route_ids: '', route_matched: '',
     status_ranges: '', path_prefixes: '', peer_cidrs: '', client_cidrs: '' });
   renderHttpRecording(); syncHttpRecordingToDocument();
+});
+$('#tcp-recording-enabled').addEventListener('change', event => {
+  state.tcpRecordingDraft = event.target.checked ? { default_action: 'record', rules: [] } : null;
+  renderTcpRecording(); syncTcpRecordingToDocument();
+});
+$('#tcp-recording-default').addEventListener('change', event => {
+  if (!state.tcpRecordingDraft) return;
+  state.tcpRecordingDraft.default_action = event.target.value;
+  syncTcpRecordingToDocument();
+});
+$('#tcp-recording-add').addEventListener('click', () => {
+  const draft = state.tcpRecordingDraft;
+  if (!draft || draft.rules.length >= 64) return;
+  let number = draft.rules.length + 1;
+  while (draft.rules.some(rule => rule.id === `rule-${number}`)) number += 1;
+  draft.rules.push({ id: `rule-${number}`, action: 'record', listen_addresses: '', peer_cidrs: '',
+    route_ids: '', route_matched: '', outcomes: '' });
+  renderTcpRecording(); syncTcpRecordingToDocument();
 });
 $('#audit-previous').addEventListener('click', () => {
   const previous = state.audit.previous.slice();
