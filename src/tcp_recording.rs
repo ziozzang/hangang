@@ -261,6 +261,24 @@ mod tests {
         policy.rules.truncate(1);
         policy.rules[0].criteria.route_ids = vec!["x".into(); 65];
         assert!(policy.validate().is_err());
+        policy.rules[0].criteria.route_ids.truncate(64);
+        for index in 1..64 {
+            policy.rules.push(Rule {
+                id: format!("r{index}"),
+                action: Action::Drop,
+                criteria: Criteria {
+                    route_ids: vec!["x".repeat(128); 64],
+                    ..Default::default()
+                },
+            });
+        }
+        assert!(
+            policy
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
+        );
     }
 
     #[test]
