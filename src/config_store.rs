@@ -48,6 +48,8 @@ pub(crate) const MAX_CONFIG_BYTES: usize = store::MAX_CONFIG_BYTES;
 pub const EPOCH_LEN: usize = 32;
 /// Retained SQL receipts are bounded; a full history refuses new operation CAS.
 pub const COMMIT_RECEIPT_CAPACITY: u64 = 100_000;
+/// Independent release evidence remains bounded and is never evicted.
+pub const COMMIT_RELEASE_CAPACITY: u64 = 100_000;
 pub const COMMIT_AUTHORITY_CAPACITY: u64 = 4_096;
 pub const MAX_ACCEPTANCE_SEQUENCE: u64 = 9_007_199_254_740_991;
 pub const SEQUENCED_RECEIPT_PAGE_LIMIT: usize = 100;
@@ -318,6 +320,38 @@ pub trait ConfigStore: Send + Sync {
             "sequenced receipt export is unsupported by this store"
         )))
     }
+    fn supports_receipt_release_v2(&self) -> bool {
+        false
+    }
+    /// `None` means the receipt is absent, not that a release was acknowledged.
+    async fn lookup_receipt_pin_v2(
+        &self,
+        _authority_id: &str,
+        _acceptance_seq: u64,
+    ) -> StoreResult<Option<bool>> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced receipt pins are unsupported by this store"
+        )))
+    }
+    /// Atomically retain immutable release evidence and clear the exact receipt's pin.
+    async fn release_commit_receipt_v2(
+        &self,
+        _release_id: &str,
+        _receipt: &SequencedCommitReceipt,
+    ) -> StoreResult<()> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced receipt release is unsupported by this store"
+        )))
+    }
+    /// A missing ledger row cannot prove that a release did not once commit.
+    async fn lookup_receipt_release_v2(
+        &self,
+        _release_id: &str,
+    ) -> StoreResult<Option<SequencedCommitReceipt>> {
+        Err(StoreError::Invalid(anyhow!(
+            "sequenced receipt release is unsupported by this store"
+        )))
+    }
     /// ACME HTTP-01 sharing: every instance behind a load balancer can answer
     /// the CA's validation request. `token`: 1..=128 chars of `[A-Za-z0-9_-]`;
     /// `key_authorization`: 1..=512 printable ASCII; `ttl`: 1 s..=1 h.
@@ -565,6 +599,27 @@ fn sequenced_receipt(
             candidate_sha256,
         },
     })
+}
+
+fn validate_release_request(release_id: &str, receipt: &SequencedCommitReceipt) -> StoreResult<()> {
+    if !valid_hex(release_id, 32) {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid receipt release identity"
+        )));
+    }
+    let parsed = sequenced_receipt(
+        receipt.stamp.authority_id.clone(),
+        i64::try_from(receipt.stamp.acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid receipt release")))?,
+        receipt.stamp.operation_id.clone(),
+        receipt.epoch.clone(),
+        revision_to_i64(receipt.revision)?,
+        receipt.stamp.candidate_sha256.clone(),
+    )?;
+    if parsed != *receipt {
+        return Err(StoreError::Invalid(anyhow!("invalid receipt release")));
+    }
+    Ok(())
 }
 
 fn sequenced_observation(
@@ -1383,6 +1438,119 @@ impl ConfigStore for SqliteConfigStore {
         true
     }
 
+    fn supports_receipt_release_v2(&self) -> bool {
+        true
+    }
+
+    async fn lookup_receipt_pin_v2(
+        &self,
+        authority_id: &str,
+        acceptance_seq: u64,
+    ) -> StoreResult<Option<bool>> {
+        canonical_operation_id(authority_id, acceptance_seq)?;
+        let authority_id = authority_id.to_owned();
+        let seq = i64::try_from(acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        self.with_connection(Access::Read, move |connection| {
+            let pin: Option<i64> = connection
+                .query_row(
+                    "SELECT unresolved_pin FROM hangang_sequenced_receipts WHERE authority_id=?1 AND acceptance_seq=?2",
+                    rusqlite::params![authority_id, seq],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            pin.map(|value| match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(StoreError::Invalid(anyhow!("invalid receipt pin"))),
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn lookup_receipt_release_v2(
+        &self,
+        release_id: &str,
+    ) -> StoreResult<Option<SequencedCommitReceipt>> {
+        if !valid_hex(release_id, 32) {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid receipt release identity"
+            )));
+        }
+        let release_id = release_id.to_owned();
+        self.with_connection(Access::Read, move |connection| {
+            sqlite_release_receipt(connection, &release_id)
+        })
+        .await
+    }
+
+    async fn release_commit_receipt_v2(
+        &self,
+        release_id: &str,
+        receipt: &SequencedCommitReceipt,
+    ) -> StoreResult<()> {
+        validate_release_request(release_id, receipt)?;
+        let release_id = release_id.to_owned();
+        let receipt = receipt.clone();
+        self.with_connection(Access::Mutation, move |connection| {
+            let tx = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_error)?;
+            if let Some(existing) = sqlite_release_receipt(&tx, &release_id)? {
+                return if existing == receipt {
+                    Ok(())
+                } else {
+                    Err(StoreError::Invalid(anyhow!("receipt release identity reused")))
+                };
+            }
+            let observed = sqlite_sequenced_observation(
+                &tx,
+                &receipt.stamp.authority_id,
+                receipt.stamp.acceptance_seq,
+            )?;
+            if observed.receipt.as_ref() != Some(&receipt) {
+                return Err(StoreError::Invalid(anyhow!("receipt release does not match retained commit")));
+            }
+            let seq = i64::try_from(receipt.stamp.acceptance_seq)
+                .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+            let pinned: i64 = tx
+                .query_row(
+                    "SELECT unresolved_pin FROM hangang_sequenced_receipts WHERE authority_id=?1 AND acceptance_seq=?2",
+                    rusqlite::params![receipt.stamp.authority_id, seq],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if pinned != 1 {
+                return Err(StoreError::Invalid(anyhow!("receipt was already released")));
+            }
+            let count: i64 = tx
+                .query_row("SELECT stored_records FROM hangang_receipt_release_meta WHERE singleton=1", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            if !(0..100_000).contains(&count) {
+                return Err(StoreError::Unavailable(anyhow!("receipt release evidence capacity exhausted")));
+            }
+            tx.execute(
+                "INSERT INTO hangang_receipt_releases(release_id,authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![release_id,receipt.stamp.authority_id,seq,receipt.stamp.operation_id,receipt.epoch,revision_to_i64(receipt.revision)?,receipt.stamp.candidate_sha256],
+            ).map_err(sqlite_error)?;
+            let changed = tx.execute(
+                "UPDATE hangang_sequenced_receipts SET unresolved_pin=0 WHERE authority_id=?1 AND acceptance_seq=?2 AND unresolved_pin=1",
+                rusqlite::params![receipt.stamp.authority_id,seq],
+            ).map_err(sqlite_error)?;
+            let counted = tx.execute(
+                "UPDATE hangang_receipt_release_meta SET stored_records=stored_records+1 WHERE singleton=1 AND stored_records<100000",
+                [],
+            ).map_err(sqlite_error)?;
+            if changed != 1 || counted != 1 {
+                return Err(StoreError::Unavailable(anyhow!("receipt release failed atomically")));
+            }
+            tx.commit().map_err(sqlite_error)
+        })
+        .await
+    }
+
     async fn lookup_commit_receipt_v2(
         &self,
         authority_id: &str,
@@ -1817,7 +1985,192 @@ fn initialize_sqlite(connection: &rusqlite::Connection) -> StoreResult<()> {
          BEGIN SELECT RAISE(ABORT, 'stamped writer requires a new write generation'); END;",
         )
         .map_err(sqlite_error)?;
+    migrate_sqlite_receipt_pins(connection)?;
     Ok(())
+}
+
+/// Independent from the account-store schema. All pin DDL, backfill, guard,
+/// release ledger, and version marker commit together. Older V2 writers omit
+/// the new column; its default and this trigger remain effective regardless of
+/// their INSERT statement.
+fn migrate_sqlite_receipt_pins(connection: &rusqlite::Connection) -> StoreResult<()> {
+    let meta: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hangang_receipt_schema_meta'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if meta.is_some() {
+        let version: Option<i64> = connection
+            .query_row(
+                "SELECT version FROM hangang_receipt_schema_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if version == Some(2) {
+            return sqlite_receipt_schema_ready(connection);
+        }
+        if version.is_some_and(|version| version > 2 || version < 1) {
+            return Err(StoreError::Invalid(anyhow!(
+                "unsupported receipt schema version"
+            )));
+        }
+    }
+    let tx =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hangang_receipt_schema_meta (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            version INTEGER NOT NULL CHECK(version>=1)
+         ) STRICT;",
+    )
+    .map_err(sqlite_error)?;
+    let version: Option<i64> = tx
+        .query_row(
+            "SELECT version FROM hangang_receipt_schema_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if version.is_some_and(|version| version > 2 || version < 1) {
+        return Err(StoreError::Invalid(anyhow!(
+            "unsupported receipt schema version"
+        )));
+    }
+    if version != Some(2) {
+        let has_pin = sqlite_receipt_has_column(&tx, "unresolved_pin")?;
+        if !has_pin {
+            tx.execute_batch(
+                "ALTER TABLE hangang_sequenced_receipts ADD COLUMN unresolved_pin INTEGER NOT NULL DEFAULT 1 CHECK(unresolved_pin IN (0,1))",
+            )
+            .map_err(sqlite_error)?;
+        }
+        // A pre-migration receipt was unresolved regardless of later local
+        // journal state. Never infer its release from the current document.
+        tx.execute("UPDATE hangang_sequenced_receipts SET unresolved_pin=1", [])
+            .map_err(sqlite_error)?;
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS hangang_sequenced_pin_insert_guard
+             BEFORE INSERT ON hangang_sequenced_receipts
+             WHEN NEW.unresolved_pin IS NOT 1
+             BEGIN SELECT RAISE(ABORT, 'new sequenced receipt must be pinned'); END;",
+        )
+        .map_err(sqlite_error)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hangang_receipt_releases (
+                release_id TEXT PRIMARY KEY,
+                authority_id TEXT NOT NULL,
+                acceptance_seq INTEGER NOT NULL CHECK(acceptance_seq>0 AND acceptance_seq<=9007199254740991),
+                operation_id TEXT NOT NULL,
+                epoch TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision>0),
+                candidate_sha256 TEXT NOT NULL,
+                UNIQUE(authority_id,acceptance_seq)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS hangang_receipt_release_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                stored_records INTEGER NOT NULL CHECK(stored_records>=0 AND stored_records<=100000)
+             ) STRICT;
+             INSERT OR IGNORE INTO hangang_receipt_release_meta(singleton,stored_records) VALUES(1,0);",
+        )
+        .map_err(sqlite_error)?;
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS hangang_sequenced_pin_release_guard
+             BEFORE UPDATE OF unresolved_pin ON hangang_sequenced_receipts
+             WHEN OLD.unresolved_pin=1 AND NEW.unresolved_pin=0
+              AND NOT EXISTS(
+                SELECT 1 FROM hangang_receipt_releases r
+                WHERE r.authority_id=NEW.authority_id AND r.acceptance_seq=NEW.acceptance_seq
+                  AND r.operation_id=NEW.operation_id AND r.epoch=NEW.epoch
+                  AND r.revision=NEW.revision AND r.candidate_sha256=NEW.candidate_sha256
+              )
+             BEGIN SELECT RAISE(ABORT,'receipt release evidence missing'); END;
+             CREATE TRIGGER IF NOT EXISTS hangang_receipt_release_no_delete
+             BEFORE DELETE ON hangang_receipt_releases
+             BEGIN SELECT RAISE(ABORT,'release evidence is retained'); END;
+             CREATE TRIGGER IF NOT EXISTS hangang_receipt_release_no_update
+             BEFORE UPDATE ON hangang_receipt_releases
+             BEGIN SELECT RAISE(ABORT,'release evidence is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS hangang_receipt_no_repin
+             BEFORE UPDATE OF unresolved_pin ON hangang_sequenced_receipts
+             WHEN OLD.unresolved_pin=0 AND NEW.unresolved_pin=1
+             BEGIN SELECT RAISE(ABORT,'released receipt cannot be re-pinned'); END;",
+        )
+        .map_err(sqlite_error)?;
+        tx.execute(
+            "INSERT INTO hangang_receipt_schema_meta(singleton,version) VALUES(1,2)
+             ON CONFLICT(singleton) DO UPDATE SET version=excluded.version",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    }
+    sqlite_receipt_schema_ready(&tx)?;
+    tx.commit().map_err(sqlite_error)
+}
+
+fn sqlite_receipt_schema_ready(connection: &rusqlite::Connection) -> StoreResult<()> {
+    if !sqlite_receipt_has_column(connection, "unresolved_pin")? {
+        return Err(StoreError::Invalid(anyhow!(
+            "receipt pin column is missing"
+        )));
+    }
+    for (kind, name) in [
+        ("trigger", "hangang_sequenced_pin_insert_guard"),
+        ("trigger", "hangang_sequenced_pin_release_guard"),
+        ("trigger", "hangang_receipt_release_no_delete"),
+        ("trigger", "hangang_receipt_release_no_update"),
+        ("trigger", "hangang_receipt_no_repin"),
+        ("table", "hangang_receipt_releases"),
+        ("table", "hangang_receipt_release_meta"),
+    ] {
+        let found: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                rusqlite::params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if found.is_none() {
+            return Err(StoreError::Invalid(anyhow!(
+                "receipt pin or evidence schema is missing"
+            )));
+        }
+    }
+    let count: i64 = connection
+        .query_row(
+            "SELECT stored_records FROM hangang_receipt_release_meta WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !(0..=100_000).contains(&count) {
+        return Err(StoreError::Invalid(anyhow!(
+            "invalid receipt release evidence count"
+        )));
+    }
+    Ok(())
+}
+
+fn sqlite_receipt_has_column(connection: &rusqlite::Connection, wanted: &str) -> StoreResult<bool> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(hangang_sequenced_receipts)")
+        .map_err(sqlite_error)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?;
+    for name in names {
+        if name.map_err(sqlite_error)? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn sqlite_has_column(connection: &rusqlite::Connection, wanted: &str) -> StoreResult<bool> {
@@ -2021,6 +2374,33 @@ fn sqlite_receipt_observation(
     receipt_observation(receipt, count)
 }
 
+fn sqlite_release_receipt(
+    connection: &rusqlite::Connection,
+    release_id: &str,
+) -> StoreResult<Option<SequencedCommitReceipt>> {
+    type Row = (String, i64, String, String, i64, String);
+    let row: Option<Row> = connection
+        .query_row(
+            "SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+             FROM hangang_receipt_releases WHERE release_id=?1",
+            [release_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    row.map(|(a, s, o, e, r, h)| sequenced_receipt(a, s, o, e, r, h))
+        .transpose()
+}
+
 fn sqlite_sequenced_observation(
     connection: &rusqlite::Connection,
     authority_id: &str,
@@ -2093,6 +2473,182 @@ fn sqlite_sequenced_observation(
         .transpose()?;
     sequenced_observation(receipt, high_water, count, authorities)
 }
+
+/// An independent schema transaction. Older instances may replace
+/// `hangang_cas_v2`, but they neither remove this column nor replace this
+/// separately named insertion guard.
+const POSTGRES_RECEIPT_PIN_MIGRATION: &str = r#"
+BEGIN;
+CREATE TABLE IF NOT EXISTS hangang_receipt_schema_meta (
+    singleton SMALLINT PRIMARY KEY CHECK(singleton=1),
+    version SMALLINT NOT NULL CHECK(version>=1)
+);
+DO $check$ DECLARE v SMALLINT; BEGIN
+    SELECT version INTO v FROM hangang_receipt_schema_meta WHERE singleton=1 FOR UPDATE;
+    IF v IS NOT NULL AND v NOT IN (1,2) THEN
+        RAISE EXCEPTION 'unsupported receipt schema version' USING ERRCODE='23514';
+    END IF;
+    IF v=2 AND (
+        NOT EXISTS (SELECT 1 FROM pg_attribute
+          WHERE attrelid='hangang_sequenced_receipts'::regclass
+            AND attname='unresolved_pin' AND NOT attisdropped)
+        OR NOT EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgrelid='hangang_sequenced_receipts'::regclass
+            AND tgname='hangang_sequenced_pin_insert_guard' AND NOT tgisinternal)
+        OR NOT EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgrelid='hangang_sequenced_receipts'::regclass
+            AND tgname='hangang_sequenced_pin_release_guard' AND NOT tgisinternal)
+        OR to_regclass('hangang_receipt_releases') IS NULL
+        OR to_regclass('hangang_receipt_release_meta') IS NULL
+        OR NOT EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgrelid=to_regclass('hangang_receipt_releases')
+            AND tgname='hangang_receipt_release_no_delete' AND NOT tgisinternal)
+        OR NOT EXISTS (SELECT 1 FROM pg_trigger
+          WHERE tgrelid=to_regclass('hangang_receipt_releases')
+            AND tgname='hangang_receipt_release_no_update' AND NOT tgisinternal)
+    ) THEN
+        RAISE EXCEPTION 'receipt pin or release evidence schema is missing' USING ERRCODE='23514';
+    END IF;
+END $check$;
+ALTER TABLE hangang_sequenced_receipts
+    ADD COLUMN IF NOT EXISTS unresolved_pin BOOLEAN NOT NULL DEFAULT TRUE;
+DO $backfill$ DECLARE v SMALLINT; BEGIN
+    SELECT version INTO v FROM hangang_receipt_schema_meta WHERE singleton=1 FOR UPDATE;
+    IF v IS DISTINCT FROM 2 THEN
+        UPDATE hangang_sequenced_receipts SET unresolved_pin=TRUE;
+    END IF;
+END $backfill$;
+CREATE OR REPLACE FUNCTION hangang_sequenced_pin_insert_guard_fn() RETURNS trigger
+LANGUAGE plpgsql AS $guard$ BEGIN
+    IF NEW.unresolved_pin IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'new sequenced receipt must be pinned' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $guard$;
+CREATE OR REPLACE TRIGGER hangang_sequenced_pin_insert_guard
+BEFORE INSERT ON hangang_sequenced_receipts FOR EACH ROW
+EXECUTE FUNCTION hangang_sequenced_pin_insert_guard_fn();
+CREATE TABLE IF NOT EXISTS hangang_receipt_releases (
+    release_id TEXT PRIMARY KEY,
+    authority_id TEXT NOT NULL,
+    acceptance_seq BIGINT NOT NULL CHECK(acceptance_seq>0 AND acceptance_seq<=9007199254740991),
+    operation_id TEXT NOT NULL,
+    epoch TEXT NOT NULL,
+    revision BIGINT NOT NULL CHECK(revision>0),
+    candidate_sha256 TEXT NOT NULL,
+    UNIQUE(authority_id,acceptance_seq)
+);
+CREATE TABLE IF NOT EXISTS hangang_receipt_release_meta (
+    singleton SMALLINT PRIMARY KEY CHECK(singleton=1),
+    stored_records BIGINT NOT NULL CHECK(stored_records>=0 AND stored_records<=100000)
+);
+INSERT INTO hangang_receipt_release_meta(singleton,stored_records)
+VALUES(1,0) ON CONFLICT(singleton) DO NOTHING;
+CREATE OR REPLACE FUNCTION hangang_sequenced_pin_release_guard_fn() RETURNS trigger
+LANGUAGE plpgsql AS $release_guard$ BEGIN
+    IF OLD.unresolved_pin=FALSE AND NEW.unresolved_pin=TRUE THEN
+        RAISE EXCEPTION 'released receipt cannot be re-pinned' USING ERRCODE='23514';
+    END IF;
+    IF OLD.unresolved_pin=TRUE AND NEW.unresolved_pin=FALSE
+       AND NOT EXISTS(
+         SELECT 1 FROM hangang_receipt_releases r
+         WHERE r.authority_id=NEW.authority_id AND r.acceptance_seq=NEW.acceptance_seq
+           AND r.operation_id=NEW.operation_id AND r.epoch=NEW.epoch
+           AND r.revision=NEW.revision AND r.candidate_sha256=NEW.candidate_sha256
+       ) THEN
+        RAISE EXCEPTION 'receipt release evidence missing' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END $release_guard$;
+CREATE OR REPLACE TRIGGER hangang_sequenced_pin_release_guard
+BEFORE UPDATE OF unresolved_pin ON hangang_sequenced_receipts FOR EACH ROW
+EXECUTE FUNCTION hangang_sequenced_pin_release_guard_fn();
+CREATE OR REPLACE FUNCTION hangang_receipt_release_no_delete_fn() RETURNS trigger
+LANGUAGE plpgsql AS $no_delete$ BEGIN
+    RAISE EXCEPTION 'release evidence is retained' USING ERRCODE='23514';
+END $no_delete$;
+CREATE OR REPLACE TRIGGER hangang_receipt_release_no_delete
+BEFORE DELETE ON hangang_receipt_releases FOR EACH ROW
+EXECUTE FUNCTION hangang_receipt_release_no_delete_fn();
+CREATE OR REPLACE TRIGGER hangang_receipt_release_no_update
+BEFORE UPDATE ON hangang_receipt_releases FOR EACH ROW
+EXECUTE FUNCTION hangang_receipt_release_no_delete_fn();
+CREATE OR REPLACE FUNCTION hangang_release_receipt_v2(
+    p_release TEXT,p_authority TEXT,p_seq BIGINT,p_operation TEXT,
+    p_epoch TEXT,p_revision BIGINT,p_digest TEXT
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY INVOKER SET search_path FROM CURRENT AS $release$
+DECLARE prior RECORD; retained RECORD; count_now BIGINT; changed BIGINT;
+BEGIN
+    -- A previous exact release remains provable even after future receipt prune.
+    SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+      INTO prior FROM hangang_receipt_releases WHERE release_id=p_release;
+    IF FOUND THEN
+        IF prior.authority_id=p_authority AND prior.acceptance_seq=p_seq
+           AND prior.operation_id=p_operation AND prior.epoch=p_epoch
+           AND prior.revision=p_revision AND prior.candidate_sha256=p_digest THEN
+            RETURN TRUE;
+        END IF;
+        RAISE EXCEPTION 'receipt release identity reused' USING ERRCODE='23514';
+    END IF;
+    -- Lock order is receipt, then capacity/meta, then release ledger.
+    SELECT operation_id,epoch,revision,candidate_sha256,unresolved_pin
+      INTO retained FROM hangang_sequenced_receipts
+      WHERE authority_id=p_authority AND acceptance_seq=p_seq FOR UPDATE;
+    IF NOT FOUND OR retained.operation_id IS DISTINCT FROM p_operation
+       OR retained.epoch IS DISTINCT FROM p_epoch
+       OR retained.revision IS DISTINCT FROM p_revision
+       OR retained.candidate_sha256 IS DISTINCT FROM p_digest THEN
+        RAISE EXCEPTION 'receipt release does not match retained commit' USING ERRCODE='23514';
+    END IF;
+    IF retained.unresolved_pin IS DISTINCT FROM TRUE THEN
+        SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+          INTO prior FROM hangang_receipt_releases WHERE release_id=p_release;
+        IF FOUND AND prior.authority_id=p_authority AND prior.acceptance_seq=p_seq
+           AND prior.operation_id=p_operation AND prior.epoch=p_epoch
+           AND prior.revision=p_revision AND prior.candidate_sha256=p_digest THEN
+            RETURN TRUE;
+        END IF;
+        RAISE EXCEPTION 'receipt was already released' USING ERRCODE='23514';
+    END IF;
+    SELECT stored_records INTO count_now FROM hangang_receipt_release_meta
+    WHERE singleton=1 FOR UPDATE;
+    IF NOT FOUND OR count_now<0 OR count_now>100000 THEN
+        RAISE EXCEPTION 'invalid release evidence count' USING ERRCODE='23514';
+    END IF;
+    -- Another transaction may have used the same release ID while we waited.
+    SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+      INTO prior FROM hangang_receipt_releases WHERE release_id=p_release;
+    IF FOUND THEN
+        IF prior.authority_id=p_authority AND prior.acceptance_seq=p_seq
+           AND prior.operation_id=p_operation AND prior.epoch=p_epoch
+           AND prior.revision=p_revision AND prior.candidate_sha256=p_digest THEN
+            RETURN TRUE;
+        END IF;
+        RAISE EXCEPTION 'receipt release identity reused' USING ERRCODE='23514';
+    END IF;
+    IF count_now>=100000 THEN
+        RAISE EXCEPTION 'receipt release evidence capacity exhausted' USING ERRCODE='23514';
+    END IF;
+    INSERT INTO hangang_receipt_releases(release_id,authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
+    VALUES(p_release,p_authority,p_seq,p_operation,p_epoch,p_revision,p_digest);
+    UPDATE hangang_sequenced_receipts SET unresolved_pin=FALSE
+    WHERE authority_id=p_authority AND acceptance_seq=p_seq AND unresolved_pin=TRUE;
+    GET DIAGNOSTICS changed=ROW_COUNT;
+    IF changed<>1 THEN
+        RAISE EXCEPTION 'receipt pin update was not applied' USING ERRCODE='23514';
+    END IF;
+    UPDATE hangang_receipt_release_meta SET stored_records=stored_records+1
+    WHERE singleton=1 AND stored_records<100000;
+    GET DIAGNOSTICS changed=ROW_COUNT;
+    IF changed<>1 THEN
+        RAISE EXCEPTION 'release evidence count was not applied' USING ERRCODE='23514';
+    END IF;
+    RETURN TRUE;
+END $release$;
+INSERT INTO hangang_receipt_schema_meta(singleton,version) VALUES(1,2)
+ON CONFLICT(singleton) DO UPDATE SET version=EXCLUDED.version;
+COMMIT;
+"#;
 
 #[derive(Clone)]
 pub struct PostgresConfigStore {
@@ -2613,6 +3169,15 @@ impl PostgresConfigStore {
                     .context("initialize PostgreSQL configuration schema"),
             )
         })?;
+        postgres_timeout(client.batch_execute(POSTGRES_RECEIPT_PIN_MIGRATION))
+            .await
+            .map_err(|failure| {
+                StoreError::Unavailable(
+                    failure
+                        .error
+                        .context("migrate PostgreSQL receipt pin schema"),
+                )
+            })?;
         let client = Arc::new(client);
         *cached = Some(client.clone());
         Ok(client)
@@ -2903,6 +3468,104 @@ impl ConfigStore for PostgresConfigStore {
 
     fn supports_sequenced_operation_cas(&self) -> bool {
         true
+    }
+
+    fn supports_receipt_release_v2(&self) -> bool {
+        true
+    }
+
+    async fn lookup_receipt_pin_v2(
+        &self,
+        authority_id: &str,
+        acceptance_seq: u64,
+    ) -> StoreResult<Option<bool>> {
+        canonical_operation_id(authority_id, acceptance_seq)?;
+        let seq = i64::try_from(acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&authority_id, &seq];
+        let row = self
+            .run(Access::Read, |client| async move {
+                client
+                    .query_opt(
+                        "SELECT unresolved_pin FROM hangang_sequenced_receipts WHERE authority_id=$1 AND acceptance_seq=$2",
+                        parameters,
+                    )
+                    .await
+            })
+            .await?
+            .value;
+        row.map(|row| postgres_column::<bool>(&row, 0)).transpose()
+    }
+
+    async fn lookup_receipt_release_v2(
+        &self,
+        release_id: &str,
+    ) -> StoreResult<Option<SequencedCommitReceipt>> {
+        if !valid_hex(release_id, 32) {
+            return Err(StoreError::Invalid(anyhow!(
+                "invalid receipt release identity"
+            )));
+        }
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&release_id];
+        let row = self
+            .run(Access::Read, |client| async move {
+                client.query_opt(
+                    "SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256
+                     FROM hangang_receipt_releases WHERE release_id=$1",
+                    parameters,
+                ).await
+            })
+            .await?
+            .value;
+        row.map(|row| {
+            sequenced_receipt(
+                postgres_column(&row, 0)?,
+                postgres_column(&row, 1)?,
+                postgres_column(&row, 2)?,
+                postgres_column(&row, 3)?,
+                postgres_column(&row, 4)?,
+                postgres_column(&row, 5)?,
+            )
+        })
+        .transpose()
+    }
+
+    async fn release_commit_receipt_v2(
+        &self,
+        release_id: &str,
+        receipt: &SequencedCommitReceipt,
+    ) -> StoreResult<()> {
+        validate_release_request(release_id, receipt)?;
+        let seq = i64::try_from(receipt.stamp.acceptance_seq)
+            .map_err(|_| StoreError::Invalid(anyhow!("invalid acceptance sequence")))?;
+        let revision = revision_to_i64(receipt.revision)?;
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &release_id,
+            &receipt.stamp.authority_id,
+            &seq,
+            &receipt.stamp.operation_id,
+            &receipt.epoch,
+            &revision,
+            &receipt.stamp.candidate_sha256,
+        ];
+        let row = self
+            .run(Access::Mutation, |client| async move {
+                client
+                    .query_one(
+                        "SELECT hangang_release_receipt_v2($1,$2,$3,$4,$5,$6,$7)",
+                        parameters,
+                    )
+                    .await
+            })
+            .await?
+            .value;
+        let accepted: bool = postgres_column(&row, 0)?;
+        if !accepted {
+            return Err(StoreError::Invalid(anyhow!(
+                "receipt release was not recorded"
+            )));
+        }
+        Ok(())
     }
 
     async fn lookup_commit_receipt_v2(

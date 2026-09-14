@@ -203,6 +203,199 @@ async fn sqlite_sequenced_contract() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn sqlite_release_is_atomic_exact_bounded_and_durable() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("release.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    assert!(store.supports_receipt_release_v2());
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    let receipt = store
+        .lookup_commit_receipt_v2(AUTHORITY, 2)
+        .await?
+        .receipt
+        .unwrap();
+    assert_eq!(store.lookup_receipt_pin_v2(AUTHORITY, 2).await?, Some(true));
+    let release_id = "11111111111111111111111111111111";
+    let mut wrong = receipt.clone();
+    wrong.stamp.candidate_sha256 = "0".repeat(64);
+    assert!(matches!(
+        store.release_commit_receipt_v2(release_id, &wrong).await,
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.lookup_receipt_release_v2(release_id).await?, None);
+    assert_eq!(store.lookup_receipt_pin_v2(AUTHORITY, 2).await?, Some(true));
+    store
+        .release_commit_receipt_v2(release_id, &receipt)
+        .await?;
+    store
+        .release_commit_receipt_v2(release_id, &receipt)
+        .await?;
+    assert_eq!(
+        store.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(false)
+    );
+    assert_eq!(
+        store.lookup_receipt_release_v2(release_id).await?,
+        Some(receipt.clone())
+    );
+    assert!(matches!(
+        store
+            .release_commit_receipt_v2("22222222222222222222222222222222", &receipt)
+            .await,
+        Err(StoreError::Invalid(_))
+    ));
+    let reopened = SqliteConfigStore::open(&path).await?;
+    assert_eq!(
+        reopened.lookup_receipt_release_v2(release_id).await?,
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        reopened.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(false)
+    );
+
+    let connection = rusqlite::Connection::open(&path)?;
+    assert!(connection.execute(
+        "UPDATE hangang_sequenced_receipts SET unresolved_pin=1 WHERE authority_id=?1 AND acceptance_seq=2",
+        [AUTHORITY],
+    ).is_err(), "released receipt cannot be re-pinned");
+    connection.execute(
+        "UPDATE hangang_receipt_release_meta SET stored_records=100000 WHERE singleton=1",
+        [],
+    )?;
+    let operation = stamp(AUTHORITY, 3, 1, &document(0, false));
+    applied(
+        reopened
+            .compare_and_swap_operation_v2(&epoch, 1, document(0, false), operation)
+            .await?,
+    );
+    let next = reopened
+        .lookup_commit_receipt_v2(AUTHORITY, 3)
+        .await?
+        .receipt
+        .unwrap();
+    assert!(matches!(
+        reopened
+            .release_commit_receipt_v2("33333333333333333333333333333333", &next)
+            .await,
+        Err(StoreError::Unavailable(_))
+    ));
+    assert_eq!(
+        reopened.lookup_receipt_pin_v2(AUTHORITY, 3).await?,
+        Some(true)
+    );
+    assert_eq!(
+        reopened
+            .lookup_receipt_release_v2("33333333333333333333333333333333")
+            .await?,
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_versioned_schema_refuses_lost_release_ledger() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("lost-ledger.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    let receipt = store
+        .lookup_commit_receipt_v2(AUTHORITY, 2)
+        .await?
+        .receipt
+        .unwrap();
+    store
+        .release_commit_receipt_v2("11111111111111111111111111111111", &receipt)
+        .await?;
+    drop(store);
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch("DROP TABLE hangang_receipt_releases")?;
+    assert!(
+        SqliteConfigStore::open(&path).await.is_err(),
+        "version 2 must not rebuild lost evidence"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_legacy_receipts_backfill_and_failed_migration_rolls_back() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("legacy-pins.db");
+    let store = SqliteConfigStore::open(&path).await?;
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    drop(store);
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch(
+        "DROP TRIGGER hangang_sequenced_pin_insert_guard;
+         ALTER TABLE hangang_sequenced_receipts RENAME TO old_receipts;
+         CREATE TABLE hangang_sequenced_receipts (
+           authority_id TEXT NOT NULL, acceptance_seq INTEGER NOT NULL,
+           operation_id TEXT NOT NULL, epoch TEXT NOT NULL, revision INTEGER NOT NULL,
+           candidate_sha256 TEXT NOT NULL,
+           PRIMARY KEY(authority_id,acceptance_seq),UNIQUE(authority_id,operation_id)
+         ) STRICT;
+         INSERT INTO hangang_sequenced_receipts SELECT authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256 FROM old_receipts;
+         DROP TABLE old_receipts;
+         UPDATE hangang_receipt_schema_meta SET version=1 WHERE singleton=1;
+         CREATE TRIGGER reject_pin_migration BEFORE UPDATE ON hangang_receipt_schema_meta
+           BEGIN SELECT RAISE(ABORT,'fixture migration failure'); END;",
+    )?;
+    assert!(SqliteConfigStore::open(&path).await.is_err());
+    let pin_columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('hangang_sequenced_receipts') WHERE name='unresolved_pin'",
+        [], |row| row.get(0),
+    )?;
+    assert_eq!(
+        pin_columns, 0,
+        "failed migration must not leave a half-installed pin"
+    );
+    connection.execute_batch("DROP TRIGGER reject_pin_migration")?;
+    let reopened = SqliteConfigStore::open(&path).await?;
+    assert_eq!(
+        reopened.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(true)
+    );
+    let next_id = canonical_operation_id(AUTHORITY, 3)?;
+    connection.execute(
+        "INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
+         VALUES(?1,3,?2,?3,2,?4)",
+        rusqlite::params![AUTHORITY, next_id, epoch, "f".repeat(64)],
+    )?;
+    assert_eq!(
+        reopened.lookup_receipt_pin_v2(AUTHORITY, 3).await?,
+        Some(true)
+    );
+    let rejected = connection.execute(
+        "INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256,unresolved_pin)
+         VALUES(?1,4,?2,?3,3,?4,0)",
+        rusqlite::params![AUTHORITY, canonical_operation_id(AUTHORITY, 4)?, epoch, "f".repeat(64)],
+    );
+    assert!(
+        rejected.is_err(),
+        "explicit unpinned legacy INSERT must fail"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn sqlite_v2_insert_failure_rolls_back_document_receipt_and_fence() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("config.db");
@@ -364,7 +557,7 @@ async fn postgres_fixture() -> anyhow::Result<Option<(PostgresConfigStore, tokio
     };
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
-    client.batch_execute("DROP TABLE IF EXISTS hangang_config CASCADE; DROP TABLE IF EXISTS hangang_commit_receipts CASCADE; DROP TABLE IF EXISTS hangang_sequenced_receipts CASCADE; DROP TABLE IF EXISTS hangang_sequenced_authorities CASCADE; DROP TABLE IF EXISTS hangang_commit_receipt_meta CASCADE").await?;
+    client.batch_execute("DROP TABLE IF EXISTS hangang_config CASCADE; DROP TABLE IF EXISTS hangang_commit_receipts CASCADE; DROP TABLE IF EXISTS hangang_sequenced_receipts CASCADE; DROP TABLE IF EXISTS hangang_sequenced_authorities CASCADE; DROP TABLE IF EXISTS hangang_commit_receipt_meta CASCADE; DROP TABLE IF EXISTS hangang_receipt_schema_meta CASCADE; DROP TABLE IF EXISTS hangang_receipt_releases CASCADE; DROP TABLE IF EXISTS hangang_receipt_release_meta CASCADE").await?;
     Ok(Some((
         PostgresConfigStore::connect_unencrypted(&url).await?,
         client,
@@ -379,6 +572,193 @@ async fn postgres_sequenced_contract() -> anyhow::Result<()> {
         return Ok(());
     };
     assert_sequenced_contract(&store).await
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: HANGANG_PG_TEST_TARGET=sequenced_store python3 tests/pg_fixture.py"]
+async fn postgres_pin_guard_survives_legacy_cas_replacement_and_release_is_durable()
+-> anyhow::Result<()> {
+    let Some((store, client)) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    let receipt = store
+        .lookup_commit_receipt_v2(AUTHORITY, 2)
+        .await?
+        .receipt
+        .unwrap();
+    assert_eq!(store.lookup_receipt_pin_v2(AUTHORITY, 2).await?, Some(true));
+    let url = std::env::var("HANGANG_TEST_POSTGRES_URL")?;
+    // Connecting an older-compatible initializer replaces hangang_cas_v2;
+    // the independent receipt trigger must still protect INSERT.
+    let reconnected = PostgresConfigStore::connect_unencrypted(&url).await?;
+    let legacy_id = canonical_operation_id(AUTHORITY, 3)?;
+    client.batch_execute(
+        "CREATE OR REPLACE FUNCTION hangang_cas_v2(BIGINT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,TEXT)
+         RETURNS BOOLEAN LANGUAGE plpgsql AS $$ BEGIN
+           INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256)
+           VALUES($3,$6,$4,$8,$1,$5);
+           RETURN TRUE;
+         END $$;",
+    ).await?;
+    let inserted: bool = client
+        .query_one(
+            "SELECT hangang_cas_v2($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                &2_i64,
+                &"old initializer",
+                &AUTHORITY,
+                &legacy_id,
+                &"f".repeat(64),
+                &3_i64,
+                &1_i64,
+                &epoch,
+            ],
+        )
+        .await?
+        .get(0);
+    assert!(inserted);
+    assert_eq!(
+        reconnected.lookup_receipt_pin_v2(AUTHORITY, 3).await?,
+        Some(true)
+    );
+    let bad = client.execute(
+        "INSERT INTO hangang_sequenced_receipts(authority_id,acceptance_seq,operation_id,epoch,revision,candidate_sha256,unresolved_pin) VALUES($1,4,$2,$3,3,$4,FALSE)",
+        &[&AUTHORITY,&canonical_operation_id(AUTHORITY, 4)?,&epoch,&"f".repeat(64)],
+    ).await;
+    assert!(bad.is_err());
+    let release_id = "11111111111111111111111111111111";
+    client.batch_execute(
+        "CREATE FUNCTION owned_skip_pin_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+         CREATE TRIGGER skip_pin_update BEFORE UPDATE ON hangang_sequenced_receipts
+           FOR EACH ROW EXECUTE FUNCTION owned_skip_pin_update();",
+    ).await?;
+    assert!(
+        reconnected
+            .release_commit_receipt_v2(release_id, &receipt)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reconnected.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(true)
+    );
+    assert_eq!(
+        reconnected.lookup_receipt_release_v2(release_id).await?,
+        None
+    );
+    client
+        .batch_execute("DROP TRIGGER skip_pin_update ON hangang_sequenced_receipts")
+        .await?;
+    reconnected
+        .release_commit_receipt_v2(release_id, &receipt)
+        .await?;
+    reconnected
+        .release_commit_receipt_v2(release_id, &receipt)
+        .await?;
+    assert_eq!(
+        reconnected.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(false)
+    );
+    assert_eq!(
+        reconnected.lookup_receipt_release_v2(release_id).await?,
+        Some(receipt.clone())
+    );
+    assert!(
+        reconnected
+            .release_commit_receipt_v2("22222222222222222222222222222222", &receipt)
+            .await
+            .is_err()
+    );
+    let reopened = PostgresConfigStore::connect_unencrypted(&url).await?;
+    assert_eq!(
+        reopened.lookup_receipt_release_v2(release_id).await?,
+        Some(receipt)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: HANGANG_PG_TEST_TARGET=sequenced_store python3 tests/pg_fixture.py"]
+async fn postgres_pin_migration_failure_rolls_back_column_and_guard() -> anyhow::Result<()> {
+    let Some((store, client)) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    client.batch_execute(
+        "DROP TRIGGER hangang_sequenced_pin_insert_guard ON hangang_sequenced_receipts;
+         DROP TRIGGER hangang_sequenced_pin_release_guard ON hangang_sequenced_receipts;
+         ALTER TABLE hangang_sequenced_receipts DROP COLUMN unresolved_pin;
+         UPDATE hangang_receipt_schema_meta SET version=1 WHERE singleton=1;
+         CREATE FUNCTION owned_reject_pin_migration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture abort'; END $$;
+         CREATE TRIGGER reject_pin_version BEFORE UPDATE ON hangang_receipt_schema_meta FOR EACH ROW EXECUTE FUNCTION owned_reject_pin_migration();",
+    ).await?;
+    let url = std::env::var("HANGANG_TEST_POSTGRES_URL")?;
+    assert!(
+        PostgresConfigStore::connect_unencrypted(&url)
+            .await
+            .is_err()
+    );
+    let column: i64 = client.query_one(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='hangang_sequenced_receipts' AND column_name='unresolved_pin'",
+        &[],
+    ).await?.get(0);
+    assert_eq!(column, 0);
+    client
+        .batch_execute("DROP TRIGGER reject_pin_version ON hangang_receipt_schema_meta")
+        .await?;
+    let reopened = PostgresConfigStore::connect_unencrypted(&url).await?;
+    assert_eq!(
+        reopened.lookup_receipt_pin_v2(AUTHORITY, 2).await?,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture: HANGANG_PG_TEST_TARGET=sequenced_store python3 tests/pg_fixture.py"]
+async fn postgres_versioned_schema_refuses_lost_release_ledger() -> anyhow::Result<()> {
+    let Some((store, client)) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let epoch = store.bootstrap(document(0, false)).await?.epoch;
+    let operation = stamp(AUTHORITY, 2, 0, &document(0, true));
+    applied(
+        store
+            .compare_and_swap_operation_v2(&epoch, 0, document(0, true), operation)
+            .await?,
+    );
+    let receipt = store
+        .lookup_commit_receipt_v2(AUTHORITY, 2)
+        .await?
+        .receipt
+        .unwrap();
+    store
+        .release_commit_receipt_v2("11111111111111111111111111111111", &receipt)
+        .await?;
+    client
+        .batch_execute("DROP TABLE hangang_receipt_releases CASCADE")
+        .await?;
+    let url = std::env::var("HANGANG_TEST_POSTGRES_URL")?;
+    assert!(
+        PostgresConfigStore::connect_unencrypted(&url)
+            .await
+            .is_err(),
+        "version 2 must not recreate missing evidence"
+    );
+    Ok(())
 }
 
 #[tokio::test]
