@@ -95,11 +95,19 @@ async fn server_on_with_traffic(
         externally_managed,
         request_limit,
         public_limit,
-        event_fixture,
-        None,
-        Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
+        ObserverFixture {
+            event_fixture,
+            runtime: None,
+            requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
+        },
     )
     .await
+}
+
+struct ObserverFixture {
+    event_fixture: EventFixture,
+    runtime: Option<Arc<hangang::fleet_observer::Runtime>>,
+    requests: Arc<tokio::sync::Semaphore>,
 }
 
 async fn server_on_with_observer(
@@ -109,10 +117,13 @@ async fn server_on_with_observer(
     externally_managed: bool,
     request_limit: usize,
     public_limit: usize,
-    event_fixture: EventFixture,
-    fleet_observer: Option<Arc<hangang::fleet_observer::Runtime>>,
-    observer_requests: Arc<tokio::sync::Semaphore>,
+    fixture: ObserverFixture,
 ) -> (std::net::SocketAddr, Arc<Manager>) {
+    let ObserverFixture {
+        event_fixture,
+        runtime: fleet_observer,
+        requests: observer_requests,
+    } = fixture;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         state_path.parent().unwrap(),
@@ -319,12 +330,14 @@ async fn fleet_observer_is_narrow_and_has_independent_admission() {
         false,
         64,
         Admin::PUBLIC_REQUEST_LIMIT,
-        EventFixture {
-            traffic: Arc::new(hangang::traffic::TrafficHistory::default()),
-            limit: Admin::EVENT_STREAM_LIMIT,
+        ObserverFixture {
+            event_fixture: EventFixture {
+                traffic: Arc::new(hangang::traffic::TrafficHistory::default()),
+                limit: Admin::EVENT_STREAM_LIMIT,
+            },
+            runtime: Some(runtime),
+            requests: observer_budget.clone(),
         },
-        Some(runtime),
-        observer_budget.clone(),
     )
     .await;
     let (status, headers, body) = request_with_token(
