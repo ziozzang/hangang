@@ -148,6 +148,8 @@ def main():
                 'node_id': 'expected-edge' if index == 1 else actual_id,
                 'endpoint': f'https://localhost:{admin}', 'token_file': str(copied_token),
                 'ca_file': str(wrong_ca if index == 2 else ca),
+                **({'group_id': 'edge-a', 'role': 'gateway'} if index == 0 else
+                   {'group_id': 'edge-b', 'role': 'gateway'} if index == 1 else {}),
             })
         inventory = root / 'inventory.json'
         private_write(inventory, json.dumps({'peers': peers}))
@@ -175,6 +177,9 @@ def main():
         assert initial['configured'] and initial['available']
         assert initial['expected_nodes'] == 3 and initial['fresh_nodes'] == 1
         rows = {row['node_id']: row for row in initial['nodes']}
+        assert (rows['good-edge']['group_id'], rows['good-edge']['role']) == ('edge-a', 'gateway')
+        assert (rows['expected-edge']['group_id'], rows['expected-edge']['role']) == ('edge-b', 'gateway')
+        assert (rows['tls-edge']['group_id'], rows['tls-edge']['role']) == (None, None)
         good = rows['good-edge']['observation']
         assert good['node_id'] == 'good-edge'
         assert rows['expected-edge']['observation'] is None

@@ -23,6 +23,7 @@ def observation():
 
 def node():
     return {'node_id': 'edge-a', 'endpoint': 'https://edge-a.example:9443',
+            'group_id': None, 'role': None,
             'condition': 'fresh', 'last_error': None, 'age_seconds': 0,
             'observation': observation()}
 
@@ -76,6 +77,21 @@ class FleetCollectorSchema(unittest.TestCase):
         value = copy.deepcopy(node())
         value['observation']['unexpected'] = 'not allowed'
         self.assertFalse(check.is_valid(value))
+
+    def test_optional_inventory_labels_are_always_nullable_bounded_wire_fields(self):
+        check = validator('FleetCollectedNode')
+        old_inventory = node()
+        self.assertTrue(check.is_valid(old_inventory))
+        labelled = {**old_inventory, 'group_id': 'edge-a', 'role': 'gateway'}
+        self.assertTrue(check.is_valid(labelled))
+        for field in ('group_id', 'role'):
+            missing = {key: value for key, value in old_inventory.items() if key != field}
+            self.assertFalse(check.is_valid(missing), field)
+            for bad in ('', 'a' * 65, 'has space', 'line\n', 'bad/slash', '한강', 7, []):
+                value = {**labelled, field: bad}
+                self.assertFalse(check.is_valid(value), (field, bad))
+        self.assertTrue(check.is_valid({**old_inventory, 'group_id': 'a' * 64,
+                                        'role': 'R._-9'}))
 
 
 if __name__ == '__main__':
