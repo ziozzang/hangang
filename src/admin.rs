@@ -2037,23 +2037,28 @@ impl Admin {
             if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
                 return Ok(account_problem(error));
             }
-            return Ok(auth_json(
-                200,
-                &self.fleet_collector.as_ref().map_or_else(
-                    || {
-                        serde_json::json!({
-                            "configured":false,
-                            "available":false,
-                            "generation":null,
-                            "expected_nodes":0,
-                            "fresh_nodes":0,
-                            "stale_after_seconds":60,
-                            "nodes":[],
-                        })
-                    },
-                    |runtime| runtime.status(),
-                ),
-            ));
+            let mut status = self.fleet_collector.as_ref().map_or_else(
+                || {
+                    serde_json::json!({
+                        "configured":false,
+                        "available":false,
+                        "generation":null,
+                        "expected_nodes":0,
+                        "fresh_nodes":0,
+                        "stale_after_seconds":60,
+                        "nodes":[],
+                    })
+                },
+                |runtime| runtime.status(),
+            );
+            status
+                .as_object_mut()
+                .expect("fleet status is an object")
+                .insert(
+                    "observer_instance_id".into(),
+                    serde_json::Value::String(instance_id().to_owned()),
+                );
+            return Ok(auth_json(200, &status));
         }
         if path == "/v1/util/hash-password" {
             if req.method() != hyper::Method::POST {

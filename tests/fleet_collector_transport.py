@@ -50,6 +50,13 @@ class PeerServer:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def handle(self):
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                    # Generation cancellation closes held TLS sockets.
+                    pass
+
             def do_GET(self):
                 owner.requests.append((self.path, self.headers.get("Authorization")))
                 status, headers, body = owner.reply()

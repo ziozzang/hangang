@@ -309,8 +309,14 @@ async fn fleet_collector_disabled_is_admin_only_and_has_fixed_shape() {
         request(address, "GET", "/v1/fleet/observations", None, None).await;
     assert_eq!(status, 200);
     assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let mut value = json(&body);
+    assert_eq!(value["observer_instance_id"].as_str().unwrap().len(), 16);
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("observer_instance_id");
     assert_eq!(
-        json(&body),
+        value,
         serde_json::json!({"configured":false,"available":false,"generation":null,"expected_nodes":0,"fresh_nodes":0,"stale_after_seconds":60,"nodes":[]})
     );
     assert_eq!(
@@ -377,6 +383,7 @@ async fn fleet_collector_reports_configured_unknown_without_network_on_read() {
     assert_eq!(status, 200);
     assert_eq!(headers.get("cache-control").unwrap(), "no-store");
     let value = json(&body);
+    assert_eq!(value["observer_instance_id"].as_str().unwrap().len(), 16);
     assert_eq!(value["configured"], true);
     assert_eq!(value["available"], true);
     assert_eq!(value["generation"], "1");
