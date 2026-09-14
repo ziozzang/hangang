@@ -212,6 +212,15 @@ async fn named_watcher_rotates_one_listener_and_keeps_last_good_on_invalid_files
         )
         .await
     );
+    assert!(
+        handshake(
+            active.load().public_http_tls["one"].load_full(),
+            client(&[&old]),
+            "alpha.test"
+        )
+        .await,
+        "invalid replacement must keep the last verified certificate"
+    );
     std::fs::write(&alpha.cert_file, new.cert.pem()).unwrap();
     std::fs::write(&alpha.key_file, new.signing_key.serialize_pem()).unwrap();
     let rotated = tokio::time::timeout(Duration::from_secs(5), async {
