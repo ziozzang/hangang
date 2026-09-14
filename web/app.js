@@ -3241,7 +3241,11 @@ function changeCertificateScope() {
   $('#certificate-list').replaceChildren(); $('#certificate-inventory').replaceChildren();
   $('#certificate-inventory-pages').replaceChildren(); $('#certificate-acme-state').replaceChildren();
   $('#certificate-inventory-count').textContent = '—'; message($('#certificate-message'));
-  loadCertificates(true).catch(error => { if (error instanceof StaleSessionError) return; message($('#certificate-message'), error.message, 'error'); });
+  const generation = state.certificateScopeGeneration;
+  loadCertificates(true).catch(error => {
+    if (error instanceof StaleSessionError || !certificateScopeCurrent(scope, generation)) return;
+    message($('#certificate-message'), error.message, 'error');
+  });
 }
 
 async function loadCertificateInventory(offset = state.certificateInventoryOffset, quiet = false) {
