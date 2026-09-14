@@ -31,6 +31,8 @@ struct InventoryFile {
 #[serde(deny_unknown_fields)]
 struct PeerFile {
     node_id: String,
+    group_id: Option<String>,
+    role: Option<String>,
     endpoint: String,
     token_file: PathBuf,
     ca_file: Option<PathBuf>,
@@ -39,6 +41,8 @@ struct PeerFile {
 #[derive(Clone, PartialEq, Eq)]
 struct Spec {
     node_id: String,
+    group_id: Option<String>,
+    role: Option<String>,
     endpoint: String,
     token: Vec<u8>,
     ca: Option<Vec<u8>>,
@@ -116,6 +120,16 @@ fn load(path: &Path, forbidden: Option<[u8; 32]>) -> Result<Vec<Spec>> {
             crate::fleet_observer::valid_node_id(&peer.node_id),
             "invalid fleet node id"
         );
+        ensure!(
+            peer.group_id
+                .as_deref()
+                .is_none_or(crate::fleet_observer::valid_node_id)
+                && peer
+                    .role
+                    .as_deref()
+                    .is_none_or(crate::fleet_observer::valid_node_id),
+            "invalid fleet group or role"
+        );
         ensure!(peer.endpoint.len() <= 2048, "fleet endpoint too long");
         let url = reqwest::Url::parse(&peer.endpoint)
             .map_err(|_| anyhow::anyhow!("invalid fleet endpoint"))?;
@@ -151,6 +165,8 @@ fn load(path: &Path, forbidden: Option<[u8; 32]>) -> Result<Vec<Spec>> {
             .transpose()?;
         specs.push(Spec {
             node_id: peer.node_id,
+            group_id: peer.group_id,
+            role: peer.role,
             endpoint,
             token,
             ca,
@@ -442,7 +458,9 @@ impl Runtime {
                 if condition == "fresh" {
                     fresh_nodes += 1;
                 }
-                serde_json::json!({"node_id":peer.spec.node_id,"endpoint":peer.spec.endpoint,
+                serde_json::json!({"node_id":peer.spec.node_id,
+                "group_id":peer.spec.group_id,"role":peer.spec.role,
+                "endpoint":peer.spec.endpoint,
                 "condition":condition,"last_error":row.last_error,"age_seconds":age,
                 "observation":row.observation})
             })
@@ -610,6 +628,8 @@ mod tests {
         let runtime = Runtime::open(path, None).await.unwrap();
         let first = runtime.status();
         assert_eq!(first["nodes"][0]["condition"], "unknown");
+        assert!(first["nodes"][0]["group_id"].is_null());
+        assert!(first["nodes"][0]["role"].is_null());
         assert_eq!(first["fresh_nodes"], 0);
         let state = runtime.state.load_full();
         {
@@ -687,6 +707,55 @@ mod tests {
         runtime.refresh().await;
         assert_eq!(runtime.status()["generation"], "3");
         assert_eq!(runtime.status()["nodes"][0]["condition"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn metadata_is_validated_and_retires_prior_samples_on_change() {
+        let (dir, path) = fixture(serde_json::json!([]));
+        let secret = token(dir.path());
+        let entry = serde_json::json!({"node_id":"one","endpoint":"https://localhost:9000",
+            "token_file":secret,"group_id":"east.1","role":"edge_proxy"});
+        fs::write(
+            &path,
+            serde_json::json!({"peers":[entry.clone()]}).to_string(),
+        )
+        .unwrap();
+        let runtime = Runtime::open(path.clone(), None).await.unwrap();
+        assert_eq!(runtime.status()["nodes"][0]["group_id"], "east.1");
+        assert_eq!(runtime.status()["nodes"][0]["role"], "edge_proxy");
+        let old = runtime.state.load_full();
+        publish_result(&old, 0, Instant::now(), Ok(wire("one")));
+        assert_eq!(runtime.status()["fresh_nodes"], 1);
+        runtime.refresh().await;
+        assert!(Arc::ptr_eq(&old, &runtime.state.load_full()));
+        let mut changed = entry.clone();
+        changed["role"] = serde_json::json!("origin");
+        fs::write(&path, serde_json::json!({"peers":[changed]}).to_string()).unwrap();
+        runtime.refresh().await;
+        assert!(old.cancel.is_cancelled());
+        assert_eq!(runtime.status()["generation"], "2");
+        assert_eq!(runtime.status()["nodes"][0]["role"], "origin");
+        assert_eq!(runtime.status()["nodes"][0]["condition"], "unknown");
+        assert_eq!(runtime.status()["fresh_nodes"], 0);
+        for invalid in [
+            "".to_owned(),
+            "bad name".to_owned(),
+            "x".repeat(65),
+            "é".to_owned(),
+        ] {
+            let mut candidate = entry.clone();
+            candidate["group_id"] = serde_json::json!(invalid);
+            fs::write(&path, serde_json::json!({"peers":[candidate]}).to_string()).unwrap();
+            assert!(load(&path, None).is_err());
+            let mut candidate = entry.clone();
+            candidate["role"] = serde_json::json!(invalid);
+            fs::write(&path, serde_json::json!({"peers":[candidate]}).to_string()).unwrap();
+            assert!(load(&path, None).is_err());
+        }
+        let mut malformed = entry;
+        malformed["role"] = serde_json::json!(42);
+        fs::write(&path, serde_json::json!({"peers":[malformed]}).to_string()).unwrap();
+        assert!(load(&path, None).is_err());
     }
 
     #[test]
