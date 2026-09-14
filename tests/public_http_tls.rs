@@ -151,11 +151,20 @@ async fn invalid_material_refuses_snapshot_and_disabled_all_stays_https() {
     let pair = rcgen::generate_simple_self_signed(vec!["alpha.test".into()]).unwrap();
     let mut config = Config::default();
     let mut missing = cert(dir.path(), "alpha", &pair);
-    std::fs::remove_file(&missing.key_file).unwrap();
+    let initial = Snapshot::new({
+        let mut valid = config.clone();
+        valid
+            .public_http
+            .push(listener("edge", 28003, vec![missing.clone()]));
+        valid
+    })
+    .unwrap();
+    missing.key_file = dir.path().join("missing.key.pem");
     config
         .public_http
         .push(listener("edge", 28003, vec![missing.clone()]));
     assert!(Snapshot::new(config.clone()).is_err());
+    assert!(Snapshot::replace(config.clone(), &initial).is_err());
     let pair = rcgen::generate_simple_self_signed(vec!["alpha.test".into()]).unwrap();
     missing = cert(dir.path(), "alpha", &pair);
     missing.enabled = false;
