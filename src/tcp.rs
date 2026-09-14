@@ -82,6 +82,32 @@ fn is_workload_http(config: &Config, address: SocketAddr) -> bool {
         .any(|listener| listener.enabled && listener.listen == address)
 }
 
+#[derive(PartialEq, Eq)]
+enum ListenerRole {
+    Tcp,
+    WorkloadHttp,
+    PublicHttp,
+    PublicHttps,
+}
+
+fn listener_role(config: &Config, address: SocketAddr) -> ListenerRole {
+    if let Some(listener) = config
+        .public_http
+        .iter()
+        .find(|listener| listener.enabled && listener.listen == address)
+    {
+        if listener.certificates.is_empty() {
+            ListenerRole::PublicHttp
+        } else {
+            ListenerRole::PublicHttps
+        }
+    } else if is_workload_http(config, address) {
+        ListenerRole::WorkloadHttp
+    } else {
+        ListenerRole::Tcp
+    }
+}
+
 fn desired_listens(config: &Config) -> HashSet<SocketAddr> {
     config
         .tcp
@@ -91,6 +117,13 @@ fn desired_listens(config: &Config) -> HashSet<SocketAddr> {
         .chain(
             config
                 .workload_http
+                .iter()
+                .filter(|listener| listener.enabled)
+                .map(|listener| listener.listen),
+        )
+        .chain(
+            config
+                .public_http
                 .iter()
                 .filter(|listener| listener.enabled)
                 .map(|listener| listener.listen),
@@ -200,8 +233,8 @@ impl TcpManager {
         let previous = self.active.load();
         for address in current.intersection(&desired) {
             ensure!(
-                is_workload_http(&previous.config, *address) == is_workload_http(config, *address),
-                "TCP and workload HTTP cannot exchange an active listener; remove it in a prior revision"
+                listener_role(&previous.config, *address) == listener_role(config, *address),
+                "TCP, workload HTTP, public HTTP, and public HTTPS cannot exchange an active listener; remove it in a prior revision"
             );
         }
         let mut added = Vec::new();
@@ -242,6 +275,22 @@ impl TcpManager {
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("bind workload HTTP listener {address}"))?;
+            let (listener, export) = retain_export_listener(listener)?;
+            added.push((address, listener, export));
+        }
+        for address in config
+            .public_http
+            .iter()
+            .filter(|listener| listener.enabled)
+            .map(|listener| listener.listen)
+        {
+            ensure!(
+                accounted.insert(address),
+                "public HTTP listener overlaps another listener at {address}"
+            );
+            let listener = TcpListener::bind(address)
+                .await
+                .with_context(|| format!("bind public HTTP listener {address}"))?;
             let (listener, export) = retain_export_listener(listener)?;
             added.push((address, listener, export));
         }
@@ -308,6 +357,22 @@ impl TcpManager {
                 TcpListener::bind(address)
                     .await
                     .with_context(|| format!("bind workload HTTP listener {address}"))?,
+            );
+        }
+        for address in config
+            .public_http
+            .iter()
+            .filter(|listener| listener.enabled)
+            .map(|listener| listener.listen)
+        {
+            ensure!(
+                !process.contains(&address) && routes.insert(address),
+                "public HTTP listener {address} collides with another listener"
+            );
+            held.push(
+                TcpListener::bind(address)
+                    .await
+                    .with_context(|| format!("bind public HTTP listener {address}"))?,
             );
         }
         drop(held);
@@ -812,47 +877,108 @@ fn spawn_accept_loop(
                 _ = cancel.cancelled() => break,
                 accepted = listener.accept() => accepted,
             };
-            let (client, peer) =
-                match accepted {
-                    Ok((client, peer)) => {
-                        // Avoid delayed-ACK/Nagle stalls when TLS or a proxied
-                        // request/response protocol emits a final short record.
-                        if client.set_nodelay(true).is_err() {
-                            metrics.errors.fetch_add(1, Ordering::Relaxed);
-                            // Even transport setup failure has a bounded terminal
-                            // observation for raw TCP. The workload HTTP role owns
-                            // its own request telemetry and is excluded here.
-                            if !active.load().config.workload_http.iter().any(|configured| {
-                                configured.enabled && configured.listen == address
-                            }) {
-                                let mut history = metrics.tcp_history.begin(
-                                    SocketAddr::new(peer.ip().to_canonical(), peer.port()),
-                                    address,
-                                );
-                                history.set_outcome(Outcome::IoError);
-                            }
-                            continue;
-                        }
-                        // Canonicalize IPv4-mapped IPv6 peers (from a dual-stack
-                        // `[::]` listener) so `deny_cidrs` with IPv4 ranges match
-                        // the real IPv4 address instead of silently failing open.
-                        (
-                            client,
-                            SocketAddr::new(peer.ip().to_canonical(), peer.port()),
-                        )
-                    }
-                    Err(error) => {
+            let (client, peer) = match accepted {
+                Ok((client, peer)) => {
+                    // Avoid delayed-ACK/Nagle stalls when TLS or a proxied
+                    // request/response protocol emits a final short record.
+                    if client.set_nodelay(true).is_err() {
                         metrics.errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(%address, %error, "TCP accept failed");
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                        // Even transport setup failure has a bounded terminal
+                        // observation for raw TCP. The workload HTTP role owns
+                        // its own request telemetry and is excluded here.
+                        if matches!(
+                            listener_role(&active.load().config, address),
+                            ListenerRole::Tcp
+                        ) {
+                            let mut history = metrics.tcp_history.begin(
+                                SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                                address,
+                            );
+                            history.set_outcome(Outcome::IoError);
                         }
                         continue;
                     }
-                };
+                    // Canonicalize IPv4-mapped IPv6 peers (from a dual-stack
+                    // `[::]` listener) so `deny_cidrs` with IPv4 ranges match
+                    // the real IPv4 address instead of silently failing open.
+                    (
+                        client,
+                        SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                    )
+                }
+                Err(error) => {
+                    metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%address, %error, "TCP accept failed");
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                    continue;
+                }
+            };
 
             let snapshot = active.load_full();
+            if let Some(configured) = snapshot
+                .config
+                .public_http
+                .iter()
+                .find(|configured| configured.enabled && configured.listen == address)
+            {
+                if !matches!(
+                    listener_role(&snapshot.config, address),
+                    ListenerRole::PublicHttp | ListenerRole::PublicHttps
+                ) || snapshot
+                    .config
+                    .tcp
+                    .iter()
+                    .any(|route| route.enabled && route.listen == address)
+                    || snapshot
+                        .config
+                        .workload_http
+                        .iter()
+                        .any(|listener| listener.enabled && listener.listen == address)
+                {
+                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Some(handler) = workload_http.get() else {
+                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let permit = match permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let lease = Arc::new(crate::metrics::ConnectionLease::new(
+                    permit,
+                    metrics.clone(),
+                ));
+                let listener_id = configured.id.clone();
+                let proxy = handler.proxy.clone();
+                let header_bytes = handler.header_bytes;
+                let task_active = active.clone();
+                let task_cancel = connection_cancel.clone();
+                let task_metrics = metrics.clone();
+                connections.spawn(async move {
+                    crate::public_http::serve(
+                        client,
+                        peer,
+                        task_active,
+                        listener_id,
+                        proxy,
+                        header_bytes,
+                        idle_timeout,
+                        task_cancel,
+                        task_metrics,
+                        lease,
+                    )
+                    .await;
+                });
+                continue;
+            }
             if let Some(configured) = snapshot
                 .config
                 .workload_http
