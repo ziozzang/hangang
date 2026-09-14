@@ -18,7 +18,11 @@ def main():
         try:
             run("docker","build","--network=none","--pull=false","-t",image,".",stdout=subprocess.DEVNULL)
             built=True
-            run("docker","run","-d","--name",name,"--read-only","--network=none","--memory=256m","--cpus=1","-e","HANGANG_ADMIN_TOKEN=hangang-static-fixture-token","--mount",f"type=bind,source={data},target=/data",image,"--supervised","--config","/data/hangang.json","--threads","2","--lua-workers","1","--drain-seconds","2",stdout=subprocess.DEVNULL)
+            # A non-root fixture owner must be able to remove the private
+            # account directory afterward. Preserve non-root execution while
+            # aligning bind-mount ownership; root runners keep the image UID.
+            user_args=["--user",f"{os.getuid()}:{os.getgid()}"] if os.getuid()!=0 else []
+            run("docker","run","-d","--name",name,*user_args,"--read-only","--network=none","--memory=256m","--cpus=1","-e","HANGANG_ADMIN_TOKEN=hangang-static-fixture-token","--mount",f"type=bind,source={data},target=/data",image,"--supervised","--config","/data/hangang.json","--threads","2","--lua-workers","1","--drain-seconds","2",stdout=subprocess.DEVNULL)
             created=True
             def await_log(text):
                 for _ in range(100):
