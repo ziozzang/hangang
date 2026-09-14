@@ -33,9 +33,10 @@ async fn fixture() -> (
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config::default()).unwrap(),
     ));
-    let mut metrics = Metrics::default();
-    metrics.tcp_history = Arc::new(History::with_limits(Duration::from_secs(60), 1, 16));
-    let metrics = Arc::new(metrics);
+    let metrics = Arc::new(Metrics {
+        tcp_history: Arc::new(History::with_limits(Duration::from_secs(60), 1, 16)),
+        ..Metrics::default()
+    });
     let manager = Arc::new(Manager {
         active: active.clone(),
         tcp: Arc::new(TcpManager::new(active, metrics.clone(), 4)),
@@ -162,7 +163,7 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
             &base,
             reqwest::Method::POST,
             "/v1/auth/bootstrap",
-            None,
+            Some(SYSTEM_TOKEN),
             Some(credentials.clone())
         )
         .await
