@@ -276,10 +276,9 @@ fn validate_wire(value: &WireObservation, expected_id: &str) -> &'static str {
             value.configuration_source.as_str(),
             "file" | "shared" | "kubernetes"
         )
-        || value
-            .store_epoch
-            .as_ref()
-            .is_some_and(|s| s.is_empty() || s.len() > 128 || !s.is_ascii())
+        || value.store_epoch.as_ref().is_some_and(|s| {
+            s.is_empty() || s.len() > 128 || !s.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        })
     {
         return "invalid_observation";
     }
@@ -570,6 +569,14 @@ mod tests {
         let mut bad = wire("one");
         bad.revision = "01".into();
         assert_eq!(validate_wire(&bad, "one"), "invalid_observation");
+        for epoch in ["", "with space", "tab\there", "line\nhere", "\u{7f}", "é"] {
+            let mut bad = wire("one");
+            bad.store_epoch = Some(epoch.into());
+            assert_eq!(validate_wire(&bad, "one"), "invalid_observation");
+        }
+        let mut valid_epoch = wire("one");
+        valid_epoch.store_epoch = Some("a-f_123".into());
+        assert_eq!(validate_wire(&valid_epoch, "one"), "ok");
         let mut missing = serde_json::to_value(wire("one")).unwrap();
         missing.as_object_mut().unwrap().remove("store_epoch");
         assert!(serde_json::from_value::<WireObservation>(missing).is_err());
