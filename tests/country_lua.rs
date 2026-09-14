@@ -239,7 +239,11 @@ async fn lua_sees_trusted_known_unknown_and_passive_unavailable_without_native_b
     let replacement = dir.path().join("damaged.mmdb");
     std::fs::write(&replacement, b"damaged database").unwrap();
     std::fs::rename(replacement, &file).unwrap();
-    wait_for(|| slot.load().is_none(), "failed database reload").await;
+    wait_for(
+        || slot.status().error_code == Some("invalid_database"),
+        "failed database reload",
+    )
+    .await;
     let (status, passive) = request(&client, &front, "/passive", "81.2.69.160").await;
     assert_eq!(status, 200);
     assert_eq!(passive, "unavailable|-|-|invalid_database");
