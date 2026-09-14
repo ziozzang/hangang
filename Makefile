@@ -46,11 +46,13 @@ test-web:
 	cd web && npm test
 	python3 tests/web_smoke.py
 
-.PHONY: test-soak test-static-container coverage-postgres
+.PHONY: test-soak test-static-container test-static-admin-relay-container coverage-postgres
 test-soak:
 	python3 tests/soak.py
 test-static-container:
 	python3 tests/static_container.py
+test-static-admin-relay-container:
+	python3 tests/admin_gateway_static_container.py
 coverage-postgres:
 	HANGANG_PG_COVERAGE=1 python3 tests/pg_fixture.py
 	cargo llvm-cov report --summary-only --ignore-filename-regex '/tests/'
