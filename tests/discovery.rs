@@ -449,3 +449,109 @@ async fn watcher_cancellation_interrupts_a_stalled_refresh() {
         .expect("watcher ignored cancellation")
         .unwrap();
 }
+
+#[tokio::test]
+async fn changed_docker_epoch_during_socks_dial_closes_without_payload_and_records_reason() {
+    use hangang::{metrics::Metrics, tcp::TcpManager};
+    use std::{net::TcpListener as StdTcpListener, os::fd::OwnedFd};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+    };
+
+    let docker = FakeDocker::start(Duration::ZERO).await;
+    docker.set("api", true, "127.0.0.1");
+    let discovery = Arc::new(Discovery::new(Some(Arc::new(DockerResolver::new(
+        docker.socket.clone(),
+    )))));
+    let reference = "docker://api/edge/8080";
+    let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_address = socks.local_addr().unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let socks_task = tokio::spawn(async move {
+        let (mut socket, _) = socks.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        socket.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 10];
+        socket.read_exact(&mut connect).await.unwrap();
+        assert_eq!(&connect[..8], &[5, 1, 0, 1, 127, 0, 0, 1]);
+        entered_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        let mut payload = [0; 64];
+        tokio::time::timeout(Duration::from_secs(2), socket.read(&mut payload))
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let held = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = held.local_addr().unwrap();
+    let document: Config = serde_json::from_value(serde_json::json!({"tcp":[{
+        "id":"stream", "listen":listen, "backends":[reference],
+        "upstream":{"socks5":{"address":socks_address.to_string()}}
+    }]}))
+    .unwrap();
+    discovery.refresh(&document).await.unwrap();
+    let first = discovery
+        .resolve_with_epoch(reference, Protocol::Tcp)
+        .unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(
+        Snapshot::new(document.clone()).unwrap(),
+    ));
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active, metrics.clone(), 8).with_discovery(discovery.clone());
+    let prepared = manager
+        .prepare_with_inherited(&document, vec![(listen, OwnedFd::from(held))])
+        .await
+        .unwrap();
+    manager.commit(prepared).await;
+    let mut client = TcpStream::connect(listen).await.unwrap();
+    client
+        .write_all(b"never forward to the stale endpoint")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = serde_json::to_value(metrics.tcp_history.active(None, 128)).unwrap();
+    assert_eq!(pending["records"][0]["phase"], "dialing");
+    assert_eq!(pending["records"][0]["bytes_upstream"], "0");
+
+    docker.set("api", true, "127.0.0.2");
+    discovery.refresh(&document).await.unwrap();
+    let second = discovery
+        .resolve_with_epoch(reference, Protocol::Tcp)
+        .unwrap();
+    assert_ne!(first, second);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        socks_task.await.unwrap(),
+        0,
+        "no payload after discovery epoch changed"
+    );
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    manager.shutdown(Duration::from_secs(1)).await;
+    let recent = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    assert_eq!(recent["records"].as_array().unwrap().len(), 1);
+    let row = &recent["records"][0];
+    assert_eq!(row["outcome"], "endpoint_changed");
+    assert_eq!(row["phase"], "dialing");
+    assert_eq!(row["bytes_upstream"], "0");
+    assert_eq!(row["bytes_downstream"], "0");
+    assert!(
+        row.get("endpoint").is_none(),
+        "resolved endpoint is not exposed"
+    );
+}

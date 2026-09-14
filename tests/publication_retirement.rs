@@ -71,7 +71,8 @@ async fn publication_retires_only_the_old_tcp_generation_after_candidate_is_read
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(config.clone()).unwrap(),
     ));
-    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 8);
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active.clone(), metrics.clone(), 8);
     let prepared = manager
         .prepare_with_inherited(&config, vec![(listen, OwnedFd::from(bound))])
         .await
@@ -149,6 +150,14 @@ async fn publication_retires_only_the_old_tcp_generation_after_candidate_is_read
     wait_for_zero(&old_gate).await;
     assert_eq!(established.active(), 0);
     manager.shutdown(Duration::from_millis(100)).await;
+    let recent = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    assert_eq!(recent["records"].as_array().unwrap().len(), 1);
+    let row = &recent["records"][0];
+    assert_eq!(row["outcome"], "member_unavailable");
+    assert_eq!(row["phase"], "dialing");
+    assert_eq!(row["member_id"], "a");
+    assert_eq!(row["bytes_upstream"], "0");
+    assert_eq!(row["bytes_downstream"], "0");
 }
 
 #[test]
