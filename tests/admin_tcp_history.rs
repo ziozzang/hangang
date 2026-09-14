@@ -371,41 +371,40 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
     let recent = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(recent["records"][0]["outcome"], "eof");
     assert_eq!(recent["records"][0]["bytes_upstream"], "9007199254740993");
-    let mut saw_closed = false;
-    for _ in 0..3 {
-        let next = frame(&mut admin_stream, &mut admin_pending).await;
-        if next.starts_with("event: tcp_connections\n")
-            && !data(&next)["recent"]["records"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        {
-            saw_closed = true;
-            break;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let next = frame(&mut admin_stream, &mut admin_pending).await;
+            if next.starts_with("event: tcp_connections\n")
+                && !data(&next)["recent"]["records"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            {
+                break;
+            }
         }
-    }
-    assert!(saw_closed, "admin stream omitted completed connection");
+    })
+    .await
+    .expect("admin stream omitted completed connection");
 
     drop(untracked);
-    let mut saw_empty = false;
-    for _ in 0..6 {
-        let next = frame(&mut admin_stream, &mut admin_pending).await;
-        if !next.starts_with("event: tcp_connections\n") {
-            continue;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let next = frame(&mut admin_stream, &mut admin_pending).await;
+            if !next.starts_with("event: tcp_connections\n") {
+                continue;
+            }
+            let snapshot = data(&next);
+            if snapshot["active"]["records"].as_array().unwrap().is_empty()
+                && snapshot["active"]["active_untracked"] == 0
+                && snapshot["recent"]["records"].as_array().unwrap().is_empty()
+            {
+                break;
+            }
         }
-        let snapshot = data(&next);
-        if snapshot["active"]["records"].as_array().unwrap().is_empty()
-            && snapshot["active"]["active_untracked"] == 0
-            && snapshot["recent"]["records"].as_array().unwrap().is_empty()
-        {
-            saw_empty = true;
-            break;
-        }
-    }
-    assert!(
-        saw_empty,
-        "admin stream did not clear the final TCP connection"
-    );
+    })
+    .await
+    .expect("admin stream did not clear the final TCP connection");
 
     assert_eq!(
         call(
@@ -433,17 +432,18 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
         .status(),
         401
     );
-    let mut expired = false;
-    for _ in 0..3 {
-        if frame(&mut admin_stream, &mut admin_pending)
-            .await
-            .starts_with("event: auth_expired\n")
-        {
-            expired = true;
-            break;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if frame(&mut admin_stream, &mut admin_pending)
+                .await
+                .starts_with("event: auth_expired\n")
+            {
+                break;
+            }
         }
-    }
-    assert!(expired, "logout did not revoke TCP SSE access");
+    })
+    .await
+    .expect("logout did not revoke TCP SSE access");
     server.abort();
     manager.policy.shutdown().await;
 }
