@@ -607,7 +607,10 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         loop {
             let event = next_event(&mut admin_events, &mut admin_pending).await;
             if event.starts_with("event: traffic\n") {
-                break event;
+                if !event_json(&event)["records"].as_array().unwrap().is_empty() {
+                    break event;
+                }
+                continue;
             }
             assert!(
                 event.starts_with("event: status\n")
@@ -649,6 +652,129 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         expired,
         "revoked viewer session must close its stream promptly"
     );
+}
+
+#[tokio::test]
+async fn traffic_events_report_filtered_only_ticks_without_allocating_ids() {
+    let (address, traffic, _directory) = event_fixture(1).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut events = client
+        .get(format!("http://{address}/v1/events"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+    let mut pending = Vec::new();
+    assert!(
+        next_event(&mut events, &mut pending)
+            .await
+            .starts_with("event: status\n")
+    );
+    // A drop-only interval has no new history ID, yet the operator must see
+    // intentional omissions rather than an apparently complete quiet stream.
+    traffic.record_filtered();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let frame = next_event(&mut events, &mut pending).await;
+            if frame.starts_with("event: traffic\n") {
+                let batch = event_json(&frame);
+                if batch["filtered_total"] == 1 {
+                    break batch;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(observed["records"].as_array().unwrap().is_empty());
+    assert_eq!(observed["latest_id"], 0);
+    assert_eq!(observed["next_after"], 0);
+    assert_eq!(observed["dropped_total"], 0);
+    assert_eq!(observed["gap"], false);
+    let (status, _, body) = request(address, "GET", "/v1/traffic", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["filtered_total"], 1);
+}
+
+#[tokio::test]
+async fn http_recording_policy_is_validated_revisioned_and_persisted_with_config() {
+    let example: Config =
+        serde_json::from_str(include_str!("../examples/http-recording.json")).unwrap();
+    Snapshot::new(example).unwrap();
+    let (address, manager, _directory) = server().await;
+    let policy = serde_json::json!({
+        "default_action": "drop",
+        "rules": [{"id":"retain-errors", "action":"record", "match": {
+            "methods":["GET"], "route_matched":false,
+            "status_ranges":[{"min":400,"max":599}],
+            "path_prefixes":["/public"], "peer_cidrs":["127.0.0.0/8"],
+            "client_cidrs":["2001:db8::/32"]
+        }}]
+    });
+    let mut config = serde_json::to_value(manager.active.load().config.clone()).unwrap();
+    config["settings"] = serde_json::json!({"http_recording":policy});
+    let body = config.to_string();
+    let (status, _, response) = request(address, "PUT", "/v1/config", Some(&body), Some(0)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&response));
+    let saved = hangang::store::load(&manager.state_path).unwrap();
+    let saved = serde_json::to_value(saved).unwrap();
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(
+        saved["settings"]["http_recording"]["rules"][0]["id"],
+        "retain-errors"
+    );
+    assert_eq!(
+        saved["settings"]["http_recording"]["default_action"],
+        "drop"
+    );
+    assert_eq!(
+        request(address, "PUT", "/v1/config", Some(&body), Some(0))
+            .await
+            .0,
+        409
+    );
+    // Recording preferences must not suppress configuration recovery evidence.
+    assert_eq!(config_operation_records(address).await.len(), 1);
+    config["revision"] = 1.into();
+    for invalid in [
+        serde_json::json!({"default_action":"record","rules":[{"id":"bad","action":"drop","match":{"status_ranges":[{"min":599,"max":400}]}}]}),
+        serde_json::json!({"default_action":"record","rules":[{"id":"bad","action":"drop","match":{"path_prefixes":["/public?token=secret"]}}]}),
+        serde_json::json!({"default_action":"record","rules":[{"id":"bad","action":"drop","match":{"route_matched":false,"route_ids":["impossible"]}}]}),
+    ] {
+        config["settings"]["http_recording"] = invalid;
+        assert_eq!(
+            request(
+                address,
+                "PUT",
+                "/v1/config",
+                Some(&config.to_string()),
+                Some(1)
+            )
+            .await
+            .0,
+            422
+        );
+        assert_eq!(manager.active.load().config.revision, 1);
+        assert_eq!(
+            serde_json::to_value(hangang::store::load(&manager.state_path).unwrap()).unwrap(),
+            saved
+        );
+    }
+    config["settings"]["http_recording"] = serde_json::json!({"unknown":true});
+    assert_eq!(
+        request(
+            address,
+            "PUT",
+            "/v1/config",
+            Some(&config.to_string()),
+            Some(1)
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(manager.active.load().config.revision, 1);
 }
 
 #[tokio::test]

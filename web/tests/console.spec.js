@@ -208,14 +208,14 @@ test('locale changes translate paused rows without admitting new or expired traf
   await signIn(page);
   const rows = page.locator('#activity-rows tr');
   await expect(rows).toHaveCount(1);
-  await expect(rows.first().locator('td').nth(3)).toHaveText('Unmatched');
+  await expect(rows.first().locator('td').nth(3)).toHaveText('UnmatchedRecording policy revision unreported');
   await page.locator('#activity-pause').click();
   release();
   await expect(page.locator('#activity-note')).toContainText('1 expired / evicted');
   await page.locator('#locale-select').selectOption('ko');
   await expect(rows).toHaveCount(1);
   await expect(rows.first().locator('td').nth(1).locator('small')).toContainText('피어');
-  await expect(rows.first().locator('td').nth(3)).toHaveText('일치하는 라우트 없음');
+  await expect(rows.first().locator('td').nth(3)).toContainText('일치하는 라우트 없음');
   await expect(rows.first()).not.toContainText('/second');
   await expect(rows).toHaveCount(0, { timeout: 5000 });
   await expect(page.locator('#activity-count')).toHaveText('최근 요청: 0건');

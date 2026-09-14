@@ -342,6 +342,10 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
             .await
             .starts_with("event: status\n")
     );
+    let http = frame(&mut admin_stream, &mut admin_pending).await;
+    assert!(http.starts_with("event: traffic\n"));
+    assert!(data(&http)["records"].as_array().unwrap().is_empty());
+    assert_eq!(data(&http)["filtered_total"], 0);
     let live = frame(&mut admin_stream, &mut admin_pending).await;
     assert!(live.starts_with("event: tcp_connections\n"));
     assert_eq!(data(&live)["active"]["records"][0]["route_id"], "tcp-blue");
@@ -531,6 +535,9 @@ async fn demoted_administrator_stream_expires_and_clears_ip_bearing_history() {
             .await
             .starts_with("event: status\n")
     );
+    let http = frame(&mut stream, &mut pending).await;
+    assert!(http.starts_with("event: traffic\n"));
+    assert!(data(&http)["records"].as_array().unwrap().is_empty());
     let sensitive = frame(&mut stream, &mut pending).await;
     assert!(sensitive.starts_with("event: tcp_connections\n"));
     assert_eq!(

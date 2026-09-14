@@ -1058,13 +1058,14 @@ impl Admin {
             if may_read_traffic {
                 let batch = state.admin.traffic.snapshot_since(Some(state.cursor), 128);
                 state.cursor = batch.next_after;
-                if batch.gap || !batch.records.is_empty() {
-                    events.push_str("event: traffic\ndata: ");
-                    events.push_str(
-                        &serde_json::to_string(&batch).expect("traffic batch is serializable"),
-                    );
-                    events.push_str("\n\n");
-                }
+                // Empty frames carry intentional-omission and eviction
+                // counters too. A record-all-to-drop transition must remain
+                // observable even when it produces no new history IDs.
+                events.push_str("event: traffic\ndata: ");
+                events.push_str(
+                    &serde_json::to_string(&batch).expect("traffic batch is serializable"),
+                );
+                events.push_str("\n\n");
                 let active = state.admin.manager.metrics.tcp_history.active(None, 128);
                 let recent = state
                     .admin

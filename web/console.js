@@ -293,14 +293,26 @@ function recordTraffic(batch) {
   const merged = new Map(records.map(record => [record.id, record]));
   const receivedAt = performance.now();
   const serverNow = Number(batch.server_time_unix_ms);
-  for (const record of batch.records.slice(0, 128)) {
+  for (const source of batch.records.slice(0, 128)) {
+    if (!source || typeof source !== 'object') continue;
+    // Old peers may return an absolute target or query-bearing path. Keep only a path
+    // in this browser's bounded ring, and never retain unrecognized raw-host fields.
+    const path = typeof source.path === 'string' && source.path.startsWith('/') && !source.path.startsWith('//')
+      ? source.path.split(/[?#]/, 1)[0].slice(0, 256) : '/';
+    const record = { id: source.id, timestamp_unix_ms: source.timestamp_unix_ms,
+      peer_ip: source.peer_ip, peer_port: source.peer_port, client_ip: source.client_ip,
+      method: source.method, path, route_id: source.route_id, status: source.status,
+      response_head_ms: source.response_head_ms, protocol: source.protocol, tls: source.tls,
+      geoip: source.geoip,
+      policy_revision: Number.isSafeInteger(source.policy_revision) && source.policy_revision >= 0 ? source.policy_revision : null };
     const age = Number.isFinite(serverNow) ? Math.max(0, serverNow - Number(record.timestamp_unix_ms)) : 0;
     const expiresAt = receivedAt + Math.max(0, retention * 1000 - age);
     const old = merged.get(record.id);
     merged.set(record.id, { ...record, expiresAt: old ? Math.min(old.expiresAt, expiresAt) : expiresAt });
   }
   records = [...merged.values()].sort((a,b) => b.id - a.id).slice(0, 128);
-  trafficSummary = { gap: Boolean(batch.gap), updated: Date.now() };
+  trafficSummary = { gap: Boolean(batch.gap), updated: Date.now(),
+    filteredTotal: Number.isSafeInteger(batch.filtered_total) && batch.filtered_total >= 0 ? batch.filtered_total : null };
   renderTrafficSummary();
   renderActivity();
 }
@@ -477,9 +489,17 @@ function renderTcpHistory() {
 function renderTrafficSummary() {
   if (!trafficSummary) return;
   display('#activity-retention', () => t('Up to {seconds}s', { seconds: retention }));
-  display('#activity-note', () => trafficSummary?.gap
-    ? t('Buffer gap: some records were overwritten or expired before delivery. Showing available records.')
-    : t('Latest 128 records in view · up to {seconds}s retention · {dropped} expired / evicted at server', { seconds: retention, dropped: number(dropped) }));
+  display('#activity-note', () => {
+    const ring = trafficSummary?.gap
+      ? t('Buffer gap: some records were overwritten or expired before delivery. Showing available records.')
+      : t('Latest 128 records in view · up to {seconds}s retention · {dropped} expired / evicted at server', { seconds: retention, dropped: number(dropped) });
+    const coverage = trafficSummary.filteredTotal === null
+      ? t('Recording-filter coverage is unknown on this server.')
+      : trafficSummary.filteredTotal > 0
+        ? t('{count} HTTP response records intentionally omitted by recording policy on this instance; this is partial history.', { count: number(trafficSummary.filteredTotal) })
+        : t('No HTTP response records have been intentionally omitted by recording policy on this instance.');
+    return `${ring} · ${coverage}`;
+  });
   display('#activity-updated', () => t('Updated {time}', { time: new Date(trafficSummary?.updated || 0).toLocaleTimeString(getLocale() === 'ko' ? 'ko-KR' : 'en-US') }));
 }
 function renderActivityCount(count, total, filtered) {
@@ -527,6 +547,15 @@ function renderCountry(cell, record) {
   detail.title = observation.digest ? t('Database generation SHA-256: {digest}', { digest: observation.digest }) : '';
 }
 
+function renderRecordingRevision(cell, record) {
+  cell.textContent = record.route_id || t('Unmatched');
+  const detail = document.createElement('small');
+  detail.textContent = record.policy_revision === null
+    ? t('Recording policy revision unreported')
+    : t('Recording policy at configuration revision #{revision}', { revision: record.policy_revision });
+  cell.append(detail);
+}
+
 function renderActivity() {
   records = records.filter(record => performance.now() < record.expiresAt);
   if (paused) {
@@ -538,7 +567,7 @@ function renderActivity() {
       row.cells[0].textContent = new Date(record.timestamp_unix_ms).toLocaleTimeString(getLocale() === 'ko' ? 'ko-KR' : 'en-US');
       row.cells[1].querySelector('small').textContent = t('peer {address}', { address: `${record.peer_ip}:${record.peer_port}` });
       renderCountry(row.cells[1], record);
-      if (!record.route_id) row.cells[3].textContent = t('Unmatched');
+      renderRecordingRevision(row.cells[3], record);
       row.cells[5].textContent = `${number(record.response_head_ms)} ms`;
     }
     const visible = $('#activity-rows').children.length;
@@ -562,7 +591,7 @@ function renderActivity() {
     const peer = document.createElement('small'); peer.textContent = t("peer {address}", { address: `${record.peer_ip}:${record.peer_port}` }); ip.append(peer);
     renderCountry(ip, record);
     const request = cell(''); const method = document.createElement('span'); method.className = 'http-method'; method.textContent = record.method; request.append(method, document.createTextNode(record.path || '/')); request.title = `${record.protocol}${record.tls ? ' · TLS' : ''}`;
-    cell(record.route_id || t("Unmatched"));
+    renderRecordingRevision(cell(''), record);
     const status = cell(''); const badge = document.createElement('span'); badge.className = `status-code${record.status >= 500 ? ' is-error' : record.status >= 400 ? ' is-warning' : ''}`; badge.textContent = String(record.status); status.append(badge);
     cell(`${number(record.response_head_ms)} ms`);
     return tr;

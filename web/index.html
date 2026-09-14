@@ -259,6 +259,18 @@
 <div aria-live="polite" class="inline-message span-2" id="settings-message"></div>
 </div>
 </details>
+<details class="form-section" id="http-recording-section">
+<summary><span class="section-title" data-i18n="HTTP request recording policy">HTTP request recording policy</span><span class="section-state" data-i18n="Configured" hidden="" id="http-recording-state">Configured</span></summary>
+<div class="form-grid" id="http-recording-form">
+<p class="section-note span-2" data-i18n="Ordered rules choose whether completed HTTP response headers enter this instance’s short-lived request ring and optional access trace. The first match wins; blank conditions match all. This does not control durable account audit, configuration receipts or TCP history. Health probes are excluded. Query strings, raw Host, payloads and body completion are not recorded here.">Ordered rules choose whether completed HTTP response headers enter this instance’s short-lived request ring and optional access trace. The first match wins; blank conditions match all. This does not control durable account audit, configuration receipts or TCP history. Health probes are excluded. Query strings, raw Host, payloads and body completion are not recorded here.</p>
+<label class="field span-2 user-enabled" for="http-recording-enabled"><input id="http-recording-enabled" type="checkbox"/><span data-i18n="Configure HTTP recording policy">Configure HTTP recording policy</span></label>
+<div class="field span-2"><label data-i18n="Default recording action" for="http-recording-default">Default recording action</label><select id="http-recording-default" disabled=""><option data-i18n="Record" value="record">Record</option><option data-i18n="Drop" value="drop">Drop</option></select></div>
+<div class="span-2 user-list" id="http-recording-rules"></div>
+<div class="button-row span-2"><button class="button button-secondary" data-i18n="Add ordered rule" disabled="" id="http-recording-add" type="button">Add ordered rule</button></div>
+<div aria-live="polite" class="inline-message span-2" id="http-recording-message"></div>
+<p class="section-note span-2" data-i18n="Changes are staged in the JSON document. Validate and Apply configuration to publish with the document revision. Existing ring rows remain until retention expiry; filtered counts do not reset when policy changes.">Changes are staged in the JSON document. Validate and Apply configuration to publish with the document revision. Existing ring rows remain until retention expiry; filtered counts do not reset when policy changes.</p>
+</div>
+</details>
 <div aria-live="polite" class="inline-message" id="config-message"></div>
 <div class="button-row">
 <button class="button button-quiet" data-i18n="Format JSON" id="format-config" type="button">Format JSON</button>

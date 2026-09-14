@@ -1,4 +1,9 @@
 export default {
+  'Recording-filter coverage is unknown on this server.': '이 서버의 기록 필터 적용 범위를 알 수 없습니다.',
+  '{count} HTTP response records intentionally omitted by recording policy on this instance; this is partial history.': '이 인스턴스에서 HTTP 응답 기록 {count}건을 기록 정책에 따라 의도적으로 생략했습니다. 이 이력은 부분적입니다.',
+  'No HTTP response records have been intentionally omitted by recording policy on this instance.': '이 인스턴스에서 기록 정책에 따라 의도적으로 생략된 HTTP 응답 기록은 없습니다.',
+  'Recording policy revision unreported': '기록 정책 개정 미보고',
+  'Recording policy at configuration revision #{revision}': '구성 개정 #{revision}의 기록 정책',
   "Paused": "일시 중지",
   "Live history is paused. Reopen this view to load recent requests.": "실시간 기록이 일시 중지되었습니다. 이 화면을 다시 열면 최근 요청을 불러옵니다.",
   "History cleared": "기록 지워짐",

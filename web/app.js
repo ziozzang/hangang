@@ -55,6 +55,8 @@ const state = {
   storeEpoch: null,
   /** Why the fleet-settings controls could not be mirrored into the document; blocks validate/apply. */
   settingsError: null,
+  httpRecordingError: null,
+  httpRecordingDraft: null,
   geoipError: null,
   geoipRuntime: { status: null, lookup: null, statusError: null, lookupError: null, statusSequence: 0, lookupSequence: 0, statusAbort: null, lookupAbort: null },
   certificateDirty: false,
@@ -104,6 +106,7 @@ function refreshAppCopy() {
   refreshCacheToggle(state.config?.cache ?? null);
   if (state.certificateInventory) renderCertificateInventory(state.certificateInventory);
   if (state.config && $('#certificate-list').children.length) renderCertificates(state.config.certificates || []);
+  if ($('#http-recording-section')) renderHttpRecording();
   if (state.config) updateConfigPreview();
   renderGeoIpStatus();
   renderGeoIpLookup();
@@ -434,6 +437,8 @@ function logout(reason = '') {
   state.configurationSource = null;
   state.storeEpoch = null;
   state.settingsError = null;
+  state.httpRecordingError = null;
+  state.httpRecordingDraft = null;
   state.geoipError = null;
   state.certificateDirty = false;
   state.certificateInventory = null;
@@ -3720,6 +3725,155 @@ function syncGeoIpToDocument() {
   } catch (error) { state.geoipError = error.message; message($('#geoip-message'), error.message, 'error'); }
 }
 
+const RECORDING_MATCH_FIELDS = ['methods', 'route_ids', 'route_matched', 'status_ranges', 'path_prefixes', 'peer_cidrs', 'client_cidrs'];
+const recordingLines = (raw) => raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+function recordingDraftFromWire(policy) {
+  if (!isObject(policy) || Object.keys(policy).some((key) => !['default_action', 'rules'].includes(key)) ||
+    !['record', 'drop'].includes(policy.default_action ?? 'record') || !Array.isArray(policy.rules ?? []) || (policy.rules ?? []).length > 64)
+    throw new Error(t('HTTP recording policy in JSON is invalid; edit the document or replace the policy.'));
+  return { default_action: policy.default_action ?? 'record', rules: (policy.rules ?? []).map((rule) => {
+    if (!isObject(rule) || Object.keys(rule).some((key) => !['id', 'action', 'match'].includes(key)) ||
+      !isObject(rule.match) || Object.keys(rule.match).some((key) => !RECORDING_MATCH_FIELDS.includes(key)))
+      throw new Error(t('HTTP recording policy in JSON is invalid; edit the document or replace the policy.'));
+    const match = rule.match;
+    for (const key of RECORDING_MATCH_FIELDS.filter((field) => field !== 'route_matched'))
+      if (match[key] !== undefined && !Array.isArray(match[key]))
+        throw new Error(t('HTTP recording policy in JSON is invalid; edit the document or replace the policy.'));
+    if (match.route_matched != null && typeof match.route_matched !== 'boolean')
+      throw new Error(t('HTTP recording policy in JSON is invalid; edit the document or replace the policy.'));
+    return { id: rule.id, action: rule.action,
+      methods: (match.methods ?? []).join('\n'), route_ids: (match.route_ids ?? []).join('\n'),
+      route_matched: match.route_matched == null ? '' : String(match.route_matched),
+      status_ranges: (match.status_ranges ?? []).map((range) => isObject(range) && Number.isSafeInteger(range.min) && Number.isSafeInteger(range.max)
+        ? `${range.min}-${range.max}` : '?').join('\n'),
+      path_prefixes: (match.path_prefixes ?? []).join('\n'), peer_cidrs: (match.peer_cidrs ?? []).join('\n'),
+      client_cidrs: (match.client_cidrs ?? []).join('\n') };
+  }) };
+}
+function recordingCidr(value) {
+  const match = /^([^/]+)\/(\d{1,3})$/.exec(value);
+  if (!match) return false;
+  const prefix = Number(match[2]); const address = match[1];
+  if (address.includes(':')) {
+    if (prefix > 128 || !/^[0-9a-fA-F:.]+$/.test(address)) return false;
+    try { new URL(`http://[${address}]/`); return true; } catch { return false; }
+  }
+  return prefix <= 32 && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(address) &&
+    address.split('.').every((octet) => Number(octet) <= 255);
+}
+function recordingPolicyFromDraft(draft) {
+  if (!draft || !['record', 'drop'].includes(draft.default_action) || draft.rules.length > 64)
+    throw new Error(t('Use at most 64 HTTP recording rules.'));
+  const ids = new Set();
+  const validLines = (raw, label, check) => {
+    const values = recordingLines(raw);
+    if (values.length > 64 || values.some((value) => !check(value)))
+      throw new Error(t('Invalid {field}; use at most 64 entries.', { field: t(label) }));
+    return values;
+  };
+  const rules = draft.rules.map((rule) => {
+    if (typeof rule.id !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(rule.id) || ids.has(rule.id) || !['record', 'drop'].includes(rule.action))
+      throw new Error(t('HTTP recording rule IDs must be unique ASCII names of 1–64 characters.'));
+    ids.add(rule.id);
+    const methods = validLines(rule.methods, 'Methods', (value) => value.length <= 32 && HEADER_NAME.test(value));
+    const route_ids = validLines(rule.route_ids, 'Route IDs', (value) => /^[A-Za-z0-9._-]{1,128}$/.test(value));
+    const route_matched = rule.route_matched === '' ? undefined : rule.route_matched === 'true' ? true : rule.route_matched === 'false' ? false : null;
+    if (route_matched === null || (route_matched === false && route_ids.length))
+      throw new Error(t('Unmatched routes cannot also match specific route IDs.'));
+    const ranges = validLines(rule.status_ranges, 'Status ranges', (value) => /^([1-5][0-9]{2})-([1-5][0-9]{2})$/.test(value));
+    const status_ranges = ranges.map((range) => { const [min, max] = range.split('-').map(Number);
+      if (min > max) throw new Error(t('Status range minimum must not exceed maximum.'));
+      return { min, max }; });
+    const path_prefixes = validLines(rule.path_prefixes, 'Path prefixes', (value) => value.startsWith('/') &&
+      value.length <= 256 && /^[\x21-\x7e]+$/.test(value) && !/[?#]/.test(value));
+    const peer_cidrs = validLines(rule.peer_cidrs, 'Peer CIDRs', recordingCidr);
+    const client_cidrs = validLines(rule.client_cidrs, 'Client CIDRs', recordingCidr);
+    const match = { methods, route_ids, status_ranges, path_prefixes, peer_cidrs, client_cidrs };
+    if (route_matched !== undefined) match.route_matched = route_matched;
+    return { id: rule.id, action: rule.action, match };
+  });
+  const policy = { default_action: draft.default_action, rules };
+  const expanded = { default_action: policy.default_action, rules: policy.rules.map((rule) => ({
+    id: rule.id, action: rule.action, match: {
+      methods: rule.match.methods, route_ids: rule.match.route_ids, route_matched: rule.match.route_matched ?? null,
+      status_ranges: rule.match.status_ranges, path_prefixes: rule.match.path_prefixes,
+      peer_cidrs: rule.match.peer_cidrs, client_cidrs: rule.match.client_cidrs,
+    },
+  })) };
+  if (new TextEncoder().encode(JSON.stringify(expanded)).length > 65_536)
+    throw new Error(t('HTTP recording policy exceeds the 64 KiB encoded limit.'));
+  return policy;
+}
+function showHttpRecording(policy) {
+  try {
+    state.httpRecordingDraft = policy == null ? null : recordingDraftFromWire(policy);
+    if (state.httpRecordingDraft) recordingPolicyFromDraft(state.httpRecordingDraft);
+    state.httpRecordingError = null;
+  } catch (error) { state.httpRecordingDraft = null; state.httpRecordingError = error.message; }
+  renderHttpRecording();
+}
+function renderHttpRecording() {
+  const draft = state.httpRecordingDraft;
+  $('#http-recording-enabled').checked = !!draft;
+  $('#http-recording-default').disabled = !draft;
+  $('#http-recording-add').disabled = !draft || draft.rules.length >= 64;
+  $('#http-recording-state').hidden = !draft;
+  if (draft) $('#http-recording-default').value = draft.default_action;
+  message($('#http-recording-message'), state.httpRecordingError || (draft ? '' : t('No explicit HTTP recording policy; requests follow the server default.')),
+    state.httpRecordingError ? 'error' : '');
+  const root = $('#http-recording-rules'); root.replaceChildren();
+  if (!draft) return;
+  for (const [index, rule] of draft.rules.entries()) {
+    const card = document.createElement('div'); card.className = 'panel user-card form-grid';
+    const heading = document.createElement('h3'); heading.className = 'span-2'; heading.textContent = t('HTTP recording rule {number}', { number: index + 1 }); card.append(heading);
+    const field = (labelText, value, onInput, { area = false, options = null } = {}) => {
+      const wrap = document.createElement('div'); wrap.className = 'field';
+      const label = document.createElement('label'); copy(label, labelText);
+      const input = options ? document.createElement('select') : area ? document.createElement('textarea') : document.createElement('input');
+      if (!area && !options) input.type = 'text';
+      if (area) input.rows = 2;
+      if (options) for (const [optionValue, text] of options) {
+        const option = document.createElement('option'); option.value = optionValue; copy(option, text); input.append(option);
+      }
+      input.value = value; input.addEventListener(options ? 'change' : 'input', () => { onInput(input.value); syncHttpRecordingToDocument(); });
+      label.append(input); wrap.append(label); card.append(wrap);
+    };
+    field('Rule ID', rule.id, (value) => { rule.id = value; });
+    field('Action', rule.action, (value) => { rule.action = value; }, { options: [['record', 'Record'], ['drop', 'Drop']] });
+    field('Methods (one case-sensitive token per line)', rule.methods, (value) => { rule.methods = value; }, { area: true });
+    field('Route IDs (one per line)', rule.route_ids, (value) => { rule.route_ids = value; }, { area: true });
+    field('Route matching', rule.route_matched, (value) => { rule.route_matched = value; },
+      { options: [['', 'Any route state'], ['true', 'Matched route only'], ['false', 'Unmatched only']] });
+    field('Status ranges (one 200-299 per line)', rule.status_ranges, (value) => { rule.status_ranges = value; }, { area: true });
+    field('Path prefixes (one per line)', rule.path_prefixes, (value) => { rule.path_prefixes = value; }, { area: true });
+    field('Peer CIDRs (one per line)', rule.peer_cidrs, (value) => { rule.peer_cidrs = value; }, { area: true });
+    field('Client CIDRs (one per line)', rule.client_cidrs, (value) => { rule.client_cidrs = value; }, { area: true });
+    const actions = document.createElement('div'); actions.className = 'button-row span-2';
+    for (const [label, offset] of [['Move up', -1], ['Move down', 1]]) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-secondary'; copy(button, label);
+      button.disabled = index + offset < 0 || index + offset >= draft.rules.length;
+      button.addEventListener('click', () => { [draft.rules[index], draft.rules[index + offset]] = [draft.rules[index + offset], draft.rules[index]];
+        renderHttpRecording(); syncHttpRecordingToDocument(); }); actions.append(button);
+    }
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove rule');
+    remove.addEventListener('click', () => { draft.rules.splice(index, 1); renderHttpRecording(); syncHttpRecordingToDocument(); }); actions.append(remove);
+    card.append(actions); root.append(card);
+  }
+}
+function syncHttpRecordingToDocument() {
+  try {
+    const document = parseConfigEditor();
+    if (!isObject(document) || (document.settings != null && !isObject(document.settings)))
+      throw new Error(t('The configuration settings block must be an object.'));
+    const settings = { ...(document.settings ?? {}) };
+    if (state.httpRecordingDraft) settings.http_recording = recordingPolicyFromDraft(state.httpRecordingDraft);
+    else delete settings.http_recording;
+    if (Object.keys(settings).length) document.settings = settings; else delete document.settings;
+    $('#config-editor').value = JSON.stringify(document, null, 2);
+    state.httpRecordingError = null; message($('#http-recording-message')); configInput(); updateConfigPreview();
+  } catch (error) { state.httpRecordingError = error.message; message($('#http-recording-message'), error.message, 'error'); }
+}
+
 const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
@@ -3738,6 +3892,7 @@ function showSettings(settings) {
   $('#settings-state').hidden = !SETTINGS_FIELDS.some(present);
   state.settingsError = null;
   message($('#settings-message'));
+  showHttpRecording(value.http_recording);
 }
 
 /** Read the fleet-settings controls into a `settings` object ({} when every field inherits); throws on an invalid draft. */
@@ -3791,7 +3946,10 @@ function syncSettingsToDocument() {
   try { value = parseConfigEditor(); }
   catch (error) { state.settingsError = t('the JSON document is invalid, so the settings could not be mirrored ({detail})', { detail: error.message }); message($('#settings-message'), state.settingsError, 'error'); return; }
   if (!isObject(value)) { state.settingsError = t('the JSON document must be an object'); message($('#settings-message'), state.settingsError, 'error'); return; }
-  if (Object.keys(settings).length) value.settings = settings; else delete value.settings;
+  const retained = isObject(value.settings) ? { ...value.settings } : {};
+  for (const key of SETTINGS_FIELDS) delete retained[key];
+  Object.assign(retained, settings);
+  if (Object.keys(retained).length) value.settings = retained; else delete value.settings;
   $('#config-editor').value = JSON.stringify(value, null, 2);
   message($('#settings-message'));
   configInput();
@@ -3820,6 +3978,7 @@ function formatConfig() { try { $('#config-editor').value = JSON.stringify(parse
 async function validateConfig() {
   const button = $('#validate-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
+  if (state.httpRecordingError) return message($('#config-message'), t('HTTP recording: {detail}', { detail: state.httpRecordingError }), 'error');
   if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   setBusy(button, true, t('Validating…'));
   try { const { data } = await api('/v1/config/validate', { method: 'POST', json: value }); message($('#config-message'), t('Valid configuration{revision}.', { revision: data?.revision !== undefined ? t(' for revision {revision}', { revision: data.revision }) : '' }), 'success'); }
@@ -3847,6 +4006,7 @@ function compact(value) { const text = JSON.stringify(value); return text && tex
 async function applyConfig() {
   const button = $('#apply-config'); let value; try { value = parseConfigEditor(); } catch (error) { return message($('#config-message'), error.message, 'error'); }
   if (state.settingsError) return message($('#config-message'), t('Fleet settings: {detail}', { detail: state.settingsError }), 'error');
+  if (state.httpRecordingError) return message($('#config-message'), t('HTTP recording: {detail}', { detail: state.httpRecordingError }), 'error');
   if (state.geoipError) return message($('#config-message'), t('GeoIP source: {detail}', { detail: state.geoipError }), 'error');
   if (!state.configEtag) return message($('#config-message'), t('Reload the active configuration before applying changes.'), 'error');
   updateConfigPreview(); setBusy(button, true, t('Applying…'));
@@ -5183,6 +5343,24 @@ $('#audit-policy-add').addEventListener('click', () => {
   auditPolicyChanged(); renderAuditPolicy();
 });
 $('#audit-policy-save').addEventListener('click', saveAuditPolicy);
+$('#http-recording-enabled').addEventListener('change', (event) => {
+  state.httpRecordingDraft = event.target.checked ? { default_action: 'record', rules: [] } : null;
+  renderHttpRecording(); syncHttpRecordingToDocument();
+});
+$('#http-recording-default').addEventListener('change', (event) => {
+  if (!state.httpRecordingDraft) return;
+  state.httpRecordingDraft.default_action = event.target.value;
+  syncHttpRecordingToDocument();
+});
+$('#http-recording-add').addEventListener('click', () => {
+  const draft = state.httpRecordingDraft;
+  if (!draft || draft.rules.length >= 64) return;
+  let number = draft.rules.length + 1;
+  while (draft.rules.some((rule) => rule.id === `rule-${number}`)) number += 1;
+  draft.rules.push({ id: `rule-${number}`, action: 'record', methods: '', route_ids: '', route_matched: '',
+    status_ranges: '', path_prefixes: '', peer_cidrs: '', client_cidrs: '' });
+  renderHttpRecording(); syncHttpRecordingToDocument();
+});
 $('#audit-previous').addEventListener('click', () => {
   const previous = state.audit.previous.slice();
   if (!previous.length) return;

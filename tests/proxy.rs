@@ -1526,6 +1526,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
         upstream_timeout_ms: Some(120_000),
         allow_dot_segments: Some(true),
         health_path: Some("/-/fleet-ready".into()),
+        ..Settings::default()
     };
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.require_tls = true;

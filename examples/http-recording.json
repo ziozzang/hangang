@@ -1,0 +1,41 @@
+{
+  "settings": {
+    "http_recording": {
+      "default_action": "record",
+      "rules": [
+        {
+          "id": "retain-errors",
+          "action": "record",
+          "match": {
+            "status_ranges": [
+              {
+                "min": 400,
+                "max": 599
+              }
+            ]
+          }
+        },
+        {
+          "id": "omit-routine-polling",
+          "action": "drop",
+          "match": {
+            "methods": [
+              "GET"
+            ],
+            "path_prefixes": [
+              "/poll/"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "http": [
+    {
+      "id": "application",
+      "backends": [
+        "http://127.0.0.1:8080"
+      ]
+    }
+  ]
+}
