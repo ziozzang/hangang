@@ -8,7 +8,10 @@ use std::{
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -38,6 +41,7 @@ pub struct Runtime {
     node_id: String,
     forbidden_digest: Option<[u8; 32]>,
     state: ArcSwap<State>,
+    watching: AtomicBool,
 }
 
 #[derive(Clone, Serialize)]
@@ -78,16 +82,33 @@ fn secure_read(path: &Path, cap: usize) -> Result<Vec<u8>> {
         "observer file owner invalid"
     );
     let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.take(cap as u64 + 1)
+    (&file)
+        .take(cap as u64 + 1)
         .read_to_end(&mut bytes)
         .context("observer file read failed")?;
     ensure!(bytes.len() <= cap, "observer file too large");
+    let after = file
+        .metadata()
+        .context("observer file metadata unavailable")?;
+    ensure!(
+        after.is_file()
+            && after.len() == bytes.len() as u64
+            && meta.len() == after.len()
+            && meta.uid() == after.uid()
+            && meta.mode() == after.mode()
+            && meta.mtime() == after.mtime()
+            && meta.mtime_nsec() == after.mtime_nsec()
+            && meta.ctime() == after.ctime()
+            && meta.ctime_nsec() == after.ctime_nsec(),
+        "observer file changed during read"
+    );
     Ok(bytes)
 }
 
 fn load(path: &Path) -> Result<(String, Vec<u8>)> {
     let raw = secure_read(path, CONFIG_MAX)?;
-    let config: FileConfig = serde_json::from_slice(&raw).context("invalid observer config")?;
+    let config: FileConfig =
+        serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("invalid observer config"))?;
     ensure!(
         (1..=64).contains(&config.node_id.len())
             && config
@@ -129,6 +150,7 @@ impl Runtime {
                 credential: Some(Credential { token }),
                 exhausted: false,
             }),
+            watching: AtomicBool::new(false),
         }))
     }
 
@@ -193,11 +215,16 @@ impl Runtime {
     }
 
     pub async fn watch(self: Arc<Self>, cancel: CancellationToken) {
+        if self.watching.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
         loop {
             tokio::select! { _ = cancel.cancelled() => break, _ = ticker.tick() => self.refresh().await }
         }
+        self.watching.store(false, Ordering::Release);
     }
 }
 
