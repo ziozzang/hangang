@@ -433,8 +433,10 @@ impl Runtime {
             })
             .collect();
         serde_json::json!({"configured":true,"available":state.available,
-            "generation":state.number.to_string(),"expected_nodes":state.peers.len(),
-            "fresh_nodes":fresh_nodes,"stale_after_seconds":60,"nodes":nodes})
+            "generation":state.number.to_string(),
+            "expected_nodes":state.available.then_some(state.peers.len()),
+            "fresh_nodes":state.available.then_some(fresh_nodes),
+            "stale_after_seconds":60,"nodes":nodes})
     }
 
     pub async fn watch(self: Arc<Self>, cancel: CancellationToken) {
@@ -649,6 +651,9 @@ mod tests {
         runtime.refresh().await;
         assert!(!runtime.status()["available"].as_bool().unwrap());
         assert_eq!(runtime.status()["generation"], "2");
+        assert!(runtime.status()["expected_nodes"].is_null());
+        assert!(runtime.status()["fresh_nodes"].is_null());
+        assert_eq!(runtime.status()["nodes"], serde_json::json!([]));
         assert!(!Arc::ptr_eq(&old, &runtime.state.load_full()));
         fs::write(&path, valid).unwrap();
         runtime.refresh().await;
