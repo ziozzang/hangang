@@ -1461,3 +1461,18 @@ test('route public listener scope preserves protected policy', async ({ page }) 
   expect(saved.basic_auth).toEqual(scoped.basic_auth);
   expect(saved.resource_policy).toEqual(scoped.resource_policy);
 });
+
+test('public listener certificate editor retains default, issuer path and disabled state', async ({ page }) => {
+  const certificate = { id: 'fallback', hosts: [], default: true, enabled: false, cert_file: '/run/secrets/fallback.crt', key_file: '/run/secrets/fallback.key', issuer_status_file: '/run/secrets/issuer.json' };
+  const original = { ...config, public_http: [{ id: 'secure', listen: '127.0.0.1:8443', certificates: [certificate], trusted_proxy_cidrs: [] }] };
+  await fixtures(page, { '/v1/config': route => route.fulfill({ json: original, headers: { etag: '"7"' } }) });
+  await login(page); await page.locator('[data-view="config"]').click();
+  await openSection(page, 'Public HTTP listeners');
+  await page.locator('#public-http-list').getByRole('button', { name: 'Edit' }).click();
+  const form = page.locator('#public-http-form');
+  await expect(form.locator('.public-certificate [name="default"]')).toBeChecked();
+  await expect(form.locator('.public-certificate [name="enabled"]')).not.toBeChecked();
+  await expect(form.locator('.public-certificate [name="issuer_status_file"]')).toHaveValue(certificate.issuer_status_file);
+  await form.getByRole('button', { name: 'Stage listener in document' }).click();
+  expect(JSON.parse(await page.locator('#config-editor').inputValue()).public_http[0].certificates).toEqual([certificate]);
+});
