@@ -442,3 +442,144 @@ async fn resource_guard_isolated_by_named_listener_scope() {
     running.shutdown().await;
     origin_task.abort();
 }
+
+#[tokio::test]
+async fn idle_sse_survives_route_publication_but_closes_on_listener_withdrawal() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = origin.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            request.push(byte);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() < 8192);
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata:x\n\n\r\n").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let running = start(config(listen, backend), bound).await;
+    let mut client = TcpStream::connect(listen).await.unwrap();
+    client
+        .write_all(b"GET /edge HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !received.windows(8).any(|part| part == b"data:x\n\n") {
+            received.push(client.read_u8().await.unwrap());
+            assert!(received.len() < 8192);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    let mut updated = config(listen, backend);
+    updated.revision = 2;
+    running.publish(updated.clone()).await;
+    let mut buffer = [0; 1024];
+    // Drain chunk framing; a quiet stream must remain open over timer ticks.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(600), client.read(&mut buffer)).await {
+            Err(_) => break,
+            Ok(Ok(n)) if n > 0 => continue,
+            other => panic!("unchanged listener lost SSE: {other:?}"),
+        }
+    }
+    updated.revision = 3;
+    updated.public_http[0].enabled = false;
+    running.publish(updated).await;
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "withdrawn listener retained SSE"
+    );
+    running.shutdown().await;
+    origin_task.abort();
+}
+
+async fn websocket_origin() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = service_fn(|mut request: Request<Incoming>| async move {
+            let upgrade = hyper::upgrade::on(&mut request);
+            tokio::spawn(async move {
+                if let Ok(upgraded) = upgrade.await {
+                    let mut upgraded = TokioIo::new(upgraded);
+                    let mut bytes = [0_u8; 4];
+                    while upgraded.read_exact(&mut bytes).await.is_ok() {
+                        if upgraded.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(101)
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades()
+            .await;
+    });
+    (address, task)
+}
+
+#[tokio::test]
+async fn upgraded_websocket_closes_when_listener_trust_changes() {
+    let (backend, backend_task) = websocket_origin().await;
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let running = start(config(listen, backend), bound).await;
+    let mut client = TcpStream::connect(listen).await.unwrap();
+    client.write_all(b"GET /edge HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap(); // gitleaks:allow -- WebSocket protocol fixture
+    let mut headers = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(client.read_u8().await.unwrap());
+            assert!(headers.len() < 8192);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(headers.starts_with(b"HTTP/1.1 101"));
+    let mut updated = config(listen, backend);
+    updated.revision = 2;
+    running.publish(updated.clone()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.write_all(b"ping").await.unwrap();
+    let mut echoed = [0; 4];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"ping");
+    updated.revision = 3;
+    updated.public_http[0].trusted_proxy_cidrs = vec!["127.0.0.1/32".parse().unwrap()];
+    running.publish(updated).await;
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut echoed))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "old upgraded stream survived trust change"
+    );
+    running.shutdown().await;
+    backend_task.abort();
+}
