@@ -6,12 +6,13 @@ const operation = (id, state = 'candidate_activated') => ({
   accepted_at_unix_ms: 1789000000000 + id * 1000,
   finished_at_unix_ms: ['accepted', 'indeterminate'].includes(state) ? null : 1789000001000 + id * 1000,
   expected_revision: id - 1, candidate_sha256: 'a'.repeat(64),
-  store_kind: 'local_file', authority_epoch: null, state,
+  store_kind: 'local_file', authority_epoch: null, state, release_state: 'not_applicable', release_id: null,
 });
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, holdExportPage = false, changedHistory = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, holdExportPage = false, changedHistory = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false, v2Release = false, missingReleaseState = false, releaseStatus = 200, delayedRelease = false } = {}) {
   const calls = [];
   let pruned = false;
+  let released = false;
   let release;
   const blocked = new Promise((resolve) => { release = resolve; });
   if (locale === 'ko') await page.addInitScript(() => localStorage.setItem('hangang-locale', 'ko'));
@@ -39,17 +40,32 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
         : longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
         : after ? [operation(101, 'indeterminate')] : Array.from({ length: 100 }, (_, index) =>
           operation(index + 1, noTerminal ? 'accepted' : index === 0 ? 'accepted' : index === 1 ? 'failed' : 'candidate_activated'));
+      if (v2Release) for (const record of rows.filter((record) => record.id === 3 || record.id === 4)) {
+        if (noTerminal && record.id === 3) { record.state = 'candidate_activated'; record.finished_at_unix_ms = record.accepted_at_unix_ms + 1000; }
+        record.receipt_version = 2; record.store_kind = 'shared_store'; record.authority_epoch = 'c'.repeat(32);
+        record.operation_id = record.id.toString(16).padStart(16, '0') + 'd'.repeat(16);
+        record.release_state = released ? 'acknowledged' : record.id === 3 ? 'protected' : 'pending';
+        record.release_id = released ? 'e'.repeat(32) : record.id === 4 ? 'f'.repeat(32) : null;
+        if (missingReleaseState && record.id === 3) { delete record.release_state; delete record.release_id; }
+      }
       if (historyGap && !after) rows.shift();
       for (const record of rows) record.authority_id = authorityId;
       const data = { scope: 'instance', coverage: ['acceptance', 'local_outcome'], authority_id: authorityId,
         started_at_unix_ms: 1788999999000, oldest_id: historyGap ? 2 : 1, latest_id: longHistory ? 10000 : 101, records: rows,
         next_after: rows.at(-1)?.id ?? after, has_more: pruned ? false : longHistory ? after < 9900 : after === 0,
-        history_revision: pruned || changedHistory && after ? 203 : 202, pruned_through: pruned ? 100 : historyGap ? 1 : 0,
+        history_revision: pruned || released || changedHistory && after ? 203 : 202, pruned_through: pruned ? 100 : historyGap ? 1 : 0,
         truncated: pruned || historyGap,
         capacity: 10000, stored_records: pruned ? 2 : historyGap ? 100 : longHistory ? 10000 : 101,
         writes_available: !longHistory, server_time_unix_ms: 1789001000000 };
       if (invalid) delete data.writes_available;
       return route.fulfill({ json: data });
+    }
+    if (url.pathname === '/v1/config/operations/release') {
+      if (delayedRelease) await blocked;
+      if (releaseStatus !== 200) return route.fulfill({ status: releaseStatus, json: { title: 'Release unavailable', detail: 'check outcome' } });
+      released = true;
+      return route.fulfill({ json: { scope: 'instance', operation_id: request.postDataJSON().operation_id,
+        release_id: 'e'.repeat(32), release_state: 'acknowledged' } });
     }
     if (url.pathname === '/v1/config/operations/prune') {
       if (delayedPrune) await blocked;
@@ -184,7 +200,7 @@ test('terminal pruning requires confirmation, exact history CAS, and never retri
   await expect(page.locator('#config-operations-prune')).toBeEnabled();
   await page.locator('#config-operations-prune').click();
   await expect(page.locator('#confirm-message')).toContainText('including earlier pages');
-  await expect(page.locator('#confirm-message')).toContainText('Accepted and indeterminate operations are retained');
+  await expect(page.locator('#confirm-message')).toContainText('V2 receipts without acknowledged release are retained');
   await page.locator('#confirm-dialog [value="cancel"]').click();
   expect(calls.filter((call) => call.path.endsWith('/prune'))).toHaveLength(0);
   await page.locator('#config-operations-prune').click();
@@ -284,4 +300,74 @@ test('all 10,000 retained operations remain reachable beyond the recent backcurs
   await expect(page.locator('#config-operations-next')).toBeEnabled();
   await page.locator('#config-operations-previous').click();
   await expect(page.locator('#config-operations-page-state')).toContainText('Page 65 ·');
+});
+
+test('V2 protection release is explicit, acknowledged, and separate from SQL receipt deletion', async ({ page }) => {
+  const { calls } = await fixture(page, { v2Release: true });
+  await page.locator('[data-view="config-operations"]').click();
+  const row = page.locator('#config-operations-rows tr').nth(2);
+  await expect(row).toContainText('SQL receipt protected');
+  await row.getByRole('button', { name: 'Release SQL receipt protection' }).click();
+  await expect(page.locator('#confirm-message')).toContainText('does not delete a SQL receipt');
+  await page.locator('#confirm-dialog [value="cancel"]').click();
+  expect(calls.filter((call) => call.path === '/v1/config/operations/release')).toHaveLength(0);
+  await row.getByRole('button', { name: 'Release SQL receipt protection' }).click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-rows tr').nth(2)).toContainText('SQL release acknowledged');
+  const releases = calls.filter((call) => call.path === '/v1/config/operations/release');
+  expect(releases).toHaveLength(1);
+  expect(releases[0].body).toEqual({ operation_id: '0000000000000003dddddddddddddddd' });
+  await expect(page.locator('#config-operations-message')).not.toContainText('SQL receipt deleted');
+});
+
+test('V2 missing release state stays protected and is not eligible for local pruning', async ({ page }) => {
+  await fixture(page, { v2Release: true, noTerminal: true, missingReleaseState: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-rows tr').nth(2)).toContainText('protection retained');
+  await expect(page.locator('#config-operations-rows tr').nth(2).getByRole('button')).toHaveCount(0);
+  await expect(page.locator('#config-operations-prune')).toBeDisabled();
+  await expect(page.locator('#config-operations-rows tr').nth(3)).toContainText('Release pending');
+  await expect(page.locator('#config-operations-rows tr').nth(3)).toContainText('Release ID:');
+});
+
+test('503 release outcome refreshes history without replaying mutation', async ({ page }) => {
+  const { calls } = await fixture(page, { v2Release: true, releaseStatus: 503 });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-rows tr').nth(2).getByRole('button').click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-message')).toContainText('no automatic mutation retry');
+  expect(calls.filter((call) => call.path === '/v1/config/operations/release')).toHaveLength(1);
+  expect(calls.filter((call) => call.path === '/v1/config/operations')).toHaveLength(2);
+});
+
+test('unsupported release is visible without claiming an acknowledged release', async ({ page }) => {
+  await fixture(page, { v2Release: true, releaseStatus: 501 });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-rows tr').nth(2).getByRole('button').click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-message')).toContainText('does not support SQL receipt release');
+  await expect(page.locator('#config-operations-rows tr').nth(2)).toContainText('SQL receipt protected');
+});
+
+for (const releaseStatus of [401, 403]) test(`release ${releaseStatus} withdraws privileged history`, async ({ page }) => {
+  const { calls } = await fixture(page, { accounts: true, v2Release: true, releaseStatus });
+  await page.locator('[data-view="config-operations"]').click();
+  await page.locator('#config-operations-rows tr').nth(2).getByRole('button').click();
+  await page.locator('#confirm-accept').click();
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
+  await expect(page.locator('[data-view="config-operations"]')).toBeHidden();
+  expect(calls.filter((call) => call.path === '/v1/config/operations/release')).toHaveLength(1);
+});
+
+test('Korean release confirmation and late response after logout do not restore privileged rows', async ({ page }) => {
+  const { calls, release } = await fixture(page, { locale: 'ko', accounts: true, v2Release: true, delayedRelease: true });
+  await page.locator('[data-view="config-operations"]').click();
+  await expect(page.locator('#config-operations-rows tr').nth(2)).toContainText('SQL 영수증 보호 중');
+  await page.locator('#config-operations-rows tr').nth(2).getByRole('button').click();
+  await expect(page.locator('#confirm-message')).toContainText('SQL 영수증이나 보관 증거를 삭제하지 않으며');
+  await page.locator('#confirm-accept').click();
+  await expect.poll(() => calls.some((call) => call.path === '/v1/config/operations/release')).toBe(true);
+  await page.locator('#logout-button').click();
+  release();
+  await expect(page.locator('#config-operations-rows')).toBeEmpty();
 });

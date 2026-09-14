@@ -71,7 +71,7 @@ const state = {
   lastStatus: null,
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
-  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false },
+  configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false, releasing: false },
   configProof: { data: null, error: null, loading: false, sequence: 0 },
   configReceipt: { data: null, error: null, loading: false, sequence: 0,
     exportSequence: 0, exporting: false, exportFetched: 0, exportError: null, exportNotice: null },
@@ -4507,6 +4507,7 @@ function resetConfigOperations() {
   state.configOperations.exporting = false;
   state.configOperations.exportFetched = 0;
   state.configOperations.exportMismatch = false;
+  state.configOperations.releasing = false;
   $('#config-operations-rows').replaceChildren();
   $('#config-operations-meta').textContent = '';
   $('#config-operations-page-state').textContent = '';
@@ -4549,7 +4550,25 @@ function validConfigOperationsPage(data, after) {
     safe(record.expected_revision) && /^[0-9a-f]{64}$/.test(record.candidate_sha256) &&
     ['local_file', 'shared_store'].includes(record.store_kind) &&
     (record.authority_epoch == null || idValue(record.authority_epoch)) &&
-    ['accepted', 'candidate_activated', 'conflict', 'failed', 'indeterminate'].includes(record.state));
+    ['accepted', 'candidate_activated', 'conflict', 'failed', 'indeterminate'].includes(record.state) &&
+    (record.release_state === undefined || ['not_applicable', 'protected', 'pending', 'acknowledged'].includes(record.release_state)) &&
+    (record.release_id == null || idValue(record.release_id)) &&
+    (record.receipt_version === 2 || record.release_state === undefined || record.release_state === 'not_applicable'));
+}
+
+function configOperationReleaseState(record) {
+  if (record.receipt_version !== 2) return t('Not applicable to this receipt');
+  return {
+    protected: t('SQL receipt protected'),
+    pending: t('Release pending; SQL outcome unconfirmed'),
+    acknowledged: t('SQL release acknowledged'),
+    not_applicable: t('Release eligibility unknown; protection retained'),
+  }[record.release_state] || t('Release state unavailable from older server; protection retained');
+}
+
+function configOperationPrunable(record) {
+  return ['candidate_activated', 'conflict', 'failed'].includes(record.state) &&
+    (record.receipt_version !== 2 || record.release_state === 'acknowledged');
 }
 
 function configOperationState(record) {
@@ -4596,7 +4615,8 @@ function renderConfigOperations() {
       const tr = document.createElement('tr');
       const actor = record.actor_kind === 'system' ? t('System authority') : t('Account #{id}', { id: record.actor_user_id });
       const values = [record.id, auditDate(record.accepted_at_unix_ms), actor, record.expected_revision,
-        configOperationState(record), record.finished_at_unix_ms == null ? '—' : auditDate(record.finished_at_unix_ms)];
+        configOperationState(record), record.finished_at_unix_ms == null ? '—' : auditDate(record.finished_at_unix_ms),
+        configOperationReleaseState(record)];
       for (const value of values) { const td = document.createElement('td'); td.textContent = String(value); tr.append(td); }
       const detailCell = document.createElement('td');
       const details = document.createElement('details');
@@ -4606,10 +4626,21 @@ function renderConfigOperations() {
         operation: record.operation_id, digest: record.candidate_sha256,
         store: record.store_kind, epoch: record.authority_epoch ?? '—',
       })}`;
-      details.append(summary, detailText); detailCell.append(details); tr.append(detailCell);
+      details.append(summary, detailText); detailCell.append(details);
+      if (record.release_id) { const releaseId = document.createElement('p'); releaseId.textContent = t('Release ID: {id}', { id: record.release_id }); details.append(releaseId); }
+      if (record.receipt_version === 2 && record.state === 'candidate_activated' &&
+        ['protected', 'pending'].includes(record.release_state)) {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'button button-secondary';
+        button.textContent = t(record.release_state === 'pending' ? 'Check pending SQL release' : 'Release SQL receipt protection');
+        button.disabled = history.releasing || history.exporting;
+        button.addEventListener('click', () => releaseConfigOperation(record));
+        detailCell.append(button);
+      }
+      tr.append(detailCell);
       rows.append(tr);
     }
-    if (!page.records.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 7; td.className = 'audit-empty'; td.textContent = t('No configuration operations on this page.'); tr.append(td); rows.append(tr); }
+    if (!page.records.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 8; td.className = 'audit-empty'; td.textContent = t('No configuration operations on this page.'); tr.append(td); rows.append(tr); }
     $('#config-operations-page-state').textContent = t('Page {page} · cursor #{cursor}', { page: history.pageNumber, cursor: page.next_after });
   }
   $('#config-operations-export').disabled = !page?.records?.length;
@@ -4617,8 +4648,9 @@ function renderConfigOperations() {
   $('#config-operations-export-all').textContent = history.exporting
     ? t('Exporting history… {done}/{total}', { done: formatNumber(history.exportFetched), total: formatNumber(page?.stored_records ?? 0) })
     : t('Export all retained JSON');
-  $('#config-operations-prune').disabled = history.exporting || history.exportMismatch ||
-    !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state));
+  $('#config-operations-prune').disabled = history.exporting || history.releasing || history.exportMismatch ||
+    !page?.records?.every((record) => record.release_state !== undefined) ||
+    !page?.records?.some(configOperationPrunable);
   $('#config-operations-previous').disabled = !page || !history.previous.length;
   $('#config-operations-next').disabled = !page?.has_more || !page.records.length;
 }
@@ -4627,6 +4659,7 @@ async function loadConfigOperations(after = 0, previous = [], pageNumber = 1) {
   if (!isAdmin() || !state.token) { resetConfigOperations(); return; }
   const priorPage = after ? state.configOperations.page : null;
   const sequence = ++state.configOperations.sequence;
+  state.configOperations.releasing = false;
   state.configOperations.page = null;
   state.configOperations.error = null;
   state.configOperations.notice = null;
@@ -4741,14 +4774,65 @@ async function exportAllConfigOperations() {
   }
 }
 
+async function releaseConfigOperation(record) {
+  const history = state.configOperations;
+  const page = history.page;
+  if (!isAdmin() || !state.token || !page || history.releasing || history.exporting ||
+    record.receipt_version !== 2 || record.state !== 'candidate_activated' ||
+    !['protected', 'pending'].includes(record.release_state) || !page.records.includes(record)) return;
+  const sequence = history.sequence;
+  const generation = state.authGeneration;
+  const token = state.token;
+  const stillCurrent = () => history.sequence === sequence && history.page === page &&
+    state.authGeneration === generation && state.token === token && state.view === 'config-operations' && isAdmin();
+  const accepted = await confirmDialog({
+    title: t('Release SQL receipt protection?'),
+    body: t('Confirm release for operation {operation}. This verifies and releases its SQL receipt protection only. It does not delete a SQL receipt, archive evidence, or prove fleet activation. If the outcome is unavailable, refresh the history before deciding again.', { operation: record.operation_id }),
+    accept: t('Confirm SQL release'),
+  });
+  if (!accepted || !stillCurrent()) return;
+  history.releasing = true;
+  renderConfigOperations();
+  try {
+    const { data } = await api('/v1/config/operations/release', { method: 'POST', json: { operation_id: record.operation_id } });
+    if (!stillCurrent()) return;
+    if (!isObject(data) || data.scope !== 'instance' || data.operation_id !== record.operation_id ||
+      !/^[0-9a-f]{32}$/.test(data.release_id) || data.release_state !== 'acknowledged')
+      throw new Error(t('SQL release response is invalid; refresh to verify its outcome.'));
+    history.releasing = false;
+    await loadConfigOperations(0, []);
+    if (state.authGeneration === generation && state.token === token && state.view === 'config-operations' && isAdmin())
+      toast(t('SQL receipt protection release acknowledged. No SQL receipt was deleted.'));
+  } catch (error) {
+    if (!stillCurrent() || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    history.releasing = false;
+    if (error.status === 409 || error.status === 503) {
+      await loadConfigOperations(0, []);
+      if (state.authGeneration !== generation || state.token !== token || state.view !== 'config-operations' || !isAdmin()) return;
+    }
+    history.notice = error.status === 503
+      ? t('SQL release acknowledgement is unknown. History was refreshed; no automatic mutation retry was made.')
+      : error.status === 409
+        ? t('Operation is not eligible for SQL release. History was refreshed; no automatic mutation retry was made.')
+        : error.status === 501
+          ? t('This store does not support SQL receipt release.')
+          : error.message;
+    renderConfigOperations();
+  } finally {
+    if (stillCurrent()) { history.releasing = false; renderConfigOperations(); }
+  }
+}
+
 async function pruneConfigOperationsPage() {
   const page = state.configOperations.page;
-  if (!isAdmin() || !page?.records?.some((record) => ['candidate_activated', 'conflict', 'failed'].includes(record.state))) return;
+  if (!isAdmin() || !page?.records?.every((record) => record.release_state !== undefined) ||
+    !page.records.some(configOperationPrunable)) return;
   const throughId = page.records.at(-1).id;
   const sequence = state.configOperations.sequence;
   const accepted = await confirmDialog({
     title: t('Permanently prune terminal configuration operations?'),
-    body: t('Archive all terminal configuration operations through #{id}, including earlier pages, before proceeding. This page export is not a complete archive. Accepted and indeterminate operations are retained. This deletion is irreversible and affects this instance only.', { id: throughId }),
+    body: t('Archive all terminal configuration operations through #{id}, including earlier pages, before proceeding. This page export is not a complete archive. Accepted and indeterminate operations and V2 receipts without acknowledged release are retained. This deletion is irreversible and affects this instance only.', { id: throughId }),
     accept: t('Permanently prune terminal records'),
   });
   if (!accepted || sequence !== state.configOperations.sequence || page !== state.configOperations.page || !isAdmin() || !state.token) return;

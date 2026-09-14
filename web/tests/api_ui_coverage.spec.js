@@ -64,6 +64,7 @@ const coverage = new Map([
   ['GET /v1/config/commit-receipt', ['#config-receipt-form', 'app', ": '/v1/config/commit-receipt';"]],
   ['GET /v1/config/commit-receipt-v2', ['#config-receipt-mode', 'app', '/v1/config/commit-receipt-v2']],
   ['GET /v1/config/commit-receipts-v2', ['#config-receipt-export-v2', 'app', '/v1/config/commit-receipts-v2?']],
+  ['POST /v1/config/operations/release', ['#config-operations-rows', 'app', "api('/v1/config/operations/release', { method: 'POST'"]],
   ['POST /v1/config/operations/prune', ['#config-operations-prune', 'app', "api('/v1/config/operations/prune', { method: 'POST'"]],
   ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
 ]);
