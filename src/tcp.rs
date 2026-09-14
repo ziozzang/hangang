@@ -285,9 +285,19 @@ impl TcpManager {
             .map(|listener| listener.listen)
         {
             ensure!(
-                accounted.insert(address),
+                !config
+                    .tcp
+                    .iter()
+                    .any(|route| route.enabled && route.listen == address)
+                    && !config
+                        .workload_http
+                        .iter()
+                        .any(|listener| listener.enabled && listener.listen == address),
                 "public HTTP listener overlaps another listener at {address}"
             );
+            if !accounted.insert(address) {
+                continue;
+            }
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("bind public HTTP listener {address}"))?;

@@ -27,6 +27,7 @@ pub struct Evidence(Arc<VerifiedListener>);
 struct VerifiedListener {
     listener: Listener,
     tls_slot: Option<Arc<ArcSwap<rustls::ServerConfig>>>,
+    generation: Arc<()>,
 }
 impl Evidence {
     pub fn listener_id(&self) -> &str {
@@ -44,6 +45,10 @@ impl Evidence {
             .public_http
             .iter()
             .any(|listener| listener.enabled && listener == &self.0.listener)
+            && snapshot
+                .public_http_generations
+                .get(&self.0.listener.id)
+                .is_some_and(|generation| Arc::ptr_eq(generation, &self.0.generation))
             && match &self.0.tls_slot {
                 Some(slot) => snapshot
                     .public_http_tls
@@ -174,9 +179,14 @@ pub async fn serve(
         };
         Some(slot)
     };
+    let Some(generation) = snapshot.public_http_generations.get(&listener_id).cloned() else {
+        reject();
+        return;
+    };
     let evidence = Evidence(Arc::new(VerifiedListener {
         listener,
         tls_slot: tls_slot.clone(),
+        generation,
     }));
     if !evidence.current(&active.load()) {
         reject();
