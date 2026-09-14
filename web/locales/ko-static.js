@@ -1,5 +1,11 @@
 // English source text is the key. Technical identifiers and user data remain untranslated.
 export default {
+  'Each entry requires id, hosts, cert_file, and key_file. Paths must be absolute files readable by Hangang. The default CLI listener needs --config-tls; named HTTPS listeners serve their own configured certificate files. Certificate and private-key PEM content is never stored in configuration.': '각 항목에는 id, hosts, cert_file, key_file이 필요합니다. 경로는 한강이 읽을 수 있는 절대 파일 경로여야 합니다. 기본 CLI 리스너에는 --config-tls가 필요하며 이름 있는 HTTPS 리스너는 자체 인증서 파일을 제공합니다. 인증서와 개인 키 PEM 내용은 구성에 저장되지 않습니다.',
+
+  'Certificate listener': '인증서 리스너',
+  'Default CLI listener': '기본 CLI 리스너',
+  'Choose the listener whose inventory and file-backed certificate set you want to manage. Switching listeners discards the current certificate draft.': '관리할 인벤토리와 파일 기반 인증서 세트의 리스너를 선택하세요. 리스너를 바꾸면 현재 인증서 초안이 폐기됩니다.',
+
   'Security diagnostics': '보안 진단',
   'Cumulative counters for this instance. A dash means the server did not report a valid count. JWT stream terminations appear in the summary above.': '이 인스턴스의 누적 계수입니다. 대시는 서버가 유효한 계수를 보고하지 않았음을 뜻합니다. JWT 스트림 종료는 위 요약에 표시됩니다.',
   'Hangang Console': '한강 콘솔',

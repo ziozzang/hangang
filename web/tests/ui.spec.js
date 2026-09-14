@@ -1476,3 +1476,105 @@ test('public listener certificate editor retains default, issuer path and disabl
   await form.getByRole('button', { name: 'Stage listener in document' }).click();
   expect(JSON.parse(await page.locator('#config-editor').inputValue()).public_http[0].certificates).toEqual([certificate]);
 });
+
+test('certificate scope separates same-ID entries and preserves every other listener', async ({ page }) => {
+  const named = id => ({ id, listen: id === 'edge' ? '127.0.0.1:8443' : '127.0.0.1:9443', certificates: [{ id: 'same', hosts: [id + '.example.test'], cert_file: `/certs/${id}.crt`, key_file: `/certs/${id}.key` }] });
+  let active = { ...config, certificates: [{ id: 'same', hosts: [], default: true, cert_file: '/certs/default.crt', key_file: '/certs/default.key' }], public_http: [named('edge'), named('other')] };
+  const otherCert = { id: 'same', hosts: [], default: true, enabled: false, cert_file: '/certs/other.crt', key_file: '/certs/other.key', issuer_status_file: '/certs/other-issuer.json' };
+  active.public_http[1].certificates = [otherCert];
+  const inventoryScopes = [];
+  const calls = await fixtures(page, {
+    '/v1/config': route => {
+      if (route.request().method() === 'PUT') {
+        active = { ...route.request().postDataJSON(), revision: active.revision + 1 };
+        return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+      }
+      return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+    },
+    '/v1/certificates': route => {
+      const scope = new URL(route.request().url()).searchParams.get('listener_id'); inventoryScopes.push(scope);
+      return route.fulfill({ json: { listener_id: scope, revision: active.revision, mode: 'configured_files', total: 1, offset: 0, limit: 32, certificates: [{ id: 'same', source: 'manual', read_state: 'ok', san_dns: [scope + '.example.test'] }], in_process_acme: null } });
+    },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  const selector = page.locator('#certificate-scope');
+  await expect(selector.locator('option')).toHaveCount(3);
+  await expect(page.locator('#certificate-editor')).toHaveValue(/default\.crt/);
+  await selector.selectOption('edge');
+  await expect(page.locator('#certificate-editor')).toHaveValue(/edge\.crt/);
+  await expect(page.locator('#certificate-editor')).not.toHaveValue(/default\.crt/);
+  expect(inventoryScopes).toContain('edge');
+  const edited = [{ ...active.public_http[0].certificates[0], enabled: false }];
+  await page.locator('#certificate-editor').fill(JSON.stringify(edited));
+  await page.locator('#apply-certificates').click();
+  await expect(page.locator('#certificate-message')).toContainText('revision 8');
+  const put = JSON.parse(calls.find(call => call.path === '/v1/config' && call.method === 'PUT').body);
+  expect(put.public_http[0].certificates).toEqual(edited);
+  expect(put.public_http[1].certificates).toEqual([otherCert]);
+  expect(put.certificates).toEqual([{ id: 'same', hosts: [], default: true, cert_file: '/certs/default.crt', key_file: '/certs/default.key' }]);
+  await selector.selectOption('default');
+  await expect(page.locator('#certificate-editor')).toHaveValue(/default\.crt/);
+  expect(inventoryScopes).toContain('default');
+  await selector.selectOption('edge');
+  await expect(page.locator('#certificate-list').getByRole('button', { name: 'Activate' })).toBeVisible();
+  await page.locator('#certificate-list').getByRole('button', { name: 'Activate' }).click();
+  await expect.poll(() => active.revision).toBe(9);
+  expect(active.public_http[0].certificates[0].enabled).toBeUndefined();
+  expect(active.public_http[1].certificates).toEqual([otherCert]);
+  expect(active.certificates[0].default).toBe(true);
+});
+
+test('certificate scope switch discards draft and prevents a pending save in the old scope', async ({ page }) => {
+  const active = { ...config, certificates: [], public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, blocked = false, pending = false;
+  const calls = await fixtures(page, { '/v1/config': async route => {
+    if (route.request().method() === 'PUT') return route.fulfill({ json: { ...route.request().postDataJSON(), revision: 8 }, headers: { etag: '"8"' } });
+    if (blocked && !pending) { pending = true; await new Promise(resolve => { release = resolve; }); }
+    return route.fulfill({ json: active, headers: { etag: '"7"' } });
+  } });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await page.locator('#certificate-scope').selectOption('edge');
+  await expect(page.locator('#certificate-editor')).toHaveValue('[]');
+  await page.locator('#certificate-editor').fill(JSON.stringify([{ id: 'draft', hosts: ['edge.test'], cert_file: '/edge.crt', key_file: '/edge.key' }]));
+  blocked = true;
+  await page.locator('#apply-certificates').click();
+  await expect.poll(() => pending).toBe(true);
+  await page.locator('#certificate-scope').selectOption('default');
+  release();
+  await expect(page.locator('#certificate-editor')).toHaveValue('[]');
+  await expect(page.locator('#certificate-dirty')).toBeHidden();
+  await expect.poll(() => calls.filter(call => call.path === '/v1/config' && call.method === 'PUT').length).toBe(0);
+});
+
+test('certificate inventory ignores delayed responses from a previous listener and resets pagination', async ({ page }) => {
+  const active = { ...config, certificates: [], public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, waiting = false;
+  await fixtures(page, {
+    '/v1/config': route => route.fulfill({ json: active, headers: { etag: '"7"' } }),
+    '/v1/certificates': async route => {
+      const scope = new URL(route.request().url()).searchParams.get('listener_id');
+      if (scope === 'edge') { waiting = true; await new Promise(resolve => { release = resolve; }); }
+      return route.fulfill({ json: { listener_id: scope, revision: 7, mode: 'configured_files', total: scope === 'edge' ? 33 : 0, offset: 0, limit: 32,
+        certificates: scope === 'edge' ? [{ id: 'stale-edge', source: 'manual', read_state: 'ok', san_dns: [] }] : [], in_process_acme: null } });
+    },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await page.locator('#certificate-scope').selectOption('edge');
+  await expect.poll(() => waiting).toBe(true);
+  await page.locator('#certificate-scope').selectOption('default');
+  release();
+  await expect(page.locator('#certificate-scope')).toHaveValue('default');
+  await expect(page.locator('#certificate-inventory-count')).toHaveText('0 configured certificate files');
+  await expect(page.locator('#certificate-inventory')).not.toContainText('stale-edge');
+  await expect(page.locator('#certificate-inventory-pages')).toBeEmpty();
+});
+
+test('Korean certificate selector distinguishes default and named listeners', async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(navigator, 'language', { configurable: true, get: () => 'ko-KR' }));
+  await fixtures(page, { '/v1/config': route => route.fulfill({ json: { ...config, public_http: [{ id: 'edge', listen: '127.0.0.1:8443' }] }, headers: { etag: '"7"' } }) });
+  await page.goto('/ui/'); await page.locator('#token-input').fill('correct-token'); await page.locator('#login-submit').click();
+  await page.locator('[data-view="certificates"]').click();
+  await expect(page.locator('label[for="certificate-scope"]')).toHaveText('인증서 리스너');
+  await expect(page.locator('#certificate-scope option[value="default"]')).toHaveText('기본 CLI 리스너');
+  await expect(page.locator('#certificate-scope option[value="edge"]')).toHaveText('edge');
+});

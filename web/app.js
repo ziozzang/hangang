@@ -60,6 +60,8 @@ const state = {
   geoipError: null,
   geoipRuntime: { status: null, lookup: null, statusError: null, lookupError: null, statusSequence: 0, lookupSequence: 0, statusAbort: null, lookupAbort: null },
   certificateDirty: false,
+  certificateScope: 'default',
+  certificateScopeGeneration: 0,
   certificateInventory: null,
   certificateInventoryOffset: 0,
   certificateInventoryLoadSequence: 0,
@@ -105,7 +107,7 @@ function refreshAppCopy() {
   if (state.cacheRuntime) renderCache(state.cacheRuntime);
   refreshCacheToggle(state.config?.cache ?? null);
   if (state.certificateInventory) renderCertificateInventory(state.certificateInventory);
-  if (state.config && $('#certificate-list').children.length) renderCertificates(state.config.certificates || []);
+  if (state.config) { showCertificateScopes(state.config); if ($('#certificate-list').children.length) renderCertificates(certificatesForScope(state.config, state.certificateScope)); }
   if ($('#http-recording-section')) renderHttpRecording();
   if (state.config) updateConfigPreview();
   renderGeoIpStatus();
@@ -441,6 +443,9 @@ function logout(reason = '') {
   state.httpRecordingDraft = null;
   state.geoipError = null;
   state.certificateDirty = false;
+  state.certificateScope = 'default';
+  state.certificateScopeGeneration++;
+  $('#certificate-scope').replaceChildren(new Option(t('Default CLI listener'), 'default'));
   state.certificateInventory = null;
   state.certificateInventoryOffset = 0;
   state.certificateInventoryLoadSequence++;
@@ -1117,7 +1122,8 @@ function adoptConfig(latest) {
   if (!state.configDirty) showConfigDocument(latest.data);
   else updateConfigPreview();
   if (!state.cachePolicyDirty) showCachePolicy(latest.data.cache ?? null);
-  if (!state.certificateDirty) { $('#certificate-editor').value = JSON.stringify(latest.data.certificates ?? [], null, 2); $('#certificate-editor').setAttribute('aria-invalid', 'false'); }
+  showCertificateScopes(latest.data);
+  if (!state.certificateDirty) { $('#certificate-editor').value = JSON.stringify(certificatesForScope(latest.data, state.certificateScope), null, 2); $('#certificate-editor').setAttribute('aria-invalid', 'false'); }
 }
 
 async function purgeCache() {
@@ -3198,18 +3204,59 @@ function renderCertificateInventory(data) {
   }
 }
 
+function certificatesForScope(config, scope) {
+  if (scope === 'default') return config?.certificates || [];
+  return config?.public_http?.find(listener => listener.id === scope)?.certificates || [];
+}
+function certificateScopeExists(config, scope) {
+  return scope === 'default' || Boolean(config?.public_http?.some(listener => listener.id === scope));
+}
+function setCertificatesForScope(config, scope, certificates) {
+  if (scope === 'default') config.certificates = certificates;
+  else {
+    const listener = config.public_http?.find(item => item.id === scope);
+    if (!listener) throw new Error(t('Selected certificate listener no longer exists. Reload its configuration.'));
+    listener.certificates = certificates;
+  }
+}
+function showCertificateScopes(config) {
+  const select = $('#certificate-scope'); const selected = state.certificateScope;
+  const options = [new Option(t('Default CLI listener'), 'default')];
+  for (const listener of config?.public_http || []) options.push(new Option(listener.id, listener.id));
+  select.replaceChildren(...options);
+  select.value = selected;
+}
+function certificateScopeCurrent(scope, generation) {
+  return state.certificateScope === scope && state.certificateScopeGeneration === generation && Boolean(state.token);
+}
+function changeCertificateScope() {
+  const scope = $('#certificate-scope').value;
+  if (scope === state.certificateScope) return;
+  state.certificateScope = scope; state.certificateScopeGeneration++;
+  state.certificateLoadSequence++; state.certificateInventoryLoadSequence++;
+  state.certificateDirty = false; state.certificateInventory = null; state.certificateInventoryOffset = 0;
+  $('#certificate-dirty').hidden = true; $('#certificate-editor').value = '[]';
+  $('#certificate-editor').setAttribute('aria-invalid', 'false');
+  $('#certificate-list').replaceChildren(); $('#certificate-inventory').replaceChildren();
+  $('#certificate-inventory-pages').replaceChildren(); $('#certificate-acme-state').replaceChildren();
+  $('#certificate-inventory-count').textContent = '—'; message($('#certificate-message'));
+  loadCertificates(true).catch(error => { if (error instanceof StaleSessionError) return; message($('#certificate-message'), error.message, 'error'); });
+}
+
 async function loadCertificateInventory(offset = state.certificateInventoryOffset, quiet = false) {
   const sequence = ++state.certificateInventoryLoadSequence;
+  const scope = state.certificateScope, generation = state.certificateScopeGeneration;
   const root = $('#certificate-inventory');
   if (!quiet) root.replaceChildren(loadingNode('Loading certificate inventory…'));
   try {
-    const { data } = await api(`/v1/certificates?offset=${offset}&limit=32`);
-    if (sequence !== state.certificateInventoryLoadSequence) return;
+    const { data } = await api(`/v1/certificates?offset=${offset}&limit=32&listener_id=${encodeURIComponent(scope)}`);
+    if (sequence !== state.certificateInventoryLoadSequence || !certificateScopeCurrent(scope, generation)) return;
+    if ((scope !== 'default' || data.listener_id) && data.listener_id !== scope) throw new Error(t('Certificate inventory answered for a different listener.'));
     state.certificateInventoryOffset = offset;
     state.certificateInventory = data;
     renderCertificateInventory(data);
   } catch (error) {
-    if (sequence !== state.certificateInventoryLoadSequence) return;
+    if (sequence !== state.certificateInventoryLoadSequence || !certificateScopeCurrent(scope, generation)) return;
     if (error instanceof StaleSessionError) throw error;
     if (error.status === 401 || error.status === 403) { logout(t('Your session is no longer authorized.')); throw new StaleSessionError(); }
     state.certificateInventory = null;
@@ -3233,20 +3280,23 @@ function stopCertificatePolling() {
 
 async function loadCertificates(force) {
   const sequence = ++state.certificateLoadSequence;
+  const scope = state.certificateScope, generation = state.certificateScopeGeneration;
   await loadCertificateInventory();
   if (!state.token) return;
   if (state.certificateDirty && !force) return;
   const list = $('#certificate-list');
   list.replaceChildren(loadingNode('Loading certificate paths…'));
   const latest = await api('/v1/config');
-  if (sequence !== state.certificateLoadSequence) return;
+  if (sequence !== state.certificateLoadSequence || !certificateScopeCurrent(scope, generation)) return;
+  if (!certificateScopeExists(latest.data, scope)) { $('#certificate-scope').value = 'default'; changeCertificateScope(); return; }
+  showCertificateScopes(latest.data);
   if (!state.configDirty) {
     state.config = latest.data;
     state.configEtag = latest.etag || `"${latest.data.revision}"`;
     showConfigDocument(latest.data);
     setRevision(latest.data.revision);
   }
-  const certificates = latest.data.certificates ?? [];
+  const certificates = certificatesForScope(latest.data, scope);
   $('#certificate-editor').value = JSON.stringify(certificates, null, 2);
   $('#certificate-editor').setAttribute('aria-invalid', 'false');
   state.certificateDirty = false;
@@ -3273,20 +3323,23 @@ function renderCertificates(certificates) {
 }
 
 async function setCertificateEnabled(id, enabled, button) {
+  const scope = state.certificateScope, generation = state.certificateScopeGeneration;
   if (state.configDirty || state.certificateDirty) return message($('#certificate-message'), t('Apply or reload unsaved configuration and certificate drafts before changing certificate activation.'), 'error');
   setBusy(button, true, t(enabled ? 'Activating…' : 'Deactivating…'));
   state.certificateLoadSequence++;
   try {
     const latest = await api('/v1/config');
+    if (!certificateScopeCurrent(scope, generation)) return;
     let current = latest.data;
     const draft = structuredClone(latest.data);
-    const certificate = (draft.certificates || []).find(item => item.id === id);
+    const certificate = certificatesForScope(draft, scope).find(item => item.id === id);
     if (!certificate) throw new Error(t('Certificate “{id}” is no longer configured. Reload the list.', { id }));
     if ((certificate.enabled !== false) !== enabled) {
       if (enabled) delete certificate.enabled; else certificate.enabled = false;
       const etag = latest.etag || `"${latest.data.revision}"`;
       const result = await api('/v1/config', { method: 'PUT', headers: { 'If-Match': etag }, json: draft });
       current = result.data;
+      if (!certificateScopeCurrent(scope, generation)) return;
       state.certificateLoadSequence++;
       state.config = result.data;
       state.configEtag = result.etag || `"${result.data.revision}"`;
@@ -3294,12 +3347,14 @@ async function setCertificateEnabled(id, enabled, button) {
       setRevision(result.data.revision);
       toast(t(enabled ? 'Certificate “{id}” activated.' : 'Certificate “{id}” deactivated.', { id }));
     } else adoptConfig(latest);
-    const active = current.certificates || [];
+    if (!certificateScopeCurrent(scope, generation)) return;
+    const active = certificatesForScope(current, scope);
     $('#certificate-editor').value = JSON.stringify(active, null, 2);
     renderCertificates(active);
     await loadCertificateInventory();
     message($('#certificate-message'));
   } catch (error) {
+    if (!certificateScopeCurrent(scope, generation)) return;
     if (error instanceof StaleSessionError) return;
     if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
     if (isRevisionConflict(error) || isIndeterminate(error)) {
@@ -3362,6 +3417,7 @@ function addCertificateTemplate() {
 
 async function applyCertificates() {
   const button = $('#apply-certificates');
+  const scope = state.certificateScope, generation = state.certificateScopeGeneration;
   state.certificateLoadSequence++;
   let certificates;
   try { certificates = parseCertificates(); }
@@ -3371,8 +3427,10 @@ async function applyCertificates() {
   let next = null;
   try {
     const latest = await api('/v1/config');
-    next = structuredClone(latest.data); next.certificates = certificates;
+    if (!certificateScopeCurrent(scope, generation)) return;
+    next = structuredClone(latest.data); setCertificatesForScope(next, scope, certificates);
     const result = await api('/v1/config', { method: 'PUT', headers: { 'If-Match': latest.etag || `"${latest.data.revision}"` }, json: next });
+    if (!certificateScopeCurrent(scope, generation)) return;
     state.certificateLoadSequence++;
     state.config = result.data;
     state.configEtag = result.etag || `"${result.data.revision}"`;
@@ -3380,7 +3438,7 @@ async function applyCertificates() {
     state.certificateDirty = false;
     showConfigDocument(result.data);
     $('#config-dirty').hidden = true;
-    const active = result.data.certificates ?? [];
+    const active = certificatesForScope(result.data, scope);
     $('#certificate-editor').value = JSON.stringify(active, null, 2);
     $('#certificate-dirty').hidden = true;
     setRevision(result.data.revision);
@@ -3388,24 +3446,26 @@ async function applyCertificates() {
     message($('#certificate-message'), t('Certificate paths are active in revision {revision}.', { revision: result.data.revision }), 'success');
     toast(t('Certificate paths applied.'));
   } catch (error) {
+    if (!certificateScopeCurrent(scope, generation)) return;
     if (isRevisionConflict(error)) message($('#certificate-message'), t('The configuration changed while certificates were being applied. Your draft is preserved; review and apply again.'), 'error');
-    else if (isIndeterminate(error)) message($('#certificate-message'), error.message, 'error', { label: t('Reload current revision'), run: () => rebaseCertificateDraft(certificates) });
+    else if (isIndeterminate(error)) message($('#certificate-message'), error.message, 'error', { label: t('Reload current revision'), run: () => rebaseCertificateDraft(certificates, scope, generation) });
     else if (next && isRejection(error)) message($('#certificate-message'), await validationDetail(next, error.message), 'error');
     else message($('#certificate-message'), error.message, 'error');
   } finally { setBusy(button, false); }
 }
 
 /** After an indeterminate certificate write: adopt the latest revision, keep the draft, and say whether it landed. */
-async function rebaseCertificateDraft(draft) {
+async function rebaseCertificateDraft(draft, scope = state.certificateScope, generation = state.certificateScopeGeneration) {
   try {
     const latest = await api('/v1/config');
+    if (!certificateScopeCurrent(scope, generation)) return;
     adoptConfig(latest);
-    const active = latest.data.certificates ?? [];
+    const active = certificatesForScope(latest.data, scope);
     if (JSON.stringify(active) === JSON.stringify(draft)) {
       $('#certificate-editor').value = JSON.stringify(active, null, 2); state.certificateDirty = false; $('#certificate-dirty').hidden = true; renderCertificates(active);
       message($('#certificate-message'), t('Revision {revision} already holds these certificate paths: the write was applied.', { revision: latest.data.revision }), 'success');
     } else message($('#certificate-message'), t('Revision {revision} is active and its certificate set differs from your draft: the write was not applied. Your draft is preserved; review and apply again.', { revision: latest.data.revision }), 'warning');
-  } catch (error) { message($('#certificate-message'), error.message, 'error'); }
+  } catch (error) { if (certificateScopeCurrent(scope, generation)) message($('#certificate-message'), error.message, 'error'); }
 }
 
 function workloadListenerControl(form, label, name, { textarea = false, checkbox = false, placeholder = '', help = '' } = {}) {
@@ -3633,6 +3693,7 @@ function showConfigDocument(data) {
   const editor = $('#config-editor');
   editor.value = JSON.stringify(data, null, 2);
   editor.setAttribute('aria-invalid', 'false');
+  showCertificateScopes(data);
   showSettings(isObject(data) ? data.settings : undefined);
   showGeoIpSource(isObject(data) ? data.geoip_database : undefined);
   renderWorkloadListeners(data);
@@ -5552,6 +5613,7 @@ $('#reload-certificates').addEventListener('click', () => {
   if (state.certificateDirty && !confirm('Discard the unsaved certificate paths and reload the active set?')) return;
   loadCertificates(true).catch((error) => showGlobalError(error.message));
 });
+$('#certificate-scope').addEventListener('change', changeCertificateScope);
 $('#certificate-editor').addEventListener('input', certificateInput);
 $('#add-certificate-template').addEventListener('click', addCertificateTemplate);
 $('#format-certificates').addEventListener('click', formatCertificates);

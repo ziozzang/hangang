@@ -1,6 +1,9 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  'Selected certificate listener no longer exists. Reload its configuration.': '선택한 인증서 리스너가 더 이상 없습니다. 구성을 다시 불러오세요.',
+  'Certificate inventory answered for a different listener.': '다른 리스너의 인증서 인벤토리가 응답했습니다.',
+
   "Public HTTP listeners": "공개 HTTP 리스너",
   "Public listener IDs": "공개 리스너 ID",
   "One public listener ID per line. Blank uses only the legacy CLI listener; default names that listener explicitly. Dedicated workload mTLS routes cannot use this field.": "한 줄에 공개 리스너 ID 하나씩 입력하세요. 비우면 기존 CLI 리스너만 사용하며 default로 명시할 수 있습니다. 전용 워크로드 mTLS 라우트에는 사용할 수 없습니다.",
