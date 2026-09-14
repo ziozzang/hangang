@@ -5072,4 +5072,138 @@ mod tests {
             .unwrap();
         assert!(Store::open(path).is_ok());
     }
+
+    #[tokio::test]
+    async fn active_policy_rejects_old_audit_writers_and_rolls_back_their_changes() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let viewer = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "second secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let mut db = connection(&path).unwrap();
+        {
+            let transaction = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute("UPDATE users SET enabled=0 WHERE id=?1", params![viewer.id])
+                .unwrap();
+            // A v6 writer does not supply policy_revision; SQLite supplies zero.
+            assert!(transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count) VALUES(100,0,'update','system',?1,'viewer',1,'viewer',0,0,1)",params![viewer.id]).is_err());
+        }
+        assert_eq!(
+            db.query_row(
+                "SELECT enabled FROM users WHERE id=?1",
+                params![viewer.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let original = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        {
+            let transaction = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM admin_audit WHERE id=?1",
+                    params![original.records[1].id],
+                )
+                .unwrap();
+            assert!(transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,password_changed,affected_count,through_id) VALUES(101,0,'prune','system',0,1,?1)",params![original.records[1].id]).is_err());
+        }
+        assert_eq!(
+            store
+                .audit_page(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .records
+                .len(),
+            original.records.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_mutation_can_commit_at_record_capacity_but_policy_change_cannot() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        store
+            .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let db = connection(&path).unwrap();
+        db.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 4 UNION ALL SELECT id+1 FROM ids WHERE id<100000)
+            INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,password_changed,affected_count,policy_revision)
+            SELECT id,0,'baseline','system',0,0,1 FROM ids;
+            UPDATE admin_audit_meta SET next_audit_id=100001,stored_records=100000 WHERE singleton=1;").unwrap();
+        let user = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "second secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT enabled FROM users WHERE id=?1",
+                params![user.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .filtered_total,
+            1
+        );
+        assert!(
+            store
+                .set_audit_policy(MutationAuthority::System, 1, AuditPolicy::default())
+                .await
+                .unwrap_err()
+                .is::<AuditCapacity>()
+        );
+        let state = store.audit_policy(MutationAuthority::System).await.unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.policy.default_action, AuditFilterAction::Drop);
+        assert_eq!(
+            db.query_row(
+                "SELECT next_audit_id FROM admin_audit_meta WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            100001
+        );
+    }
 }
