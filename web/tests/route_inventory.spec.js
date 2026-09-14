@@ -17,15 +17,15 @@ const tcp = [
   { id: 'tcp-c', priority: 0, listen: '127.0.0.1:9002', sni: null, backends: ['other.internal:9000'], deny_cidrs: ['198.51.100.0/24'] },
 ];
 
-async function setup(page) {
+async function setup(page, httpRoutes = http) {
   await page.route('**/*', async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path.startsWith('/ui/')) return route.continue();
-    if (path === '/v1/status') return route.fulfill({ json: { revision: 7, http_routes: http.length, tcp_routes: tcp.length, metrics: {}, state: { draining: false }, uptime_seconds: 1, version: 'test', process_id: 1 } });
+    if (path === '/v1/status') return route.fulfill({ json: { revision: 7, http_routes: httpRoutes.length, tcp_routes: tcp.length, metrics: {}, state: { draining: false }, uptime_seconds: 1, version: 'test', process_id: 1 } });
     if (path === '/v1/update/status') return route.fulfill({ json: { enabled: false, phase: 'idle' } });
-    if (path === '/v1/routes/http') return route.fulfill({ json: { revision: 7, routes: http }, headers: { etag: '"7"' } });
+    if (path === '/v1/routes/http') return route.fulfill({ json: { revision: 7, routes: httpRoutes }, headers: { etag: '"7"' } });
     if (path === '/v1/routes/tcp') return route.fulfill({ json: { revision: 7, routes: tcp }, headers: { etag: '"7"' } });
-    for (const [type, routes] of [['http', http], ['tcp', tcp]]) {
+    for (const [type, routes] of [['http', httpRoutes], ['tcp', tcp]]) {
       const prefix = `/v1/routes/${type}/`;
       if (path.startsWith(prefix)) {
         const found = routes.find((item) => item.id === decodeURIComponent(path.slice(prefix.length)));
@@ -35,8 +35,8 @@ async function setup(page) {
     return route.fulfill({ status: 404, body: 'missing fixture' });
   });
   await page.goto('/ui/');
-  await page.getByLabel('Administrator token').fill('fixture-token');
-  await page.getByRole('button', { name: 'Connect' }).click();
+  await page.locator('#token-input').fill('fixture-token');
+  await page.locator('#login-submit').click();
   await expect(page.getByRole('dialog', { name: 'Connect to this proxy' })).toBeHidden();
 }
 
@@ -99,4 +99,51 @@ test('TCP inventory supports SNI and upstream policy filters', async ({ page }) 
   await expect(view.locator('tbody tr')).toHaveCount(2);
   await view.locator('.route-search').fill('cache.internal');
   await expect(view.locator('tbody tr').first()).toHaveAttribute('data-route-id', 'tcp-b');
+});
+
+test('HTTP inventory distinguishes same-host listener scopes including disabled and workload routes', async ({ page }) => {
+  const shared = { host: 'api.example.test', path_prefix: '/', backends: ['http://127.0.0.1:8080'] };
+  const routes = [
+    { ...shared, id: 'legacy', listener_ids: [] },
+    { ...shared, id: 'named', listener_ids: ['edge'], enabled: false },
+    { ...shared, id: 'both', listener_ids: ['default', 'edge'] },
+    { ...shared, id: 'private', workload_auth: { listener_ids: ['orders'] } },
+  ];
+  await setup(page, routes);
+  await page.getByRole('link', { name: 'HTTP routes' }).click();
+  const view = page.locator('#http-routes');
+  await expect(view.locator('tbody tr')).toHaveCount(4);
+  await expect(view.locator('[data-route-id="legacy"] .route-listener-scope')).toHaveText('Public listeners: Default CLI listener');
+  await expect(view.locator('[data-route-id="named"] .route-listener-scope')).toHaveText('Public listeners: edge');
+  await expect(view.locator('[data-route-id="named"]')).toContainText('Disabled');
+  await expect(view.locator('[data-route-id="both"] .route-listener-scope')).toHaveText('Public listeners: Default CLI listener, edge');
+  await expect(view.locator('[data-route-id="private"] .route-listener-scope')).toHaveText('Workload mTLS listeners: orders');
+  const search = view.locator('.route-search');
+  await expect(search).toHaveAttribute('placeholder', 'Search host, ID, listener, or upstream');
+  await search.fill('default');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('[data-route-id="private"]')).toHaveCount(0);
+  await search.fill('edge');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await search.fill('orders');
+  await expect(view.locator('tbody tr')).toHaveCount(1);
+  await expect(view.locator('tbody tr')).toHaveAttribute('data-route-id', 'private');
+});
+
+test('Korean HTTP inventory keeps listener IDs and translates scope semantics', async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(navigator, 'language', { configurable: true, get: () => 'ko-KR' }));
+  const shared = { host: 'api.example.test', path_prefix: '/', backends: ['http://127.0.0.1:8080'] };
+  await setup(page, [
+    { ...shared, id: 'legacy', listener_ids: [] },
+    { ...shared, id: 'edge', listener_ids: ['default', 'public-edge'] },
+    { ...shared, id: 'private', workload_auth: { listener_ids: ['orders'] } },
+  ]);
+  await page.locator('[data-view="http"]').click();
+  const view = page.locator('#http-routes');
+  await expect(view.locator('[data-route-id="legacy"] .route-listener-scope')).toContainText('기본 CLI 리스너');
+  await expect(view.locator('[data-route-id="edge"] .route-listener-scope')).toContainText('public-edge');
+  await expect(view.locator('[data-route-id="private"] .route-listener-scope')).toContainText('워크로드 mTLS 리스너: orders');
+  await expect(view.locator('.route-search')).toHaveAttribute('placeholder', '호스트, ID, 리스너 또는 업스트림 검색');
+  await view.locator('.route-search').fill('public-edge');
+  await expect(view.locator('tbody tr')).toHaveCount(1);
 });

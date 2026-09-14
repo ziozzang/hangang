@@ -1,6 +1,10 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  'Search host, ID, listener, or upstream': '호스트, ID, 리스너 또는 업스트림 검색',
+  'Public listeners: {names}': '공개 리스너: {names}',
+  'Workload mTLS listeners: {names}': '워크로드 mTLS 리스너: {names}',
+
   'Selected certificate listener no longer exists. Reload its configuration.': '선택한 인증서 리스너가 더 이상 없습니다. 구성을 다시 불러오세요.',
   'Certificate inventory answered for a different listener.': '다른 리스너의 인증서 인벤토리가 응답했습니다.',
 

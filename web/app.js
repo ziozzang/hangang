@@ -1287,7 +1287,7 @@ function renderRoutes(type) {
   const settings = state.routeInventory[type];
   const inventory = document.createElement('div'); inventory.className = 'route-inventory';
   const toolbar = document.createElement('div'); toolbar.className = 'route-toolbar';
-  const search = document.createElement('input'); search.type = 'search'; search.className = 'route-search'; search.placeholder = t('Search host, ID, or upstream'); search.setAttribute('aria-label', t('Search {type} routes', { type: type.toUpperCase() })); search.value = settings.query;
+  const search = document.createElement('input'); search.type = 'search'; search.className = 'route-search'; search.placeholder = t(type === 'http' ? 'Search host, ID, listener, or upstream' : 'Search host, ID, or upstream'); search.setAttribute('aria-label', t('Search {type} routes', { type: type.toUpperCase() })); search.value = settings.query;
   const policy = routeSelect('route-policy-filter', t('Filter {type} route policies', { type: type.toUpperCase() }), type === 'http'
     ? [['all', 'All policies'], ['domains', 'Domain groups'], ['tls', 'TLS required'], ['auth', 'Authentication'], ['cache', 'Cache'], ['network', 'Network restrictions'], ['advanced', 'Lua or transform'], ['upstream', 'Upstream options']]
     : [['all', 'All policies'], ['sni', 'SNI matching'], ['tls', 'Upstream TLS'], ['network', 'Network restrictions'], ['upstream', 'Upstream options']], settings.policy);
@@ -1327,8 +1327,18 @@ function routeMatch(type, route) {
 
 function backendAddress(backend) { return typeof backend === 'string' ? backend : backend?.address || ''; }
 
+function routeListenerScope(route) {
+  const workload = route.workload_auth?.listener_ids;
+  if (route.workload_auth) return t('Workload mTLS listeners: {names}', { names: Array.isArray(workload) ? workload.join(', ') : '—' });
+  const ids = Array.isArray(route.listener_ids) ? route.listener_ids : [];
+  const names = ids.length ? ids.map(id => id === 'default' ? t('Default CLI listener') : id).join(', ') : t('Default CLI listener');
+  return t('Public listeners: {names}', { names });
+}
+
 function routeSearchText(type, route) {
-  return [route.id, routeMatch(type, route), ...(route.hosts || []), route.listen, route.path_prefix, route.upstream_host,
+  const scope = type === 'http' ? [routeListenerScope(route), ...(route.workload_auth?.listener_ids || []), ...(route.listener_ids || []),
+    ...(route.workload_auth || (route.listener_ids || []).length ? [] : ['default'])] : [];
+  return [route.id, routeMatch(type, route), ...scope, ...(route.hosts || []), route.listen, route.path_prefix, route.upstream_host,
     route.upstream?.connect_address, route.upstream?.unix_socket, ...(route.backends || []).flatMap((backend) => [backendAddress(backend), backend?.id])].filter(Boolean).join(' ').toLowerCase();
 }
 
@@ -1432,6 +1442,7 @@ function routeRow(type, route) {
   const row = document.createElement('tr'); row.className = 'route-row route-card'; row.dataset.routeId = route.id || '';
   const cell = (primary, secondary = '') => { const td = document.createElement('td'); const main = document.createElement('span'); main.className = 'route-cell-main'; main.textContent = primary; td.append(main); if (secondary) { const detail = document.createElement('small'); detail.className = 'route-cell-detail'; detail.textContent = secondary; td.append(detail); } return td; };
   const identity = document.createElement('th'); identity.scope = 'row'; const title = document.createElement('h2'); title.className = 'route-cell-main'; title.textContent = route.id || t('(unnamed)'); const stateLabel = document.createElement('small'); stateLabel.className = 'route-cell-detail'; stateLabel.textContent = route.enabled === false ? t('Disabled') : t('Enabled'); identity.append(title, stateLabel);
+  if (type === 'http') { const scope = document.createElement('small'); scope.className = 'route-cell-detail route-listener-scope'; scope.textContent = routeListenerScope(route); identity.append(scope); }
   if (type === 'tcp' && route.inbound_tls) {
     const material = document.createElement('small'); material.className = 'route-cell-detail workload-material-state';
     material.dataset.workloadMaterialKind = 'tcp'; material.dataset.workloadMaterialId = route.id;
