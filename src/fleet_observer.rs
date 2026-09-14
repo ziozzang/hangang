@@ -356,4 +356,39 @@ mod tests {
         runtime.refresh().await;
         assert!(!runtime.status().available);
     }
+
+    #[tokio::test]
+    async fn parser_rejects_bad_boundaries_without_reflecting_values() {
+        let (_dir, config, token) = fixture();
+        let good = serde_json::json!({"node_id":"edge.a", "token_file":token});
+        for value in [
+            serde_json::json!({"node_id":"edge.a"}),
+            serde_json::json!({"node_id":"edge.a", "token_file":token, "unknown":"secret-marker"}),
+            serde_json::json!({"node_id":"bad\nnode", "token_file":token}),
+            serde_json::json!({"node_id":"nödé", "token_file":token}),
+            serde_json::json!({"node_id":"x".repeat(65), "token_file":token}),
+            serde_json::json!({"node_id":"edge.a", "token_file":"relative/token"}),
+        ] {
+            fs::write(&config, value.to_string()).unwrap();
+            let error = Runtime::open(config.clone(), None)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(!error.contains("secret-marker"));
+        }
+        fs::write(&config, vec![b'x'; CONFIG_MAX + 1]).unwrap();
+        assert!(Runtime::open(config.clone(), None).await.is_err());
+        fs::write(&config, good.to_string()).unwrap();
+        for bytes in [
+            b"abcdefghijklmnopqrstuvwxyz012345\nextra".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz012345\r\n".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz012345 ".to_vec(),
+        ] {
+            fs::write(&token, bytes).unwrap();
+            assert!(Runtime::open(config.clone(), None).await.is_err());
+        }
+        fs::write(&token, [vec![b'a'; 256], vec![b'\n']].concat()).unwrap();
+        assert!(Runtime::open(config, None).await.is_ok());
+    }
 }
