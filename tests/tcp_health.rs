@@ -504,7 +504,8 @@ async fn health_closes_during_tls_dial_before_any_client_hello_is_forwarded() {
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(original.clone()).unwrap(),
     ));
-    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 64);
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active.clone(), metrics.clone(), 64);
     let prepared = manager
         .prepare_with_inherited(&original, vec![(listen, OwnedFd::from(held_listener))])
         .await
@@ -547,4 +548,10 @@ async fn health_closes_during_tls_dial_before_any_client_hello_is_forwarded() {
         .expect("downstream closes after health loss");
     assert!(matches!(closed, Ok(0) | Err(_)));
     manager.shutdown(Duration::from_secs(1)).await;
+    let recent = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    let row = &recent["records"][0];
+    assert_eq!(row["outcome"], "member_unavailable");
+    assert_eq!(row["phase"], "dialing");
+    assert_eq!(row["bytes_upstream"], "0");
+    assert_eq!(row["bytes_downstream"], "0");
 }

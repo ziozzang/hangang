@@ -2,6 +2,8 @@ use crate::{
     config::{Config, Snapshot, TcpRoute},
     metrics::Metrics,
     pool_member::{Backend, DesiredState},
+    tcp_history::{Outcome, Phase},
+    tcp_io::{CountedIo, Direction},
 };
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwap;
@@ -810,32 +812,45 @@ fn spawn_accept_loop(
                 _ = cancel.cancelled() => break,
                 accepted = listener.accept() => accepted,
             };
-            let (client, peer) = match accepted {
-                Ok((client, peer)) => {
-                    // Avoid delayed-ACK/Nagle stalls when TLS or a proxied
-                    // request/response protocol emits a final short record.
-                    if client.set_nodelay(true).is_err() {
+            let (client, peer) =
+                match accepted {
+                    Ok((client, peer)) => {
+                        // Avoid delayed-ACK/Nagle stalls when TLS or a proxied
+                        // request/response protocol emits a final short record.
+                        if client.set_nodelay(true).is_err() {
+                            metrics.errors.fetch_add(1, Ordering::Relaxed);
+                            // Even transport setup failure has a bounded terminal
+                            // observation for raw TCP. The workload HTTP role owns
+                            // its own request telemetry and is excluded here.
+                            if !active.load().config.workload_http.iter().any(|configured| {
+                                configured.enabled && configured.listen == address
+                            }) {
+                                let mut history = metrics.tcp_history.begin(
+                                    SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                                    address,
+                                );
+                                history.set_outcome(Outcome::IoError);
+                            }
+                            continue;
+                        }
+                        // Canonicalize IPv4-mapped IPv6 peers (from a dual-stack
+                        // `[::]` listener) so `deny_cidrs` with IPv4 ranges match
+                        // the real IPv4 address instead of silently failing open.
+                        (
+                            client,
+                            SocketAddr::new(peer.ip().to_canonical(), peer.port()),
+                        )
+                    }
+                    Err(error) => {
                         metrics.errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(%address, %error, "TCP accept failed");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                        }
                         continue;
                     }
-                    // Canonicalize IPv4-mapped IPv6 peers (from a dual-stack
-                    // `[::]` listener) so `deny_cidrs` with IPv4 ranges match
-                    // the real IPv4 address instead of silently failing open.
-                    (
-                        client,
-                        SocketAddr::new(peer.ip().to_canonical(), peer.port()),
-                    )
-                }
-                Err(error) => {
-                    metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(%address, %error, "TCP accept failed");
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-                    }
-                    continue;
-                }
-            };
+                };
 
             let snapshot = active.load_full();
             if let Some(configured) = snapshot
@@ -893,6 +908,7 @@ fn spawn_accept_loop(
                 });
                 continue;
             }
+            let mut history = metrics.tcp_history.begin(peer, address);
             if routing_cache
                 .as_ref()
                 .is_none_or(|routes| !Weak::ptr_eq(&routes.source, &Arc::downgrade(&snapshot)))
@@ -900,6 +916,7 @@ fn spawn_accept_loop(
                 routing_cache = ListenerRoutes::build(&snapshot, address);
             }
             let Some(routes) = routing_cache.clone() else {
+                history.set_outcome(Outcome::NoRoute);
                 metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -907,12 +924,14 @@ fn spawn_accept_loop(
             // denies the peer. It also keeps denied legacy traffic out of global
             // admission without weakening the selected-route check below.
             if routes.all_routes_deny(peer.ip()) {
+                history.set_outcome(Outcome::IpDenied);
                 metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
+                    history.set_outcome(Outcome::Capacity);
                     metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -926,6 +945,7 @@ fn spawn_accept_loop(
                 let _permit = permit;
                 let _active = ActiveConnection::new(task_metrics.clone());
                 let mut client = client;
+                history.set_phase(Phase::Inspecting);
                 let (route_index, consumed) = if let Some(route_index) = routes.legacy {
                     (route_index, Vec::new())
                 } else {
@@ -933,7 +953,7 @@ fn spawn_accept_loop(
                         routes.hello_settings.expect("validated SNI listener settings");
                     let inspected = tokio::select! {
                         biased;
-                        _ = task_cancel.cancelled() => return,
+                        _ = task_cancel.cancelled() => { history.set_outcome(Outcome::Shutdown); return; },
                         result = timeout(
                             Duration::from_millis(hello_timeout_ms),
                             crate::client_hello::read_client_hello(
@@ -945,17 +965,20 @@ fn spawn_accept_loop(
                     let hello = match inspected {
                         Ok(Ok(hello)) => hello,
                         Ok(Err(error)) => {
+                            history.set_outcome(Outcome::SniRejected);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%peer, %error, "TCP ClientHello rejected");
                             return;
                         }
                         Err(_) => {
+                            history.set_outcome(Outcome::SniTimeout);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%peer, "TCP ClientHello timed out");
                             return;
                         }
                     };
                     let Some(route_index) = routes.route_for_server_name(&hello.server_name) else {
+                        history.set_outcome(Outcome::NoRoute);
                         task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(%peer, server_name=%hello.server_name, "TCP SNI did not match a route");
                         return;
@@ -966,11 +989,13 @@ fn spawn_accept_loop(
                 let (route, counter, upstream_tls, health, member_activity, member_admissions, inbound_tls, country_policy) =
                     routes.routes[route_index].clone();
                 drop(routes);
+                history.set_route(&route.id);
                 if route
                     .deny_cidrs
                     .iter()
                     .any(|cidr| cidr.contains(&peer.ip()))
                 {
+                    history.set_outcome(Outcome::IpDenied);
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -978,6 +1003,7 @@ fn spawn_accept_loop(
                 // Copy only metadata, then release the slot before forwarding.
                 let observation = crate::country_observation::capture(geoip.as_ref(), peer.ip());
                 drop(geoip);
+                history.set_geoip(&observation);
                 let country_decision = country_policy.as_ref().filter(|policy| policy.enforced())
                     .map(|policy| match observation.policy_country() {
                         Ok(country) if policy.evaluate_code(country) => crate::country_metrics::Decision::Allowed,
@@ -986,6 +1012,7 @@ fn spawn_accept_loop(
                     });
                 task_metrics.geoip.observe(crate::country_metrics::Protocol::Tcp, &observation, country_decision);
                 if matches!(country_decision, Some(crate::country_metrics::Decision::Denied | crate::country_metrics::Decision::Unavailable)) {
+                    history.set_outcome(if matches!(country_decision, Some(crate::country_metrics::Decision::Denied)) { Outcome::CountryDenied } else { Outcome::CountryUnavailable });
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -993,6 +1020,7 @@ fn spawn_accept_loop(
                     match crate::admission::acquire(&counter, route.max_connections) {
                         Ok(permit) => permit,
                         Err(_) => {
+                            history.set_outcome(Outcome::Capacity);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -1002,15 +1030,18 @@ fn spawn_accept_loop(
                 // never manufacture an authenticated workload identity.
                 let (client, identity_lease): (crate::upstream::BoxIo, Option<WorkloadLease>) =
                     if let Some(policy) = &route.inbound_tls {
+                        history.set_phase(Phase::Authenticating);
                         // ListenerRoutes may be cached across file rotations.
                         // Resolve the current slot generation for every new
                         // handshake; a missing/invalid generation stays closed.
                         let Some(prepared) = inbound_tls.and_then(|slot| slot.load()) else {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
                         };
                         let Ok(handshake_permit) = workload_handshake_admission().try_acquire_owned() else {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -1018,10 +1049,11 @@ fn spawn_accept_loop(
                         let acceptor = tokio_rustls::TlsAcceptor::from(prepared.server_config.clone());
                         let accepted = tokio::select! {
                             biased;
-                            _ = task_cancel.cancelled() => return,
+                            _ = task_cancel.cancelled() => { history.set_outcome(Outcome::Shutdown); return; },
                             accepted = timeout(Duration::from_millis(policy.handshake_timeout_ms), acceptor.accept(client)) => accepted,
                         };
                         let Ok(Ok(stream)) = accepted else {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -1030,6 +1062,7 @@ fn spawn_accept_loop(
                             .ok_or_else(|| anyhow::anyhow!("client certificate missing"))
                             .and_then(|chain| prepared.authorize_peer(chain));
                         let Ok(identity) = identity else {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -1039,39 +1072,48 @@ fn spawn_accept_loop(
                             .and_then(|now| identity.expires_at.checked_sub(now.as_secs()))
                             .and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)));
                         let Some(deadline) = lifetime else {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
                         };
                         let lease = WorkloadLease { active: task_active, route_id: route.id.clone(), prepared, expires_at: identity.expires_at, deadline };
                         if !lease.current() {
+                            history.set_outcome(Outcome::MtlsRejected);
                             task_metrics.tcp_mtls_rejections.fetch_add(1, Ordering::Relaxed);
                             task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                         (Box::new(stream), Some(lease))
                     } else { (Box::new(client), None) };
+                history.set_outcome(Outcome::Interrupted);
                 let Some(index) = next_backend_index(&task_backend_counter, &route, &member_admissions, health.as_deref(), task_discovery.as_deref()) else {
+                    history.set_outcome(Outcome::NoBackend);
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
                 // The gate owns the pending dial as well as the eventual
                 // stream. A concurrent closure between selection and acquire
                 // conservatively rejects this connection before any dial.
+                history.set_member(route.backends[index].id());
                 let Some(member_lease) = member_admissions[index].lease() else {
+                    history.set_outcome(Outcome::MemberUnavailable);
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
                 let Some(target) = resolve_probe_target(route.backends[index].address(), task_discovery.as_deref()) else {
+                    history.set_outcome(Outcome::NoBackend);
                     task_metrics.errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
                 if health.as_ref().is_some_and(|health| !health.observe_epoch(index, target.epoch) || !health.available_for(index, target.epoch)) {
+                    history.set_outcome(Outcome::MemberUnavailable);
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 let member_counter = if route.backends[index].id().is_some() {
                     let Some(counter) = member_activity.as_ref().and_then(|activity| activity.node(index)) else {
+                        history.set_outcome(Outcome::MemberUnavailable);
                         // A named route must have a prepared counter for every
                         // member. Do not serve it without activity ownership.
                         task_metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -1105,6 +1147,7 @@ fn spawn_accept_loop(
                         idle_timeout,
                         task_cancel,
                         identity_lease.as_ref(),
+                        &mut history,
                     )
                     .await
                 };
@@ -1113,14 +1156,18 @@ fn spawn_accept_loop(
                         biased;
                         _ = lease.revoked() => {
                             task_metrics.tcp_mtls_lease_terminations.fetch_add(1, Ordering::Relaxed);
-                            Ok(())
+                            Ok(Outcome::IdentityRevoked)
                         },
                         result = connection => result,
                     }
                 } else { connection.await };
-                if let Err(error) = result {
+                match result {
+                    Ok(outcome) => history.set_outcome(outcome),
+                    Err((outcome, error)) => {
+                    history.set_outcome(outcome);
                     task_metrics.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(%peer, %backend, %error, "TCP proxy connection failed");
+                    }
                 }
             });
         }
@@ -1268,43 +1315,54 @@ async fn proxy_connection(
     idle_timeout: Duration,
     cancel: CancellationToken,
     identity_lease: Option<&WorkloadLease>,
-) -> Result<()> {
-    ensure!(
-        identity_lease.is_none_or(WorkloadLease::current),
-        "workload identity no longer authorized"
-    );
-    let mut upstream = tokio::select! {
+    history: &mut crate::tcp_history::Guard,
+) -> std::result::Result<Outcome, (Outcome, anyhow::Error)> {
+    if !identity_lease.is_none_or(WorkloadLease::current) {
+        return Err((
+            Outcome::IdentityRevoked,
+            anyhow::anyhow!("workload identity no longer authorized"),
+        ));
+    }
+    history.set_phase(Phase::Dialing);
+    let upstream = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return Ok(()),
+        _ = cancel.cancelled() => return Ok(Outcome::Shutdown),
         result = crate::upstream::connect_with_tls(&admission.target.endpoint, options, tls_config) => {
-            result.context("connect TCP backend")?
+            result.map_err(|error| (Outcome::DialFailed, error.context("connect TCP backend")))?
         },
     };
-    ensure!(
-        identity_lease.is_none_or(WorkloadLease::current),
-        "workload identity changed while connecting"
-    );
-    // The dial can await proxy negotiation and TLS. Revalidate immediately
-    // before forwarding any downstream bytes, including a buffered ClientHello.
-    ensure!(
-        resolve_probe_target(&admission.configured, admission.discovery.as_deref()).as_ref()
-            == Some(&admission.target),
-        "TCP endpoint changed while connecting"
-    );
-    ensure!(
-        admission
-            .health
-            .as_ref()
-            .is_none_or(|health| health.available_for(admission.index, admission.target.epoch)),
-        "TCP backend became unavailable while connecting"
-    );
-    ensure!(
-        admission.member_lease.is_open(),
-        "TCP member admission closed while connecting"
-    );
-    // Count only established streams. A failed dial or an endpoint/health
-    // change during the dial never acquires a member lease. Keep the guard
-    // through ClientHello forwarding, byte copy, cancellation, and idle exit.
+    if !identity_lease.is_none_or(WorkloadLease::current) {
+        return Err((
+            Outcome::IdentityRevoked,
+            anyhow::anyhow!("workload identity changed while connecting"),
+        ));
+    }
+    // Revalidate after the dial, before any buffered or streamed bytes leave.
+    if resolve_probe_target(&admission.configured, admission.discovery.as_deref()).as_ref()
+        != Some(&admission.target)
+    {
+        return Err((
+            Outcome::EndpointChanged,
+            anyhow::anyhow!("TCP endpoint changed while connecting"),
+        ));
+    }
+    if !admission
+        .health
+        .as_ref()
+        .is_none_or(|health| health.available_for(admission.index, admission.target.epoch))
+    {
+        return Err((
+            Outcome::MemberUnavailable,
+            anyhow::anyhow!("TCP backend became unavailable while connecting"),
+        ));
+    }
+    if !admission.member_lease.is_open() {
+        return Err((
+            Outcome::MemberUnavailable,
+            anyhow::anyhow!("TCP member admission closed while connecting"),
+        ));
+    }
+    // This lease still covers buffered ClientHello, copy and all cancellation.
     let _member_lease = admission
         .member_counter
         .as_ref()
@@ -1313,36 +1371,41 @@ async fn proxy_connection(
                 .acquire()
                 .context("TCP member stream capacity exhausted")
         })
-        .transpose()?;
+        .transpose()
+        .map_err(|error| (Outcome::Capacity, error))?;
+    history.set_phase(Phase::Forwarding);
+    // Count successful destination writes. Read-ahead is not delivery; each
+    // successful partial write survives future cancellation or a later error.
+    let mut upstream = CountedIo::new(upstream, history.bytes(), Direction::Upstream);
+    let client = CountedIo::new(client, history.bytes(), Direction::Downstream);
     if !consumed.is_empty() {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Ok(()),
-            result = upstream.write_all(consumed) => result.context("forward TLS ClientHello")?,
+            _ = cancel.cancelled() => return Ok(Outcome::Shutdown),
+            result = upstream.write_all(consumed) => {
+                result.map_err(|error| (Outcome::IoError, anyhow::Error::new(error).context("forward TLS ClientHello")))?;
+            },
         }
     }
     if idle_timeout.is_zero() {
         let mut client = client;
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => Ok(()),
+            _ = cancel.cancelled() => Ok(Outcome::Shutdown),
             result = copy_bidirectional(&mut client, &mut upstream) => {
-                result.context("bidirectional TCP copy")?;
-                Ok(())
+                result.map_err(|error| (Outcome::IoError, anyhow::Error::new(error).context("bidirectional TCP copy")))?;
+                Ok(Outcome::Eof)
             }
         }
     } else {
-        // Wrap the client side so any byte-level progress in either direction
-        // resets the idle timer; a session that transmits nothing within the
-        // window is closed, bounding L4 slowloris without a hard total cap.
         let (mut client, watch) = crate::idle::IdleIo::new(client, idle_timeout);
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => Ok(()),
-            _ = watch.expired() => Ok(()),
+            _ = cancel.cancelled() => Ok(Outcome::Shutdown),
+            _ = watch.expired() => Ok(Outcome::IdleTimeout),
             result = copy_bidirectional(&mut client, &mut upstream) => {
-                result.context("bidirectional TCP copy")?;
-                Ok(())
+                result.map_err(|error| (Outcome::IoError, anyhow::Error::new(error).context("bidirectional TCP copy")))?;
+                Ok(Outcome::Eof)
             }
         }
     }

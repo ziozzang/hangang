@@ -525,7 +525,8 @@ async fn signed_crl_rotation_revokes_and_restores_tcp_identity_without_config_re
         active.clone(),
         watch_cancel.clone(),
     ));
-    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 16);
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active.clone(), metrics.clone(), 16);
     let prepared = manager
         .prepare_with_inherited(&document, vec![(listen, OwnedFd::from(bound))])
         .await
@@ -572,6 +573,15 @@ async fn signed_crl_rotation_revokes_and_restores_tcp_identity_without_config_re
     watch_cancel.cancel();
     watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
+    let history = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    let rows = history["records"].as_array().unwrap();
+    let revoked = rows
+        .iter()
+        .find(|row| row["outcome"] == "identity_revoked")
+        .expect("revocation has its own TCP outcome");
+    assert_eq!(revoked["bytes_upstream"], "4");
+    assert_eq!(revoked["bytes_downstream"], "4");
+    assert!(rows.iter().any(|row| row["outcome"] == "mtls_rejected"));
     backend_task.abort();
 }
 

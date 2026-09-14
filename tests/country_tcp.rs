@@ -212,7 +212,8 @@ async fn tcp_unknown_country_is_explicit_and_invalid_database_closes_new_streams
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config::default()).unwrap(),
     ));
-    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 8);
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active.clone(), metrics.clone(), 8);
     let mut document = json!({
         "geoip_database":source(&database_path),
         "tcp":[route(front, origin, "deny")]
@@ -268,6 +269,21 @@ async fn tcp_unknown_country_is_explicit_and_invalid_database_closes_new_streams
     cancel.cancel();
     watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
+    let history = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    let rows = history["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    let denied = rows
+        .iter()
+        .find(|row| row["outcome"] == "country_denied")
+        .unwrap();
+    assert_eq!(denied["geoip"]["state"], "unknown");
+    assert_eq!(denied["bytes_upstream"], "0");
+    let unavailable = rows
+        .iter()
+        .find(|row| row["outcome"] == "country_unavailable")
+        .unwrap();
+    assert_eq!(unavailable["geoip"]["state"], "unavailable");
+    assert_eq!(rows.iter().filter(|row| row["outcome"] == "eof").count(), 2);
     origin_task.abort();
 }
 
@@ -300,7 +316,8 @@ async fn shared_sni_listener_applies_only_selected_route_country_policy() {
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config::default()).unwrap(),
     ));
-    let manager = TcpManager::new(active.clone(), Arc::new(Metrics::default()), 8);
+    let metrics = Arc::new(Metrics::default());
+    let manager = TcpManager::new(active.clone(), metrics.clone(), 8);
     let prepared = manager
         .prepare_with_inherited(&config, vec![(front, OwnedFd::from(held))])
         .await
@@ -322,9 +339,30 @@ async fn shared_sni_listener_applies_only_selected_route_country_policy() {
     assert_eq!(denied_count.load(Ordering::SeqCst), 0);
     assert_eq!(allowed_count.load(Ordering::SeqCst), 1);
 
+    sni_attempt(front, "no-match.example.test", false).await;
     cancel.cancel();
     watcher.await.unwrap();
     manager.shutdown(Duration::from_secs(1)).await;
+    let history = serde_json::to_value(metrics.tcp_history.recent(None, 128)).unwrap();
+    let rows = history["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let unmatched = rows
+        .iter()
+        .find(|row| row["outcome"] == "no_route")
+        .unwrap();
+    assert_eq!(unmatched["bytes_upstream"], "0");
+    assert!(unmatched["route_id"].is_null());
+    let hello_bytes = client_hello("a.example.test").len().to_string();
+    let allowed = rows
+        .iter()
+        .find(|row| row["route_id"] == "allowed")
+        .unwrap();
+    let denied = rows.iter().find(|row| row["route_id"] == "denied").unwrap();
+    assert_eq!(allowed["outcome"], "eof");
+    assert_eq!(allowed["bytes_upstream"], hello_bytes);
+    assert_eq!(allowed["bytes_downstream"], hello_bytes);
+    assert_eq!(denied["outcome"], "country_denied");
+    assert_eq!(denied["bytes_upstream"], "0");
     allowed_task.abort();
     denied_task.abort();
 }

@@ -603,10 +603,20 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         protocol: "h2",
         tls: true,
     });
-    let next_admin = next_event(&mut admin_events, &mut admin_pending).await;
-    assert!(next_admin.starts_with("event: status\n"));
-    let traffic_event = next_event(&mut admin_events, &mut admin_pending).await;
-    assert!(traffic_event.starts_with("event: traffic\n"));
+    let traffic_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = next_event(&mut admin_events, &mut admin_pending).await;
+            if event.starts_with("event: traffic\n") {
+                break event;
+            }
+            assert!(
+                event.starts_with("event: status\n")
+                    || event.starts_with("event: tcp_connections\n")
+            );
+        }
+    })
+    .await
+    .expect("HTTP traffic must arrive alongside the independent TCP snapshots");
     assert_eq!(event_json(&traffic_event)["records"][0]["path"], "/new");
     let next_viewer = next_event(&mut viewer_events, &mut viewer_pending).await;
     assert!(next_viewer.starts_with("event: status\n"));

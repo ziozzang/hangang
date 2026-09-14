@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Default)]
 pub struct Metrics {
+    pub tcp_history: std::sync::Arc<crate::tcp_history::History>,
     pub geoip: crate::country_metrics::Counters,
     pub requests: AtomicU64,
     pub cache_hits: AtomicU64,
