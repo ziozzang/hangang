@@ -42,7 +42,12 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
                 workload.as_fd(),
             )
             .unwrap();
-        sender.send_descriptor(DescriptorRole::PublicHttp(named_public_address), named_public.as_fd()).unwrap();
+        sender
+            .send_descriptor(
+                DescriptorRole::PublicHttp(named_public_address),
+                named_public.as_fd(),
+            )
+            .unwrap();
         sender
             .send_descriptor(DescriptorRole::ConfigSnapshot, snapshot.as_fd())
             .unwrap();
@@ -58,7 +63,11 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
 
     let received = receiver.receive_export(Duration::from_secs(1)).unwrap();
     assert_eq!(received.len(), 8);
-    assert!(received.iter().any(|item| item.role == DescriptorRole::PublicHttp(named_public_address)));
+    assert!(
+        received
+            .iter()
+            .any(|item| item.role == DescriptorRole::PublicHttp(named_public_address))
+    );
     assert!(
         received
             .iter()

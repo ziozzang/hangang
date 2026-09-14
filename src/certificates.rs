@@ -280,12 +280,23 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
             let id = listener.id.clone();
             let files = listener.certificates.clone();
             let inspected = files.clone();
-            let Ok(Ok(fingerprint)) =
-                tokio::task::spawn_blocking(move || fingerprint(&inspected)).await
-            else {
-                observations.remove(&id);
-                continue;
-            };
+            let fingerprint =
+                match tokio::task::spawn_blocking(move || fingerprint(&inspected)).await {
+                    Ok(Ok(value)) => value,
+                    result => {
+                        observations.remove(&id);
+                        let detail = match result {
+                            Ok(Err(error)) => error.to_string(),
+                            Err(error) => error.to_string(),
+                            _ => unreachable!(),
+                        };
+                        report_once(
+                            last_errors.entry(id.clone()).or_default(),
+                            &format!("public listener {id}: {detail}"),
+                        );
+                        continue;
+                    }
+                };
             let now = Instant::now();
             if observations.get(&id).is_some_and(|seen| {
                 Arc::ptr_eq(&seen.target, &target)
@@ -341,12 +352,24 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
                     digest: material.digest,
                 },
             );
-            let Ok(Ok(config)) = tokio::task::spawn_blocking(move || {
+            let config = match tokio::task::spawn_blocking(move || {
                 crate::tls::sni_server_config(material.certificates)
             })
             .await
-            else {
-                continue;
+            {
+                Ok(Ok(value)) => value,
+                result => {
+                    let detail = match result {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                        _ => unreachable!(),
+                    };
+                    report_once(
+                        last_errors.entry(id.clone()).or_default(),
+                        &format!("public listener {id}: {detail}"),
+                    );
+                    continue;
+                }
             };
             let current = active.load_full();
             if current

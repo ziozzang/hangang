@@ -28,7 +28,7 @@ class Restart(unittest.TestCase):
                 value=free_port()
                 while value in ports: value=free_port()
                 ports.add(value);return value
-            public,admin,tcp,workload=allocate(),allocate(),allocate(),allocate()
+            public,admin,tcp,workload,named_http,named_https=[allocate() for _ in range(6)]
             # Owned CA and leaves exercise the workload descriptor through the
             # actual supervisor export/import path, including failed candidates.
             def openssl(*args):
@@ -52,7 +52,17 @@ class Restart(unittest.TestCase):
             ca_key.chmod(0o600)
             context=ssl.create_default_context(cafile=str(ca))
             context.load_cert_chain(str(root/"client.pem"),str(root/"client.key"))
+            def named_requests():
+                self.assertEqual(smoke.Smoke.request(named_http,"GET","/named")[0],200)
+                self.assertEqual(smoke.Smoke.request(named_http,"GET","/")[0],404)
+                with socket.create_connection(("127.0.0.1",named_https),timeout=3) as raw:
+                    with ssl.create_default_context(cafile=str(ca)).wrap_socket(raw,server_hostname="localhost") as tls:
+                        tls.sendall(b"GET /named HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        response=http.client.HTTPResponse(tls);response.begin()
+                        self.assertEqual(response.status,200)
+                        self.assertIn(b"handoff",response.read())
             def workload_request():
+                named_requests()
                 with socket.create_connection(("127.0.0.1",workload),timeout=3) as raw:
                     with context.wrap_socket(raw,server_hostname="localhost") as tls:
                         tls.sendall(b"GET /workload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -62,6 +72,11 @@ class Restart(unittest.TestCase):
             state=root/"config.json"
             state.write_text(json.dumps({"http":[{"id":"main","backends":[f"http://127.0.0.1:{backend.server_port}"]}],"tcp":[{"id":"echo","listen":f"127.0.0.1:{tcp}","backends":[f"127.0.0.1:{echo.server_address[1]}"]}]}))
             config=json.loads(state.read_text())
+            config["public_http"]=[{"id":"edge-http","listen":f"127.0.0.1:{named_http}"},
+                {"id":"edge-https","listen":f"127.0.0.1:{named_https}","certificates":[
+                    {"id":"local","hosts":["localhost"],"cert_file":str(root/"server.pem"),"key_file":str(root/"server.key")}]}]
+            config["http"].append({"id":"named","listener_ids":["edge-http","edge-https"],
+                "path_prefix":"/named","backends":[f"http://127.0.0.1:{backend.server_port}"]})
             config["workload_http"]=[{"id":"private","listen":f"127.0.0.1:{workload}","tls":{
                 "cert_file":str(root/"server.pem"),"key_file":str(root/"server.key"),
                 "client_ca_file":str(ca),"allowed_uri_sans":[identity]}}]

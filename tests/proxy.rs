@@ -255,6 +255,7 @@ async fn frontend(proxy: Proxy) -> (SocketAddr, JoinHandle<()>, Arc<Metrics>) {
 
 fn route(backends: Vec<String>) -> HttpRoute {
     HttpRoute {
+        listener_ids: Vec::new(),
         access_mode: Default::default(),
         resource_policy: None,
         language_policy: None,
@@ -311,6 +312,7 @@ fn proxy_with_settings(
         http: routes,
         tcp: Vec::new(),
         workload_http: Vec::new(),
+        public_http: Vec::new(),
         settings,
         cache_generation_floor: 0,
     };
@@ -1612,6 +1614,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
         http: vec![secured, open],
         tcp: Vec::new(),
         workload_http: Vec::new(),
+        public_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,
     };
@@ -1748,6 +1751,7 @@ async fn one_streaming_route_cannot_consume_another_routes_capacity() {
             http: vec![first, second],
             tcp: Vec::new(),
             workload_http: Vec::new(),
+            public_http: Vec::new(),
             settings: Default::default(),
             cache_generation_floor: 0,
         })

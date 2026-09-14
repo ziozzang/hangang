@@ -3508,7 +3508,7 @@ function openWorkloadListener(index) {
     for (const name of ['cert_file', 'key_file', 'client_ca_file', 'client_crl_file']) form.elements[name].value = item?.tls?.[name] ?? '';
     form.elements.allowed_uri_sans.value = Array.isArray(item?.tls?.allowed_uri_sans) ? item.tls.allowed_uri_sans.join('\n') : '';
     form.elements.handshake_timeout_ms.value = item?.tls?.handshake_timeout_ms ?? 5000;
-    form.querySelector('#public-http-id').focus();
+    form.elements.id.focus();
   } catch (error) { message($('#workload-http-message'), error.message, 'error'); }
 }
 

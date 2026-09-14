@@ -582,8 +582,14 @@ impl Manager {
         authority: Option<ConfigAuthority>,
     ) -> anyhow::Result<Config> {
         if self.externally_managed {
-            anyhow::ensure!(config.public_http.is_empty() && config.http.iter().all(|route| route.listener_ids.is_empty()),
-                "public listener scopes require local file authority; controller listener ownership is not supported");
+            anyhow::ensure!(
+                config.public_http.is_empty()
+                    && config
+                        .http
+                        .iter()
+                        .all(|route| route.listener_ids.is_empty()),
+                "public listener scopes require local file authority; controller listener ownership is not supported"
+            );
         }
         if self.config_store.is_some() {
             crate::config_store::ensure_reader_compatibility(&config)?;
@@ -1936,6 +1942,24 @@ impl Admin {
             if let Err(error) = config.validate() {
                 return Ok(problem(422, "Configuration Invalid", &error.to_string()));
             }
+            if self.manager.config_store.is_some()
+                && let Err(error) = crate::config_store::ensure_reader_compatibility(&config)
+            {
+                return Ok(problem(422, "Configuration Invalid", &error.to_string()));
+            }
+            if self.manager.externally_managed
+                && (!config.public_http.is_empty()
+                    || config
+                        .http
+                        .iter()
+                        .any(|route| !route.listener_ids.is_empty()))
+            {
+                return Ok(problem(
+                    422,
+                    "Configuration Invalid",
+                    "public listener scopes require local file authority",
+                ));
+            }
             if let Err(error) = config.validate_transition_from(&self.manager.active.load().config)
             {
                 return Ok(problem(422, "Configuration Invalid", &error.to_string()));
@@ -1949,6 +1973,13 @@ impl Admin {
             }
             if let Err(error) = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 crate::certificates::load(&config.certificates)?;
+                for listener in config
+                    .public_http
+                    .iter()
+                    .filter(|listener| listener.enabled && !listener.certificates.is_empty())
+                {
+                    crate::certificates::load_public(&listener.certificates)?;
+                }
                 config.prepare_upstream_tls()?;
                 config.prepare_host_regexes()?;
                 Ok(())

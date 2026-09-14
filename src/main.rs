@@ -497,12 +497,15 @@ async fn run(args: Args) -> Result<()> {
                 .tcp
                 .iter()
                 .any(|route| route.enabled && route.listen == *address);
-            let public_http = inherited.config.public_http.iter()
+            let public_http = inherited
+                .config
+                .public_http
+                .iter()
                 .any(|listener| listener.enabled && listener.listen == *address);
             anyhow::ensure!(
                 usize::from(workload) + usize::from(tcp) + usize::from(public_http) == 1
-                && workload == inherited_workload_addresses.contains(address)
-                && public_http == inherited_public_http_addresses.contains(address),
+                    && workload == inherited_workload_addresses.contains(address)
+                    && public_http == inherited_public_http_addresses.contains(address),
                 "inherited listener role disagrees with frozen configuration"
             );
         }
@@ -523,6 +526,15 @@ async fn run(args: Args) -> Result<()> {
         );
         Config::default()
     };
+    anyhow::ensure!(
+        !args.kubernetes_controller
+            || (config.public_http.is_empty()
+                && config
+                    .http
+                    .iter()
+                    .all(|route| route.listener_ids.is_empty())),
+        "public listener scopes require local file authority"
+    );
     anyhow::ensure!(
         (1..=1024).contains(&args.max_body_transforms),
         "max-body-transforms must be 1..1024"
@@ -1065,7 +1077,10 @@ async fn run(args: Args) -> Result<()> {
         anyhow::bail!("workload TLS material did not become ready within 10 seconds");
     }
     tcp.open_gate();
-    tls_watchers.push(tokio::spawn(hangang::certificates::watch_public(active.clone(), cancel.clone())));
+    tls_watchers.push(tokio::spawn(hangang::certificates::watch_public(
+        active.clone(),
+        cancel.clone(),
+    )));
     if args.config_tls {
         tls_watchers.push(tokio::spawn(hangang::certificates::watch(
             active.clone(),
@@ -1536,8 +1551,12 @@ async fn lifecycle_wait(
                         .any(|listener| listener.enabled && listener.listen == address)
                     {
                         DescriptorRole::WorkloadHttp(address)
-                    } else if snapshot.config.public_http.iter()
-                        .any(|listener| listener.enabled && listener.listen == address) {
+                    } else if snapshot
+                        .config
+                        .public_http
+                        .iter()
+                        .any(|listener| listener.enabled && listener.listen == address)
+                    {
                         DescriptorRole::PublicHttp(address)
                     } else {
                         DescriptorRole::Tcp(address)

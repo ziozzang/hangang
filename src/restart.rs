@@ -208,7 +208,9 @@ impl ControlChannel {
                         DescriptorRole::ConfigLock => lock = true,
                         DescriptorRole::DockerLock => {}
                         DescriptorRole::ConfigSnapshot => snapshot = true,
-                        DescriptorRole::Tcp(address) | DescriptorRole::WorkloadHttp(address) | DescriptorRole::PublicHttp(address) => {
+                        DescriptorRole::Tcp(address)
+                        | DescriptorRole::WorkloadHttp(address)
+                        | DescriptorRole::PublicHttp(address) => {
                             if !listener_addresses.insert(address) {
                                 return Err(invalid_data("duplicate listener address in handoff"));
                             }

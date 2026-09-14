@@ -6,13 +6,23 @@ use std::sync::Arc;
 /// Public listener identity is supplied by the accepted socket, never a header.
 /// Legacy unscoped routes remain on the CLI listener and existing workload path.
 pub(crate) fn listener_matches<B>(route: &HttpRoute, request: &Request<B>) -> bool {
-    if request.extensions().get::<crate::workload_http::Evidence>().is_some() {
+    if request
+        .extensions()
+        .get::<crate::workload_http::Evidence>()
+        .is_some()
+    {
         return route.listener_ids.is_empty();
     }
-    let id = request.extensions().get::<crate::public_http::Evidence>()
-        .map(|evidence| evidence.listener_id()).unwrap_or("default");
-    if route.listener_ids.is_empty() { id == "default" }
-    else { route.listener_ids.iter().any(|allowed| allowed == id) }
+    let id = request
+        .extensions()
+        .get::<crate::public_http::Evidence>()
+        .map(|evidence| evidence.listener_id())
+        .unwrap_or("default");
+    if route.listener_ids.is_empty() {
+        id == "default"
+    } else {
+        route.listener_ids.iter().any(|allowed| allowed == id)
+    }
 }
 
 pub(crate) fn request_host<B>(request: &Request<B>) -> Option<String> {
@@ -107,10 +117,10 @@ pub(crate) fn check<'a, B>(
     let forwarded = forwarded_host.and_then(authority_host);
     let absolute = request.uri().authority().map(|authority| authority.host());
     let candidates = [raw.as_deref(), forwarded.as_deref(), absolute];
-    if !guards
-        .iter()
-        .any(|runtime| listener_matches(&runtime.route, request) && candidates.iter().any(|host| scope_host(runtime, *host)))
-    {
+    if !guards.iter().any(|runtime| {
+        listener_matches(&runtime.route, request)
+            && candidates.iter().any(|host| scope_host(runtime, *host))
+    }) {
         return Ok((None, None));
     }
     if !same_host(raw.as_deref(), forwarded.as_deref())
@@ -122,7 +132,10 @@ pub(crate) fn check<'a, B>(
     let path = crate::resource_policy::canonical_path(request.uri().path()).map_err(|_| 400u16)?;
     let mut resource = None;
     for runtime in guards {
-        if listener_matches(&runtime.route, request) && scope_host(runtime, raw.as_deref()) && path_matches(&runtime.route, &path) {
+        if listener_matches(&runtime.route, request)
+            && scope_host(runtime, raw.as_deref())
+            && path_matches(&runtime.route, &path)
+        {
             let id = runtime
                 .route
                 .resource_policy

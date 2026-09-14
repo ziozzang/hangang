@@ -44,6 +44,7 @@ fn config(revision: u64, id: &str) -> Config {
         cache: None,
         revision,
         http: vec![HttpRoute {
+            listener_ids: Vec::new(),
             access_mode: Default::default(),
             resource_policy: None,
             language_policy: None,
@@ -82,6 +83,7 @@ fn config(revision: u64, id: &str) -> Config {
         }],
         tcp: Vec::new(),
         workload_http: Vec::new(),
+        public_http: Vec::new(),
     }
 }
 

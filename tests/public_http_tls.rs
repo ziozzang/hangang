@@ -92,15 +92,17 @@ async fn named_https_resolvers_isolate_sni_and_default_certificates() {
     let mut fallback_file = cert(dir.path(), "fallback", &fallback);
     fallback_file.hosts.clear();
     fallback_file.default = true;
-    let mut config = Config::default();
-    config.public_http = vec![
-        listener(
-            "one",
-            28001,
-            vec![cert(dir.path(), "alpha", &alpha), fallback_file],
-        ),
-        listener("two", 28002, vec![cert(dir.path(), "beta", &beta)]),
-    ];
+    let config = Config {
+        public_http: vec![
+            listener(
+                "one",
+                28001,
+                vec![cert(dir.path(), "alpha", &alpha), fallback_file],
+            ),
+            listener("two", 28002, vec![cert(dir.path(), "beta", &beta)]),
+        ],
+        ..Config::default()
+    };
     let snapshot = Snapshot::new(config).unwrap();
     let client = client(&[&alpha, &beta, &fallback]);
     assert!(
@@ -192,11 +194,13 @@ async fn named_watcher_rotates_one_listener_and_keeps_last_good_on_invalid_files
     let other = rcgen::generate_simple_self_signed(vec!["beta.test".into()]).unwrap();
     let alpha = cert(dir.path(), "alpha", &old);
     let beta = cert(dir.path(), "beta", &other);
-    let mut config = Config::default();
-    config.public_http = vec![
-        listener("one", 28004, vec![alpha.clone()]),
-        listener("two", 28005, vec![beta]),
-    ];
+    let config = Config {
+        public_http: vec![
+            listener("one", 28004, vec![alpha.clone()]),
+            listener("two", 28005, vec![beta]),
+        ],
+        ..Config::default()
+    };
     let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
     let cancel = CancellationToken::new();
     let watcher = tokio::spawn(watch_public(active.clone(), cancel.clone()));
@@ -264,7 +268,7 @@ async fn named_material_budget_rejects_actual_bytes_and_keeps_last_good() {
     let mut padded = pair.cert.pem().into_bytes();
     padded.resize(1024 * 1024, b'\n');
     std::fs::write(&alpha.cert_file, padded).unwrap();
-    assert!(load_public(&[alpha.clone()]).is_err());
+    assert!(load_public(std::slice::from_ref(&alpha)).is_err());
     assert!(
         load(&[alpha]).is_ok(),
         "legacy global TLS retains its 16 MiB budget"
@@ -303,11 +307,13 @@ fn named_certificate_count_is_aggregate_across_listeners() {
             })
             .collect()
     };
-    let mut config = Config::default();
-    config.public_http = vec![
-        listener("one", 28007, certificates("a")),
-        listener("two", 28008, certificates("b")),
-    ];
+    let config = Config {
+        public_http: vec![
+            listener("one", 28007, certificates("a")),
+            listener("two", 28008, certificates("b")),
+        ],
+        ..Config::default()
+    };
     assert!(
         config
             .validate()

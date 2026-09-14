@@ -3978,7 +3978,12 @@ fn load_optional(path: &Path) -> StoreResult<Option<Config>> {
 }
 
 pub(crate) fn ensure_reader_compatibility(config: &Config) -> StoreResult<()> {
-    if !config.public_http.is_empty() || config.http.iter().any(|route| !route.listener_ids.is_empty()) {
+    if !config.public_http.is_empty()
+        || config
+            .http
+            .iter()
+            .any(|route| !route.listener_ids.is_empty())
+    {
         return Err(StoreError::Invalid(anyhow!(
             "public listener scopes require fleet reader capability coordination; use local file authority until it is available"
         )));
@@ -4168,6 +4173,25 @@ mod tests {
             Access::Mutation.transport(anyhow!("x")),
             StoreError::Indeterminate(_)
         ));
+    }
+
+    #[test]
+    fn scoped_public_listeners_are_refused_by_uncoordinated_shared_readers() {
+        let listener: Config = serde_json::from_value(serde_json::json!({
+            "public_http": [{"id":"edge","listen":"127.0.0.1:18080"}]
+        }))
+        .unwrap();
+        assert!(ensure_reader_compatibility(&listener).is_err());
+        let route: Config = serde_json::from_value(serde_json::json!({
+            "http": [{"id":"edge","listener_ids":["default"],"backends":["http://127.0.0.1:80"]}]
+        }))
+        .unwrap();
+        assert!(ensure_reader_compatibility(&route).is_err());
+        let legacy: Config = serde_json::from_value(serde_json::json!({
+            "http": [{"id":"edge","backends":["http://127.0.0.1:80"]}]
+        }))
+        .unwrap();
+        ensure_reader_compatibility(&legacy).unwrap();
     }
 
     #[test]
