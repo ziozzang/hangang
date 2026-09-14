@@ -26,7 +26,9 @@ const rows = [first, ...Array.from({ length: 99 }, (_, index) => ({
   ...first, backend_index: index + 1, address: `http://192.0.2.${index + 1}:8080`,
 })), last];
 
-async function fixture(page, viewer = false, operationRows = rows, retiredRows = []) {
+async function fixture(page, viewer = false, operationRows = rows, retiredRows = [], observerReply = {
+  configured: false, available: false, node_id: null, generation: null,
+}) {
   const calls = [];
   await page.route('**/*', async (route) => {
     const request = route.request();
@@ -40,6 +42,8 @@ async function fixture(page, viewer = false, operationRows = rows, retiredRows =
     } });
     if (url.pathname === '/v1/status') return route.fulfill({ json: status });
     if (url.pathname === '/v1/update/status') return route.fulfill({ json: { enabled: false, phase: 'idle' } });
+    if (url.pathname === '/v1/fleet/observer-status') return typeof observerReply === 'function'
+      ? observerReply(route) : route.fulfill({ json: observerReply });
     if (url.pathname === '/v1/operations') {
       const offset = Number(url.searchParams.get('offset'));
       const limit = Number(url.searchParams.get('limit'));
@@ -75,6 +79,93 @@ async function fixture(page, viewer = false, operationRows = rows, retiredRows =
   await expect(page.locator('#login-dialog')).toBeHidden();
   return calls;
 }
+
+test('node observation identity shows disabled, available and unavailable without remote claims', async ({ page }) => {
+  let current = { configured: false, available: false, node_id: null, generation: null };
+  const calls = await fixture(page, false, rows, [], route => route.fulfill({ json: current }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Disabled');
+  await expect(page.locator('#observer-identity-node')).toHaveText('—');
+  await expect(page.locator('#observer-identity-generation')).toHaveText('—');
+  await expect(page.locator('#observer-identity-title')).toHaveText('Node observation identity');
+  await expect(page.locator('#view-operations')).toContainText('This instance only. Remote fleet observations are not configured by this panel.');
+  current = { configured: true, available: true, node_id: 'node-east-01', generation: '9007199254740993' };
+  await page.locator('#observer-identity-refresh').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Available');
+  await expect(page.locator('#observer-identity-node')).toHaveText('node-east-01');
+  await expect(page.locator('#observer-identity-generation')).toHaveText('9,007,199,254,740,993');
+  current = { configured: true, available: true, node_id: 'node-east-01', generation: '0' };
+  await page.locator('#observer-identity-refresh').click();
+  await expect(page.locator('#observer-identity-generation')).toHaveText('0');
+  current = { configured: true, available: false, node_id: 'node-east-01', generation: '3' };
+  await page.locator('#observer-identity-refresh').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Unavailable');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#observer-identity-title')).toHaveText('노드 관찰 식별 정보');
+  await expect(page.locator('#observer-identity-state')).toHaveText('사용 불가');
+  expect(calls.filter(call => call.path === '/v1/fleet/observer-status')).toHaveLength(4);
+  expect(calls.filter(call => call.path === '/v1/fleet/observer-status').every(call => call.authorization === `Bearer ${TOKEN}`)).toBe(true);
+});
+
+for (const [label, bad] of [
+  ['missing node', { configured: true, available: true, node_id: null, generation: '1' }],
+  ['control-character node', { configured: true, available: true, node_id: 'node\nspoof', generation: '1' }],
+  ['oversize node', { configured: true, available: true, node_id: 'n'.repeat(65), generation: '1' }],
+  ['non-ASCII node', { configured: true, available: true, node_id: '노드', generation: '1' }],
+  ['newline generation', { configured: true, available: true, node_id: 'node', generation: '1\n' }],
+  ['oversize generation', { configured: true, available: true, node_id: 'node', generation: '18446744073709551616' }],
+  ['wrong configured type', { configured: 'true', available: true, node_id: 'node', generation: '1' }],
+]) test(`malformed observer ${label} is unknown without displaying identity or generation`, async ({ page }) => {
+  await fixture(page, false, rows, [], bad);
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Unknown');
+  await expect(page.locator('#observer-identity-message')).toContainText('invalid');
+  await expect(page.locator('#observer-identity-node')).toHaveText('—');
+  await expect(page.locator('#observer-identity-generation')).toHaveText('—');
+});
+
+test('observer read errors and unsupported endpoint stay distinct from Disabled', async ({ page }) => {
+  let statusCode = 503;
+  await fixture(page, false, rows, [], route => route.fulfill({ status: statusCode, json: { title: 'unavailable' } }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Observer read error');
+  statusCode = 404;
+  await page.locator('#observer-identity-refresh').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Unknown');
+  await expect(page.locator('#observer-identity-message')).toContainText('not reported');
+});
+
+test('observer response from a left view or logged-out session cannot repaint identity', async ({ page }) => {
+  let release, seen;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { seen = resolve; });
+  let calls = 0;
+  await fixture(page, false, rows, [], route => {
+    calls += 1;
+    if (calls === 1) return route.fulfill({ json: { configured: false, available: false, node_id: null, generation: null } });
+    seen();
+    return gate.then(() => route.fulfill({ json: { configured: true, available: true, node_id: 'late-node', generation: '9' } }).catch(() => {}));
+  });
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Disabled');
+  await page.locator('#observer-identity-refresh').click();
+  await started;
+  await page.locator('.nav-link[data-view="status"]').click();
+  release();
+  await expect(page.locator('#observer-identity-node')).toHaveText('—');
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#observer-identity-state')).toHaveText('Available');
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#observer-identity-node')).toHaveText('—');
+  await expect(page.locator('#observer-identity-state')).toHaveText('Unknown');
+});
+
+test('viewer does not request observer identity', async ({ page }) => {
+  const calls = await fixture(page, true);
+  await expect(page.locator('#view-operations')).toBeHidden();
+  expect(calls.some(call => call.path === '/v1/fleet/observer-status')).toBe(false);
+});
 
 test('checking state comes only from the initial-check gate and differs from observed exclusion', async ({ page }) => {
   await fixture(page, false, [

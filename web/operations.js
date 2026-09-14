@@ -14,6 +14,78 @@ let retiredPage = null;
 let retiredOffset = 0;
 let retiredRequestGeneration = 0;
 let retiredLoading = false;
+let observerRequestGeneration = 0;
+let observerViewActive = false;
+let observerLoading = false;
+let observer = null;
+
+const observerDecimal = value => typeof value === 'string' && /^(?:0|[1-9][0-9]{0,19})$(?![\s\S])/.test(value)
+  && BigInt(value) <= 18446744073709551615n;
+const observerNodeId = value => typeof value === 'string'
+  && /^[A-Za-z0-9._-]{1,64}$(?![\s\S])/.test(value);
+
+function observerState(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || typeof data.configured !== 'boolean'
+    || typeof data.available !== 'boolean' || !Object.hasOwn(data, 'node_id') || !Object.hasOwn(data, 'generation')) return null;
+  const node = data.node_id === null ? null : observerNodeId(data.node_id) ? data.node_id : undefined;
+  const generation = data.generation === null ? null : observerDecimal(data.generation) ? data.generation : undefined;
+  if (node === undefined || generation === undefined) return null;
+  if (!data.configured && !data.available && node === null && generation === null)
+    return { kind: 'disabled', node: null, generation: null };
+  if (data.configured && data.available && node !== null && generation !== null)
+    return { kind: 'available', node, generation };
+  if (data.configured && !data.available && node !== null && generation !== null)
+    return { kind: 'unavailable', node, generation };
+  return null;
+}
+
+function renderObserver() {
+  const state = observer?.kind ?? 'unknown';
+  $('#observer-identity-state').textContent = t(({ disabled: 'Disabled', available: 'Available',
+    unavailable: 'Unavailable', error: 'Observer read error', unknown: 'Unknown' })[state]);
+  $('#observer-identity-node').textContent = observer?.node ?? '—';
+  $('#observer-identity-generation').textContent = observer?.generation === null || observer?.generation === undefined
+    ? '—' : formatNumberLocale(BigInt(observer.generation));
+  $('#observer-identity-refresh').disabled = observerLoading;
+}
+
+async function fetchObserver() {
+  if (!apiCall || !observerViewActive) return;
+  const generation = ++observerRequestGeneration;
+  observerLoading = true;
+  observer = null;
+  renderObserver();
+  $('#observer-identity-message').textContent = t('Loading node observation identity…');
+  try {
+    const { data } = await apiCall('/v1/fleet/observer-status');
+    if (generation !== observerRequestGeneration || !observerViewActive) return;
+    observer = observerState(data);
+    $('#observer-identity-message').textContent = observer ? '' : t('Node observation identity response is invalid.');
+  } catch (error) {
+    if (generation !== observerRequestGeneration || !observerViewActive) return;
+    if (error.status === 401 || error.status === 403) {
+      const callback = onUnauthorized;
+      resetOperations();
+      callback?.();
+      return;
+    }
+    observer = { kind: error.status === 404 ? 'unknown' : 'error', node: null, generation: null };
+    $('#observer-identity-message').textContent = error.status === 404
+      ? t('Node observation identity is not reported by this server.')
+      : t('Node observation identity could not be refreshed.');
+  } finally {
+    if (generation === observerRequestGeneration && observerViewActive) {
+      observerLoading = false;
+      renderObserver();
+    }
+  }
+}
+
+export function pauseObserver() {
+  observerViewActive = false;
+  observerRequestGeneration += 1;
+  observerLoading = false;
+}
 
 function node(tag, className, content) {
   const element = document.createElement(tag);
@@ -301,15 +373,18 @@ async function fetchPage(nextOffset, allowCorrection = true) {
 export async function loadOperations(api, unauthorized) {
   apiCall = api;
   onUnauthorized = unauthorized;
-  await Promise.all([fetchPage(offset), fetchRetiredPage(retiredOffset)]);
+  observerViewActive = true;
+  await Promise.all([fetchPage(offset), fetchRetiredPage(retiredOffset), fetchObserver()]);
 }
 
 export function refreshOperationsCopy() {
   if (page) render();
   if (retiredPage) renderRetired();
+  renderObserver();
 }
 
 export function resetOperations() {
+  pauseObserver();
   requestGeneration += 1;
   retiredRequestGeneration += 1;
   apiCall = null;
@@ -321,6 +396,9 @@ export function resetOperations() {
   retiredPage = null;
   retiredOffset = 0;
   retiredLoading = false;
+  observer = null;
+  $('#observer-identity-message').textContent = '';
+  renderObserver();
   $('#operations-message').textContent = '';
   $('#operations-capabilities').replaceChildren();
   $('#operations-rows').replaceChildren();
@@ -347,3 +425,4 @@ $('#operations-next').addEventListener('click', () => { if (!loading && page && 
 $('#retired-refresh').addEventListener('click', () => { if (!retiredLoading) fetchRetiredPage(retiredOffset); });
 $('#retired-prev').addEventListener('click', () => { if (!retiredLoading && retiredOffset > 0) fetchRetiredPage(Math.max(0, retiredOffset - RETIRED_PAGE_SIZE)); });
 $('#retired-next').addEventListener('click', () => { if (!retiredLoading && retiredPage && retiredOffset + RETIRED_PAGE_SIZE < retiredPage.total) fetchRetiredPage(retiredOffset + RETIRED_PAGE_SIZE); });
+$('#observer-identity-refresh').addEventListener('click', () => { if (!observerLoading) fetchObserver(); });

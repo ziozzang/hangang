@@ -25,6 +25,7 @@ const coverage = new Map([
   ['GET /v1/connections/tcp/active', ['#tcp-active-rows', 'console', '/v1/connections/tcp/active${query}']],
   ['GET /v1/connections/tcp/recent', ['#tcp-recent-rows', 'console', '/v1/connections/tcp/recent?limit=128']],
   ['GET /v1/operations', ['#view-operations', 'operations', '/v1/operations?offset=']],
+  ['GET /v1/fleet/observer-status', ['#observer-identity-fields', 'operations', "apiCall('/v1/fleet/observer-status')"]],
   ['GET /v1/retired-members', ['#retired-rows', 'operations', '/v1/retired-members?offset=']],
   ['GET /v1/status', ['#view-status', 'app', "api('/v1/status'"]],
   ['POST /v1/lifecycle/restart', ['#restart-server', 'app', "api('/v1/lifecycle/restart'"]],
@@ -71,12 +72,16 @@ const coverage = new Map([
   ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
 ]);
 
+// This endpoint uses a separate machine observer credential and is intentionally
+// unavailable to the browser's administrator session.
+const machineOnly = new Set(['GET /v1/fleet/observation']);
+
 test('every OpenAPI operation has a concrete console surface and caller', async ({ page }) => {
   const spec = JSON.parse(read('../../docs/openapi.json'));
   const operations = Object.entries(spec.paths).flatMap(([path, methods]) =>
     Object.keys(methods).filter((method) => /^(get|post|put|patch|delete|head|options)$/.test(method))
       .map((method) => `${method.toUpperCase()} ${path}`));
-  expect([...coverage.keys()].sort()).toEqual(operations.sort());
+  expect([...coverage.keys()].sort()).toEqual(operations.filter(operation => !machineOnly.has(operation)).sort());
 
   await page.goto('/ui/');
   for (const [operation, [selector, module, call]] of coverage) {

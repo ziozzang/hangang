@@ -171,6 +171,15 @@
   <div class="page-head"><div><p class="eyebrow" data-i18n="Instance operations">Instance operations</p><h1 id="operations-title" data-i18n="Operations">Operations</h1><p data-i18n="Configured load-balancer targets and capabilities of this instance.">Configured load-balancer targets and capabilities of this instance.</p></div><button id="operations-refresh" class="button button-secondary" type="button" data-i18n="Refresh">Refresh</button></div>
   <div id="operations-message" class="inline-message" role="status" aria-live="polite"></div>
   <div id="operations-capabilities" class="operations-capabilities"></div>
+  <section class="panel operations-panel" aria-labelledby="observer-identity-title">
+    <div class="section-heading"><div><h2 id="observer-identity-title" data-i18n="Node observation identity">Node observation identity</h2><p data-i18n="This instance only. Remote fleet observations are not configured by this panel. Node ID is stable across processes; availability does not prove fleet acknowledgement.">This instance only. Remote fleet observations are not configured by this panel. Node ID is stable across processes; availability does not prove fleet acknowledgement.</p></div><button id="observer-identity-refresh" class="button button-secondary" type="button" data-i18n="Refresh observer identity">Refresh observer identity</button></div>
+    <div class="operations-capabilities" id="observer-identity-fields">
+      <div class="operations-capability"><h3 data-i18n="Observer credential">Observer credential</h3><p id="observer-identity-state">—</p></div>
+      <div class="operations-capability"><h3 data-i18n="Stable node ID">Stable node ID</h3><p id="observer-identity-node">—</p></div>
+      <div class="operations-capability"><h3 data-i18n="Credential generation">Credential generation</h3><p id="observer-identity-generation">—</p></div>
+    </div>
+    <div id="observer-identity-message" class="inline-message" role="status" aria-live="polite"></div>
+  </section>
   <div class="panel operations-panel">
     <div class="section-heading"><div><h2 data-i18n="Backend targets">Backend targets</h2><p data-i18n="Configured addresses are shown literally; this page does not scan or control remote servers.">Configured addresses are shown literally; this page does not scan or control remote servers.</p></div><div class="operations-head-meta"><span id="operations-updated"></span><span id="operations-instance" class="neutral-badge"></span></div></div>
     <p class="operations-caution" data-i18n="Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.">Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.</p>

@@ -1,6 +1,6 @@
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
 import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
-import { loadOperations, refreshOperationsCopy, resetOperations } from './operations.js';
+import { loadOperations, pauseObserver, refreshOperationsCopy, resetOperations } from './operations.js';
 import { loadDockerPanel, refreshDockerCopy, resetDockerPanel } from './docker.js';
 import { createLuaEditor } from './lua-editor.js';
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -565,6 +565,7 @@ async function switchView() {
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
   state.view = name;
+  if (name !== 'operations') pauseObserver();
   if (name !== 'config') resetGeoIpRuntime(true);
   if (name !== 'audit') state.audit.sequence += 1;
   if (name !== 'audit') state.auditPolicy.sequence += 1;
