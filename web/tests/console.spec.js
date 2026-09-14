@@ -384,11 +384,13 @@ test('request history rejects malformed known listener kinds without losing vali
     [11, { kind: 'public', id: 'default' }, 'Listener unknown'],
     [12, { kind: 'public', id: 'edge:port' }, 'Listener unknown'],
     [13, { kind: 'public', id: longPublicId }, 'Listener unknown'],
+    [19, { kind: 'public', id: 'edge\n' }, 'Listener unknown'],
     [14, { kind: 'default', id: 'edge' }, 'Listener unknown'],
     [15, { kind: 'default', id: null }, 'Listener unknown'],
     [16, { kind: 'workload', id: 'private:edge' }, 'Workload mTLS listener: private:edge'],
     [17, { kind: 'workload', id: longWorkloadId }, 'Listener unknown'],
     [18, { kind: 'workload', id: 'private edge' }, 'Listener unknown'],
+    [20, { kind: 'workload', id: 'private:edge\n' }, 'Listener unknown'],
   ];
   await fixtures(page, { snapshot: traffic(cases.map(([id, listener]) => record(id, { route_id: 'shared', listener }))) });
   await signIn(page);

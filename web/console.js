@@ -286,8 +286,8 @@ function renderGeoMetrics(geoip) {
   section.append(grid);
   $('.prometheus-table-wrap').before(section);
 }
-const publicListenerId = /^[A-Za-z0-9._-]{1,64}$/;
-const workloadListenerId = /^[A-Za-z0-9._:-]{1,128}$/;
+const publicListenerId = /^[A-Za-z0-9._-]{1,64}(?![\s\S])/;
+const workloadListenerId = /^[A-Za-z0-9._:-]{1,128}(?![\s\S])/;
 function normalizeTrafficListener(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'unknown', id: null };
   if (value.kind === 'default' && value.id === 'default') return { kind: 'default', id: 'default' };
