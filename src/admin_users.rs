@@ -2036,16 +2036,17 @@ fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Resul
     let before_enabled = record.before.map(|s| i64::from(s.enabled));
     let after_role = record.after.map(|s| s.role.as_str());
     let after_enabled = record.after.map(|s| i64::from(s.enabled));
-    if schema_version >= 7 {
+    let inserted = if schema_version >= 7 {
         let snapshot = record
             .policy_snapshot
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id,policy_revision,policy_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id,i64::try_from(record.policy_revision)?,snapshot])?;
+        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id,policy_revision,policy_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id,i64::try_from(record.policy_revision)?,snapshot])?
     } else {
-        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id])?;
-    }
+        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id])?
+    };
+    ensure!(inserted == 1, "administrator audit insertion was skipped");
     let changed = transaction.execute("UPDATE admin_audit_meta SET next_audit_id=?1,stored_records=stored_records+1 WHERE singleton=1", params![id+1])?;
     ensure!(changed == 1, "administrator audit metadata update failed");
     Ok(record)
@@ -5018,6 +5019,32 @@ mod tests {
             .unwrap();
         let path = directory.path().join("accounts.sqlite3");
         let db = connection(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER ignore_policy_receipt BEFORE INSERT ON admin_audit WHEN NEW.action='policy_change' BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(
+            store
+                .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        assert_eq!(
+            store
+                .audit_page(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+        db.execute_batch("DROP TRIGGER ignore_policy_receipt")
+            .unwrap();
         db.execute_batch("CREATE TRIGGER block_policy_change BEFORE UPDATE OF policy_revision ON admin_audit_meta BEGIN SELECT RAISE(IGNORE); END;").unwrap();
         assert!(
             store
