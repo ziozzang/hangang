@@ -118,6 +118,29 @@ async fn request(stream: &mut TcpStream) -> String {
     String::from_utf8(response).unwrap()
 }
 
+async fn status_for(listen: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(listen).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !response.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut bytes = [0u8; 1024];
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(count > 0, "connection closed before response headers");
+            response.extend_from_slice(&bytes[..count]);
+        }
+    })
+    .await
+    .unwrap();
+    String::from_utf8(response)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn unrelated_publication_reuses_active_socket_and_keepalive() {
     let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -190,6 +213,33 @@ async fn disable_and_reenable_revokes_old_plaintext_connection() {
     );
     let mut fresh = TcpStream::connect(listen).await.unwrap();
     assert!(request(&mut fresh).await.starts_with("HTTP/1.1 200"));
+    running.shutdown().await;
+    origin_task.abort();
+}
+
+#[tokio::test]
+async fn public_listener_cannot_reach_unscoped_default_route() {
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let (backend, origin_task) = origin().await;
+    let mut candidate = config(listen, backend);
+    candidate.http.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "default", "path_prefix": "/default", "backends": [format!("http://{backend}")]
+        }))
+        .unwrap(),
+    );
+    let running = start(candidate, bound).await;
+    assert!(
+        status_for(listen, "/edge")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        status_for(listen, "/default")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
     running.shutdown().await;
     origin_task.abort();
 }
