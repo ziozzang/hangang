@@ -10,6 +10,7 @@ export default {
   'Collector inventory': '수집기 목록',
   'Reporting coverage': '관찰 범위',
   'Collector generation': '수집기 세대',
+  'Collector process ID': '수집기 프로세스 ID',
   'Expected node / endpoint': '예상 노드 / 주소',
   'Observation state / age': '관찰 상태 / 경과 시간',
   'Last good process sample': '마지막 정상 프로세스 표본',

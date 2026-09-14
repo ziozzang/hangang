@@ -28,7 +28,7 @@ const rows = [first, ...Array.from({ length: 99 }, (_, index) => ({
 
 async function fixture(page, viewer = false, operationRows = rows, retiredRows = [], observerReply = {
   configured: false, available: false, node_id: null, generation: null,
-}, fleetReply = { configured: false, available: false, generation: null, expected_nodes: 0, fresh_nodes: 0, stale_after_seconds: 60, nodes: [] }) {
+}, fleetReply = { configured: false, available: false, generation: null, observer_instance_id: 'aaaaaaaaaaaaaaaa', expected_nodes: 0, fresh_nodes: 0, stale_after_seconds: 60, nodes: [] }) {
   const calls = [];
   await page.route('**/*', async (route) => {
     const request = route.request();
@@ -601,7 +601,7 @@ const fleetRow = (condition = 'fresh', instance = '0123456789abcdef') => ({
   age_seconds: 2, observation: fleetSample(instance),
 });
 const fleetInventory = (row = fleetRow()) => ({
-  configured: true, available: true, generation: '9', expected_nodes: 1,
+  configured: true, available: true, generation: '9', observer_instance_id: 'aaaaaaaaaaaaaaaa', expected_nodes: 1,
   fresh_nodes: row.condition === 'fresh' ? 1 : 0, stale_after_seconds: 60, nodes: [row],
 });
 
@@ -704,7 +704,7 @@ test('malformed fleet identifiers and missing fields never render as a zero-node
 
 test('fresh sample ages to historical without a new server response', async ({ page }) => {
   await page.clock.install();
-  await fixture(page, false, rows, [], undefined, fleetInventory({ ...fleetRow(), age_seconds: 59 }));
+  await fixture(page, false, rows, [], undefined, fleetInventory({ ...fleetRow(), age_seconds: 58 }));
   await page.locator('a[href="#operations"]').click();
   await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
   await page.clock.fastForward(2000);
@@ -719,7 +719,7 @@ test('unavailable inventory has unknown coverage, distinct from a valid empty ro
   await page.locator('a[href="#operations"]').click();
   await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
   reply = {
-    configured: true, available: false, generation: '10', expected_nodes: null,
+    configured: true, available: false, generation: '10', observer_instance_id: 'aaaaaaaaaaaaaaaa', expected_nodes: null,
     fresh_nodes: null, stale_after_seconds: 60, nodes: [],
   };
   await page.locator('#fleet-observations-refresh').click();
@@ -729,7 +729,7 @@ test('unavailable inventory has unknown coverage, distinct from a valid empty ro
   await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(0);
   await expect(page.locator('#fleet-observations-empty')).toBeHidden();
   reply = {
-    configured: true, available: true, generation: '11', expected_nodes: 0,
+    configured: true, available: true, generation: '11', observer_instance_id: 'aaaaaaaaaaaaaaaa', expected_nodes: 0,
     fresh_nodes: 0, stale_after_seconds: 60, nodes: [],
   };
   await page.locator('#fleet-observations-refresh').click();
@@ -742,7 +742,7 @@ test('unavailable inventory has unknown coverage, distinct from a valid empty ro
 
 test('available inventory with null counts is unknown rather than an empty success', async ({ page }) => {
   await fixture(page, false, rows, [], undefined, {
-    configured: true, available: true, generation: '1', expected_nodes: null,
+    configured: true, available: true, generation: '1', observer_instance_id: 'aaaaaaaaaaaaaaaa', expected_nodes: null,
     fresh_nodes: null, stale_after_seconds: 60, nodes: [],
   });
   await page.locator('a[href="#operations"]').click();
@@ -750,4 +750,71 @@ test('available inventory with null counts is unknown rather than an empty succe
   await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
   await expect(page.locator('#fleet-observations-empty')).toBeHidden();
   await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+});
+
+test('a held response cannot reset freshness when it finally arrives', async ({ page }) => {
+  await page.clock.install();
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = new Promise(resolve => { started = resolve; });
+  await fixture(page, false, rows, [], undefined, route => {
+    started();
+    return gate.then(() => route.fulfill({ json: fleetInventory() }).catch(() => {}));
+  });
+  await page.locator('a[href="#operations"]').click();
+  await seen;
+  await page.clock.fastForward(61000);
+  release();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('0 of 1 fresh');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Historical reported ready: Yes');
+});
+
+test('fleet response rejects contradictory states, duplicate origins, hidden keys, and invalid epochs', async ({ page }) => {
+  let reply = fleetInventory();
+  await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  const changed = row => fleetInventory(row);
+  const invalid = [
+    changed({ ...fleetRow(), condition: 'unknown', last_error: null, age_seconds: null, observation: fleetSample() }),
+    changed({ ...fleetRow(), condition: 'fresh', last_error: 'transport' }),
+    changed({ ...fleetRow(), condition: 'fresh', age_seconds: 60 }),
+    changed({ ...fleetRow(), condition: 'stale', last_error: null, age_seconds: 2 }),
+    changed({ ...fleetRow(), condition: 'unavailable', last_error: null }),
+    changed({ ...fleetRow(), condition: 'identity_mismatch', last_error: 'transport' }),
+    changed({ ...fleetRow(), token: 'must-not-render' }),
+    changed({ ...fleetRow(), observation: { ...fleetSample(), token: 'must-not-render' } }),
+    changed({ ...fleetRow(), observation: { ...fleetSample(), store_epoch: 'bad\nvalue' } }),
+    changed({ ...fleetRow(), observation: { ...fleetSample(), store_epoch: '' } }),
+    { ...fleetInventory(), expected_nodes: 2, fresh_nodes: 2, nodes: [fleetRow(), { ...fleetRow(), node_id: 'edge-2', observation: { ...fleetSample(), node_id: 'edge-2' } }] },
+  ];
+  for (const candidate of invalid) {
+    reply = candidate;
+    await page.locator('#fleet-observations-refresh').click();
+    await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+    await expect(page.locator('#fleet-observations-rows')).not.toContainText('must-not-render');
+  }
+  reply = changed({ ...fleetRow(), endpoint: `https://${'a'.repeat(2050)}.test` });
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+});
+
+test('collector process identity changes independently of generation without merging peer rows', async ({ page }) => {
+  let reply = fleetInventory();
+  await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-process')).toHaveText('aaaaaaaaaaaaaaaa');
+  await expect(page.locator('#fleet-observations-generation')).toHaveText('9');
+  reply = { ...fleetInventory(fleetRow('fresh', '1111111111111111')), observer_instance_id: 'bbbbbbbbbbbbbbbb' };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-process')).toHaveText('bbbbbbbbbbbbbbbb');
+  await expect(page.locator('#fleet-observations-generation')).toHaveText('9');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('1111111111111111');
+  await expect(page.locator('#fleet-observations-rows')).not.toContainText('0123456789abcdef');
+  reply = { ...fleetInventory(), observer_instance_id: 'bad' };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+  await expect(page.locator('#fleet-observations-process')).toHaveText('bbbbbbbbbbbbbbbb');
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.locator('#fleet-observations-process')).toHaveText('—');
 });

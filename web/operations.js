@@ -23,7 +23,7 @@ let fleetActive = false;
 let fleetLoading = false;
 let fleetTimer = null;
 let fleetSnapshot = null;
-let fleetReceivedAt = 0;
+let fleetRequestedAt = 0;
 let fleetError = '';
 const FLEET_POLL_MS = 5000;
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -31,17 +31,21 @@ const finiteInteger = (value, max) => Number.isSafeInteger(value) && value >= 0 
 const hex16 = value => typeof value === 'string' && /^[a-f0-9]{16}$(?![\s\S])/.test(value);
 const safeCode = value => value === null || ['transport', 'http_status', 'body_too_large', 'invalid_observation', 'identity_mismatch'].includes(value);
 const safeEndpoint = value => {
-  if (typeof value !== 'string' || value.length > 512) return false;
+  if (typeof value !== 'string' || value.length > 2048) return false;
   try {
     const url = new URL(value);
     return url.protocol === 'https:' && url.origin === value && !url.username && !url.password;
   } catch { return false; }
 };
-const safeEpoch = value => value === null || (typeof value === 'string' && value.length <= 128
-  && !/[\x00-\x1f\x7f]/.test(value));
+const safeEpoch = value => value === null || (typeof value === 'string' && value.length >= 1
+  && value.length <= 128 && /^[\x20-\x7e]+$(?![\s\S])/.test(value));
+const exactKeys = (value, keys) => isObject(value) && Object.keys(value).length === keys.length
+  && keys.every(key => Object.hasOwn(value, key));
 function fleetObservation(value, id) {
   if (value === null) return null;
-  if (!isObject(value) || value.schema_version !== 1 || value.node_id !== id
+  if (!exactKeys(value, ['schema_version', 'node_id', 'observer_generation', 'instance_id',
+    'configuration_source', 'revision', 'config_digest', 'ready', 'store_epoch'])
+    || value.schema_version !== 1 || value.node_id !== id
     || !observerDecimal(value.observer_generation) || !hex16(value.instance_id)
     || !['file', 'shared', 'kubernetes'].includes(value.configuration_source)
     || !observerDecimal(value.revision) || !hex16(value.config_digest)
@@ -49,37 +53,47 @@ function fleetObservation(value, id) {
   return value;
 }
 function fleetState(data) {
-  if (!isObject(data) || typeof data.configured !== 'boolean' || typeof data.available !== 'boolean'
-    || data.stale_after_seconds !== 60 || !Array.isArray(data.nodes) || data.nodes.length > 64) return null;
+  if (!exactKeys(data, ['configured', 'available', 'generation', 'observer_instance_id', 'expected_nodes', 'fresh_nodes',
+    'stale_after_seconds', 'nodes']) || typeof data.configured !== 'boolean' || typeof data.available !== 'boolean'
+    || !hex16(data.observer_instance_id) || data.stale_after_seconds !== 60 || !Array.isArray(data.nodes) || data.nodes.length > 64) return null;
   const generation = data.generation === null ? null : observerDecimal(data.generation) ? data.generation : undefined;
   if (generation === undefined) return null;
   if (!data.configured) return !data.available && generation === null && data.expected_nodes === 0
-    && data.fresh_nodes === 0 && data.nodes.length === 0 ? { kind: 'disabled', generation, nodes: [] } : null;
+    && data.fresh_nodes === 0 && data.nodes.length === 0 ? { kind: 'disabled', generation, process: data.observer_instance_id, nodes: [] } : null;
   if (generation === null) return null;
   // A failed inventory reload cannot certify either the expected roster or its coverage.
   if (!data.available) return data.expected_nodes === null && data.fresh_nodes === null
-    && data.nodes.length === 0 ? { kind: 'unavailable', generation, nodes: [] } : null;
+    && data.nodes.length === 0 ? { kind: 'unavailable', generation, process: data.observer_instance_id, nodes: [] } : null;
   if (!finiteInteger(data.expected_nodes, 64) || !finiteInteger(data.fresh_nodes, 64)
     || data.fresh_nodes > data.expected_nodes || data.nodes.length !== data.expected_nodes) return null;
   const seen = new Set();
+  const origins = new Set();
   const nodes = [];
   for (const row of data.nodes) {
-    if (!isObject(row) || !observerNodeId(row.node_id) || seen.has(row.node_id)
-      || !safeEndpoint(row.endpoint) || !['unknown', 'fresh', 'stale', 'unavailable', 'identity_mismatch'].includes(row.condition)
-      || !safeCode(row.last_error) || !(row.age_seconds === null || finiteInteger(row.age_seconds, 86400 * 365))
-      || (row.condition === 'fresh' && (row.observation === null || row.age_seconds === null))
-      || (row.condition !== 'fresh' && row.condition !== 'stale' && row.age_seconds !== null && row.observation === null)) return null;
+    if (!exactKeys(row, ['node_id', 'endpoint', 'condition', 'last_error', 'age_seconds', 'observation'])
+      || !observerNodeId(row.node_id) || seen.has(row.node_id)
+      || !safeEndpoint(row.endpoint) || origins.has(row.endpoint)
+      || !['unknown', 'fresh', 'stale', 'unavailable', 'identity_mismatch'].includes(row.condition)
+      || !safeCode(row.last_error) || !(row.age_seconds === null || finiteInteger(row.age_seconds, Number.MAX_SAFE_INTEGER))
+      || (row.observation === null) !== (row.age_seconds === null)
+      || (row.condition === 'unknown' && (row.observation !== null || row.last_error !== null))
+      || (row.condition === 'fresh' && (row.observation === null || row.age_seconds >= 60 || row.last_error !== null))
+      || (row.condition === 'stale' && (row.observation === null || row.age_seconds < 60 || row.last_error !== null))
+      || (row.condition === 'unavailable' && !['transport', 'http_status', 'body_too_large', 'invalid_observation'].includes(row.last_error))
+      || (row.condition === 'identity_mismatch' && row.last_error !== 'identity_mismatch')) return null;
     const observation = fleetObservation(row.observation, row.node_id);
     if (observation === undefined) return null;
     seen.add(row.node_id);
-    nodes.push({ ...row, observation });
+    origins.add(row.endpoint);
+    nodes.push({ node_id: row.node_id, endpoint: row.endpoint, condition: row.condition,
+      last_error: row.last_error, age_seconds: row.age_seconds, observation });
   }
   if (nodes.filter(row => row.condition === 'fresh').length !== data.fresh_nodes) return null;
-  return { kind: 'available', generation, nodes, expected: data.expected_nodes };
+  return { kind: 'available', generation, process: data.observer_instance_id, nodes, expected: data.expected_nodes };
 }
 function fleetCondition(row) {
   if (row.condition !== 'fresh' || fleetError) return row.condition === 'fresh' && fleetError ? 'stale' : row.condition;
-  return row.age_seconds + Math.max(0, (performance.now() - fleetReceivedAt) / 1000) >= 60 ? 'stale' : 'fresh';
+  return row.age_seconds + Math.max(0, (performance.now() - fleetRequestedAt) / 1000) >= 60 ? 'stale' : 'fresh';
 }
 function renderFleet() {
   const state = fleetSnapshot?.kind ?? 'unknown';
@@ -87,6 +101,7 @@ function renderFleet() {
     unavailable: 'Inventory unavailable', unknown: 'Unknown' })[state]);
   $('#fleet-observations-generation').textContent = fleetSnapshot?.generation === null || fleetSnapshot?.generation === undefined
     ? '—' : formatNumberLocale(BigInt(fleetSnapshot.generation));
+  $('#fleet-observations-process').textContent = fleetSnapshot?.process ?? '—';
   const rows = fleetSnapshot?.nodes ?? [];
   const fresh = rows.filter(row => fleetCondition(row) === 'fresh').length;
   $('#fleet-observations-coverage').textContent = fleetSnapshot?.kind === 'disabled' ? t('Disabled')
@@ -128,13 +143,14 @@ async function fetchFleet() {
   const generation = ++fleetGeneration;
   fleetLoading = true;
   renderFleet();
+  const requestedAt = performance.now();
   try {
     const { data } = await apiCall('/v1/fleet/observations');
     if (generation !== fleetGeneration || !fleetActive) return;
     const parsed = fleetState(data);
     if (parsed) {
       fleetSnapshot = parsed;
-      fleetReceivedAt = performance.now();
+      fleetRequestedAt = requestedAt - 1000; // Server ages are truncated to whole seconds.
       fleetError = '';
     } else fleetError = 'Fleet observations response is invalid; showing historical data if available.';
   } catch (error) {
