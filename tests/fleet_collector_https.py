@@ -201,6 +201,25 @@ def main():
             else:
                 shutil.rmtree(artifacts)
 
+        # A label change retires the old sample and requires a new authenticated
+        # observation under a new inventory generation.
+        peers[0]['group_id'] = 'edge-c'
+        peers[0]['role'] = 'origin'
+        private_write(inventory, json.dumps({'peers': peers}))
+
+        def relabelled_fresh():
+            value = snapshot()
+            row = next(row for row in value['nodes'] if row['node_id'] == 'good-edge')
+            if value['generation'] == initial['generation'] or row['condition'] != 'fresh':
+                return None
+            assert (row['group_id'], row['role']) == ('edge-c', 'origin')
+            assert value['fresh_nodes'] == 1
+            assert row['observation']['node_id'] == 'good-edge'
+            return value
+
+        relabelled = until(relabelled_fresh)
+        good = next(row for row in relabelled['nodes'] if row['node_id'] == 'good-edge')['observation']
+
         # Rotate only the remote credential. The collector retains its old
         # credential so its next scheduled request fails after a prior success.
         private_write(source_tokens[0], secrets.token_hex(24) + '\n')
@@ -219,7 +238,7 @@ def main():
         until(lambda: not snapshot()['available'])
         private_write(inventory, '{"peers":[]}')
         until(lambda: snapshot()['available'] and snapshot()['nodes'] == [])
-        print('Fleet HTTPS passed: trusted peer, identity mismatch, untrusted certificate, historical failed peer, invalid roster withdrawal and removal')
+        print('Fleet HTTPS passed: trusted peer, identity mismatch, untrusted certificate, label recollection, historical failed peer, invalid roster withdrawal and removal')
 
 
 if __name__ == '__main__':
