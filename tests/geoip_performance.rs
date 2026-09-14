@@ -173,6 +173,7 @@ async fn geoip_observation_contention_release_diagnostic() {
                             counters.observe(Protocol::Http, black_box(&observed), None);
                             if ring_enabled {
                                 history.record(TrafficInput {
+                                    listener: hangang::traffic::ListenerInput::Unknown,
                                     peer_ip: address,
                                     peer_port: 41000,
                                     client_ip: address,

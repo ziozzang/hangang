@@ -8,6 +8,7 @@ use hangang::{
     policy::PolicyPool,
     proxy::Proxy,
     tcp::TcpManager,
+    traffic::TrafficHistory,
 };
 use http_body_util::Full;
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
@@ -52,6 +53,7 @@ struct Running {
     proxy: Arc<Proxy>,
     policy: Arc<PolicyPool>,
     listen: SocketAddr,
+    traffic: Arc<TrafficHistory>,
 }
 impl Running {
     async fn publish(&self, config: Config) {
@@ -79,7 +81,11 @@ async fn start(config: Config, bound: TcpListener) -> Running {
     ));
     let metrics = Arc::new(Metrics::default());
     let policy = Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1));
-    let proxy = Arc::new(Proxy::new(active.clone(), policy.clone(), metrics.clone()));
+    let traffic = Arc::new(TrafficHistory::default());
+    let proxy = Arc::new(
+        Proxy::new(active.clone(), policy.clone(), metrics.clone())
+            .with_traffic_history(traffic.clone()),
+    );
     let manager = TcpManager::new(active.clone(), metrics, 32).with_gate_closed();
     manager.set_workload_http(proxy.clone(), 32 * 1024).unwrap();
     let inherited: OwnedFd = bound.into_std().unwrap().into();
@@ -95,6 +101,7 @@ async fn start(config: Config, bound: TcpListener) -> Running {
         proxy,
         policy,
         listen,
+        traffic,
     }
 }
 async fn request(stream: &mut TcpStream) -> String {
@@ -251,6 +258,17 @@ async fn public_listener_cannot_reach_unscoped_default_route() {
             .await
             .starts_with("HTTP/1.1 404")
     );
+    let records = running.traffic.snapshot_since(None, 128).records;
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].status, 200);
+    assert_eq!(records[1].status, 404);
+    assert_eq!(records[2].status, 404);
+    for record in records {
+        assert_eq!(
+            serde_json::to_value(record.listener).unwrap(),
+            serde_json::json!({"kind":"public","id":"edge"})
+        );
+    }
     running.shutdown().await;
     origin_task.abort();
 }

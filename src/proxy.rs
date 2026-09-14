@@ -147,6 +147,7 @@ struct TrafficContext {
     method: Method,
     uri: Uri,
     route_id: Option<String>,
+    listener: crate::traffic::ListenerInput,
     protocol: &'static str,
     tls: bool,
     started: std::time::Instant,
@@ -154,6 +155,24 @@ struct TrafficContext {
 
 impl TrafficContext {
     fn new(request: &Request<Incoming>, peer: SocketAddr) -> Self {
+        // Listener evidence is inserted by the accepting server, never read
+        // from request headers. Named evidence wins over generic transport.
+        let listener = if let Some(evidence) =
+            request.extensions().get::<crate::public_http::Evidence>()
+        {
+            crate::traffic::ListenerInput::Public(evidence.listener_id().to_owned())
+        } else if let Some(evidence) = request.extensions().get::<crate::workload_http::Evidence>()
+        {
+            crate::traffic::ListenerInput::Workload(evidence.listener_id().to_owned())
+        } else if request
+            .extensions()
+            .get::<crate::tls::TransportInfo>()
+            .is_some()
+        {
+            crate::traffic::ListenerInput::Default
+        } else {
+            crate::traffic::ListenerInput::Unknown
+        };
         Self {
             geoip: Default::default(),
             peer_ip: peer.ip(),
@@ -162,6 +181,7 @@ impl TrafficContext {
             method: request.method().clone(),
             uri: request.uri().clone(),
             route_id: None,
+            listener,
             protocol: if request.version() == Version::HTTP_2 {
                 "h2"
             } else {
@@ -185,6 +205,7 @@ impl TrafficContext {
                 method: self.method.as_str(),
                 path: self.uri.path(),
                 route_id: self.route_id.as_deref(),
+                listener: self.listener.clone(),
                 status,
                 response_head_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 protocol: self.protocol,

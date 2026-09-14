@@ -506,6 +506,7 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
     .await;
     let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
     traffic.record(TrafficInput {
+        listener: hangang::traffic::ListenerInput::Unknown,
         geoip: None,
         peer_ip: "192.0.2.10".parse().unwrap(),
         peer_port: 45678,
@@ -591,6 +592,7 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         event_json(&first_admin)["revision"]
     );
     traffic.record(TrafficInput {
+        listener: hangang::traffic::ListenerInput::Unknown,
         geoip: None,
         peer_ip: "192.0.2.11".parse().unwrap(),
         peer_port: 45679,

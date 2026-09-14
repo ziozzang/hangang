@@ -9,6 +9,7 @@ use hangang::{
     policy::PolicyPool,
     proxy::Proxy,
     tcp::TcpManager,
+    traffic::TrafficHistory,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
@@ -154,6 +155,7 @@ struct Running {
     policy: Arc<PolicyPool>,
     active: Arc<ArcSwap<Snapshot>>,
     metrics: Arc<Metrics>,
+    traffic: Arc<TrafficHistory>,
     watch_cancel: CancellationToken,
     watcher: JoinHandle<()>,
 }
@@ -210,7 +212,11 @@ async fn start_with_limit_and_idle(
     ));
     let metrics = Arc::new(Metrics::default());
     let policy = Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1));
-    let proxy = Arc::new(Proxy::new(active.clone(), policy.clone(), metrics.clone()));
+    let traffic = Arc::new(TrafficHistory::default());
+    let proxy = Arc::new(
+        Proxy::new(active.clone(), policy.clone(), metrics.clone())
+            .with_traffic_history(traffic.clone()),
+    );
     let manager = TcpManager::with_idle_timeout(
         active.clone(),
         metrics.clone(),
@@ -233,6 +239,7 @@ async fn start_with_limit_and_idle(
         policy,
         active,
         metrics,
+        traffic,
         watch_cancel,
         watcher,
     }
@@ -428,6 +435,16 @@ async fn http1_requires_verified_workload_and_ignores_spoofed_forwarding_identit
     .await
     .unwrap();
     assert_eq!(status, 200);
+    let record = running
+        .traffic
+        .snapshot_since(None, 128)
+        .records
+        .pop()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(record.listener).unwrap(),
+        serde_json::json!({"kind":"workload","id":"private-edge"})
+    );
     {
         let headers = seen.lock().unwrap();
         assert_eq!(headers.len(), 1);

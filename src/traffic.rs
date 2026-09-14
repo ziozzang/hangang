@@ -16,6 +16,62 @@ pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60);
 pub const DEFAULT_CAPACITY: usize = 4096;
 const MAX_SNAPSHOT: usize = 128;
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerKind {
+    Default,
+    Public,
+    Workload,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Listener {
+    pub kind: ListenerKind,
+    pub id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ListenerInput {
+    Default,
+    Public(String),
+    Workload(String),
+    Unknown,
+}
+
+impl ListenerInput {
+    fn bounded(self) -> Listener {
+        match self {
+            Self::Default => Listener {
+                kind: ListenerKind::Default,
+                id: Some("default".into()),
+            },
+            Self::Public(id) if id != "default" && valid_listener_id(&id, 64, false) => Listener {
+                kind: ListenerKind::Public,
+                id: Some(id),
+            },
+            Self::Workload(id) if valid_listener_id(&id, 128, true) => Listener {
+                kind: ListenerKind::Workload,
+                id: Some(id),
+            },
+            _ => Listener {
+                kind: ListenerKind::Unknown,
+                id: None,
+            },
+        }
+    }
+}
+
+fn valid_listener_id(id: &str, max: usize, colon: bool) -> bool {
+    !id.is_empty()
+        && id.len() <= max
+        && id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-')
+                || (colon && byte == b':')
+        })
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficRecord {
     pub id: u64,
@@ -29,6 +85,7 @@ pub struct TrafficRecord {
     pub method: String,
     pub path: String,
     pub route_id: Option<String>,
+    pub listener: Listener,
     pub status: u16,
     /// Milliseconds from request admission to response headers, not body end.
     pub response_head_ms: u64,
@@ -44,6 +101,7 @@ pub struct TrafficInput<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub route_id: Option<&'a str>,
+    pub listener: ListenerInput,
     pub status: u16,
     pub response_head_ms: u64,
     pub protocol: &'static str,
@@ -141,6 +199,7 @@ impl TrafficHistory {
             method: bounded_ascii(input.method, 16),
             path: bounded_path(input.path),
             route_id: input.route_id.map(|id| bounded_ascii(id, 128)),
+            listener: input.listener.bounded(),
             status: input.status,
             response_head_ms: input.response_head_ms,
             protocol: input.protocol,
@@ -284,6 +343,41 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn listener_metadata_is_bounded_and_kind_consistent() {
+        let history = TrafficHistory::default();
+        for listener in [
+            ListenerInput::Default,
+            ListenerInput::Public("edge".into()),
+            ListenerInput::Workload("private:edge".into()),
+            ListenerInput::Public("a".repeat(65)),
+            ListenerInput::Public("default".into()),
+            ListenerInput::Workload("/private".into()),
+            ListenerInput::Unknown,
+        ] {
+            let mut request = input("/");
+            request.listener = listener;
+            history.record(request);
+        }
+        let records = history.snapshot_since(None, 128).records;
+        let scopes: Vec<_> = records
+            .iter()
+            .map(|row| serde_json::to_value(&row.listener).unwrap())
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                serde_json::json!({"kind":"default","id":"default"}),
+                serde_json::json!({"kind":"public","id":"edge"}),
+                serde_json::json!({"kind":"workload","id":"private:edge"}),
+                serde_json::json!({"kind":"unknown","id":null}),
+                serde_json::json!({"kind":"unknown","id":null}),
+                serde_json::json!({"kind":"unknown","id":null}),
+                serde_json::json!({"kind":"unknown","id":null}),
+            ]
+        );
+    }
+
+    #[test]
     fn clock_rollback_cannot_make_any_returned_record_newer_than_batch_time() {
         let history = TrafficHistory::default();
         history.record(input("/first"));
@@ -335,6 +429,7 @@ mod tests {
             method: "GET",
             path,
             route_id: Some("api"),
+            listener: ListenerInput::Unknown,
             status: 200,
             response_head_ms: 12,
             protocol: "h2",

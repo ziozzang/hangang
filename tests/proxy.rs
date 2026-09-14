@@ -67,6 +67,10 @@ async fn traffic_history_records_real_peer_and_trusted_client_without_query_or_h
     assert_eq!(record.method, "GET");
     assert_eq!(record.path, "/items");
     assert_eq!(record.route_id.as_deref(), Some("route"));
+    assert_eq!(
+        serde_json::to_value(&record.listener).unwrap(),
+        serde_json::json!({"kind":"unknown","id":null})
+    );
     assert_eq!(record.status, 200);
     assert_eq!(record.protocol, "h1");
     assert!(!record.tls);
@@ -1151,6 +1155,48 @@ async fn streaming_response_holds_request_admission_until_complete() {
     let accepted = client().request(request()).await.unwrap();
     assert_eq!(accepted.status(), 200);
     accepted.into_body().collect().await.unwrap();
+    policy.shutdown().await;
+    front_task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn default_listener_and_request_capacity_are_server_attributed() {
+    let (upstream, upstream_task) = sse_upstream().await;
+    let (proxy, policy) = proxy(vec![route(vec![format!("http://{upstream}")])]);
+    let traffic = Arc::new(TrafficHistory::default());
+    let (front, front_task) = frontend_with_peer_transport(
+        proxy
+            .with_traffic_history(traffic.clone())
+            .with_request_limit(1),
+        "127.0.0.1:34567".parse().unwrap(),
+        true,
+    )
+    .await;
+    let request = || {
+        Request::builder()
+            .uri(format!("http://{front}/events?secret=hidden"))
+            .header("x-hangang-listener", "forged")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let mut stream = client().request(request()).await.unwrap().into_body();
+    assert_eq!(
+        stream.frame().await.unwrap().unwrap().into_data().unwrap(),
+        "one\n\n"
+    );
+    assert_eq!(client().request(request()).await.unwrap().status(), 503);
+    let records = traffic.snapshot_since(None, 128).records;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].status, 503);
+    for row in records {
+        assert_eq!(
+            serde_json::to_value(row.listener).unwrap(),
+            serde_json::json!({"kind":"default","id":"default"})
+        );
+        assert_eq!(row.path, "/events");
+    }
+    stream.collect().await.unwrap();
     policy.shutdown().await;
     front_task.abort();
     upstream_task.abort();
