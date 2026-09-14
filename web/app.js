@@ -71,6 +71,7 @@ const state = {
   lastStatus: null,
   lastUpdateStatus: null,
   audit: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null },
+  auditPolicy: { observation: null, draft: null, sequence: 0, dirty: false, saving: false, error: null, notice: null },
   configOperations: { page: null, after: 0, previous: [], pageNumber: 1, sequence: 0, error: null, notice: null, exporting: false, exportFetched: 0, exportMismatch: false, releasing: false },
   configProof: { data: null, error: null, loading: false, sequence: 0 },
   configReceipt: { data: null, error: null, loading: false, sequence: 0,
@@ -111,6 +112,7 @@ function refreshAppCopy() {
   refreshOperationsCopy();
   refreshDockerCopy();
   if (state.audit.page || state.audit.error) renderAudit();
+  if (state.auditPolicy.observation || state.auditPolicy.error || state.auditPolicy.draft) renderAuditPolicy();
   if (state.configOperations.page || state.configOperations.error) renderConfigOperations();
   if (state.configProof.data || state.configProof.error || state.configProof.loading) renderConfigProof();
   if (state.configReceipt.data || state.configReceipt.error || state.configReceipt.loading ||
@@ -380,6 +382,7 @@ function scrubRenderedData() {
   resetOperations();
   resetDockerPanel();
   resetAudit();
+  resetAuditPolicy();
   resetConfigOperations();
   resetConfigProof();
   resetConfigReceipt();
@@ -548,6 +551,7 @@ async function switchView() {
   state.view = name;
   if (name !== 'config') resetGeoIpRuntime(true);
   if (name !== 'audit') state.audit.sequence += 1;
+  if (name !== 'audit') state.auditPolicy.sequence += 1;
   if (name !== 'config-operations') state.configOperations.sequence += 1;
   if (name !== 'config-operations') resetConfigProof();
   if (name !== 'config-operations') resetConfigReceipt();
@@ -577,7 +581,7 @@ async function loadView(name, quiet = false) {
       startWorkloadMaterialPolling();
     }
     if (name === 'users' && isAdmin()) await loadUsers();
-    if (name === 'audit' && isAdmin()) await loadAudit(0, []);
+    if (name === 'audit' && isAdmin()) await Promise.all([loadAudit(0, []), loadAuditPolicy()]);
     if (name === 'config-operations' && isAdmin()) await Promise.all([loadConfigOperations(0, []), loadConfigProof()]);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
@@ -753,6 +757,7 @@ async function verifySession() {
     updateAccess();
     if (!isAdmin()) {
       resetAudit();
+      resetAuditPolicy();
       resetConfigOperations();
       resetConfigProof();
       resetConfigReceipt();
@@ -3978,6 +3983,218 @@ function resetAudit() {
   for (const id of ['audit-export', 'audit-prune', 'audit-previous', 'audit-next']) $(`#${id}`).disabled = true;
 }
 
+function resetAuditPolicy() {
+  const policy = state.auditPolicy;
+  policy.sequence += 1;
+  policy.observation = null;
+  policy.draft = null;
+  policy.dirty = false;
+  policy.saving = false;
+  policy.error = null;
+  policy.notice = null;
+  $('#audit-policy-rules').replaceChildren();
+  $('#audit-policy-meta').textContent = '';
+  message($('#audit-policy-message'));
+  for (const id of ['audit-policy-default', 'audit-policy-refresh', 'audit-policy-add', 'audit-policy-save']) $(`#${id}`).disabled = true;
+}
+
+function validAuditRecordingPolicy(policy) {
+  const unique = (values) => new Set(values).size === values.length;
+  if (!isObject(policy) || !['record', 'drop'].includes(policy.default_action) ||
+    !Array.isArray(policy.rules) || policy.rules.length > 64) return false;
+  const ids = [];
+  for (const rule of policy.rules) {
+    if (!isObject(rule) || typeof rule.id !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/.test(rule.id) ||
+      !['record', 'drop'].includes(rule.action) || !isObject(rule.match)) return false;
+    ids.push(rule.id);
+    const match = rule.match;
+    if (Object.keys(match).some((key) => !['actions', 'actor_kinds', 'actor_user_ids', 'target_user_ids'].includes(key))) return false;
+    for (const [key, allowed] of [['actions', ['create', 'update', 'delete']], ['actor_kinds', ['system', 'account']]]) {
+      const values = match[key] ?? [];
+      if (!Array.isArray(values) || values.length > 64 || !unique(values) || values.some((value) => !allowed.includes(value))) return false;
+    }
+    for (const key of ['actor_user_ids', 'target_user_ids']) {
+      const values = match[key] ?? [];
+      if (!Array.isArray(values) || values.length > 64 || !unique(values) ||
+        values.some((value) => !Number.isSafeInteger(value) || value <= 0)) return false;
+    }
+  }
+  return unique(ids);
+}
+
+function validAuditPolicyObservation(data) {
+  return isObject(data) && data.scope === 'instance' &&
+    Number.isSafeInteger(data.revision) && data.revision >= 0 &&
+    Number.isSafeInteger(data.filtered_total) && data.filtered_total >= 0 &&
+    Number.isSafeInteger(data.last_changed_at_unix_ms) && data.last_changed_at_unix_ms >= 0 &&
+    validAuditRecordingPolicy(data.policy);
+}
+
+function auditPolicyDraftFromWire(policy) {
+  return { default_action: policy.default_action, rules: policy.rules.map((rule) => ({
+    id: rule.id, action: rule.action,
+    actions: [...(rule.match.actions ?? [])], actor_kinds: [...(rule.match.actor_kinds ?? [])],
+    actor_user_ids: (rule.match.actor_user_ids ?? []).join('\n'), target_user_ids: (rule.match.target_user_ids ?? []).join('\n'),
+    match_all: Object.values(rule.match).every((values) => Array.isArray(values) && !values.length),
+  })) };
+}
+
+function auditPolicyWireFromDraft(draft) {
+  const parseIds = (raw) => {
+    const entries = raw.split(/[\s,]+/).filter(Boolean);
+    if (entries.length > 64 || entries.some((value) => !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))))
+      throw new Error(t('Use at most 64 unique positive account IDs per list.'));
+    const ids = entries.map(Number);
+    if (new Set(ids).size !== ids.length) throw new Error(t('Account ID lists cannot contain duplicates.'));
+    return ids;
+  };
+  if (draft.rules.length > 64) throw new Error(t('Account audit policy allows at most 64 ordered rules.'));
+  const policy = { default_action: draft.default_action, rules: draft.rules.map((rule) => {
+    const match = rule.match_all ? {} : {
+      actions: rule.actions, actor_kinds: rule.actor_kinds,
+      actor_user_ids: parseIds(rule.actor_user_ids), target_user_ids: parseIds(rule.target_user_ids),
+    };
+    if (!rule.match_all && Object.values(match).every((values) => !values.length))
+      throw new Error(t('Select a condition or explicitly choose Match all account changes.'));
+    return { id: rule.id.trim(), action: rule.action, match };
+  }) };
+  if (!validAuditRecordingPolicy(policy)) throw new Error(t('Account audit policy contains an invalid or duplicate rule.'));
+  const expanded = { default_action: policy.default_action, rules: policy.rules.map((rule) => ({
+    id: rule.id, action: rule.action, match: {
+      actions: rule.match.actions ?? [], actor_kinds: rule.match.actor_kinds ?? [],
+      actor_user_ids: rule.match.actor_user_ids ?? [], target_user_ids: rule.match.target_user_ids ?? [],
+    },
+  })) };
+  if (new TextEncoder().encode(JSON.stringify(expanded)).length > 65_536)
+    throw new Error(t('Account audit policy exceeds the 64 KiB encoded limit.'));
+  return policy;
+}
+
+function auditPolicyChanged() {
+  state.auditPolicy.dirty = true;
+  state.auditPolicy.notice = null;
+  state.auditPolicy.error = null;
+  $('#audit-policy-save').disabled = state.auditPolicy.saving || !state.auditPolicy.observation;
+}
+
+function renderAuditPolicy() {
+  const current = state.auditPolicy;
+  const root = $('#audit-policy-rules'); root.replaceChildren();
+  const available = !!current.observation && !!current.draft;
+  $('#audit-policy-default').disabled = !available || current.saving;
+  $('#audit-policy-add').disabled = !available || current.saving || current.draft.rules.length >= 64;
+  $('#audit-policy-refresh').disabled = current.saving;
+  $('#audit-policy-save').disabled = !available || current.saving || !current.dirty;
+  $('#audit-policy-meta').textContent = available
+    ? t('Local policy revision #{revision} · Filtered account events: {count} · Last changed: {time}', {
+      revision: current.observation.revision, count: formatNumber(current.observation.filtered_total),
+      time: current.observation.last_changed_at_unix_ms ? auditDate(current.observation.last_changed_at_unix_ms) : t('Never'),
+    }) : t('Account audit recording policy unavailable; no policy is assumed.');
+  message($('#audit-policy-message'), current.error || current.notice || '', current.error ? 'error' : 'warning');
+  if (!available) return;
+  $('#audit-policy-default').value = current.draft.default_action;
+  const checkbox = (container, labelText, checked, onChange) => {
+    const label = document.createElement('label');
+    label.className = 'user-enabled';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = checked; input.disabled = current.saving;
+    input.addEventListener('change', () => { onChange(input.checked); auditPolicyChanged(); });
+    label.append(input, ` ${t(labelText)}`); container.append(label);
+  };
+  for (const [index, rule] of current.draft.rules.entries()) {
+    const card = document.createElement('div'); card.className = 'panel user-card';
+    const heading = document.createElement('h3'); heading.textContent = t('Rule {number}', { number: index + 1 }); card.append(heading);
+    const inputLabel = document.createElement('label'); inputLabel.textContent = t('Rule ID');
+    const id = document.createElement('input'); id.type = 'text'; id.maxLength = 64; id.value = rule.id; id.disabled = current.saving;
+    id.addEventListener('input', () => { rule.id = id.value; auditPolicyChanged(); }); inputLabel.append(id); card.append(inputLabel);
+    const actionLabel = document.createElement('label'); actionLabel.textContent = t('Action');
+    const action = document.createElement('select'); action.disabled = current.saving;
+    for (const value of ['record', 'drop']) { const option = document.createElement('option'); option.value = value; option.textContent = t(value === 'record' ? 'Record' : 'Drop'); action.append(option); }
+    action.value = rule.action; action.addEventListener('change', () => { rule.action = action.value; auditPolicyChanged(); }); actionLabel.append(action); card.append(actionLabel);
+    checkbox(card, 'Match all account changes', rule.match_all, (checked) => { rule.match_all = checked; renderAuditPolicy(); });
+    if (!rule.match_all) {
+      for (const [field, values] of [['actions', ['create', 'update', 'delete']], ['actor_kinds', ['system', 'account']]]) {
+        const group = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = t(field === 'actions' ? 'Account actions' : 'Actor kinds'); group.append(legend);
+        for (const value of values) checkbox(group, value, rule[field].includes(value), (checked) => {
+          rule[field] = checked ? [...rule[field], value] : rule[field].filter((existing) => existing !== value);
+        });
+        card.append(group);
+      }
+      for (const field of ['actor_user_ids', 'target_user_ids']) {
+        const label = document.createElement('label'); label.textContent = t(field === 'actor_user_ids' ? 'Actor account IDs' : 'Target account IDs');
+        const input = document.createElement('textarea'); input.rows = 2; input.value = rule[field]; input.disabled = current.saving;
+        input.placeholder = t('Positive IDs separated by commas or lines');
+        input.addEventListener('input', () => { rule[field] = input.value; auditPolicyChanged(); }); label.append(input); card.append(label);
+      }
+    }
+    const buttons = document.createElement('div'); buttons.className = 'button-row';
+    for (const [label, offset] of [['Move up', -1], ['Move down', 1]]) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'button button-secondary'; button.textContent = t(label);
+      button.disabled = current.saving || index + offset < 0 || index + offset >= current.draft.rules.length;
+      button.addEventListener('click', () => { const rules = current.draft.rules; [rules[index], rules[index + offset]] = [rules[index + offset], rules[index]]; auditPolicyChanged(); renderAuditPolicy(); }); buttons.append(button);
+    }
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-secondary'; remove.textContent = t('Remove rule'); remove.disabled = current.saving;
+    remove.addEventListener('click', () => { current.draft.rules.splice(index, 1); auditPolicyChanged(); renderAuditPolicy(); }); buttons.append(remove); card.append(buttons);
+    root.append(card);
+  }
+}
+
+async function loadAuditPolicy(force = false) {
+  const current = state.auditPolicy;
+  if (!isAdmin() || !state.token) { resetAuditPolicy(); return; }
+  if (current.dirty && !force) {
+    const accepted = await confirmDialog({ title: t('Discard unsaved audit policy?'), body: t('Reloading replaces your unsaved account audit rules.'), accept: t('Discard and reload') });
+    if (!accepted) return;
+  }
+  const sequence = ++current.sequence;
+  current.error = null; current.notice = null;
+  try {
+    const { data } = await api('/v1/audit/policy');
+    if (sequence !== current.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (!validAuditPolicyObservation(data)) throw new Error(t('Account audit policy response is invalid.'));
+    current.observation = data; current.draft = auditPolicyDraftFromWire(data.policy); current.dirty = false;
+  } catch (error) {
+    if (sequence !== current.sequence || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    current.observation = null; current.draft = null; current.dirty = false; current.error = error.message;
+  }
+  renderAuditPolicy();
+}
+
+async function saveAuditPolicy() {
+  const current = state.auditPolicy;
+  if (!isAdmin() || !state.token || !current.observation || !current.draft || !current.dirty || current.saving) return;
+  let policy;
+  try { policy = auditPolicyWireFromDraft(current.draft); }
+  catch (error) { current.error = error.message; renderAuditPolicy(); return; }
+  const sequence = current.sequence; const generation = state.authGeneration; const token = state.token;
+  const stillCurrent = () => sequence === current.sequence && generation === state.authGeneration &&
+    token === state.token && state.view === 'audit' && isAdmin();
+  const accepted = await confirmDialog({
+    title: t('Publish account audit recording policy?'),
+    body: policy.default_action === 'drop'
+      ? t('The default action drops unmatched account create, update and delete records. Mandatory control receipts and configuration recovery evidence remain. Missing account records will not prove no change. Save this local policy?')
+      : t('Rules are evaluated in order. Drop rules omit matching account create, update and delete records only. Mandatory control receipts and configuration recovery evidence remain. Save this local policy?'),
+    accept: t('Save policy'),
+  });
+  if (!accepted || !stillCurrent()) return;
+  current.saving = true; current.error = null; current.notice = null; renderAuditPolicy();
+  try {
+    const { data } = await api('/v1/audit/policy', { method: 'PUT', json: { expected_revision: current.observation.revision, policy } });
+    if (!stillCurrent()) return;
+    if (!validAuditPolicyObservation(data) || data.revision <= current.observation.revision)
+      throw new Error(t('Account audit policy save response is invalid; refresh to verify its outcome.'));
+    current.observation = data; current.draft = auditPolicyDraftFromWire(data.policy); current.dirty = false;
+    await loadAudit(0, []);
+  } catch (error) {
+    if (!stillCurrent() || error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    current.error = error.status === 409 ? t('Audit policy changed. Refresh before deciding again; no automatic save retry was made.') :
+      error.status === 503 ? t('Audit policy save outcome is unknown. Refresh before deciding again; no automatic save retry was made.') : error.message;
+  } finally {
+    if (stillCurrent()) { current.saving = false; renderAuditPolicy(); }
+  }
+}
+
 function auditDate(unixMs) {
   if (!Number.isSafeInteger(unixMs) || unixMs < 0 || !Number.isFinite(new Date(unixMs).getTime())) return t('Unknown');
   return new Intl.DateTimeFormat(getLocale() === 'ko' ? 'ko-KR' : 'en-US', {
@@ -4000,6 +4217,14 @@ function auditChange(record) {
   if (record.action === 'config_operations_prune' && Number.isSafeInteger(record.affected_count)) parts.push(t('{count} terminal configuration operations pruned', { count: formatNumber(record.affected_count) }));
   if (record.action === 'prune' && Number.isSafeInteger(record.through_id)) parts.push(t('Through #{id}', { id: record.through_id }));
   if (record.action === 'config_operations_prune' && Number.isSafeInteger(record.through_id)) parts.push(t('Configuration operation through #{id}', { id: record.through_id }));
+  if (record.action === 'policy_change' && Number.isSafeInteger(record.policy_revision)) {
+    parts.push(t('Recording policy revision #{revision}', { revision: record.policy_revision }));
+    if (validAuditRecordingPolicy(record.policy_snapshot))
+      parts.push(t('Default: {action} · Ordered rules: {count}', {
+        action: t(record.policy_snapshot.default_action === 'drop' ? 'Drop' : 'Record'),
+        count: record.policy_snapshot.rules.length,
+      }));
+  }
   return parts.join(' · ') || t('No role or enabled-state change');
 }
 
@@ -4019,15 +4244,22 @@ function renderAudit() {
       scope, coverage, stored: formatNumber(page.stored_records), capacity: formatNumber(page.capacity),
       started: auditDate(page.started_at_unix_ms), observed: auditDate(page.server_time_unix_ms), writes: page.writes_available ? t('available') : t('blocked'),
     });
+    if (Number.isSafeInteger(page.filtered_total) && Number.isSafeInteger(page.policy_revision))
+      $('#audit-meta').textContent += ` · ${t('Policy revision #{revision} · Filtered: {count}', {
+        revision: page.policy_revision, count: formatNumber(page.filtered_total),
+      })}`;
     const notices = [];
     if (audit.notice) notices.push(audit.notice);
+    if (page.policy_revision === undefined || page.filtered_total === undefined)
+      notices.push(t('This server does not expose recording-filter coverage; completeness is unknown.'));
+    if (page.coverage_filtered) notices.push(t('This account audit is partial because a recording policy omitted events.'));
     if (page.truncated || page.pruned_through > 0) notices.push(t('Earlier records were pruned; this page is not the complete history.'));
     if (!page.writes_available) notices.push(t('Account changes are blocked while audit storage is full or unavailable. Export needed records before pruning.'));
     if (notices.length) message($('#audit-message'), notices.join(' '), page.writes_available && !audit.notice ? 'warning' : 'error');
     for (const record of page.records) {
       const tr = document.createElement('tr');
       const values = [record.id, auditDate(record.time_unix_ms),
-        t(record.action === 'config_operations_prune' ? 'Configuration operation history pruned' : `Audit ${record.action}`), auditActor(record),
+        t(record.action === 'config_operations_prune' ? 'Configuration operation history pruned' : record.action === 'policy_change' ? 'Audit policy changed' : `Audit ${record.action}`), auditActor(record),
         Number.isSafeInteger(record.target_user_id) ? `#${record.target_user_id}` : '—', auditChange(record)];
       for (const value of values) { const td = document.createElement('td'); td.textContent = String(value); tr.append(td); }
       rows.append(tr);
@@ -4053,6 +4285,10 @@ async function loadAudit(after = 0, previous = [], pageNumber = 1) {
     if (sequence !== state.audit.sequence || state.view !== 'audit' || !isAdmin()) return;
     if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
       !['bootstrap', 'create', 'update', 'delete', 'prune', 'config_operations_prune'].every((action) => data.coverage.includes(action)) ||
+      (data.policy_revision !== undefined && (!Number.isSafeInteger(data.policy_revision) || data.policy_revision < 0)) ||
+      (data.filtered_total !== undefined && (!Number.isSafeInteger(data.filtered_total) || data.filtered_total < 0)) ||
+      (data.coverage_filtered !== undefined && typeof data.coverage_filtered !== 'boolean') ||
+      (data.coverage.includes('policy_change') && (data.policy_revision === undefined || data.filtered_total === undefined || data.coverage_filtered === undefined)) ||
       !Array.isArray(data.records) || data.records.length > 100 ||
       !Number.isSafeInteger(data.latest_id) || data.latest_id < 0 || !Number.isSafeInteger(data.next_after) ||
       !Number.isSafeInteger(data.pruned_through) || data.pruned_through < 0 || typeof data.truncated !== 'boolean' ||
@@ -4061,7 +4297,10 @@ async function loadAudit(after = 0, previous = [], pageNumber = 1) {
       !Number.isSafeInteger(data.started_at_unix_ms) || data.started_at_unix_ms < 0 ||
       !Number.isSafeInteger(data.server_time_unix_ms) || data.server_time_unix_ms < 0 || typeof data.writes_available !== 'boolean' ||
       typeof data.has_more !== 'boolean' ||
-      data.records.some((record, index) => !isObject(record) || !Number.isSafeInteger(record.id) || record.id <= (index ? data.records[index - 1].id : after) || record.id > data.latest_id) ||
+      data.records.some((record, index) => !isObject(record) || !Number.isSafeInteger(record.id) || record.id <= (index ? data.records[index - 1].id : after) || record.id > data.latest_id ||
+        (record.policy_revision !== undefined && (!Number.isSafeInteger(record.policy_revision) || record.policy_revision < 0 || record.policy_revision > data.policy_revision)) ||
+        (record.action === 'policy_change' && (!Number.isSafeInteger(record.policy_revision) || !validAuditRecordingPolicy(record.policy_snapshot))) ||
+        (record.action !== 'policy_change' && record.policy_snapshot != null)) ||
       data.next_after !== (data.records.at(-1)?.id ?? after) || (data.records.length && data.oldest_id === null))
       throw new Error(t('Account audit response is invalid.'));
     state.audit.page = data;
@@ -4083,6 +4322,8 @@ function exportAuditPage() {
   if (!isAdmin() || !page?.records?.length) return;
   const exportDocument = { scope: 'instance', coverage: page.coverage, exported_page_after: state.audit.after,
     started_at_unix_ms: page.started_at_unix_ms, oldest_id: page.oldest_id, latest_id_at_read: page.latest_id,
+    policy_revision: page.policy_revision ?? null, filtered_total: page.filtered_total ?? null,
+    coverage_filtered: page.coverage_filtered ?? null,
     pruned_through: page.pruned_through, truncated: page.truncated, has_more: page.has_more,
     server_time_unix_ms: page.server_time_unix_ms, records: page.records };
   const url = URL.createObjectURL(new Blob([JSON.stringify(exportDocument, null, 2)], { type: 'application/json' }));
@@ -4926,6 +5167,22 @@ $('#utility-copy-credential').addEventListener('click', copyUtilityCredential);
 $('#verify-session').addEventListener('click', verifySession);
 $('#refresh-users').addEventListener('click', () => loadUsers().catch((error) => message($('#users-message'), error.message, 'error')));
 $('#audit-refresh').addEventListener('click', () => loadAudit(0, []));
+$('#audit-policy-refresh').addEventListener('click', () => loadAuditPolicy());
+$('#audit-policy-default').addEventListener('change', (event) => {
+  if (!state.auditPolicy.draft) return;
+  state.auditPolicy.draft.default_action = event.target.value;
+  auditPolicyChanged();
+});
+$('#audit-policy-add').addEventListener('click', () => {
+  const draft = state.auditPolicy.draft;
+  if (!draft || draft.rules.length >= 64) return;
+  let number = draft.rules.length + 1;
+  while (draft.rules.some((rule) => rule.id === `rule-${number}`)) number += 1;
+  draft.rules.push({ id: `rule-${number}`, action: 'record', actions: [], actor_kinds: [],
+    actor_user_ids: '', target_user_ids: '', match_all: false });
+  auditPolicyChanged(); renderAuditPolicy();
+});
+$('#audit-policy-save').addEventListener('click', saveAuditPolicy);
 $('#audit-previous').addEventListener('click', () => {
   const previous = state.audit.previous.slice();
   if (!previous.length) return;
