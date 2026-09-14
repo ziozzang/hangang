@@ -1441,6 +1441,7 @@ pub struct Snapshot {
         std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
     pub public_http_tls:
         std::collections::HashMap<String, std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
+    pub public_http_generations: std::collections::HashMap<String, std::sync::Arc<()>>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
     pub upstream_tls: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
     // Fingerprints of the exact custom CA certificates used by prepared TLS.
@@ -2039,6 +2040,26 @@ impl Snapshot {
             )
         };
         let mut public_http_tls = std::collections::HashMap::new();
+        let mut public_http_generations = std::collections::HashMap::new();
+        for listener in config
+            .public_http
+            .iter()
+            .filter(|listener| listener.enabled)
+        {
+            let old = previous
+                .filter(|snapshot| {
+                    snapshot
+                        .config
+                        .public_http
+                        .iter()
+                        .any(|prior| prior.enabled && prior == listener)
+                })
+                .and_then(|snapshot| snapshot.public_http_generations.get(&listener.id));
+            public_http_generations.insert(
+                listener.id.clone(),
+                old.cloned().unwrap_or_else(|| std::sync::Arc::new(())),
+            );
+        }
         for listener in config
             .public_http
             .iter()
@@ -2075,6 +2096,7 @@ impl Snapshot {
             jwt_routes,
             http_workload_tls,
             public_http_tls,
+            public_http_generations,
             sni_regex: regexes.sni,
             upstream_tls,
             upstream_trust,
@@ -2355,6 +2377,28 @@ mod tests {
         next.validate_transition_from(&old).unwrap_err();
         old.http[0].resource_policy.as_mut().unwrap().enforce = false;
         next.validate_transition_from(&old).unwrap();
+    }
+    #[test]
+    fn public_listener_generation_does_not_revive_after_disable() {
+        let mut config = route();
+        config
+            .public_http
+            .push(serde_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap());
+        let first = Snapshot::new(config.clone()).unwrap();
+        let same = Snapshot::replace(config.clone(), &first).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &first.public_http_generations["edge"],
+            &same.public_http_generations["edge"]
+        ));
+        config.public_http[0].enabled = false;
+        let disabled = Snapshot::replace(config.clone(), &same).unwrap();
+        assert!(!disabled.public_http_generations.contains_key("edge"));
+        config.public_http[0].enabled = true;
+        let restored = Snapshot::replace(config, &disabled).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.public_http_generations["edge"],
+            &restored.public_http_generations["edge"]
+        ));
     }
     #[test]
     fn activation_defaults_preserve_legacy_json_and_disabled_policy_round_trips() {
