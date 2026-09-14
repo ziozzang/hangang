@@ -992,6 +992,7 @@ impl Admin {
             account_token,
             interval,
             cursor: self.traffic.latest_id(),
+            tcp_cursor: self.manager.metrics.tcp_history.latest_event_id(),
             done: false,
             _permit: permit,
         };
@@ -1031,6 +1032,25 @@ impl Admin {
                     );
                     events.push_str("\n\n");
                 }
+                let active = state.admin.manager.metrics.tcp_history.active(None, 128);
+                let recent = state
+                    .admin
+                    .manager
+                    .metrics
+                    .tcp_history
+                    .recent(Some(state.tcp_cursor), 128);
+                state.tcp_cursor = recent.next_after;
+                if !active.records.is_empty() || !recent.records.is_empty() || recent.gap {
+                    events.push_str("event: tcp_connections\ndata: ");
+                    events.push_str(
+                        &serde_json::to_string(&serde_json::json!({
+                            "active": active,
+                            "recent": recent,
+                        }))
+                        .expect("TCP connection batches are serializable"),
+                    );
+                    events.push_str("\n\n");
+                }
             }
             Some((
                 Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(events))),
@@ -1064,6 +1084,8 @@ impl Admin {
             let is_new = path == "/v1/status"
                 || path == "/v1/geoip/status"
                 || path == "/v1/geoip/lookup"
+                || path == "/v1/connections/tcp/active"
+                || path == "/v1/connections/tcp/recent"
                 || path == "/v1/config/validate"
                 || path == "/v1/config/operations"
                 || path == "/v1/config/operations/prune"
@@ -1503,6 +1525,31 @@ impl Admin {
             };
             let batch = self.traffic.snapshot_since(after, limit);
             return Ok(json_value(200, &batch, None));
+        }
+        if path == "/v1/connections/tcp/active" || path == "/v1/connections/tcp/recent" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let Some((after, limit)) = tcp_history_query(req.uri().query()) else {
+                return Ok(problem(
+                    400,
+                    "Invalid TCP Connection Query",
+                    "invalid connection cursor or limit",
+                ));
+            };
+            let history = &self.manager.metrics.tcp_history;
+            if path == "/v1/connections/tcp/active" {
+                let batch = history.active(after, limit);
+                if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                    return Ok(account_problem(error));
+                }
+                return Ok(auth_json(200, &batch));
+            }
+            let batch = history.recent(after, limit);
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            return Ok(auth_json(200, &batch));
         }
         if path == "/v1/certificates" {
             if req.method() != hyper::Method::GET {
@@ -2252,6 +2299,7 @@ struct EventStreamState {
     account_token: Option<String>,
     interval: tokio::time::Interval,
     cursor: u64,
+    tcp_cursor: u64,
     done: bool,
     _permit: OwnedSemaphorePermit,
 }
@@ -2344,6 +2392,40 @@ fn traffic_query(query: Option<&str>) -> Option<(Option<u64>, usize)> {
                 }
                 "limit" if !seen_limit => {
                     limit = value.parse::<usize>().ok()?;
+                    if !(1..=128).contains(&limit) {
+                        return None;
+                    }
+                    seen_limit = true;
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some((after, limit))
+}
+
+/// These cursors are displayed as decimal strings in JSON because they may
+/// exceed JavaScript's exact integer range. Accept only that canonical form.
+fn tcp_history_query(query: Option<&str>) -> Option<(Option<u64>, usize)> {
+    let mut after = None;
+    let mut limit = 128;
+    let mut seen_limit = false;
+    if let Some(query) = query {
+        if query.is_empty() || query.len() > 128 {
+            return None;
+        }
+        for pair in query.split('&') {
+            let (name, value) = pair.split_once('=')?;
+            if value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || (value.starts_with('0') && value.len() > 1)
+            {
+                return None;
+            }
+            match name {
+                "after" if after.is_none() => after = Some(value.parse().ok()?),
+                "limit" if !seen_limit => {
+                    limit = value.parse().ok()?;
                     if !(1..=128).contains(&limit) {
                         return None;
                     }
