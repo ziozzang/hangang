@@ -1286,6 +1286,9 @@ impl Admin {
         if path == "/v1/audit/users" || path == "/v1/audit/users/prune" {
             return Ok(self.handle_user_audit(req, &path, &actor).await);
         }
+        if path == "/v1/audit/policy" {
+            return Ok(self.handle_audit_policy(req, &actor).await);
+        }
         if path == "/v1/users" || path.starts_with("/v1/users/") {
             return Ok(self.handle_users(req, &path, &actor).await);
         }
@@ -3315,6 +3318,63 @@ impl Admin {
             .await
         {
             Ok(result) => auth_json(200, &result),
+            Err(error) => account_problem(error),
+        }
+    }
+
+    async fn handle_audit_policy(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Audit Policy Query",
+                "audit policy does not accept query parameters",
+            );
+        }
+        let result = match *req.method() {
+            hyper::Method::GET => self.users.audit_policy(actor.mutation_authority()).await,
+            hyper::Method::PUT => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Update {
+                    expected_revision: u64,
+                    policy: crate::admin_users::AuditPolicy,
+                }
+                let body: Update = match read_json(req, 128 * 1024).await {
+                    Ok(body) => body,
+                    Err(response) => return response,
+                };
+                if body.expected_revision > 9_007_199_254_740_991 || body.policy.validate().is_err()
+                {
+                    return problem(
+                        400,
+                        "Invalid Audit Policy",
+                        "use a safe revision and bounded, valid account audit rules",
+                    );
+                }
+                self.users
+                    .set_audit_policy(
+                        actor.mutation_authority(),
+                        body.expected_revision,
+                        body.policy,
+                    )
+                    .await
+            }
+            _ => return problem(405, "Method Not Allowed", "GET or PUT required"),
+        };
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        match result {
+            Ok(policy) => auth_json(200, &policy),
+            Err(error) if error.is::<crate::admin_users::AuditConflict>() => problem(
+                409,
+                "Audit Policy Conflict",
+                "audit policy changed; refresh before deciding again",
+            ),
             Err(error) => account_problem(error),
         }
     }

@@ -5473,6 +5473,192 @@ async fn receipt_release_endpoint_rejects_unsupported_invalid_and_revoked_reques
 }
 
 #[tokio::test]
+async fn account_audit_policy_filters_selected_changes_and_preserves_policy_history() {
+    let (address, manager, _dir) = server().await;
+    let _ = account_admin_token(address).await;
+    let endpoint = "/v1/audit/policy";
+    let (status, headers, body) = request(address, "GET", endpoint, None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let original = json(&body);
+    assert_eq!(original["revision"], 0);
+    assert_eq!(original["policy"]["default_action"], "record");
+    let policy = serde_json::json!({
+        "default_action":"record",
+        "rules":[{"id":"omit-system-creation","action":"drop","match":{"actions":["create"],"actor_kinds":["system"]}}]
+    });
+    let payload = serde_json::json!({"expected_revision":0,"policy":policy}).to_string();
+    let (status, _, body) = request(address, "PUT", endpoint, Some(&payload), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["revision"], 1);
+    assert_eq!(
+        request(address, "PUT", endpoint, Some(&payload), None)
+            .await
+            .0,
+        409
+    );
+    let user = r#"{"username":"filtered-user","password":"safe-fixture-password","role":"viewer"}"#;
+    let (status, _, body) = request(address, "POST", "/v1/users", Some(user), None).await;
+    assert_eq!(status, 201);
+    let user_id = json(&body)["user"]["id"].as_i64().unwrap();
+    let (status, _, body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert_eq!(status, 200);
+    let page = json(&body);
+    assert_eq!(page["filtered_total"], 1);
+    assert_eq!(page["coverage_filtered"], true);
+    assert_eq!(page["policy_revision"], 1);
+    let records = page["records"].as_array().unwrap();
+    assert!(!records.iter().any(|r| r["action"] == "create"));
+    let changed = records
+        .iter()
+        .find(|r| r["action"] == "policy_change")
+        .unwrap();
+    assert_eq!(changed["policy_revision"], 1);
+    assert_eq!(
+        changed["policy_snapshot"]["rules"][0]["id"],
+        "omit-system-creation"
+    );
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &format!("/v1/users/{user_id}"),
+            None,
+            None
+        )
+        .await
+        .0,
+        204
+    );
+    let (_, _, body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert!(
+        json(&body)["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["action"] == "delete" && r["policy_revision"] == 1)
+    );
+    // Changing the observation policy does not publish a proxy configuration.
+    assert_eq!(manager.active.load().config.revision, 0);
+    let reopened =
+        hangang::admin_users::Store::open(manager.state_path.with_extension("admin-users.sqlite3"))
+            .unwrap();
+    let saved = reopened
+        .audit_policy(hangang::admin_users::MutationAuthority::System)
+        .await
+        .unwrap();
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.filtered_total, 1);
+    let payload = r#"{"expected_revision":1,"policy":{"default_action":"drop","rules":[]}}"#;
+    assert_eq!(
+        request(address, "PUT", endpoint, Some(payload), None)
+            .await
+            .0,
+        200
+    );
+    let (_, _, body) = request(address, "GET", "/v1/audit/users", None, None).await;
+    assert!(
+        json(&body)["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["action"] == "policy_change"
+                && record["policy_revision"] == 2
+                && record["policy_snapshot"]["default_action"] == "drop")
+    );
+    let route = r#"{"id":"recovery-journal","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(route), Some(0))
+            .await
+            .0,
+        201
+    );
+    let operations = config_operation_records(address).await;
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["state"], "candidate_activated");
+}
+
+#[tokio::test]
+async fn account_audit_policy_rejects_invalid_and_revoked_updates_without_changes() {
+    let (address, _, _dir) = server().await;
+    let endpoint = "/v1/audit/policy";
+    for payload in [
+        r#"{"expected_revision":0,"policy":{"default_action":"drop","extra":1}}"#,
+        r#"{"expected_revision":0,"policy":{"default_action":"drop","rules":[{"id":"bad","action":"drop","match":{"actions":["prune"]}}]}}"#,
+        r#"{"expected_revision":0,"policy":{"default_action":"record","rules":[{"id":"bad","action":"drop","match":{"actor_user_ids":[0]}}]}}"#,
+        r#"{"expected_revision":9007199254740992,"policy":{"default_action":"drop","rules":[]}}"#,
+    ] {
+        assert_eq!(
+            request(address, "PUT", endpoint, Some(payload), None)
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        request(address, "GET", "/v1/audit/policy?unused=1", None, None)
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        request(address, "POST", endpoint, Some("{}"), None).await.0,
+        405
+    );
+    assert_eq!(
+        request_with_token(address, "GET", endpoint, None, None, None)
+            .await
+            .0,
+        401
+    );
+    let token = account_admin_token(address).await;
+    let payload = r#"{"expected_revision":0,"policy":{"default_action":"drop","rules":[]}}"#;
+    let mut pending =
+        admitted_config_mutation_waiting_for_body(address, "PUT", endpoint, &token, payload).await;
+    revoke_account_session(address, &token).await;
+    assert_eq!(finish_user_mutation(&mut pending, payload).await, 403);
+    let (_, _, body) = request(address, "GET", endpoint, None, None).await;
+    assert_eq!(json(&body)["revision"], 0);
+    assert_eq!(json(&body)["filtered_total"], 0);
+    let viewer =
+        r#"{"username":"policy-viewer","password":"policy-viewer-password","role":"viewer"}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/users", Some(viewer), None)
+            .await
+            .0,
+        201
+    );
+    let credentials = r#"{"username":"policy-viewer","password":"policy-viewer-password"}"#;
+    let (status, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(credentials),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let login = json(&body);
+    let viewer_token = login["token"].as_str().unwrap();
+    for method in ["GET", "PUT"] {
+        assert_eq!(
+            request_with_token(
+                address,
+                method,
+                endpoint,
+                if method == "PUT" { Some(payload) } else { None },
+                None,
+                Some(viewer_token)
+            )
+            .await
+            .0,
+            403
+        );
+    }
+}
+
+#[tokio::test]
 async fn retained_commit_receipt_validates_query_and_reports_unsupported() {
     let (address, _, _directory) = server().await;
     let query = "authority_id=11111111111111111111111111111111&operation_id=22222222222222222222222222222222";
