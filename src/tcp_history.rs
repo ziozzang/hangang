@@ -314,7 +314,7 @@ impl History {
             listen,
             peer_ip: peer.ip().to_canonical(),
             route_id: None,
-            policy_source,
+            policy_source: None,
         }
     }
 
@@ -480,6 +480,9 @@ impl Guard {
     }
 
     pub fn set_route(&mut self, route: &str) {
+        if self.untracked {
+            return;
+        }
         let route = bounded_id(route, 128);
         self.route_id = Some(route.clone());
         self.with_entry(|entry| entry.route_id = Some(route));

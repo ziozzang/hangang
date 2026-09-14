@@ -166,6 +166,47 @@ async fn held_completion_uses_current_policy_without_consuming_filtered_event_id
 }
 
 #[tokio::test]
+async fn held_completion_matches_removed_route_and_listener_address() {
+    let (backend, origin) = echo_origin().await;
+    let fixture = Fixture::new(backend, json!({}), Duration::ZERO, 8).await;
+    let mut client = TcpStream::connect(fixture.front).await.unwrap();
+    client.write_all(b"held").await.unwrap();
+    until(|| fixture.active_rows()["records"][0]["phase"] == "forwarding").await;
+
+    // The accepted stream keeps its original route and listen metadata after
+    // the listener is removed. Completion policy must still be able to match it.
+    let mut document = serde_json::to_value(fixture.active.load().config.clone()).unwrap();
+    document["revision"] = json!(1);
+    document["tcp"] = json!([]);
+    document["settings"] = json!({
+        "tcp_recent_recording": {
+            "default_action": "record",
+            "rules": [{"id": "removed-listener", "action": "drop", "match": {
+                "listen_addresses": [fixture.front],
+                "route_ids": ["observed"],
+                "outcomes": ["eof"]
+            }}]
+        }
+    });
+    let changed: Config = serde_json::from_value(document).unwrap();
+    let prepared = fixture.manager.prepare(&changed).await.unwrap();
+    fixture
+        .active
+        .store(Arc::new(Snapshot::new(changed).unwrap()));
+    fixture.manager.commit(prepared).await;
+
+    client.shutdown().await.unwrap();
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).await.unwrap();
+    assert_eq!(answer, b"held");
+    until(|| fixture.recent()["filtered_total"] == "1").await;
+    assert_eq!(fixture.recent()["latest_event_id"], "0");
+    assert!(fixture.recent()["records"].as_array().unwrap().is_empty());
+    fixture.manager.shutdown(Duration::ZERO).await;
+    origin.abort();
+}
+
+#[tokio::test]
 async fn early_ip_denial_uses_canonical_peer_and_final_outcome_filter() {
     let (backend, origin) = echo_origin().await;
     let fixture = Fixture::new(
@@ -188,6 +229,14 @@ async fn early_ip_denial_uses_canonical_peer_and_final_outcome_filter() {
     .await;
     let _client = TcpStream::connect(fixture.front).await.unwrap();
     until(|| fixture.recent()["filtered_total"] == "1").await;
+    assert_eq!(
+        fixture
+            .metrics
+            .rejected_connections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "recording policy must not suppress aggregate rejection metrics"
+    );
     assert_eq!(fixture.recent()["latest_event_id"], "0");
     assert!(
         fixture.active_rows()["records"]
