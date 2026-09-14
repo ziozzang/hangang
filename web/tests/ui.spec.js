@@ -71,7 +71,7 @@ test('authenticates in memory and renders live status accessibly', async ({ page
   await expect(page.locator('#process-id')).toHaveText('4242');
   expect(calls.find((call) => call.path === '/v1/status').headers.authorization).toBe('Bearer secret-value');
   const stored = await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage), cookie: document.cookie, url: location.href, input: document.querySelector('#token-input').value }));
-  expect(stored).toEqual({ local: [], session: [], cookie: '', url: 'http://127.0.0.1:41739/ui/#status', input: '' });
+  expect(stored).toEqual({ local: [], session: [], cookie: '', url: `http://127.0.0.1:${process.env.HANGANG_UI_TEST_PORT || 41739}/ui/#status`, input: '' });
 });
 
 test('rejects a bad token without retaining it', async ({ page }) => {
@@ -1407,4 +1407,57 @@ test('an indeterminate store outcome is surfaced verbatim with a reload action',
   const before = reloaded;
   await page.locator('#route-message').getByRole('button', { name: 'Reload routes' }).click();
   await expect.poll(() => reloaded).toBeGreaterThan(before);
+});
+
+test('public listener editor stages HTTPS without discarding config', async ({ page }) => {
+  const original = { ...config, public_http: [{ id: 'plain', listen: '0.0.0.0:8081', trusted_proxy_cidrs: [], certificates: [] }], geoip_database: { path: '/var/lib/geoip/country.mmdb' } };
+  await fixtures(page, { '/v1/config': route => route.fulfill({ json: original, headers: { etag: '"7"' } }) });
+  await login(page); await page.locator('[data-view="config"]').click();
+  await openSection(page, 'Public HTTP listeners');
+  await page.locator('#public-http-panel').getByRole('button', { name: 'Add public listener' }).click();
+  const form = page.locator('#public-http-form');
+  await form.locator('[name="id"]').fill('secure');
+  await form.locator('[name="listen"]').fill('0.0.0.0:8443');
+  await form.getByRole('button', { name: 'Add certificate' }).click();
+  const cert = form.locator('.public-certificate');
+  await cert.locator('[name="id"]').fill('site');
+  await cert.locator('[name="hosts"]').fill('api.example.test');
+  await cert.locator('[name="cert_file"]').fill('/run/secrets/site.crt');
+  await cert.locator('[name="key_file"]').fill('/run/secrets/site.key');
+  await form.getByRole('button', { name: 'Stage listener in document' }).click();
+  const draft = JSON.parse(await page.locator('#config-editor').inputValue());
+  expect(draft.public_http).toHaveLength(2);
+  expect(draft.public_http[1]).toMatchObject({ id: 'secure', certificates: [{ id: 'site', hosts: ['api.example.test'] }], trusted_proxy_cidrs: [] });
+  expect(draft.geoip_database).toEqual(original.geoip_database);
+  expect(draft.http).toEqual(original.http);
+  await page.locator('#public-http-panel').getByRole('button', { name: 'Deactivate' }).first().click();
+  expect(JSON.parse(await page.locator('#config-editor').inputValue()).public_http[0].enabled).toBe(false);
+});
+
+test('public listener fields and route scope render in Korean', async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(navigator, 'language', { configurable: true, get: () => 'ko-KR' }));
+  await fixtures(page); await page.goto('/ui/');
+  await page.locator('#token-input').fill('correct-token');
+  await page.locator('#login-submit').click();
+  await page.locator('[data-view="config"]').click();
+  await expect(page.locator('#public-http-panel summary')).toContainText('공개 HTTP 리스너');
+  await page.locator('[data-view="http"]').click();
+  await page.locator('[data-new-route="http"]').click();
+  await expect(page.locator('#route-form .field', { has: page.locator('[name="listener_ids"]') })).toContainText('공개 리스너 ID');
+});
+
+test('route public listener scope preserves protected policy', async ({ page }) => {
+  const scoped = { ...config.http[0], access_mode: 'protected', basic_auth: { realm: 'restricted', credentials: [CREDENTIAL], hide_credentials: false, identity_header: null }, resource_policy: { resource_id: 'api', principal: { source: 'basic' }, allow: [] } };
+  const calls = await fixtures(page, {
+    '/v1/routes/http': route => route.fulfill({ json: { revision: 7, routes: [scoped] }, headers: { etag: '"7"' } }),
+    '/v1/routes/http/api': route => route.request().method() === 'PUT' ? route.fulfill({ json: { revision: 8, route: route.request().postDataJSON() }, headers: { etag: '"8"' } }) : route.fulfill({ json: scoped, headers: { etag: '"7"' } }),
+  });
+  await login(page); await page.getByRole('link', { name: 'HTTP routes' }).click();
+  await page.getByRole('button', { name: 'Edit' }).click();
+  await page.locator('#route-form [name="listener_ids"]').fill('edge\ndefault');
+  await page.getByRole('button', { name: 'Save route' }).click();
+  const saved = JSON.parse(calls.find(call => call.path === '/v1/routes/http/api' && call.method === 'PUT').body);
+  expect(saved.listener_ids).toEqual(['edge', 'default']);
+  expect(saved.basic_auth).toEqual(scoped.basic_auth);
+  expect(saved.resource_policy).toEqual(scoped.resource_policy);
 });

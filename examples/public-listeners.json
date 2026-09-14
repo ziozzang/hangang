@@ -1,0 +1,24 @@
+{
+  "revision": 0,
+  "public_http": [
+    {
+      "id": "public-api",
+      "listen": "0.0.0.0:8080",
+      "enabled": true,
+      "certificates": [],
+      "trusted_proxy_cidrs": ["192.0.2.0/24"]
+    },
+    {
+      "id": "secure-api",
+      "listen": "0.0.0.0:8443",
+      "certificates": [
+        {"id": "secure-api", "hosts": ["api.example.test"], "cert_file": "/run/secrets/api.crt", "key_file": "/run/secrets/api.key"}
+      ],
+      "trusted_proxy_cidrs": []
+    }
+  ],
+  "http": [
+    {"id": "api", "listener_ids": ["public-api", "secure-api"], "path_prefix": "/", "backends": ["http://127.0.0.1:9000"]}
+  ],
+  "tcp": []
+}

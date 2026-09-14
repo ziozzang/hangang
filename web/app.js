@@ -1978,6 +1978,7 @@ function httpSections(route) {
     section({ title: 'Matching', open: true, fields: [
       field('Route ID', 'id', route.id || '', { required: true, pattern: '[A-Za-z0-9._-]+', maxlength: 128, readonly: editing, help: editing ? 'Route IDs cannot be renamed in place.' : 'Letters, digits, dots, underscores and dashes; at most 128 characters.' }),
       span2(field('Route enabled', 'enabled', route.enabled !== false, { checkbox: true, help: 'Disabled routes keep their settings but do not match new traffic. Re-enabling validates the route again.' })),
+      span2(field('Public listener IDs', 'listener_ids', (route.listener_ids || []).join('\n'), { textarea: true, help: 'One public listener ID per line. Blank uses only the legacy CLI listener; default names that listener explicitly. Dedicated workload mTLS routes cannot use this field.' })),
       field('Matching priority', 'priority', route.priority ?? 0, { type: 'number', min: -2147483648, max: 2147483647, help: 'Higher numbers match first; default 0. Equal HTTP priorities retain configuration order.' }),
       ...hostMatchFields(route),
       field('Path prefix', 'path_prefix', route.path_prefix || '', { placeholder: '/v1/', help: 'Must start with /. Blank matches every path.' }),
@@ -2428,6 +2429,13 @@ function routeFromForm() {
   if (checked('enabled')) delete route.enabled; else route.enabled = false;
   route.priority = integer('priority', 'Matching priority', { min: -2147483648, max: 2147483647 });
   route.backends = readBackendValues(route.backends);
+  if (type === 'http') {
+    const ids = lines('listener_ids');
+    if (ids.length > 64 || new Set(ids).size !== ids.length || ids.some((id) => id !== 'default' && !/^[A-Za-z0-9._-]{1,64}$/.test(id)))
+      throw new Error(t('Public listener IDs must be 1–64 distinct ASCII names'));
+    if (ids.length && route.workload_auth) throw new Error(t('Public listener IDs cannot be combined with workload authentication'));
+    if (ids.length) route.listener_ids = ids; else delete route.listener_ids;
+  }
   route.deny_cidrs = lines('deny_cidrs');
   if (route.deny_cidrs.length > 1024) throw new Error(t('At most 1,024 denied CIDRs are allowed'));
   for (const cidr of route.deny_cidrs) if (!/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr)) throw new Error(t('Denied CIDR must be address/prefix: {cidr}', { cidr }));
@@ -2607,6 +2615,7 @@ function routeFromForm() {
         throw new Error(t('Workload identity header conflicts with another verified identity header'));
       route.workload_auth = { ...(isObject(route.workload_auth) ? route.workload_auth : {}), listener_ids: listenerIds, allowed_uri_sans: allowed, identity_header: identity };
     } else if (Object.hasOwn(route, 'workload_auth')) route.workload_auth = null;
+    if (route.workload_auth && route.listener_ids?.length) throw new Error(t('Public listener IDs cannot be combined with workload authentication'));
 
     const accessMode = raw('access_mode');
     if (state.editing.originalId && state.editing.value.access_mode === 'protected' && accessMode === 'legacy') {
@@ -2871,6 +2880,7 @@ function syncRouteControlsFromJson() {
     form.elements['workload_allowed_uri_sans'].value = Array.isArray(auth?.allowed_uri_sans) ? auth.allowed_uri_sans.join('\n') : '';
     form.elements['workload_identity_header'].value = auth?.identity_header ?? '';
   }
+  if (form.elements.listener_ids) form.elements.listener_ids.value = Array.isArray(draft.listener_ids) ? draft.listener_ids.join('\n') : '';
   if (form.elements['resource_policy_action'] && (draft.resource_policy === null || draft.resource_policy === undefined || isObject(draft.resource_policy))) {
     const policy = isObject(draft.resource_policy) ? draft.resource_policy : null;
     const principal = isObject(policy?.principal) ? policy.principal : {};
@@ -3498,7 +3508,7 @@ function openWorkloadListener(index) {
     for (const name of ['cert_file', 'key_file', 'client_ca_file', 'client_crl_file']) form.elements[name].value = item?.tls?.[name] ?? '';
     form.elements.allowed_uri_sans.value = Array.isArray(item?.tls?.allowed_uri_sans) ? item.tls.allowed_uri_sans.join('\n') : '';
     form.elements.handshake_timeout_ms.value = item?.tls?.handshake_timeout_ms ?? 5000;
-    form.elements.id.focus();
+    form.querySelector('#public-http-id').focus();
   } catch (error) { message($('#workload-http-message'), error.message, 'error'); }
 }
 
@@ -3524,6 +3534,90 @@ function renderWorkloadListeners(draft) {
   refreshWorkloadMaterialBadges();
 }
 
+function ensurePublicListenersPanel() {
+  if ($('#public-http-panel')) return;
+  const panel = document.createElement('details'); panel.className = 'form-section'; panel.id = 'public-http-panel';
+  const summary = document.createElement('summary'); const title = document.createElement('span'); title.className = 'section-title'; copy(title, 'Public HTTP listeners'); summary.append(title);
+  const note = document.createElement('p'); note.className = 'section-note'; copy(note, 'Ordered listener definitions bind on this instance after Apply configuration. Empty certificates serve HTTP; configured certificates serve HTTPS. Proxy trust is local to each listener and never inherits global trusted proxies.');
+  const list = document.createElement('div'); list.id = 'public-http-list'; list.className = 'user-list';
+  const add = document.createElement('button'); add.type = 'button'; add.className = 'button button-secondary'; copy(add, 'Add public listener'); add.addEventListener('click', () => openPublicListener(-1));
+  const form = document.createElement('form'); form.id = 'public-http-form'; form.className = 'form-grid'; form.hidden = true;
+  const control = (label, name, options = {}) => {
+    const wrap = document.createElement('div'); wrap.className = 'field'; const caption = document.createElement('label'); caption.htmlFor = `public-http-${name}`; copy(caption, label);
+    const input = document.createElement(options.textarea ? 'textarea' : 'input'); input.id = caption.htmlFor; input.name = name;
+    if (!options.textarea) input.type = options.checkbox ? 'checkbox' : 'text';
+    if (options.checkbox) wrap.classList.add('user-enabled');
+    wrap.append(caption, input); form.append(wrap);
+  };
+  control('Listener ID', 'id'); control('Listen address', 'listen'); control('Listener enabled', 'enabled', { checkbox: true });
+  control('Allowed proxy peer CIDRs', 'trusted_proxy_cidrs', { textarea: true });
+  const certNote = document.createElement('p'); certNote.className = 'section-note span-2'; copy(certNote, 'Certificate entries use file paths and SNI hosts. A default certificate has no hosts. Empty entries serve plain HTTP.'); form.append(certNote);
+  const certs = document.createElement('div'); certs.id = 'public-http-certificates'; certs.className = 'span-2 user-list'; form.append(certs);
+  const addCert = document.createElement('button'); addCert.type = 'button'; addCert.className = 'button button-secondary'; copy(addCert, 'Add certificate'); addCert.addEventListener('click', () => addPublicCertificate({})); form.append(addCert);
+  const actions = document.createElement('div'); actions.className = 'button-row span-2';
+  const stage = document.createElement('button'); stage.type = 'submit'; stage.className = 'button button-primary'; copy(stage, 'Stage listener in document');
+  const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button button-secondary'; copy(cancel, 'Cancel listener edit'); cancel.addEventListener('click', () => { form.hidden = true; }); actions.append(stage, cancel); form.append(actions);
+  const msg = document.createElement('div'); msg.id = 'public-http-message'; msg.className = 'inline-message'; msg.setAttribute('aria-live', 'polite');
+  form.addEventListener('submit', (event) => { event.preventDefault(); try {
+    const index = Number(form.dataset.editIndex), listener = publicListenerFromForm(form);
+    mutatePublicListeners((items) => { if (items.some((item, pos) => pos !== index && item.id === listener.id)) throw new Error(t('Public listener ID already exists')); if (index < 0) items.push(listener); else items[index] = listener; });
+    message(msg, t('Listener staged. Apply configuration to publish it.'), 'success');
+  } catch (error) { message(msg, error.message, 'error'); } });
+  panel.append(summary, note, list, add, form, msg); $('#settings-section').after(panel);
+}
+function addPublicCertificate(value) {
+  const row = document.createElement('div'); row.className = 'form-grid public-certificate';
+  for (const [name, label, textarea] of [['id','Certificate ID'],['hosts','SNI hosts',true],['cert_file','Certificate file'],['key_file','Private key file'],['issuer_status_file','Issuer status file']]) {
+    const wrap = document.createElement('div'); wrap.className = 'field'; const caption = document.createElement('label'); copy(caption, label);
+    const input = document.createElement(textarea ? 'textarea' : 'input'); input.name = name; if (!textarea) input.type = 'text'; input.value = name === 'hosts' ? (value.hosts || []).join('\n') : value[name] || ''; caption.append(input); wrap.append(caption); row.append(wrap);
+  }
+  for (const [name, label] of [['default','Default certificate'],['enabled','Certificate enabled']]) { const wrap = document.createElement('label'); wrap.className = 'user-enabled'; const input = document.createElement('input'); input.type = 'checkbox'; input.name = name; input.checked = name === 'enabled' ? value.enabled !== false : value.default === true; wrap.append(input, document.createTextNode(t(label))); row.append(wrap); }
+  const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove'); remove.addEventListener('click', () => row.remove()); row.append(remove); $('#public-http-certificates').append(row);
+}
+function publicListenerFromForm(form) {
+  const id = form.querySelector('#public-http-id').value.trim(), listen = form.querySelector('#public-http-listen').value.trim();
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(id) || id === 'default') throw new Error(t('Public listener ID must be 1–64 ASCII letters, digits, dots, underscores or dashes, excluding default'));
+  const socket = /^(?:\[[0-9a-fA-F:.]+\]|[0-9.]+):(\d{1,5})$/.exec(listen);
+  if (!socket || +socket[1] < 1 || +socket[1] > 65535) throw new Error(t('Public listen address must be ip:port with a nonzero port'));
+  const cidrs = nonemptyLines(form.querySelector('#public-http-trusted_proxy_cidrs').value);
+  if (cidrs.length > 1024 || cidrs.some((cidr) => !/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr))) throw new Error(t('Public trusted proxies require address/prefix CIDRs, at most 1,024'));
+  const certificates = [...form.querySelectorAll('.public-certificate')].map((row) => {
+    const get = (name) => row.querySelector(`[name="${name}"]`), value = (name) => get(name).value.trim();
+    const cert = { id: value('id'), hosts: nonemptyLines(value('hosts')), cert_file: value('cert_file'), key_file: value('key_file') };
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(cert.id) || cert.hosts.length > 128 || (!get('default').checked && !cert.hosts.length) || (get('default').checked && cert.hosts.length)) throw new Error(t('Certificate ID or SNI hosts are invalid'));
+    if (!validInboundTlsPath(cert.cert_file) || !validInboundTlsPath(cert.key_file)) throw new Error(t('Certificate and key must be absolute normalized file paths'));
+    if (value('issuer_status_file')) { if (!validInboundTlsPath(value('issuer_status_file'))) throw new Error(t('Issuer status must be an absolute normalized file path')); cert.issuer_status_file = value('issuer_status_file'); }
+    if (get('default').checked) cert.default = true; if (!get('enabled').checked) cert.enabled = false; return cert;
+  });
+  if (certificates.length > 1024 || new Set(certificates.map((cert) => cert.id)).size !== certificates.length) throw new Error(t('Certificate IDs must be unique, at most 1,024'));
+  return { id, listen, ...(form.querySelector('#public-http-enabled').checked ? {} : { enabled: false }), certificates, trusted_proxy_cidrs: cidrs };
+}
+function mutatePublicListeners(change) {
+  const draft = parseConfigEditor();
+  if (!isObject(draft) || (draft.public_http !== undefined && !Array.isArray(draft.public_http))) throw new Error(t('Document public_http must be an array'));
+  const items = structuredClone(draft.public_http || []); change(items); if (items.length > 64) throw new Error(t('At most 64 public listeners are allowed'));
+  draft.public_http = items; $('#config-editor').value = JSON.stringify(draft, null, 2); configInput(); updateConfigPreview(); renderPublicListeners(draft);
+}
+function openPublicListener(index) {
+  try { const draft = parseConfigEditor(), item = index < 0 ? null : draft.public_http?.[index];
+    const form = $('#public-http-form'); form.dataset.editIndex = String(index); form.hidden = false;
+    form.querySelector('#public-http-id').value = item?.id || ''; form.querySelector('#public-http-listen').value = item?.listen || ''; form.querySelector('#public-http-enabled').checked = item?.enabled !== false;
+    form.querySelector('#public-http-trusted_proxy_cidrs').value = Array.isArray(item?.trusted_proxy_cidrs) ? item.trusted_proxy_cidrs.join('\n') : '';
+    $('#public-http-certificates').replaceChildren(); for (const cert of item?.certificates || []) addPublicCertificate(cert); form.querySelector('#public-http-id').focus();
+  } catch (error) { message($('#public-http-message'), error.message, 'error'); }
+}
+function renderPublicListeners(draft) {
+  ensurePublicListenersPanel(); const list = $('#public-http-list'); list.replaceChildren(); $('#public-http-form').hidden = true;
+  for (const [index, item] of (Array.isArray(draft?.public_http) ? draft.public_http : []).entries()) {
+    const row = document.createElement('div'); row.className = 'button-row';
+    const title = document.createElement('strong'); title.textContent = `${item?.id || '?'} · ${item?.listen || '?'} · ${item?.certificates?.length ? 'HTTPS' : 'HTTP'}`;
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button button-secondary'; copy(edit, 'Edit'); edit.addEventListener('click', () => openPublicListener(index));
+    const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'button button-quiet'; copy(toggle, item?.enabled === false ? 'Activate' : 'Deactivate'); toggle.addEventListener('click', () => { try { mutatePublicListeners((items) => { if (items[index].enabled === false) delete items[index].enabled; else items[index].enabled = false; }); } catch (error) { message($('#public-http-message'), error.message, 'error'); } });
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-quiet'; copy(remove, 'Remove'); remove.addEventListener('click', () => { try { mutatePublicListeners((items) => items.splice(index, 1)); } catch (error) { message($('#public-http-message'), error.message, 'error'); } });
+    row.append(title, edit, toggle, remove); list.append(row);
+  }
+}
+
 async function loadConfig(force) {
   if (state.configDirty && !force && state.config) return;
   const editor = $('#config-editor'); editor.disabled = true; message($('#config-message'), t('Loading active configuration…'));
@@ -3542,6 +3636,7 @@ function showConfigDocument(data) {
   showSettings(isObject(data) ? data.settings : undefined);
   showGeoIpSource(isObject(data) ? data.geoip_database : undefined);
   renderWorkloadListeners(data);
+  renderPublicListeners(data);
 }
 
 function parseConfigEditor() {
@@ -3553,7 +3648,7 @@ function configInput() { state.configDirty = true; $('#config-dirty').hidden = f
 /** A hand-edited document drives the fleet-settings controls (the reverse direction is syncSettingsToDocument). */
 function configEditorInput() {
   configInput();
-  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) { showSettings(value.settings); showGeoIpSource(value.geoip_database); renderWorkloadListeners(value); } } catch (_) { /* mid-edit; the controls keep their values */ }
+  try { const value = JSON.parse($('#config-editor').value); if (isObject(value)) { showSettings(value.settings); showGeoIpSource(value.geoip_database); renderWorkloadListeners(value); renderPublicListeners(value); } } catch (_) { /* mid-edit; the controls keep their values */ }
 }
 
 function ensureGeoIpPanel() {
