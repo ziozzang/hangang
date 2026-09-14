@@ -92,6 +92,7 @@ struct Generation {
     number: u64,
     available: bool,
     exhausted: bool,
+    cancel: CancellationToken,
     peers: Vec<Peer>,
     seen: Mutex<Vec<Seen>>,
 }
@@ -182,6 +183,7 @@ fn prepare(specs: Vec<Spec>, number: u64) -> Result<Generation> {
         number,
         available: true,
         exhausted: false,
+        cancel: CancellationToken::new(),
         peers,
         seen: Mutex::new(seen),
     })
@@ -318,6 +320,16 @@ async fn poll(peer: Peer) -> std::result::Result<WireObservation, &'static str> 
     }
 }
 
+async fn poll_guarded<F>(cancel: CancellationToken, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! { biased;
+        _ = cancel.cancelled() => None,
+        result = future => Some(result),
+    }
+}
+
 fn publish_result(
     generation: &Generation,
     index: usize,
@@ -381,10 +393,12 @@ impl Runtime {
             return;
         }
         if old.number == u64::MAX {
+            old.cancel.cancel();
             self.state.store(Arc::new(Generation {
                 number: old.number,
                 available: false,
                 exhausted: true,
+                cancel: CancellationToken::new(),
                 peers: Vec::new(),
                 seen: Mutex::new(Vec::new()),
             }));
@@ -396,9 +410,11 @@ impl Runtime {
                 number: old.number + 1,
                 available: false,
                 exhausted: false,
+                cancel: CancellationToken::new(),
                 peers: Vec::new(),
                 seen: Mutex::new(Vec::new()),
             });
+        old.cancel.cancel();
         self.state.store(Arc::new(next));
     }
 
@@ -459,17 +475,21 @@ impl Runtime {
                         let peer = &state.peers[index];
                         let peer = Peer { spec: peer.spec.clone(), client: peer.client.clone() };
                         let generation = state.clone();
-                        tasks.spawn(async move { let result = poll(peer).await; (generation, index, Instant::now(), result) });
+                        tasks.spawn(async move {
+                            let result = poll_guarded(generation.cancel.clone(), poll(peer)).await;
+                            (generation, index, Instant::now(), result)
+                        });
                     }
                 }
                 Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Ok((generation, index, completed, result)) = done {
                         if !Arc::ptr_eq(&generation, &self.state.load_full()) { continue; }
-                        publish_result(&generation, index, completed, result);
+                        if let Some(result) = result { publish_result(&generation, index, completed, result); }
                     }
                 }
             }
         }
+        self.state.load().cancel.cancel();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         self.watching.store(false, Ordering::Release);
@@ -650,6 +670,7 @@ mod tests {
         fs::write(&path, b"invalid").unwrap();
         runtime.refresh().await;
         assert!(!runtime.status()["available"].as_bool().unwrap());
+        assert!(old.cancel.is_cancelled());
         assert_eq!(runtime.status()["generation"], "2");
         assert!(runtime.status()["expected_nodes"].is_null());
         assert!(runtime.status()["fresh_nodes"].is_null());
@@ -678,5 +699,48 @@ mod tests {
         // Once the first four become eligible again, never-attempted peers
         // must still go first; a fixed index scan would starve them.
         assert_eq!(due_indices(&mut waiting, now + POLL, 4), vec![4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_never_starts_poll_and_releases_budget() {
+        use std::sync::atomic::AtomicUsize;
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let contacted = Arc::new(AtomicUsize::new(0));
+        let marker = contacted.clone();
+        let result = poll_guarded(cancelled, async move {
+            marker.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(result.is_none());
+        assert_eq!(contacted.load(Ordering::SeqCst), 0);
+
+        let (dir, path) = fixture(serde_json::json!([]));
+        let secret = token(dir.path());
+        fs::write(&path, serde_json::json!({"peers":[{"node_id":"one","endpoint":"https://localhost:9000","token_file":secret}]}).to_string()).unwrap();
+        let runtime = Runtime::open(path.clone(), None).await.unwrap();
+        let old = runtime.state.load_full();
+        let mut tasks = JoinSet::new();
+        for _ in 0..4 {
+            let cancellation = old.cancel.clone();
+            tasks.spawn(
+                async move { poll_guarded(cancellation, std::future::pending::<()>()).await },
+            );
+        }
+        tokio::task::yield_now().await;
+        fs::write(path, b"invalid").unwrap();
+        runtime.refresh().await;
+        assert!(old.cancel.is_cancelled());
+        for _ in 0..4 {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(tasks.is_empty());
     }
 }
