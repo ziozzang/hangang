@@ -571,6 +571,15 @@ impl Store {
                 PRAGMA user_version=6;",
             )?;
         }
+        let release_guards: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='admin_config_operations' AND name IN ('admin_v2_release_delete_guard','admin_v2_release_version_guard')",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            release_guards == 2,
+            "local V2 release deletion guards missing"
+        );
         let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
@@ -4400,5 +4409,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(work.state, ConfigReleaseState::Pending);
+    }
+
+    #[tokio::test]
+    async fn reopening_v6_requires_both_local_v2_deletion_guards() {
+        let (directory, store) = store();
+        let operation = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let connection = connection(&path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER admin_v2_release_delete_guard")
+            .unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT operation_id FROM admin_config_operations WHERE id=?1",
+                    params![operation.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            operation.operation_id
+        );
     }
 }
