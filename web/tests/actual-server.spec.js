@@ -79,7 +79,7 @@ test.describe('actual embedded Hangang server', () => {
     await openSection(page, 'Basic authentication');
     await page.getByLabel('Credentials', { exact: true }).fill(credential);
     await page.getByLabel('Realm').fill('ops');
-    await page.getByLabel('Identity header').fill('x-authenticated-user');
+    await page.locator('input[name="basic_auth_identity_header"]').fill('x-authenticated-user');
     await page.getByLabel('Hide credentials from the upstream').check();
     await openSection(page, 'Response headers');
     await page.getByLabel('Set response headers').fill('x-frame-options: DENY');
