@@ -97,3 +97,12 @@ test-upstream:
 	cargo test --locked --test upstream_http --test upstream_dns --test tcp_outbound
 	cargo build --locked
 	python3 examples/upstream/run.py
+
+.PHONY: test-fleet
+test-fleet:
+	cargo build --locked --bin hangang
+	python3 examples/fleet-observer/run.py
+	python3 tests/fleet_observer_tls.py
+	HANGANG_FLEET_BROWSER=1 python3 tests/fleet_collector_https.py
+	python3 tests/fleet_collector_transport.py
+	python3 tests/fleet_inventory_reload.py

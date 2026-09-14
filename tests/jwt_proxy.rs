@@ -431,14 +431,15 @@ async fn jwt_precedes_external_authorization_and_origin_hides_bearer() {
         auth_seen.lock().unwrap().is_empty(),
         "bad JWT cannot reach external auth"
     );
+    let sent_token = good_token();
     assert_eq!(
-        request(front, "/secure/records", Some(&good_token()), &[]).await,
+        request(front, "/secure/records", Some(&sent_token), &[]).await,
         200
     );
     {
         let auth = auth_seen.lock().unwrap();
         assert_eq!(auth.len(), 1);
-        assert_eq!(auth[0]["authorization"], format!("Bearer {}", good_token()));
+        assert_eq!(auth[0]["authorization"], format!("Bearer {sent_token}"));
         let origin = origin_seen.lock().unwrap();
         assert_eq!(origin.len(), 1);
         assert!(origin[0].get("authorization").is_none());
