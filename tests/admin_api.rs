@@ -350,9 +350,10 @@ async fn fleet_collector_reports_configured_unknown_without_network_on_read() {
     for path in [&token_path, &inventory_path] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let runtime = hangang::fleet_collector::Runtime::open(inventory_path, Some(TOKEN))
+    let runtime = hangang::fleet_collector::Runtime::open(inventory_path.clone(), Some(TOKEN))
         .await
         .unwrap();
+    let runtime_for_watch = runtime.clone();
     let (address, _) = server_on_with_observer(
         state_path,
         config,
@@ -395,6 +396,28 @@ async fn fleet_collector_reports_configured_unknown_without_network_on_read() {
             .any(|w| w == PEER_TOKEN.as_bytes())
     );
     assert!(!String::from_utf8_lossy(&body).contains(token_path.to_str().unwrap()));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = tokio::spawn(runtime_for_watch.watch(cancel.clone()));
+    fs::write(&inventory_path, b"invalid inventory").unwrap();
+    let unavailable = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (_, _, body) = request(address, "GET", "/v1/fleet/observations", None, None).await;
+            let value = json(&body);
+            if value["available"] == false {
+                break value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(unavailable["configured"], true);
+    assert!(unavailable["generation"].as_str().is_some());
+    assert!(unavailable["expected_nodes"].is_null());
+    assert!(unavailable["fresh_nodes"].is_null());
+    assert_eq!(unavailable["nodes"], serde_json::json!([]));
+    cancel.cancel();
+    watcher.await.unwrap();
 }
 
 #[tokio::test]
