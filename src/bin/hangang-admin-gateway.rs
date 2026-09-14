@@ -27,8 +27,9 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, UnixStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
+    signal::unix::{SignalKind, signal},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::{JoinHandle, JoinSet},
 };
 
 #[derive(Parser)]
@@ -51,6 +52,9 @@ struct Args {
     header_bytes: usize,
     #[arg(long, default_value_t = 60)]
     idle_seconds: u64,
+    /// Time to let active responses finish after SIGTERM or SIGINT.
+    #[arg(long, default_value_t = 25)]
+    shutdown_grace_seconds: u64,
 }
 
 struct State {
@@ -319,6 +323,10 @@ fn validate(args: &Args) -> Result<()> {
         (5..=3600).contains(&args.idle_seconds),
         "idle-seconds must be 5..3600"
     );
+    ensure!(
+        (1..=30).contains(&args.shutdown_grace_seconds),
+        "shutdown-grace-seconds must be 1..30"
+    );
     Ok(())
 }
 
@@ -326,6 +334,10 @@ fn validate(args: &Args) -> Result<()> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate(&args)?;
+    // Register before binding so PID 1 handles TERM from the first instant
+    // the listener can become visible to a supervisor.
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let listener = TcpListener::bind(args.listen).await?;
     // The address is useful for supervisors and lets an owned :0 fixture
     // confirm readiness from this process instead of probing a released port.
@@ -344,15 +356,24 @@ async fn main() -> Result<()> {
         requests: Arc::new(Semaphore::new(args.max_requests)),
         max_body_bytes: args.max_body_bytes,
     });
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks = JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            biased;
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
+            result = listener.accept() => result?,
+        };
         let Ok(permit) = connections.clone().try_acquire_owned() else {
             continue;
         };
         let state = state.clone();
+        let mut shutdown = shutdown_rx.clone();
         let idle = Duration::from_secs(args.idle_seconds);
         let header_bytes = args.header_bytes;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
+            let _permit = permit;
             let (stream, watch) = IdleIo::new(stream, idle);
             let service = service_fn(move |request| {
                 let state = state.clone();
@@ -367,8 +388,29 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = &mut connection => {},
                 _ = watch.expired() => {},
+                changed = shutdown.changed() => {
+                    if changed.is_ok() {
+                        connection.as_mut().graceful_shutdown();
+                        let _ = connection.await;
+                    }
+                },
             }
-            drop(permit);
         });
+        // Completed connections must be reaped during normal service as well
+        // as during shutdown; otherwise their JoinSet entries accumulate.
+        while tasks.try_join_next().is_some() {}
     }
+    drop(listener);
+    let _ = shutdown_tx.send(true);
+    // Long-lived SSE responses and stalled clients cannot extend container
+    // shutdown beyond this deadline. Dropping their tasks closes both hops.
+    if tokio::time::timeout(Duration::from_secs(args.shutdown_grace_seconds), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tasks.abort_all();
+    }
+    Ok(())
 }
