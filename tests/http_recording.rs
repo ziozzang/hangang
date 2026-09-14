@@ -72,6 +72,16 @@ impl Fixture {
 }
 
 async fn fixture(recording: Value, trusted: bool, request_limit: usize, ipv6: bool) -> Fixture {
+    fixture_with_history(recording, trusted, request_limit, ipv6, true).await
+}
+
+async fn fixture_with_history(
+    recording: Value,
+    trusted: bool,
+    request_limit: usize,
+    ipv6: bool,
+    with_history: bool,
+) -> Fixture {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_address = origin.local_addr().unwrap();
     let origin_hits = Arc::new(AtomicUsize::new(0));
@@ -125,10 +135,12 @@ async fn fixture(recording: Value, trusted: bool, request_limit: usize, ipv6: bo
     let policy_pool = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 2));
     let traffic = Arc::new(TrafficHistory::default());
     let metrics = Arc::new(Metrics::default());
-    let proxy = Proxy::new(active.clone(), policy_pool.clone(), metrics.clone())
-        .with_traffic_history(traffic.clone())
+    let mut proxy = Proxy::new(active.clone(), policy_pool.clone(), metrics.clone())
         .with_access_log(true)
         .with_request_limit(request_limit);
+    if with_history {
+        proxy = proxy.with_traffic_history(traffic.clone());
+    }
     let front_listener = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
         .await
         .unwrap();
@@ -450,5 +462,50 @@ async fn access_trace_shares_the_ring_decision_and_never_emits_query_or_raw_host
     );
     assert_eq!(f.batch()["records"].as_array().unwrap().len(), 1);
     assert_eq!(f.batch()["filtered_total"], 1);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn access_trace_only_still_applies_recording_filter_without_a_traffic_ring() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(true)
+        .with_env_filter("hangang::access=info")
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let f = fixture_with_history(
+        recording(
+            "drop",
+            vec![rule(
+                "visible",
+                "record",
+                json!({"path_prefixes":["/ok/visible"]}),
+            )],
+        ),
+        false,
+        8,
+        false,
+        false,
+    )
+    .await;
+    assert_eq!(status(&f, "/ok/hidden?token=hidden-secret", &[]).await, 200);
+    assert_eq!(
+        status(&f, "/ok/visible?token=visible-secret", &[]).await,
+        200
+    );
+    let trace = capture.text();
+    assert_eq!(trace.matches("hangang::access").count(), 1, "{trace}");
+    assert!(trace.contains("/ok/visible"), "{trace}");
+    assert!(!trace.contains("/ok/hidden"), "{trace}");
+    assert!(
+        !trace.contains("hidden-secret") && !trace.contains("visible-secret"),
+        "{trace}"
+    );
+    assert!(f.batch()["records"].as_array().unwrap().is_empty());
+    assert_eq!(f.origin_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(f.metrics.requests.load(Ordering::SeqCst), 2);
     f.close().await;
 }
