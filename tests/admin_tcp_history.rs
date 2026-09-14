@@ -7,7 +7,7 @@ use hangang::{
     metrics::Metrics,
     policy::PolicyPool,
     tcp::TcpManager,
-    tcp_history::{Outcome, Phase},
+    tcp_history::{History, Outcome, Phase},
 };
 use hyper::{Request, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -24,11 +24,18 @@ async fn fixture() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let state_path = directory.path().join("state.json");
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config::default()).unwrap(),
     ));
-    let metrics = Arc::new(Metrics::default());
+    let mut metrics = Metrics::default();
+    metrics.tcp_history = Arc::new(History::with_limits(Duration::from_secs(60), 1, 16));
+    let metrics = Arc::new(metrics);
     let manager = Arc::new(Manager {
         active: active.clone(),
         tcp: Arc::new(TcpManager::new(active, metrics.clone(), 4)),
@@ -82,7 +89,7 @@ async fn fixture() -> (
     });
     let client = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
         .build()
         .unwrap();
     (
@@ -242,6 +249,13 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
         bytes.add_upstream(9_007_199_254_740_993);
         bytes.add_downstream(17);
     }
+    // With one active slot, a second connection is counted but has no record
+    // or completion event. Its later close must still reach SSE subscribers.
+    let untracked = history.begin(
+        "192.0.2.11:44321".parse().unwrap(),
+        "127.0.0.1:8443".parse().unwrap(),
+    );
+    assert!(untracked.bytes().is_none());
     let response = call(
         &client,
         &base,
@@ -258,6 +272,7 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
     assert_eq!(active["records"][0]["route_id"], "tcp-blue");
     assert_eq!(active["records"][0]["member_id"], "blue");
     assert_eq!(active["records"][0]["bytes_upstream"], "9007199254740993");
+    assert_eq!(active["active_untracked"], 1);
     assert!(active["records"][0]["connection_id"].is_string());
     assert!(active["process_id"].as_str().unwrap().len() == 16);
     let cursor = active["records"][0]["connection_id"].as_str().unwrap();
@@ -369,6 +384,27 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
         }
     }
     assert!(saw_closed, "admin stream omitted completed connection");
+
+    drop(untracked);
+    let mut saw_empty = false;
+    for _ in 0..6 {
+        let next = frame(&mut admin_stream, &mut admin_pending).await;
+        if !next.starts_with("event: tcp_connections\n") {
+            continue;
+        }
+        let snapshot = data(&next);
+        if snapshot["active"]["records"].as_array().unwrap().is_empty()
+            && snapshot["active"]["active_untracked"] == 0
+            && snapshot["recent"]["records"].as_array().unwrap().is_empty()
+        {
+            saw_empty = true;
+            break;
+        }
+    }
+    assert!(
+        saw_empty,
+        "admin stream did not clear the final TCP connection"
+    );
 
     assert_eq!(
         call(

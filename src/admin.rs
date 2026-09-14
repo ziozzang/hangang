@@ -1040,17 +1040,15 @@ impl Admin {
                     .tcp_history
                     .recent(Some(state.tcp_cursor), 128);
                 state.tcp_cursor = recent.next_after;
-                if !active.records.is_empty() || !recent.records.is_empty() || recent.gap {
-                    events.push_str("event: tcp_connections\ndata: ");
-                    events.push_str(
-                        &serde_json::to_string(&serde_json::json!({
-                            "active": active,
-                            "recent": recent,
-                        }))
-                        .expect("TCP connection batches are serializable"),
-                    );
-                    events.push_str("\n\n");
-                }
+                events.push_str("event: tcp_connections\ndata: ");
+                events.push_str(
+                    &serde_json::to_string(&serde_json::json!({
+                        "active": active,
+                        "recent": recent,
+                    }))
+                    .expect("TCP connection batches are serializable"),
+                );
+                events.push_str("\n\n");
             }
             Some((
                 Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(events))),
