@@ -3308,7 +3308,7 @@ async function loadCertificates(force) {
 function renderCertificates(certificates) {
   const root = $('#certificate-list');
   if (!certificates.length) {
-    root.replaceChildren(emptyNode('No file certificates', 'Add certificate paths before serving TLS with --config-tls.'));
+    root.replaceChildren(emptyNode('No file certificates', state.certificateScope === 'default' ? 'Add certificate paths before serving TLS with --config-tls.' : 'Add certificate paths to serve HTTPS on this listener.'));
     return;
   }
   root.replaceChildren(...certificates.map((certificate) => {
@@ -3352,6 +3352,7 @@ async function setCertificateEnabled(id, enabled, button) {
     $('#certificate-editor').value = JSON.stringify(active, null, 2);
     renderCertificates(active);
     await loadCertificateInventory();
+    if (!certificateScopeCurrent(scope, generation)) return;
     message($('#certificate-message'));
   } catch (error) {
     if (!certificateScopeCurrent(scope, generation)) return;
@@ -3359,6 +3360,7 @@ async function setCertificateEnabled(id, enabled, button) {
     if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
     if (isRevisionConflict(error) || isIndeterminate(error)) {
       try { await loadCertificates(false); } catch (_) { /* keep original error */ }
+      if (!certificateScopeCurrent(scope, generation)) return;
     }
     message($('#certificate-message'), isRevisionConflict(error) ? t('The configuration changed on the server. Reloaded certificates; review their current state before retrying.') : isIndeterminate(error) ? t('The certificate activation outcome is unknown. Reloaded certificates; verify their current state before retrying.') : error.message, 'error');
   } finally { setBusy(button, false); }
@@ -3449,7 +3451,11 @@ async function applyCertificates() {
     if (!certificateScopeCurrent(scope, generation)) return;
     if (isRevisionConflict(error)) message($('#certificate-message'), t('The configuration changed while certificates were being applied. Your draft is preserved; review and apply again.'), 'error');
     else if (isIndeterminate(error)) message($('#certificate-message'), error.message, 'error', { label: t('Reload current revision'), run: () => rebaseCertificateDraft(certificates, scope, generation) });
-    else if (next && isRejection(error)) message($('#certificate-message'), await validationDetail(next, error.message), 'error');
+    else if (next && isRejection(error)) {
+      const detail = await validationDetail(next, error.message);
+      if (!certificateScopeCurrent(scope, generation)) return;
+      message($('#certificate-message'), detail, 'error');
+    }
     else message($('#certificate-message'), error.message, 'error');
   } finally { setBusy(button, false); }
 }

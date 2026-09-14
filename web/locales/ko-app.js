@@ -604,6 +604,7 @@ export default {
   'No users': '사용자 없음', 'Create an account above.': '위에서 계정을 만드세요.',
   'Hide': '숨기기', 'Show': '표시', 'Hide token': '토큰 숨기기', 'Show token': '토큰 표시',
   'Loading certificate paths…': '인증서 경로 불러오는 중…',
+  'Add certificate paths to serve HTTPS on this listener.': '이 리스너에서 HTTPS를 제공하려면 인증서 경로를 추가하세요.',
   'No file certificates': '파일 인증서 없음', 'Add certificate paths before serving TLS with --config-tls.': '--config-tls로 TLS를 제공하기 전에 인증서 경로를 추가하세요.',
   '{count} host': '호스트 {count}개', '{count} hosts': '호스트 {count}개', 'Files': '파일',
   'Invalid certificate JSON: {detail}': '인증서 JSON이 올바르지 않습니다: {detail}',

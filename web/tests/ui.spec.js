@@ -1535,6 +1535,7 @@ test('certificate scope switch discards draft and prevents a pending save in the
   await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
   await page.locator('#certificate-scope').selectOption('edge');
   await expect(page.locator('#certificate-editor')).toHaveValue('[]');
+  await expect(page.locator('#certificate-list')).toContainText('Add certificate paths to serve HTTPS on this listener.');
   await page.locator('#certificate-editor').fill(JSON.stringify([{ id: 'draft', hosts: ['edge.test'], cert_file: '/edge.crt', key_file: '/edge.key' }]));
   blocked = true;
   await page.locator('#apply-certificates').click();
@@ -1577,4 +1578,74 @@ test('Korean certificate selector distinguishes default and named listeners', as
   await expect(page.locator('label[for="certificate-scope"]')).toHaveText('인증서 리스너');
   await expect(page.locator('#certificate-scope option[value="default"]')).toHaveText('기본 CLI 리스너');
   await expect(page.locator('#certificate-scope option[value="edge"]')).toHaveText('edge');
+});
+
+test('certificate validation detail cannot overwrite a new listener scope', async ({ page }) => {
+  const active = { ...config, public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, validating = false;
+  await fixtures(page, {
+    '/v1/config': route => route.request().method() === 'PUT'
+      ? route.fulfill({ status: 422, json: { title: 'Configuration Invalid', detail: 'rejected' }, contentType: 'application/problem+json' })
+      : route.fulfill({ json: active, headers: { etag: '"7"' } }),
+    '/v1/config/validate': async route => { validating = true; await new Promise(resolve => { release = resolve; }); return route.fulfill({ status: 422, json: { title: 'Configuration Invalid', detail: 'old scope validation detail' }, contentType: 'application/problem+json' }); },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await page.locator('#certificate-editor').fill(JSON.stringify([{ id: 'site', hosts: ['site.test'], cert_file: '/site.crt', key_file: '/site.key' }]));
+  await page.locator('#apply-certificates').click();
+  await expect.poll(() => validating).toBe(true);
+  await page.locator('#certificate-scope').selectOption('edge');
+  await expect(page.locator('#certificate-editor')).toHaveValue('[]');
+  release();
+  await expect(page.locator('#certificate-message')).not.toContainText('old scope validation detail');
+});
+
+test('late certificate activation inventory cannot clear a new scope error', async ({ page }) => {
+  const cert = { id: 'same', hosts: ['default.test'], cert_file: '/default.crt', key_file: '/default.key' };
+  let active = { ...config, certificates: [cert], public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, waiting = false, defaultReads = 0;
+  await fixtures(page, {
+    '/v1/config': route => {
+      if (route.request().method() === 'PUT') { active = { ...route.request().postDataJSON(), revision: 8 }; return route.fulfill({ json: active, headers: { etag: '"8"' } }); }
+      return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+    },
+    '/v1/certificates': async route => {
+      const scope = new URL(route.request().url()).searchParams.get('listener_id');
+      if (scope === 'default' && ++defaultReads === 2) { waiting = true; await new Promise(resolve => { release = resolve; }); }
+      return route.fulfill({ json: { listener_id: scope, revision: active.revision, mode: 'configured_files', total: 0, offset: 0, limit: 32, certificates: [], in_process_acme: null } });
+    },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await page.locator('#certificate-list').getByRole('button', { name: 'Deactivate' }).click();
+  await expect.poll(() => waiting).toBe(true);
+  await page.locator('#certificate-scope').selectOption('edge');
+  await page.locator('#certificate-editor').fill('{');
+  await page.locator('#apply-certificates').click();
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
+  release();
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
+});
+
+test('late certificate activation conflict cannot overwrite a new scope error', async ({ page }) => {
+  const cert = { id: 'same', hosts: ['default.test'], cert_file: '/default.crt', key_file: '/default.key' };
+  const active = { ...config, certificates: [cert], public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, waiting = false, defaultReads = 0;
+  await fixtures(page, {
+    '/v1/config': route => route.request().method() === 'PUT'
+      ? route.fulfill({ status: 409, json: { title: 'Revision Conflict', detail: 'stale revision' }, contentType: 'application/problem+json' })
+      : route.fulfill({ json: active, headers: { etag: '"7"' } }),
+    '/v1/certificates': async route => {
+      const scope = new URL(route.request().url()).searchParams.get('listener_id');
+      if (scope === 'default' && ++defaultReads === 2) { waiting = true; await new Promise(resolve => { release = resolve; }); }
+      return route.fulfill({ json: { listener_id: scope, revision: 7, mode: 'configured_files', total: 0, offset: 0, limit: 32, certificates: [], in_process_acme: null } });
+    },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await page.locator('#certificate-list').getByRole('button', { name: 'Deactivate' }).click();
+  await expect.poll(() => waiting).toBe(true);
+  await page.locator('#certificate-scope').selectOption('edge');
+  await page.locator('#certificate-editor').fill('{');
+  await page.locator('#apply-certificates').click();
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
+  release();
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
 });
