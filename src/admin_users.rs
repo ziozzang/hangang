@@ -2165,12 +2165,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let receipt = v2_receipt(&first);
-        let work = store
-            .prepare_config_release(&first.operation_id, &receipt)
-            .await
-            .unwrap();
-        store.acknowledge_config_release(&work).await.unwrap();
         store
             .finish_config(&third.operation_id, ConfigOperationState::Indeterminate)
             .await
@@ -3757,6 +3751,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let receipt = v2_receipt(&first);
+        let work = store
+            .prepare_config_release(&first.operation_id, &receipt)
+            .await
+            .unwrap();
+        store.acknowledge_config_release(&work).await.unwrap();
         let page = store
             .config_operations(MutationAuthority::System, 0, 100)
             .await
