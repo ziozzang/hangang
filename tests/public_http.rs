@@ -12,6 +12,7 @@ use hangang::{
 use http_body_util::Full;
 use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use sha2::{Digest, Sha256};
 use std::{convert::Infallible, net::SocketAddr, os::fd::OwnedFd, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -350,6 +351,93 @@ async fn forwarded_headers_require_listener_specific_proxy_trust() {
         status_with(listen, "/filtered", spoof)
             .await
             .starts_with("HTTP/1.1 403")
+    );
+    running.shutdown().await;
+    origin_task.abort();
+}
+
+fn protected_route(
+    id: &str,
+    path: &str,
+    backend: SocketAddr,
+    listener_ids: &[&str],
+    priority: i32,
+) -> serde_json::Value {
+    let salt = b"0123456789abcdef";
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(b"secret");
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    serde_json::json!({
+        "id": id, "access_mode": "protected", "priority": priority,
+        "path_prefix": path, "path_match": "segment_prefix", "listener_ids": listener_ids,
+        "backends": [format!("http://{backend}")],
+        "basic_auth": {"credentials": [format!("alice:{}:{}", hex(salt), hex(&digest.finalize()))],
+            "hide_credentials": true, "identity_header": "x-verified-user"},
+        "resource_policy": {"resource_id": id, "principal": {"source":"basic"},
+            "allow": [{"subjects": ["alice"], "methods": ["GET"]}]}
+    })
+}
+
+#[tokio::test]
+async fn resource_guard_isolated_by_named_listener_scope() {
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let (backend, origin_task) = origin().await;
+    let mut candidate = config(listen, backend);
+    // CLI/default namespace owns /collision, but this socket has its own
+    // public route at the same host and path.
+    candidate.http.push(
+        serde_json::from_value(protected_route(
+            "default-protected",
+            "/collision",
+            backend,
+            &[],
+            20,
+        ))
+        .unwrap(),
+    );
+    candidate.http.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "named-public", "path_prefix": "/collision", "listener_ids": ["edge"],
+            "priority": 10, "backends": [format!("http://{backend}")]
+        }))
+        .unwrap(),
+    );
+    // Within the same listener, a higher-priority public route cannot bypass
+    // the protected resource namespace.
+    candidate.http.push(
+        serde_json::from_value(protected_route(
+            "named-protected",
+            "/protected",
+            backend,
+            &["edge"],
+            20,
+        ))
+        .unwrap(),
+    );
+    candidate.http.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "named-shadow", "path_prefix": "/protected", "listener_ids": ["edge"],
+        "priority": 30, "backends": [format!("http://{backend}")]
+        }))
+        .unwrap(),
+    );
+    let running = start(candidate, bound).await;
+    assert!(
+        status_for(listen, "/collision")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let protected_status = status_for(listen, "/protected").await;
+    assert!(
+        protected_status.starts_with("HTTP/1.1 403"),
+        "{protected_status}"
     );
     running.shutdown().await;
     origin_task.abort();
