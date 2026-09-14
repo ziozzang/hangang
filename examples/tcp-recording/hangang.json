@@ -1,0 +1,27 @@
+{
+  "settings": {
+    "tcp_recent_recording": {
+      "default_action": "record",
+      "rules": [
+        {
+          "id": "omit-routine-echo",
+          "action": "drop",
+          "match": {
+            "listen_addresses": ["127.0.0.1:15432"],
+            "peer_cidrs": ["127.0.0.0/8"],
+            "route_ids": ["echo"],
+            "outcomes": ["eof"]
+          }
+        }
+      ]
+    }
+  },
+  "http": [],
+  "tcp": [
+    {
+      "id": "echo",
+      "listen": "127.0.0.1:15432",
+      "backends": ["127.0.0.1:15433"]
+    }
+  ]
+}

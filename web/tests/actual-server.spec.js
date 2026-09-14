@@ -189,4 +189,56 @@ test.describe('actual embedded Hangang server', () => {
     const after = await request.get(`${base}/v1/routes/http`, { headers: authorization });
     expect((await after.json()).routes.some(route => route.id === 'shared-domains')).toBe(false);
   });
+
+  test('native TCP completion policy publishes to the real API and removal preserves other configuration', async ({ page, request }) => {
+    const authorization = { Authorization: `Bearer ${token}` };
+    const originalResponse = await request.get(`${base}/v1/config`, { headers: authorization });
+    expect(originalResponse.status()).toBe(200);
+    const original = await originalResponse.json();
+    expect(original.settings?.tcp_recent_recording ?? null).toBeNull();
+    await page.goto(`${base}/ui/`);
+    if (await page.getByRole('button', { name: 'Use administrator token' }).isVisible()) {
+      await page.getByRole('button', { name: 'Use administrator token' }).click();
+    }
+    await page.getByLabel('Administrator token').fill(token);
+    await page.getByRole('button', { name: 'Connect' }).click();
+    await expect(page.locator('#connection-state')).toHaveText('Connected');
+    await page.locator('[data-view="config"]').click();
+    const panel = page.locator('#tcp-recording-section');
+    if (!(await panel.evaluate(element => element.open))) await panel.locator('summary').click();
+    await page.locator('#tcp-recording-enabled').check();
+    await page.locator('#tcp-recording-add').click();
+    const card = page.locator('#tcp-recording-rules .user-card').first();
+    await card.getByLabel('Rule ID').fill('retired-echo');
+    await card.getByLabel('Action').selectOption('drop');
+    // A policy can retain a listener address after the listener is removed.
+    await card.getByLabel('Listen addresses (one IP:port per line)').fill('127.0.0.1:15432');
+    await card.getByLabel('Outcomes (one code per line)').fill('eof');
+    await page.locator('#apply-config').click();
+    await expect(page.locator('#config-message')).toContainText(`Revision ${original.revision + 1} is active`);
+    const savedResponse = await request.get(`${base}/v1/config`, { headers: authorization });
+    const saved = await savedResponse.json();
+    expect(saved.settings.tcp_recent_recording).toMatchObject({ default_action: 'record', rules: [{
+      id: 'retired-echo', action: 'drop', match: { listen_addresses: ['127.0.0.1:15432'], outcomes: ['eof'] },
+    }] });
+    const withoutRecording = value => {
+      const copy = structuredClone(value); delete copy.revision;
+      if (copy.settings) {
+        delete copy.settings.tcp_recent_recording;
+        if (!Object.keys(copy.settings).length) delete copy.settings;
+      }
+      return copy;
+    };
+    expect(withoutRecording(saved)).toEqual(withoutRecording(original));
+    await page.locator('#locale-select').selectOption('ko');
+    await expect(panel.locator('summary')).toContainText('TCP');
+    await page.locator('#locale-select').selectOption('en');
+    await page.locator('#tcp-recording-enabled').uncheck();
+    await page.locator('#apply-config').click();
+    await expect(page.locator('#config-message')).toContainText(`Revision ${original.revision + 2} is active`);
+    const restored = await (await request.get(`${base}/v1/config`, { headers: authorization })).json();
+    expect(restored.settings?.tcp_recent_recording ?? null).toBeNull();
+    expect(withoutRecording(restored)).toEqual(withoutRecording(original));
+  });
+
 });
