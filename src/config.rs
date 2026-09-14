@@ -485,9 +485,6 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
-        if let Some(policy) = &self.settings.tcp_recent_recording {
-            policy.validate_listeners(&self.tcp)?;
-        }
         if let Some(source) = &self.geoip_database {
             source.validate().context("geoip_database")?;
         }

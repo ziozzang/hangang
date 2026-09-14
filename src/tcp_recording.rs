@@ -105,22 +105,6 @@ impl Policy {
         Ok(())
     }
 
-    pub fn validate_listeners(&self, configured: &[crate::config::TcpRoute]) -> Result<()> {
-        self.validate()?;
-        let addresses: HashSet<_> = configured.iter().map(|route| route.listen).collect();
-        for address in self
-            .rules
-            .iter()
-            .flat_map(|rule| &rule.criteria.listen_addresses)
-        {
-            ensure!(
-                addresses.contains(address),
-                "TCP recording listen address is not a configured raw TCP socket: {address}"
-            );
-        }
-        Ok(())
-    }
-
     pub fn compile(&self) -> Result<CompiledPolicy> {
         self.validate()?;
         Ok(CompiledPolicy {
@@ -282,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_only_configured_raw_listener_and_roundtrips() {
+    fn recording_policy_survives_raw_listener_removal_and_move() {
         let source = serde_json::json!({
             "settings": {"tcp_recent_recording": {"default_action":"drop", "rules":[
                 {"id":"socket", "action":"record", "match":{
@@ -300,21 +284,31 @@ mod tests {
         );
         let restored: crate::config::Config = serde_json::from_value(json).unwrap();
         assert_eq!(restored, config);
-        let mut unknown = config.clone();
-        unknown
+        let mut removed = config.clone();
+        removed.tcp.clear();
+        removed.validate().unwrap();
+        let policy = removed
             .settings
             .tcp_recent_recording
-            .as_mut()
+            .as_ref()
             .unwrap()
-            .rules[0]
-            .criteria
-            .listen_addresses = vec!["127.0.0.1:11335".parse().unwrap()];
-        assert!(
-            unknown
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("configured raw TCP socket")
+            .compile()
+            .unwrap();
+        assert_eq!(
+            policy.action(input(
+                "127.0.0.1:11235",
+                "192.0.2.1",
+                None,
+                crate::tcp_history::Outcome::NoRoute
+            )),
+            Action::Record
+        );
+        let mut moved = config.clone();
+        moved.tcp[0].listen = "127.0.0.1:11335".parse().unwrap();
+        moved.validate().unwrap();
+        assert_eq!(
+            moved.settings.tcp_recent_recording,
+            config.settings.tcp_recent_recording
         );
         let legacy = crate::config::Config::default();
         assert!(
