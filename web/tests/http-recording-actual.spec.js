@@ -13,6 +13,15 @@ test('embedded recording editor changes real forwarding observations and persist
   await page.getByLabel('Administrator token').fill(token);
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.locator('#login-dialog')).toBeHidden();
+  // Qualify the embedded diagnostics against actual backend fields, not only mocked UI data.
+  const liveStatus = await (await request.get(`${base}/v1/status`, { headers })).json();
+  const diagnostics = page.locator('#security-diagnostics-grid [data-metric]');
+  await expect(diagnostics).toHaveCount(9);
+  for (const row of await diagnostics.all()) {
+    const field = await row.getAttribute('data-metric');
+    expect(liveStatus.metrics[field]).toBe(0);
+    await expect(row.locator('strong')).toHaveText('0');
+  }
   await page.locator('[data-view="config"]').click();
   const section = page.locator('#http-recording-section');
   if (!(await section.evaluate(element => element.open))) await section.locator('summary').click();

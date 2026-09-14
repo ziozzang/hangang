@@ -435,3 +435,64 @@ test('capture owned Korean operations layout', async ({ page }) => {
   expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport + 1);
   expect(dimensions.tableContent).toBeGreaterThan(dimensions.tableViewport);
 });
+
+test('unknown capability and policy modes stay unknown in English and Korean', async ({ page }) => {
+  await fixture(page, false, [{ ...first, balance_mode: 'future', health_mode: 'future' }]);
+  await page.route('**/v1/operations?*', (route) => route.fulfill({ json: {
+    revision: 7, instance_id: 'fixture-instance', capabilities: {
+      docker_enabled: 'false', self_restart_enabled: null, configuration_source: 'future',
+    }, total: 1, offset: 0, limit: 100,
+    rows: [{ ...first, balance_mode: 'future', health_mode: 'future' }],
+  } }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#operations-rows')).toContainText('Balance mode unavailable');
+  await expect(page.locator('#operations-rows')).toContainText('Health mode unavailable');
+  await expect(page.locator('#operations-capabilities')).toContainText('Configuration authority is not reported or is not recognized.');
+  await expect(page.locator('#operations-capabilities .is-enabled')).toHaveCount(0);
+  await expect(page.locator('#operations-capabilities .is-disabled')).toHaveCount(0);
+  await expect(page.locator('#operations-capabilities')).not.toContainText('uses a local configuration file');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#operations-rows')).toContainText('부하 분산 방식 확인 불가');
+  await expect(page.locator('#operations-rows')).toContainText('상태 검사 방식 확인 불가');
+  await expect(page.locator('#operations-capabilities')).toContainText('설정 원본이 보고되지 않았거나 지원하지 않는 유형입니다.');
+  await expect(page.locator('#operations-capabilities')).toContainText('이 인스턴스가 기능 지원 여부를 보고하지 않았습니다.');
+});
+
+for (const [name, patch] of [
+  ['offset mismatch', { offset: 100 }],
+  ['limit mismatch', { limit: 1 }],
+  ['rows beyond total', { total: 0 }],
+  ['null target', { rows: [null] }],
+  ['unknown protocol', { rows: [{ ...first, protocol: 'future' }] }],
+]) {
+  test(`malformed operations response retains an explicitly stale snapshot: ${name}`, async ({ page }) => {
+    await fixture(page, false, [{ ...first, route_id: 'known-good' }]);
+    await page.locator('a[href="#operations"]').click();
+    await expect(page.locator('#operations-rows')).toContainText('known-good');
+    await page.route('**/v1/operations?*', (route) => route.fulfill({ json: {
+      revision: 8, instance_id: 'bad-instance', total: 1, offset: 0, limit: 100,
+      rows: [{ ...first, route_id: 'invalid-page' }], ...patch,
+    } }));
+    await page.locator('#operations-refresh').click();
+    await expect(page.locator('#operations-message')).toContainText('Refresh failed; showing last loaded snapshot.');
+    await expect(page.locator('#operations-rows')).toContainText('known-good');
+    await expect(page.locator('#operations-rows')).not.toContainText('invalid-page');
+    await expect(page.locator('#operations-instance')).not.toContainText('bad-instance');
+  });
+}
+
+test('removing all targets on a later page resets the empty range and paging', async ({ page }) => {
+  await fixture(page);
+  await page.locator('a[href="#operations"]').click();
+  await page.locator('#operations-next').click();
+  await expect(page.locator('#operations-range')).toHaveText('101–101 of 101 configured targets');
+  await page.route('**/v1/operations?*', (route) => route.fulfill({ json: {
+    revision: 8, instance_id: 'fixture-instance', total: 0,
+    offset: Number(new URL(route.request().url()).searchParams.get('offset')), limit: 100, rows: [],
+  } }));
+  await page.locator('#operations-refresh').click();
+  await expect(page.locator('#operations-range')).toHaveText('0–0 of 0 configured targets');
+  await expect(page.locator('#operations-prev')).toBeDisabled();
+  await expect(page.locator('#operations-next')).toBeDisabled();
+  await expect(page.locator('#operations-empty')).toBeVisible();
+});

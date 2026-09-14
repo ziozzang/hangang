@@ -1,4 +1,9 @@
 export default {
+  'Balance mode unavailable': '부하 분산 방식 확인 불가',
+  'Health mode unavailable': '상태 검사 방식 확인 불가',
+  'Capability not reported by this instance.': '이 인스턴스가 기능 지원 여부를 보고하지 않았습니다.',
+  'Configuration authority is not reported or is not recognized.': '설정 원본이 보고되지 않았거나 지원하지 않는 유형입니다.',
+
   'Operations': '운영',
   'Instance operations': '인스턴스 운영',
   'Configured load-balancer targets and capabilities of this instance.': '이 인스턴스에 설정된 부하 분산 대상과 운영 기능을 확인합니다.',

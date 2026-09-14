@@ -1,5 +1,5 @@
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
-import { t, getLocale, initLocale } from './i18n.js';
+import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
 import { loadOperations, refreshOperationsCopy, resetOperations } from './operations.js';
 import { loadDockerPanel, refreshDockerCopy, resetDockerPanel } from './docker.js';
 import { createLuaEditor } from './lua-editor.js';
@@ -691,7 +691,7 @@ function renderStatus(data, record = true) {
 
 function renderSecurityDiagnostics(metrics) {
   const groups = [
-    [t('Denied'), [
+    [t('Authentication and access rejections'), [
       ['jwt_auth_rejections_total', 'JWT authentication rejections'],
       ['http_mtls_rejections_total', 'HTTP mTLS rejections'],
       ['tcp_mtls_rejections_total', 'TCP mTLS rejections'],
@@ -718,7 +718,7 @@ function renderSecurityDiagnostics(metrics) {
       const name = document.createElement('span'); name.textContent = t(label);
       const count = document.createElement('strong');
       const value = metrics[field];
-      count.textContent = Number.isSafeInteger(value) && value >= 0 ? formatNumber(value) : '—';
+      count.textContent = Number.isSafeInteger(value) && value >= 0 ? formatNumberLocale(value) : '—';
       row.append(name, count); group.append(row);
     }
     return group;

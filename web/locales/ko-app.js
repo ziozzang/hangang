@@ -1,7 +1,7 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
-  'Denied': '인증·접근 거부',
+  'Authentication and access rejections': '인증·접근 거부',
   'Unavailable or at capacity': '사용 불가 또는 용량 초과',
   'Existing streams terminated': '기존 스트림 종료',
   'JWT authentication rejections': 'JWT 인증 거부',

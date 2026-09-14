@@ -55,3 +55,28 @@ test('missing and unsafe counts remain unknown', async ({ page }) => {
   await expect(grid.locator('.security-diagnostics-row')).toHaveCount(9);
   await expect(grid.locator('strong')).toHaveText(Array(9).fill('—'));
 });
+
+test('logout clears diagnostics and late stream data cannot restore them', async ({ page }) => {
+  const release = await openStatus(page, status({ jwt_auth_rejections_total: 12 }),
+    status({ jwt_auth_rejections_total: 99 }));
+  await expect(page.locator('[data-metric="jwt_auth_rejections_total"] strong')).toHaveText('12');
+  await page.locator('#logout-button').click();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  release();
+  await expect(page.locator('#security-diagnostics-grid')).toBeEmpty();
+  await page.waitForTimeout(100);
+  await expect(page.locator('#security-diagnostics-grid')).toBeEmpty();
+});
+
+test('largest safe counters remain readable on the Korean mobile layout', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openStatus(page, status({ jwt_auth_rejections_total: Number.MAX_SAFE_INTEGER,
+    http_mtls_rejections_total: Number.MAX_SAFE_INTEGER + 1 }));
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('[data-metric="jwt_auth_rejections_total"] strong')).toHaveText('9,007,199,254,740,991');
+  await expect(page.locator('[data-metric="http_mtls_rejections_total"] strong')).toHaveText('—');
+  const overflow = await page.locator('.security-diagnostics').evaluate((panel) =>
+    panel.scrollWidth > panel.clientWidth || [...panel.querySelectorAll('.security-diagnostics-row')]
+      .some((row) => row.scrollWidth > row.clientWidth));
+  expect(overflow).toBe(false);
+});

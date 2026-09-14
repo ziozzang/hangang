@@ -29,7 +29,9 @@ function appendDetail(parent, title, detail, className = '') {
 }
 
 function modeLabel(mode) {
-  return mode === 'least_connections' ? t('Least connections') : t('Round robin');
+  if (mode === 'least_connections') return t('Least connections');
+  if (mode === 'round_robin') return t('Round robin');
+  return t('Balance mode unavailable');
 }
 
 function healthLabel(row) {
@@ -37,7 +39,7 @@ function healthLabel(row) {
   if (row.health_mode === 'active_passive') return t('Active + passive checks');
   if (row.health_mode === 'active') return t('Active checks');
   if (row.health_mode === 'cooldown') return t('Failure cooldown');
-  return t('Unmonitored');
+  return row.health_mode === 'unmonitored' ? t('Unmonitored') : t('Health mode unavailable');
 }
 
 function desiredStateLabel(state) {
@@ -47,28 +49,32 @@ function desiredStateLabel(state) {
   return t('State unavailable');
 }
 
-function renderCapabilities(capabilities = {}) {
+function renderCapabilities(value) {
+  const capabilities = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const evidence = (key, enabled, disabled) => capabilities[key] === true ? t(enabled)
+    : capabilities[key] === false ? t(disabled) : t('Capability not reported by this instance.');
   const root = $('#operations-capabilities');
   root.replaceChildren();
-  appendDetail(root, t('Docker backend resolution'), capabilities.docker_enabled
-    ? t('Enabled for configured docker:// targets. Resolved IPs are not shown here; edit references in HTTP or TCP routes.')
-    : t('Disabled on this process. Configured docker:// targets cannot resolve here.'),
-  capabilities.docker_enabled ? 'is-enabled' : 'is-disabled');
+  appendDetail(root, t('Docker backend resolution'), evidence('docker_enabled',
+    'Enabled for configured docker:// targets. Resolved IPs are not shown here; edit references in HTTP or TCP routes.',
+    'Disabled on this process. Configured docker:// targets cannot resolve here.'),
+  capabilities.docker_enabled === true ? 'is-enabled' : capabilities.docker_enabled === false ? 'is-disabled' : '');
   const source = capabilities.configuration_source;
   const sourceDetail = source === 'shared'
     ? t('A shared configuration store is authoritative for this instance. This page does not enumerate fleet peers.')
     : source === 'kubernetes'
       ? t('A Kubernetes controller manages this instance. This page does not enumerate cluster members.')
-      : t('This instance uses a local configuration file. No fleet membership is implied.');
+      : source === 'file' ? t('This instance uses a local configuration file. No fleet membership is implied.')
+        : t('Configuration authority is not reported or is not recognized.');
   appendDetail(root, t('Configuration authority'), sourceDetail);
-  appendDetail(root, t('Graceful self-restart'), capabilities.self_restart_enabled
-    ? t('Available through the supervised process. Use the Status page to request it.')
-    : t('Unavailable because this process has no supervisor control channel.'),
-  capabilities.self_restart_enabled ? 'is-enabled' : 'is-disabled');
-  appendDetail(root, t('Signed updates'), capabilities.signed_updates_enabled
-    ? t('Signed update checks are configured. Use the Status page to check and apply.')
-    : t('Unavailable on this process. A signed manifest and supervisor are required.'),
-  capabilities.signed_updates_enabled ? 'is-enabled' : 'is-disabled');
+  appendDetail(root, t('Graceful self-restart'), evidence('self_restart_enabled',
+    'Available through the supervised process. Use the Status page to request it.',
+    'Unavailable because this process has no supervisor control channel.'),
+  capabilities.self_restart_enabled === true ? 'is-enabled' : capabilities.self_restart_enabled === false ? 'is-disabled' : '');
+  appendDetail(root, t('Signed updates'), evidence('signed_updates_enabled',
+    'Signed update checks are configured. Use the Status page to check and apply.',
+    'Unavailable on this process. A signed manifest and supervisor are required.'),
+  capabilities.signed_updates_enabled === true ? 'is-enabled' : capabilities.signed_updates_enabled === false ? 'is-disabled' : '');
 }
 
 function renderRows(rows) {
@@ -257,15 +263,19 @@ async function fetchPage(nextOffset, allowCorrection = true) {
     const { data } = await apiCall(`/v1/operations?offset=${nextOffset}&limit=${PAGE_SIZE}`);
     if (generation !== requestGeneration) return;
     if (!data || !Array.isArray(data.rows) || data.rows.length > PAGE_SIZE
-      || !Number.isSafeInteger(data.total) || data.total < 0) {
+      || !Number.isSafeInteger(data.total) || data.total < 0
+      || data.offset !== nextOffset || data.limit !== PAGE_SIZE
+      || data.rows.length > Math.max(0, data.total - nextOffset)
+      || data.rows.some((row) => !row || !['http', 'tcp'].includes(row.protocol)
+        || typeof row.route_id !== 'string' || typeof row.address !== 'string')) {
       throw new Error(t('Invalid operations response.'));
     }
     if (allowCorrection && data.total > 0 && nextOffset >= data.total) {
       loading = false;
       return fetchPage(Math.floor((data.total - 1) / PAGE_SIZE) * PAGE_SIZE, false);
     }
-    offset = nextOffset;
-    page = data;
+    offset = data.total === 0 ? 0 : nextOffset;
+    page = data.total === 0 ? { ...data, offset: 0 } : data;
     loadedAt = new Date();
     $('#operations-message').textContent = '';
   } catch (error) {
