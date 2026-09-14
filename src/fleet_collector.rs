@@ -1,6 +1,7 @@
 //! Opt-in, instance-local observations of an explicit HTTPS peer inventory.
 use anyhow::{Result, ensure};
 use arc_swap::ArcSwap;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -58,7 +59,15 @@ pub struct WireObservation {
     pub revision: String,
     pub config_digest: String,
     pub ready: bool,
+    #[serde(deserialize_with = "required_nullable_epoch")]
     pub store_epoch: Option<String>,
+}
+
+fn required_nullable_epoch<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 struct Seen {
@@ -129,9 +138,9 @@ fn load(path: &Path, forbidden: Option<[u8; 32]>) -> Result<Vec<Spec>> {
             crate::fleet_observer::TOKEN_MAX,
         )?)?;
         ensure!(
-            !forbidden
+            forbidden
                 .as_ref()
-                .is_some_and(|digest| Sha256::digest(&token).as_slice() == digest),
+                .is_none_or(|digest| Sha256::digest(&token).as_slice() != digest),
             "fleet peer token must differ from admin token"
         );
         let ca = peer
@@ -158,10 +167,10 @@ fn prepare(specs: Vec<Spec>, number: u64) -> Result<Generation> {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3));
         if let Some(bytes) = &spec.ca {
-            builder = builder.add_root_certificate(
-                reqwest::Certificate::from_pem(bytes)
-                    .map_err(|_| anyhow::anyhow!("invalid fleet CA"))?,
-            );
+            builder = builder.tls_built_in_root_certs(false);
+            for certificate in parse_ca_bundle(bytes)? {
+                builder = builder.add_root_certificate(certificate);
+            }
         }
         peers.push(Peer {
             spec,
@@ -176,6 +185,43 @@ fn prepare(specs: Vec<Spec>, number: u64) -> Result<Generation> {
         peers,
         seen: Mutex::new(seen),
     })
+}
+
+fn parse_ca_bundle(bytes: &[u8]) -> Result<Vec<reqwest::Certificate>> {
+    let mut rest = std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!("invalid fleet CA"))?;
+    let mut certificates = Vec::new();
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if rest.is_empty() {
+            break;
+        }
+        ensure!(
+            rest.starts_with(BEGIN) && certificates.len() < 32,
+            "invalid fleet CA"
+        );
+        let end = rest
+            .find(END)
+            .ok_or_else(|| anyhow::anyhow!("invalid fleet CA"))?
+            + END.len();
+        let (pem, tail) = rest.split_at(end);
+        let body = &pem[BEGIN.len()..pem.len() - END.len()];
+        let compact: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .map_err(|_| anyhow::anyhow!("invalid fleet CA"))?;
+        let (remainder, _) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|_| anyhow::anyhow!("invalid fleet CA"))?;
+        ensure!(remainder.is_empty(), "invalid fleet CA");
+        certificates.push(
+            reqwest::Certificate::from_der(&der)
+                .map_err(|_| anyhow::anyhow!("invalid fleet CA"))?,
+        );
+        rest = tail;
+    }
+    ensure!(!certificates.is_empty(), "invalid fleet CA");
+    Ok(certificates)
 }
 
 fn valid_decimal(value: &str) -> bool {
@@ -193,19 +239,23 @@ fn valid_hex(value: &str, len: usize) -> bool {
 }
 
 fn due_indices(seen: &mut [Seen], now: Instant, capacity: usize) -> Vec<usize> {
-    let mut result = Vec::new();
-    for (index, row) in seen.iter_mut().enumerate() {
-        if result.len() >= capacity {
-            break;
-        }
-        if row
-            .last_attempt
-            .is_some_and(|at| now.saturating_duration_since(at) < POLL)
-        {
-            continue;
-        }
-        row.last_attempt = Some(now);
-        result.push(index);
+    let mut eligible: Vec<_> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row.last_attempt
+                .is_none_or(|at| now.saturating_duration_since(at) >= POLL)
+                .then_some((row.last_attempt, index))
+        })
+        .collect();
+    eligible.sort_by_key(|(last, index)| (*last, *index));
+    let result: Vec<_> = eligible
+        .into_iter()
+        .take(capacity)
+        .map(|(_, index)| index)
+        .collect();
+    for index in &result {
+        seen[*index].last_attempt = Some(now);
     }
     result
 }
@@ -243,7 +293,7 @@ async fn poll(peer: Peer) -> std::result::Result<WireObservation, &'static str> 
         .send()
         .await
         .map_err(|_| "transport")?;
-    if !response.status().is_success() {
+    if response.status() != reqwest::StatusCode::OK {
         return Err("http_status");
     }
     if response
@@ -265,6 +315,35 @@ async fn poll(peer: Peer) -> std::result::Result<WireObservation, &'static str> 
     match validate_wire(&value, &peer.spec.node_id) {
         "ok" => Ok(value),
         code => Err(code),
+    }
+}
+
+fn publish_result(
+    generation: &Generation,
+    index: usize,
+    completed: Instant,
+    result: std::result::Result<WireObservation, &'static str>,
+) {
+    let mut rows = generation
+        .seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let row = &mut rows[index];
+    match result {
+        Ok(observation) => {
+            row.last_success = Some(completed);
+            row.observation = Some(observation);
+            row.condition = "fresh";
+            row.last_error = None;
+        }
+        Err(code) => {
+            row.condition = if code == "identity_mismatch" {
+                "identity_mismatch"
+            } else {
+                "unavailable"
+            };
+            row.last_error = Some(code);
+        }
     }
 }
 
@@ -339,13 +418,13 @@ impl Runtime {
                 let age = row
                     .last_success
                     .map(|at| now.saturating_duration_since(at).as_secs());
-                let condition = if age.is_some_and(|s| s >= STALE.as_secs()) {
-                    "stale"
-                } else {
-                    row.condition
-                };
-                if condition == "fresh" && row.observation.as_ref().is_some_and(|value| value.ready)
-                {
+                let condition =
+                    if row.condition == "fresh" && age.is_some_and(|s| s >= STALE.as_secs()) {
+                        "stale"
+                    } else {
+                        row.condition
+                    };
+                if condition == "fresh" {
                     fresh_nodes += 1;
                 }
                 serde_json::json!({"node_id":peer.spec.node_id,"endpoint":peer.spec.endpoint,
@@ -378,18 +457,13 @@ impl Runtime {
                         let peer = &state.peers[index];
                         let peer = Peer { spec: peer.spec.clone(), client: peer.client.clone() };
                         let generation = state.clone();
-                        tasks.spawn(async move { (generation, index, poll(peer).await) });
+                        tasks.spawn(async move { let result = poll(peer).await; (generation, index, Instant::now(), result) });
                     }
                 }
                 Some(done) = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Ok((generation, index, result)) = done {
+                    if let Ok((generation, index, completed, result)) = done {
                         if !Arc::ptr_eq(&generation, &self.state.load_full()) { continue; }
-                        let mut rows = generation.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let row = &mut rows[index];
-                        match result {
-                            Ok(observation) => { row.last_success=Some(Instant::now()); row.observation=Some(observation); row.condition="fresh"; row.last_error=None; }
-                            Err(code) => { row.condition=if code=="identity_mismatch" { "identity_mismatch" } else { "unavailable" }; row.last_error=Some(code); }
-                        }
+                        publish_result(&generation, index, completed, result);
                     }
                 }
             }
@@ -474,6 +548,29 @@ mod tests {
         let mut bad = wire("one");
         bad.revision = "01".into();
         assert_eq!(validate_wire(&bad, "one"), "invalid_observation");
+        let mut missing = serde_json::to_value(wire("one")).unwrap();
+        missing.as_object_mut().unwrap().remove("store_epoch");
+        assert!(serde_json::from_value::<WireObservation>(missing).is_err());
+        assert!(
+            serde_json::from_value::<WireObservation>(serde_json::to_value(wire("one")).unwrap())
+                .is_ok()
+        );
+        assert!(
+            parse_ca_bundle(b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----")
+                .is_err()
+        );
+        assert!(parse_ca_bundle(b"not a certificate").is_err());
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .unwrap()
+            .cert
+            .pem();
+        assert_eq!(
+            parse_ca_bundle(format!("{cert}\n{cert}").as_bytes())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_ca_bundle(format!("{cert}\nnot-pem").as_bytes()).is_err());
     }
 
     #[tokio::test]
@@ -495,6 +592,15 @@ mod tests {
         assert_eq!(runtime.status()["fresh_nodes"], 1);
         {
             let mut rows = state.seen.lock().unwrap();
+            rows[0].observation.as_mut().unwrap().ready = false;
+        }
+        assert_eq!(
+            runtime.status()["fresh_nodes"],
+            1,
+            "fresh_nodes counts observed peers, including unready peers"
+        );
+        {
+            let mut rows = state.seen.lock().unwrap();
             rows[0].condition = "unavailable";
             rows[0].last_error = Some("transport");
         }
@@ -507,8 +613,26 @@ mod tests {
             let mut rows = state.seen.lock().unwrap();
             rows[0].last_success = Some(Instant::now() - Duration::from_secs(61));
         }
-        assert_eq!(runtime.status()["nodes"][0]["condition"], "stale");
+        assert_eq!(
+            runtime.status()["nodes"][0]["condition"],
+            "unavailable",
+            "an explicit failure remains visible even when historical success ages"
+        );
         assert_eq!(runtime.status()["fresh_nodes"], 0);
+        {
+            let mut rows = state.seen.lock().unwrap();
+            rows[0].condition = "fresh";
+        }
+        assert_eq!(runtime.status()["nodes"][0]["condition"], "stale");
+        // A completed network response harvested after a long watcher stall
+        // must carry its completion time rather than its publication time.
+        publish_result(
+            &state,
+            0,
+            Instant::now() - Duration::from_secs(61),
+            Ok(wire("one")),
+        );
+        assert_eq!(runtime.status()["nodes"][0]["condition"], "stale");
     }
 
     #[tokio::test]
@@ -544,5 +668,10 @@ mod tests {
         }
         assert_eq!(selected, (0..64).collect::<Vec<_>>());
         assert!(due_indices(&mut rows, now, 4).is_empty());
+        let mut waiting: Vec<_> = (0..8).map(|_| Seen::default()).collect();
+        assert_eq!(due_indices(&mut waiting, now, 4), vec![0, 1, 2, 3]);
+        // Once the first four become eligible again, never-attempted peers
+        // must still go first; a fixed index scan would starve them.
+        assert_eq!(due_indices(&mut waiting, now + POLL, 4), vec![4, 5, 6, 7]);
     }
 }
