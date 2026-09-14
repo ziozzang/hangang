@@ -67,6 +67,7 @@ const state = {
   certificateInventoryLoadSequence: 0,
   certificateTimer: null,
   certificateLoadSequence: 0,
+  certificateScopeLoadSequence: 0,
   routes: { http: [], tcp: [] },
   routeEtags: { http: null, tcp: null },
   routeInventory: { http: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 }, tcp: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 } },
@@ -3280,16 +3281,17 @@ function stopCertificatePolling() {
 
 async function loadCertificates(force) {
   const sequence = ++state.certificateLoadSequence;
+  const discovery = ++state.certificateScopeLoadSequence;
   const scope = state.certificateScope, generation = state.certificateScopeGeneration;
-  await loadCertificateInventory();
+  // Inventory and configuration are independent. Discover listener options even when
+  // a slow inventory request is pending or the user starts editing the certificate draft.
+  loadCertificateInventory().catch(() => {});
   if (!state.token) return;
-  if (state.certificateDirty && !force) return;
-  const list = $('#certificate-list');
-  list.replaceChildren(loadingNode('Loading certificate paths…'));
   const latest = await api('/v1/config');
-  if (sequence !== state.certificateLoadSequence || !certificateScopeCurrent(scope, generation)) return;
+  if (discovery !== state.certificateScopeLoadSequence || !certificateScopeCurrent(scope, generation)) return;
   if (!certificateScopeExists(latest.data, scope)) { $('#certificate-scope').value = 'default'; changeCertificateScope(); return; }
   showCertificateScopes(latest.data);
+  if (sequence !== state.certificateLoadSequence || (state.certificateDirty && !force)) return;
   if (!state.configDirty) {
     state.config = latest.data;
     state.configEtag = latest.etag || `"${latest.data.revision}"`;

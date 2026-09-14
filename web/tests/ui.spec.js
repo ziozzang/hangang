@@ -1649,3 +1649,30 @@ test('late certificate activation conflict cannot overwrite a new scope error', 
   release();
   await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
 });
+
+test('typing before initial certificate inventory and config return still discovers named scopes', async ({ page }) => {
+  const active = { ...config, public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let releaseInventory, releaseConfig, inventoryPending = false, configPending = false;
+  await fixtures(page, {
+    '/v1/certificates': async route => {
+      inventoryPending = true;
+      await new Promise(resolve => { releaseInventory = resolve; });
+      return route.fulfill({ json: { listener_id: 'default', revision: 7, mode: 'other_or_none', total: 0, offset: 0, limit: 32, certificates: [], in_process_acme: null } });
+    },
+    '/v1/config': async route => {
+      configPending = true;
+      await new Promise(resolve => { releaseConfig = resolve; });
+      return route.fulfill({ json: active, headers: { etag: '"7"' } });
+    },
+  });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await expect.poll(() => inventoryPending && configPending).toBe(true);
+  const draft = '[{"id":"early-draft"}]';
+  await page.locator('#certificate-editor').fill(draft);
+  releaseConfig();
+  await expect(page.locator('#certificate-scope option[value="edge"]')).toHaveCount(1);
+  await expect(page.locator('#certificate-editor')).toHaveValue(draft);
+  await expect(page.locator('#certificate-dirty')).toBeVisible();
+  releaseInventory();
+  await expect(page.locator('#certificate-editor')).toHaveValue(draft);
+});
