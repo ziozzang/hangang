@@ -447,3 +447,143 @@ async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
     server.abort();
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn demoted_administrator_stream_expires_and_clears_ip_bearing_history() {
+    let (base, client, manager, _directory, server) = fixture().await;
+    let first = serde_json::json!({"username":"firstadmin","password":"correct horse battery"});
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::POST,
+            "/v1/auth/bootstrap",
+            Some(SYSTEM_TOKEN),
+            Some(first.clone())
+        )
+        .await
+        .status(),
+        201,
+    );
+    let first_login = call(
+        &client,
+        &base,
+        reqwest::Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(first),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap();
+    let first_id = first_login["user"]["id"].as_i64().unwrap();
+    let first_token = first_login["token"].as_str().unwrap().to_owned();
+    let second = serde_json::json!({"username":"secondadmin","password":"second correct horse battery","role":"admin"});
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::POST,
+            "/v1/users",
+            Some(&first_token),
+            Some(second.clone())
+        )
+        .await
+        .status(),
+        201,
+    );
+    let second_token = call(
+        &client,
+        &base,
+        reqwest::Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(
+            serde_json::json!({"username":"secondadmin","password":"second correct horse battery"}),
+        ),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let history = manager.metrics.tcp_history.clone();
+    let _guard = history.begin(
+        "198.51.100.9:45678".parse().unwrap(),
+        "127.0.0.1:8443".parse().unwrap(),
+    );
+    let mut stream = call(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/v1/events",
+        Some(&first_token),
+        None,
+    )
+    .await;
+    let mut pending = Vec::new();
+    assert!(
+        frame(&mut stream, &mut pending)
+            .await
+            .starts_with("event: status\n")
+    );
+    let sensitive = frame(&mut stream, &mut pending).await;
+    assert!(sensitive.starts_with("event: tcp_connections\n"));
+    assert_eq!(
+        data(&sensitive)["active"]["records"][0]["peer_ip"],
+        "198.51.100.9"
+    );
+
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::PUT,
+            &format!("/v1/users/{first_id}"),
+            Some(&second_token),
+            Some(serde_json::json!({"role":"viewer"})),
+        )
+        .await
+        .status(),
+        200,
+    );
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::GET,
+            "/v1/connections/tcp/active",
+            Some(&first_token),
+            None
+        )
+        .await
+        .status(),
+        403,
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if frame(&mut stream, &mut pending)
+                .await
+                .starts_with("event: auth_expired\n")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("demoted administrator stream retained an IP-bearing session");
+    assert!(pending.is_empty(), "frames followed the revoke signal");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stream.chunk())
+            .await
+            .expect("stream did not close after revocation")
+            .unwrap()
+            .is_none()
+    );
+    server.abort();
+    manager.policy.shutdown().await;
+}

@@ -981,6 +981,7 @@ impl Admin {
                 );
             }
         };
+        let privileged_seen = actor.role() == crate::admin_users::Role::Admin;
         let account_token = match actor {
             AdminActor::System => None,
             AdminActor::Account { token, .. } => Some(token),
@@ -993,6 +994,7 @@ impl Admin {
             interval,
             cursor: self.traffic.latest_id(),
             tcp_cursor: self.manager.metrics.tcp_history.latest_event_id(),
+            privileged_seen,
             done: false,
             _permit: permit,
         };
@@ -1017,6 +1019,19 @@ impl Admin {
                 },
                 None => true,
             };
+            if state.privileged_seen && !may_read_traffic {
+                // The client may still display IP-bearing rows from earlier
+                // ticks. Force the existing auth-expired clear path on role
+                // withdrawal instead of silently switching to status-only.
+                state.done = true;
+                return Some((
+                    Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from_static(
+                        b"event: auth_expired\ndata: {}\n\n",
+                    ))),
+                    state,
+                ));
+            }
+            state.privileged_seen |= may_read_traffic;
             let (status, _) = state.admin.status_value();
             let mut events = format!(
                 "event: status\ndata: {}\n\n",
@@ -2298,6 +2313,7 @@ struct EventStreamState {
     interval: tokio::time::Interval,
     cursor: u64,
     tcp_cursor: u64,
+    privileged_seen: bool,
     done: bool,
     _permit: OwnedSemaphorePermit,
 }
