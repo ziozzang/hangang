@@ -156,8 +156,8 @@ impl TrafficContext {
             peer_ip: peer.ip(),
             peer_port: peer.port(),
             client_ip: peer.ip(),
-            method: request.method().as_str().chars().take(16).collect(),
-            path: request.uri().path().chars().take(256).collect(),
+            method: request.method().as_str().to_owned(),
+            path: request.uri().path().to_owned(),
             route_id: None,
             protocol: if request.version() == Version::HTTP_2 {
                 "h2"
@@ -172,20 +172,23 @@ impl TrafficContext {
         }
     }
 
-    fn record(&self, history: &crate::traffic::TrafficHistory, status: u16) {
-        history.record(crate::traffic::TrafficInput {
-            geoip: Some(&self.geoip),
-            peer_ip: self.peer_ip,
-            peer_port: self.peer_port,
-            client_ip: self.client_ip,
-            method: &self.method,
-            path: &self.path,
-            route_id: self.route_id.as_deref(),
-            status,
-            response_head_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            protocol: self.protocol,
-            tls: self.tls,
-        });
+    fn record(&self, history: &crate::traffic::TrafficHistory, status: u16, policy_revision: u64) {
+        history.record_with_policy_revision(
+            crate::traffic::TrafficInput {
+                geoip: Some(&self.geoip),
+                peer_ip: self.peer_ip,
+                peer_port: self.peer_port,
+                client_ip: self.client_ip,
+                method: &self.method,
+                path: &self.path,
+                route_id: self.route_id.as_deref(),
+                status,
+                response_head_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                protocol: self.protocol,
+                tls: self.tls,
+            },
+            policy_revision,
+        );
     }
 }
 
@@ -726,6 +729,58 @@ impl Proxy {
         }
     }
 
+    /// Decide observation at the response head using one *current* policy
+    /// generation. The request's captured route and client identity remain
+    /// unchanged; publication affects only this recording decision.
+    fn record_response_head(&self, context: &TrafficContext, status: u16) {
+        let current = self.active.load_full();
+        let action = current.settings.http_recording.as_ref().map_or(
+            crate::http_recording::Action::Record,
+            |policy| {
+                policy.action(crate::http_recording::Input {
+                    method: &context.method,
+                    path: &context.path,
+                    route_id: context.route_id.as_deref(),
+                    status,
+                    peer_ip: context.peer_ip,
+                    client_ip: context.client_ip,
+                })
+            },
+        );
+        if action == crate::http_recording::Action::Drop {
+            if let Some(history) = &self.traffic {
+                history.record_filtered();
+            }
+            return;
+        }
+        let revision = current.config.revision;
+        if let Some(history) = &self.traffic {
+            context.record(history, status, revision);
+        }
+        if self.access_log {
+            // The trace has the same bounded, query-free metadata as the ring.
+            // In particular, never emit a raw Host or a path-and-query.
+            let method = crate::traffic::bounded_ascii(&context.method, 16);
+            let path = crate::traffic::bounded_path(&context.path);
+            let route = context
+                .route_id
+                .as_deref()
+                .map(|id| crate::traffic::bounded_ascii(id, 128));
+            tracing::info!(
+                target: "hangang::access",
+                peer = %context.peer_ip,
+                client = %context.client_ip,
+                method = %method,
+                path = %path,
+                route = ?route,
+                status,
+                policy_revision = revision,
+                latency_ms = context.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                "request"
+            );
+        }
+    }
+
     pub async fn handle(
         &self,
         mut request: Request<Incoming>,
@@ -738,10 +793,8 @@ impl Proxy {
         // forwarded X-Forwarded-For / X-Real-IP / x-original-client-ip carry
         // the mapped form.
         let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        let mut traffic = self
-            .traffic
-            .as_ref()
-            .map(|_| TrafficContext::new(&request, peer));
+        let mut traffic = (self.traffic.is_some() || self.access_log)
+            .then(|| TrafficContext::new(&request, peer));
         // Unauthenticated health probe for external load balancers. Answered
         // before route matching and before acquiring a request permit, so it
         // stays responsive under data-plane saturation. Reports 503 while
@@ -787,51 +840,38 @@ impl Proxy {
                 self.metrics
                     .rejected_requests
                     .fetch_add(1, Ordering::Relaxed);
-                if let (Some(history), Some(context)) = (&self.traffic, &traffic) {
-                    context.record(history, 503);
+                if let Some(context) = traffic.as_mut() {
+                    let trusted_proxies: &[ipnet::IpNet] = snapshot
+                        .settings
+                        .trusted_proxy_cidrs
+                        .as_deref()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&self.trusted_proxies);
+                    let direct_workload = request
+                        .extensions()
+                        .get::<crate::workload_http::Evidence>()
+                        .is_some();
+                    if let Ok(edge) = self.resolve_edge(
+                        &request,
+                        peer,
+                        if direct_workload {
+                            &[]
+                        } else {
+                            trusted_proxies
+                        },
+                    ) {
+                        context.client_ip = edge.client_ip;
+                    }
+                    self.record_response_head(context, 503);
                 }
                 return Ok(response(503, "request capacity exhausted"));
             }
         };
-        // Capture access-log fields before the request is consumed.
-        let access = self.access_log.then(|| {
-            let host = request
-                .headers()
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .or_else(|| request.uri().authority().map(|a| a.as_str()))
-                .unwrap_or("")
-                .to_owned();
-            let path = request
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/")
-                .to_owned();
-            (
-                request.method().clone(),
-                host,
-                path,
-                std::time::Instant::now(),
-            )
-        });
         let response = self
             .handle_inner(request, peer, snapshot, traffic.as_mut())
             .await?;
-        if let (Some(history), Some(context)) = (&self.traffic, &traffic) {
-            context.record(history, response.status().as_u16());
-        }
-        if let Some((method, host, path, started)) = access {
-            tracing::info!(
-                target: "hangang::access",
-                client = %peer.ip(),
-                method = %method,
-                host = %host,
-                path = %path,
-                status = response.status().as_u16(),
-                latency_ms = started.elapsed().as_millis() as u64,
-                "request"
-            );
+        if let Some(context) = &traffic {
+            self.record_response_head(context, response.status().as_u16());
         }
         Ok(retain_request_permit(response, permit))
     }
@@ -1082,6 +1122,9 @@ impl Proxy {
                 "no matching route",
             ));
         };
+        if let Some(context) = traffic.as_mut() {
+            context.route_id = Some(runtime.route.id.clone());
+        }
         if protected_resource.is_some_and(|id| {
             !runtime
                 .route
@@ -1101,9 +1144,6 @@ impl Proxy {
                 403,
                 "route is not bound to this workload listener",
             ));
-        }
-        if let Some(context) = traffic.as_mut() {
-            context.route_id = Some(runtime.route.id.chars().take(128).collect());
         }
         let (workload_identity, workload_route_lease) =
             if let Some(prepared) = &runtime.workload_auth {

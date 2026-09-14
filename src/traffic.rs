@@ -19,6 +19,8 @@ const MAX_SNAPSHOT: usize = 128;
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficRecord {
     pub id: u64,
+    /// Configuration revision whose recording policy selected this row.
+    pub policy_revision: u64,
     pub timestamp_unix_ms: u64,
     pub peer_ip: String,
     pub peer_port: u16,
@@ -59,6 +61,8 @@ pub struct TrafficBatch {
     pub next_after: u64,
     pub gap: bool,
     pub dropped_total: u64,
+    /// Response heads omitted by policy; these consume no traffic ID.
+    pub filtered_total: u64,
     pub retention_seconds: u64,
 }
 
@@ -72,6 +76,7 @@ struct State {
     records: VecDeque<Entry>,
     latest_id: u64,
     dropped_total: u64,
+    filtered_total: u64,
 }
 
 pub struct TrafficHistory {
@@ -99,6 +104,18 @@ impl TrafficHistory {
     /// Records only bounded metadata. Poisoned state is reset; traffic logging
     /// must never make the data plane unavailable.
     pub fn record(&self, input: TrafficInput<'_>) {
+        self.record_with_policy_revision(input, 0);
+    }
+
+    pub fn record_filtered(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.filtered_total = state.filtered_total.saturating_add(1);
+    }
+
+    pub fn record_with_policy_revision(&self, input: TrafficInput<'_>, policy_revision: u64) {
         let now = Instant::now();
         let timestamp_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,6 +126,7 @@ impl TrafficHistory {
         // section only assigns an ID, prunes, and pushes one bounded entry.
         let mut record = TrafficRecord {
             id: 0,
+            policy_revision,
             timestamp_unix_ms,
             peer_ip: input.peer_ip.to_string(),
             peer_port: input.peer_port,
@@ -220,6 +238,7 @@ impl TrafficHistory {
             next_after,
             gap,
             dropped_total: state.dropped_total,
+            filtered_total: state.filtered_total,
             retention_seconds: self.retention.as_secs(),
         }
     }
@@ -236,7 +255,7 @@ impl TrafficHistory {
     }
 }
 
-fn bounded_ascii(value: &str, max: usize) -> String {
+pub(crate) fn bounded_ascii(value: &str, max: usize) -> String {
     value
         .bytes()
         .take(max)
@@ -250,7 +269,7 @@ fn bounded_ascii(value: &str, max: usize) -> String {
         .collect()
 }
 
-fn bounded_path(value: &str) -> String {
+pub(crate) fn bounded_path(value: &str) -> String {
     let path = value.split('?').next().unwrap_or("/");
     if path.is_empty() {
         "/".to_owned()
@@ -384,5 +403,21 @@ mod tests {
         assert!(expired.gap);
         assert_eq!(expired.next_after, 1600);
         assert_eq!(expired.dropped_total, 1600);
+    }
+
+    #[test]
+    fn filtered_heads_use_no_id_and_do_not_count_as_evictions() {
+        let history = TrafficHistory::default();
+        history.record_filtered();
+        history.record_filtered();
+        let empty = history.snapshot_since(None, 128);
+        assert_eq!(empty.latest_id, 0);
+        assert_eq!(empty.filtered_total, 2);
+        assert_eq!(empty.dropped_total, 0);
+        history.record_with_policy_revision(input("/selected"), 42);
+        let selected = history.snapshot_since(Some(0), 128);
+        assert_eq!(selected.records[0].id, 1);
+        assert_eq!(selected.records[0].policy_revision, 42);
+        assert_eq!(selected.filtered_total, 2);
     }
 }

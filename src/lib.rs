@@ -48,6 +48,7 @@ pub mod idle;
 
 pub mod acme_runtime;
 
+pub mod http_recording;
 pub mod traffic;
 pub mod transform;
 pub mod transform_body;
