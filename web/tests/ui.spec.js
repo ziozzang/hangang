@@ -1676,3 +1676,32 @@ test('typing before initial certificate inventory and config return still discov
   releaseInventory();
   await expect(page.locator('#certificate-editor')).toHaveValue(draft);
 });
+
+test('failed config response from previous certificate scope cannot overwrite current error', async ({ page }) => {
+  const active = { ...config, public_http: [{ id: 'edge', listen: '127.0.0.1:8443', certificates: [] }] };
+  let release, edgePending = false, configReads = 0;
+  await fixtures(page, { '/v1/config': async route => {
+    configReads++;
+    if (configReads === 2) {
+      edgePending = true;
+      await new Promise(resolve => { release = resolve; });
+      return route.fulfill({ status: 503, json: { title: 'Service Unavailable', detail: 'old edge config failed' }, contentType: 'application/problem+json' });
+    }
+    return route.fulfill({ json: active, headers: { etag: '"7"' } });
+  } });
+  await login(page); await page.getByRole('link', { name: 'Certificates' }).click();
+  await expect(page.locator('#certificate-scope option[value="edge"]')).toHaveCount(1);
+  await page.locator('#certificate-scope').selectOption('edge');
+  await expect.poll(() => edgePending).toBe(true);
+  await page.locator('#certificate-scope').selectOption('default');
+  await expect(page.locator('#certificate-scope')).toHaveValue('default');
+  await page.locator('#certificate-editor').fill('{');
+  await page.locator('#apply-certificates').click();
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
+  const staleResponse = page.waitForResponse(response => response.url().endsWith('/v1/config') && response.status() === 503);
+  release();
+  await staleResponse;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
+  await expect(page.locator('#certificate-message')).not.toContainText('old edge config failed');
+});
