@@ -25,6 +25,7 @@ const coverage = new Map([
   ['GET /v1/connections/tcp/active', ['#tcp-active-rows', 'console', '/v1/connections/tcp/active${query}']],
   ['GET /v1/connections/tcp/recent', ['#tcp-recent-rows', 'console', '/v1/connections/tcp/recent?limit=128']],
   ['GET /v1/operations', ['#view-operations', 'operations', '/v1/operations?offset=']],
+  ['GET /v1/fleet/observations', ['#fleet-observations-summary', 'operations', "apiCall('/v1/fleet/observations')"]],
   ['GET /v1/fleet/observer-status', ['#observer-identity-fields', 'operations', "apiCall('/v1/fleet/observer-status')"]],
   ['GET /v1/retired-members', ['#retired-rows', 'operations', '/v1/retired-members?offset=']],
   ['GET /v1/status', ['#view-status', 'app', "api('/v1/status'"]],

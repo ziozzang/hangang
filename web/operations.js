@@ -18,6 +18,150 @@ let observerRequestGeneration = 0;
 let observerViewActive = false;
 let observerLoading = false;
 let observer = null;
+let fleetGeneration = 0;
+let fleetActive = false;
+let fleetLoading = false;
+let fleetTimer = null;
+let fleetSnapshot = null;
+let fleetReceivedAt = 0;
+let fleetError = '';
+const FLEET_POLL_MS = 5000;
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const finiteInteger = (value, max) => Number.isSafeInteger(value) && value >= 0 && value <= max;
+const hex16 = value => typeof value === 'string' && /^[a-f0-9]{16}$(?![\s\S])/.test(value);
+const safeCode = value => value === null || ['transport', 'http_status', 'body_too_large', 'invalid_observation', 'identity_mismatch'].includes(value);
+const safeEndpoint = value => {
+  if (typeof value !== 'string' || value.length > 512) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.origin === value && !url.username && !url.password;
+  } catch { return false; }
+};
+const safeEpoch = value => value === null || (typeof value === 'string' && value.length <= 128
+  && !/[\x00-\x1f\x7f]/.test(value));
+function fleetObservation(value, id) {
+  if (value === null) return null;
+  if (!isObject(value) || value.schema_version !== 1 || value.node_id !== id
+    || !observerDecimal(value.observer_generation) || !hex16(value.instance_id)
+    || !['file', 'shared', 'kubernetes'].includes(value.configuration_source)
+    || !observerDecimal(value.revision) || !hex16(value.config_digest)
+    || typeof value.ready !== 'boolean' || !safeEpoch(value.store_epoch)) return undefined;
+  return value;
+}
+function fleetState(data) {
+  if (!isObject(data) || typeof data.configured !== 'boolean' || typeof data.available !== 'boolean'
+    || !finiteInteger(data.expected_nodes, 64) || !finiteInteger(data.fresh_nodes, 64)
+    || data.fresh_nodes > data.expected_nodes || data.stale_after_seconds !== 60
+    || !Array.isArray(data.nodes) || data.nodes.length > 64 || data.nodes.length !== data.expected_nodes) return null;
+  const generation = data.generation === null ? null : observerDecimal(data.generation) ? data.generation : undefined;
+  if (generation === undefined) return null;
+  if (!data.configured) return !data.available && generation === null && data.expected_nodes === 0
+    && data.fresh_nodes === 0 ? { kind: 'disabled', generation, nodes: [] } : null;
+  if (generation === null) return null;
+  const seen = new Set();
+  const nodes = [];
+  for (const row of data.nodes) {
+    if (!isObject(row) || !observerNodeId(row.node_id) || seen.has(row.node_id)
+      || !safeEndpoint(row.endpoint) || !['unknown', 'fresh', 'stale', 'unavailable', 'identity_mismatch'].includes(row.condition)
+      || !safeCode(row.last_error) || !(row.age_seconds === null || finiteInteger(row.age_seconds, 86400 * 365))
+      || (row.condition === 'fresh' && (row.observation === null || row.age_seconds === null))
+      || (row.condition !== 'fresh' && row.condition !== 'stale' && row.age_seconds !== null && row.observation === null)) return null;
+    const observation = fleetObservation(row.observation, row.node_id);
+    if (observation === undefined) return null;
+    seen.add(row.node_id);
+    nodes.push({ ...row, observation });
+  }
+  if (nodes.filter(row => row.condition === 'fresh').length !== data.fresh_nodes) return null;
+  return { kind: data.available ? 'available' : 'unavailable', generation, nodes, expected: data.expected_nodes };
+}
+function fleetCondition(row) {
+  if (row.condition !== 'fresh' || fleetError) return row.condition === 'fresh' && fleetError ? 'stale' : row.condition;
+  return row.age_seconds + Math.max(0, (performance.now() - fleetReceivedAt) / 1000) >= 60 ? 'stale' : 'fresh';
+}
+function renderFleet() {
+  const state = fleetSnapshot?.kind ?? 'unknown';
+  $('#fleet-observations-state').textContent = t(({ disabled: 'Disabled', available: 'Inventory available',
+    unavailable: 'Inventory unavailable', unknown: 'Unknown' })[state]);
+  $('#fleet-observations-generation').textContent = fleetSnapshot?.generation === null || fleetSnapshot?.generation === undefined
+    ? '—' : formatNumberLocale(BigInt(fleetSnapshot.generation));
+  const rows = fleetSnapshot?.nodes ?? [];
+  const fresh = rows.filter(row => fleetCondition(row) === 'fresh').length;
+  $('#fleet-observations-coverage').textContent = fleetSnapshot?.kind === 'disabled' ? t('Disabled')
+    : fleetSnapshot?.expected === undefined ? '—'
+      : t('{fresh} of {expected} fresh', { fresh: formatNumberLocale(fresh), expected: formatNumberLocale(fleetSnapshot.expected) });
+  $('#fleet-observations-message').textContent = fleetError ? t(fleetError) : '';
+  $('#fleet-observations-refresh').disabled = fleetLoading;
+  const body = $('#fleet-observations-rows');
+  body.replaceChildren();
+  for (const row of rows) {
+    const condition = fleetCondition(row);
+    const tr = node('tr');
+    const identity = node('td');
+    identity.append(node('strong', '', row.node_id), node('div', 'field-help', row.endpoint));
+    const status = node('td');
+    status.append(node('strong', '', t(({ unknown: 'Unknown', fresh: 'Fresh', stale: 'Stale',
+      unavailable: 'Unavailable', identity_mismatch: 'Identity mismatch' })[condition])));
+    status.append(node('div', 'field-help', row.age_seconds === null ? t('Age unknown')
+      : t('{seconds} seconds at last read', { seconds: formatNumberLocale(row.age_seconds) })));
+    const sample = node('td');
+    if (row.observation) {
+      sample.append(node('strong', '', condition === 'fresh' ? t('Reported ready: {state}', { state: t(row.observation.ready ? 'Yes' : 'No') })
+        : t('Historical reported ready: {state}', { state: t(row.observation.ready ? 'Yes' : 'No') })));
+      sample.append(node('div', 'field-help', t('Process {instance}; revision {revision}; digest {digest}', {
+        instance: row.observation.instance_id, revision: row.observation.revision, digest: row.observation.config_digest,
+      })));
+      sample.append(node('div', 'field-help', t('Source {source}; store epoch {epoch}; observer generation {generation}', {
+        source: row.observation.configuration_source, epoch: row.observation.store_epoch ?? '—',
+        generation: row.observation.observer_generation,
+      })));
+    } else sample.textContent = '—';
+    tr.append(identity, status, sample, node('td', '', row.last_error ?? '—'));
+    body.append(tr);
+  }
+  $('#fleet-observations-empty').hidden = rows.length > 0 || state !== 'disabled' && state !== 'available';
+}
+async function fetchFleet() {
+  if (!apiCall || !fleetActive || fleetLoading || document.hidden) return;
+  const generation = ++fleetGeneration;
+  fleetLoading = true;
+  renderFleet();
+  try {
+    const { data } = await apiCall('/v1/fleet/observations');
+    if (generation !== fleetGeneration || !fleetActive) return;
+    const parsed = fleetState(data);
+    if (parsed) {
+      fleetSnapshot = parsed;
+      fleetReceivedAt = performance.now();
+      fleetError = '';
+    } else fleetError = 'Fleet observations response is invalid; showing historical data if available.';
+  } catch (error) {
+    if (generation !== fleetGeneration || !fleetActive) return;
+    if (error.status === 401 || error.status === 403) {
+      const callback = onUnauthorized;
+      resetOperations();
+      callback?.();
+      return;
+    }
+    fleetError = error.status === 404 ? 'Fleet observations are not reported by this server.'
+      : 'Fleet observations could not be refreshed; showing historical data if available.';
+  } finally {
+    if (generation === fleetGeneration && fleetActive) { fleetLoading = false; renderFleet(); }
+  }
+}
+function startFleet() {
+  fleetActive = true;
+  if (fleetTimer !== null) clearInterval(fleetTimer);
+  fleetTimer = setInterval(() => { renderFleet(); fetchFleet(); }, FLEET_POLL_MS);
+  fetchFleet();
+}
+function pauseFleet() {
+  fleetActive = false;
+  fleetGeneration += 1;
+  fleetLoading = false;
+  if (fleetTimer !== null) clearInterval(fleetTimer);
+  fleetTimer = null;
+}
+
 
 const observerDecimal = value => typeof value === 'string' && /^(?:0|[1-9][0-9]{0,19})$(?![\s\S])/.test(value)
   && BigInt(value) <= 18446744073709551615n;
@@ -85,6 +229,7 @@ export function pauseObserver() {
   observerViewActive = false;
   observerRequestGeneration += 1;
   observerLoading = false;
+  pauseFleet();
 }
 
 function node(tag, className, content) {
@@ -374,6 +519,7 @@ export async function loadOperations(api, unauthorized) {
   apiCall = api;
   onUnauthorized = unauthorized;
   observerViewActive = true;
+  startFleet();
   await Promise.all([fetchPage(offset), fetchRetiredPage(retiredOffset), fetchObserver()]);
 }
 
@@ -381,6 +527,7 @@ export function refreshOperationsCopy() {
   if (page) render();
   if (retiredPage) renderRetired();
   renderObserver();
+  renderFleet();
 }
 
 export function resetOperations() {
@@ -397,6 +544,9 @@ export function resetOperations() {
   retiredOffset = 0;
   retiredLoading = false;
   observer = null;
+  fleetSnapshot = null;
+  fleetError = '';
+  renderFleet();
   $('#observer-identity-message').textContent = '';
   renderObserver();
   $('#operations-message').textContent = '';
@@ -426,3 +576,6 @@ $('#retired-refresh').addEventListener('click', () => { if (!retiredLoading) fet
 $('#retired-prev').addEventListener('click', () => { if (!retiredLoading && retiredOffset > 0) fetchRetiredPage(Math.max(0, retiredOffset - RETIRED_PAGE_SIZE)); });
 $('#retired-next').addEventListener('click', () => { if (!retiredLoading && retiredPage && retiredOffset + RETIRED_PAGE_SIZE < retiredPage.total) fetchRetiredPage(retiredOffset + RETIRED_PAGE_SIZE); });
 $('#observer-identity-refresh').addEventListener('click', () => { if (!observerLoading) fetchObserver(); });
+
+$('#fleet-observations-refresh').addEventListener('click', () => { if (!fleetLoading) fetchFleet(); });
+document.addEventListener('visibilitychange', () => { if (fleetActive && !document.hidden) { renderFleet(); fetchFleet(); } });

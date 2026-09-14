@@ -28,7 +28,7 @@ const rows = [first, ...Array.from({ length: 99 }, (_, index) => ({
 
 async function fixture(page, viewer = false, operationRows = rows, retiredRows = [], observerReply = {
   configured: false, available: false, node_id: null, generation: null,
-}) {
+}, fleetReply = { configured: false, available: false, generation: null, expected_nodes: 0, fresh_nodes: 0, stale_after_seconds: 60, nodes: [] }) {
   const calls = [];
   await page.route('**/*', async (route) => {
     const request = route.request();
@@ -42,6 +42,8 @@ async function fixture(page, viewer = false, operationRows = rows, retiredRows =
     } });
     if (url.pathname === '/v1/status') return route.fulfill({ json: status });
     if (url.pathname === '/v1/update/status') return route.fulfill({ json: { enabled: false, phase: 'idle' } });
+    if (url.pathname === '/v1/fleet/observations') return typeof fleetReply === 'function'
+      ? fleetReply(route) : route.fulfill({ json: fleetReply });
     if (url.pathname === '/v1/fleet/observer-status') return typeof observerReply === 'function'
       ? observerReply(route) : route.fulfill({ json: observerReply });
     if (url.pathname === '/v1/operations') {
@@ -586,4 +588,127 @@ test('removing all targets on a later page resets the empty range and paging', a
   await expect(page.locator('#operations-prev')).toBeDisabled();
   await expect(page.locator('#operations-next')).toBeDisabled();
   await expect(page.locator('#operations-empty')).toBeVisible();
+});
+
+const fleetSample = (instance = '0123456789abcdef') => ({
+  schema_version: 1, node_id: 'edge-1', observer_generation: '9', instance_id: instance,
+  configuration_source: 'shared', revision: '9007199254740993',
+  config_digest: 'fedcba9876543210', ready: true, store_epoch: 'epoch-1',
+});
+const fleetRow = (condition = 'fresh', instance = '0123456789abcdef') => ({
+  node_id: 'edge-1', endpoint: 'https://edge.example.test:9443', condition,
+  last_error: condition === 'identity_mismatch' ? 'identity_mismatch' : null,
+  age_seconds: 2, observation: fleetSample(instance),
+});
+const fleetInventory = (row = fleetRow()) => ({
+  configured: true, available: true, generation: '9', expected_nodes: 1,
+  fresh_nodes: row.condition === 'fresh' ? 1 : 0, stale_after_seconds: 60, nodes: [row],
+});
+
+test('fleet observations preserve historical process evidence across restart and mismatch', async ({ page }) => {
+  let reply = fleetInventory();
+  const calls = await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Reported ready: Yes');
+  reply = fleetInventory(fleetRow('fresh', '1111111111111111'));
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-rows')).toContainText('1111111111111111');
+  reply = fleetInventory(fleetRow('identity_mismatch', '1111111111111111'));
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Historical reported ready: Yes');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('identity_mismatch');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('0 of 1 fresh');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#fleet-observations-title')).toHaveText('전체 노드 관찰');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('과거에 보고된 준비 상태');
+  expect(calls.filter(call => call.path === '/v1/fleet/observations').every(call => call.authorization === `Bearer ${TOKEN}`)).toBe(true);
+});
+
+test('fresh reporting includes a process that reports ready false', async ({ page }) => {
+  await fixture(page, false, rows, [], undefined, fleetInventory({
+    ...fleetRow(), observation: { ...fleetSample(), ready: false },
+  }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Reported ready: No');
+});
+
+test('fleet read errors retain last good sample and malformed responses never become zero coverage', async ({ page }) => {
+  let reply = fleetInventory();
+  await fixture(page, false, rows, [], undefined, route => typeof reply === 'number'
+    ? route.fulfill({ status: reply, body: 'error' }) : route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  reply = 503;
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-message')).toContainText('could not be refreshed');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Historical reported ready: Yes');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('0123456789abcdef');
+  reply = { ...fleetInventory(), fresh_nodes: 0, nodes: [{ ...fleetRow(), endpoint: 'https://user:secret@edge.example.test' }] };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('0 of 1 fresh');
+  await expect(page.locator('#fleet-observations-rows')).not.toContainText('secret');
+});
+
+test('viewer never requests collector inventory', async ({ page }) => {
+  const calls = await fixture(page, true);
+  await expect(page.locator('#view-operations')).toBeHidden();
+  expect(calls.some(call => call.path === '/v1/fleet/observations')).toBe(false);
+});
+
+
+test('fleet delayed responses after view leave and logout cannot repaint rows', async ({ page }) => {
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = new Promise(resolve => { started = resolve; });
+  let reads = 0;
+  await fixture(page, false, rows, [], undefined, route => {
+    reads += 1;
+    if (reads === 1) return route.fulfill({ json: fleetInventory() });
+    if (reads === 2) { started(); return gate.then(() => route.fulfill({ json: fleetInventory(fleetRow('fresh', '1111111111111111')) }).catch(() => {})); }
+    return route.fulfill({ json: fleetInventory() });
+  });
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-rows')).toContainText('0123456789abcdef');
+  await page.locator('#fleet-observations-refresh').click();
+  await seen;
+  await page.locator('.nav-link[data-view="status"]').click();
+  release();
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-rows')).not.toContainText('1111111111111111');
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(0);
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+});
+
+test('malformed fleet identifiers and missing fields never render as a zero-node inventory', async ({ page }) => {
+  let reply = { ...fleetInventory(), generation: '9\n' };
+  await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-state')).toHaveText('Unknown');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+  for (const bad of [
+    { ...fleetInventory(), nodes: [{ ...fleetRow(), observation: { ...fleetSample(), instance_id: 'bad' } }] },
+    { ...fleetInventory(), nodes: [{ ...fleetRow(), node_id: 'edge-1\n' }] },
+    { ...fleetInventory(), nodes: [{ ...fleetRow(), observation: null }] },
+    { ...fleetInventory(), expected_nodes: undefined },
+  ]) {
+    reply = bad;
+    await page.locator('#fleet-observations-refresh').click();
+    await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+    await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+  }
+});
+
+test('fresh sample ages to historical without a new server response', async ({ page }) => {
+  await page.clock.install();
+  await fixture(page, false, rows, [], undefined, fleetInventory({ ...fleetRow(), age_seconds: 59 }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  await page.clock.fastForward(2000);
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#fleet-observations-coverage')).toContainText('0');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('과거에 보고된 준비 상태');
 });

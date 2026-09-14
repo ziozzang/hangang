@@ -180,6 +180,17 @@
     </div>
     <div id="observer-identity-message" class="inline-message" role="status" aria-live="polite"></div>
   </section>
+  <section class="panel operations-panel" aria-labelledby="fleet-observations-title">
+    <div class="section-heading"><div><h2 id="fleet-observations-title" data-i18n="Fleet observations">Fleet observations</h2><p data-i18n="Configured observer peers only. Samples report each process at its last successful observation; this is not fleet acknowledgement or drain completion.">Configured observer peers only. Samples report each process at its last successful observation; this is not fleet acknowledgement or drain completion.</p></div><button id="fleet-observations-refresh" class="button button-secondary" type="button" data-i18n="Refresh fleet observations">Refresh fleet observations</button></div>
+    <div class="operations-capabilities" id="fleet-observations-summary">
+      <div class="operations-capability"><h3 data-i18n="Collector inventory">Collector inventory</h3><p id="fleet-observations-state">—</p></div>
+      <div class="operations-capability"><h3 data-i18n="Reporting coverage">Reporting coverage</h3><p id="fleet-observations-coverage">—</p></div>
+      <div class="operations-capability"><h3 data-i18n="Collector generation">Collector generation</h3><p id="fleet-observations-generation">—</p></div>
+    </div>
+    <div id="fleet-observations-message" class="inline-message" role="status" aria-live="polite"></div>
+    <div class="operations-table-wrap"><table class="operations-table"><thead><tr><th scope="col" data-i18n="Expected node / endpoint">Expected node / endpoint</th><th scope="col" data-i18n="Observation state / age">Observation state / age</th><th scope="col" data-i18n="Last good process sample">Last good process sample</th><th scope="col" data-i18n="Last attempt error">Last attempt error</th></tr></thead><tbody id="fleet-observations-rows"></tbody></table></div>
+    <p id="fleet-observations-empty" class="operations-empty" data-i18n="No expected observer peers are configured.">No expected observer peers are configured.</p>
+  </section>
   <div class="panel operations-panel">
     <div class="section-heading"><div><h2 data-i18n="Backend targets">Backend targets</h2><p data-i18n="Configured addresses are shown literally; this page does not scan or control remote servers.">Configured addresses are shown literally; this page does not scan or control remote servers.</p></div><div class="operations-head-meta"><span id="operations-updated"></span><span id="operations-instance" class="neutral-badge"></span></div></div>
     <p class="operations-caution" data-i18n="Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.">Eligible means selectable by the local balancer, not verified reachable or healthy. Unmonitored targets have no probe evidence.</p>
