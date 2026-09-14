@@ -121,8 +121,10 @@ fn load(path: &Path) -> Result<(String, Vec<u8>)> {
     if token.last() == Some(&b'\n') {
         token.pop();
     }
+    // Admin session bearers are exactly 43 base64url characters
+    // (admin_users::valid_session_token). Keep this credential shape disjoint.
     ensure!(
-        (32..=256).contains(&token.len())
+        (48..=256).contains(&token.len())
             && token
                 .iter()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(c)),
@@ -237,7 +239,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("observer.json");
         let token = dir.path().join("observer.token");
-        fs::write(&token, b"abcdefghijklmnopqrstuvwxyz012345\n").unwrap();
+        fs::write(
+            &token,
+            b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef\n",
+        )
+        .unwrap();
         fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(
             &config,
@@ -259,22 +265,26 @@ mod tests {
         assert_eq!(runtime.status().generation, "1");
         assert!(
             runtime
-                .authenticate("abcdefghijklmnopqrstuvwxyz012345")
+                .authenticate("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef")
                 .is_some()
         );
         let serialized = serde_json::to_string(&runtime.status()).unwrap();
-        assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz012345"));
-        fs::write(&token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n").unwrap();
+        assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef"));
+        fs::write(
+            &token,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF\n",
+        )
+        .unwrap();
         runtime.refresh().await;
         assert_eq!(runtime.status().generation, "2");
         assert!(
             runtime
-                .authenticate("abcdefghijklmnopqrstuvwxyz012345")
+                .authenticate("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef")
                 .is_none()
         );
         assert!(
             runtime
-                .authenticate("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+                .authenticate("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF")
                 .is_some()
         );
         fs::write(
@@ -296,7 +306,11 @@ mod tests {
         fs::write(&token, b"invalid").unwrap();
         runtime.refresh().await;
         assert!(!runtime.status().available);
-        fs::write(&token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n").unwrap();
+        fs::write(
+            &token,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF\n",
+        )
+        .unwrap();
         runtime.refresh().await;
         assert_eq!(runtime.status().generation, "6");
         assert!(runtime.status().available);
@@ -306,16 +320,36 @@ mod tests {
     async fn rejects_admin_token_and_revokes_on_reload_collision() {
         let (_dir, config, token) = fixture();
         assert!(
-            Runtime::open(config.clone(), Some("abcdefghijklmnopqrstuvwxyz012345"))
-                .await
-                .is_err()
-        );
-        let runtime = Runtime::open(config, Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"))
+            Runtime::open(
+                config.clone(),
+                Some("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef")
+            )
             .await
-            .unwrap();
-        fs::write(token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").unwrap();
+            .is_err()
+        );
+        let runtime = Runtime::open(
+            config,
+            Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF"),
+        )
+        .await
+        .unwrap();
+        fs::write(token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF").unwrap();
         runtime.refresh().await;
         assert!(!runtime.status().available);
+    }
+
+    #[tokio::test]
+    async fn session_shaped_token_cannot_be_observer_credential() {
+        let (_dir, config, token) = fixture();
+        let session_shaped = "a".repeat(43);
+        fs::write(&token, &session_shaped).unwrap();
+        assert!(Runtime::open(config.clone(), None).await.is_err());
+        fs::write(&token, "b".repeat(48)).unwrap();
+        let runtime = Runtime::open(config, None).await.unwrap();
+        fs::write(&token, session_shaped).unwrap();
+        runtime.refresh().await;
+        assert!(!runtime.status().available);
+        assert!(runtime.authenticate(&"b".repeat(48)).is_none());
     }
 
     #[tokio::test]
@@ -345,11 +379,11 @@ mod tests {
         runtime.state.store(Arc::new(State {
             generation: u64::MAX,
             credential: Some(Credential {
-                token: b"abcdefghijklmnopqrstuvwxyz012345".to_vec(),
+                token: b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef".to_vec(),
             }),
             exhausted: false,
         }));
-        fs::write(token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").unwrap();
+        fs::write(token, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefABCDEF").unwrap();
         runtime.refresh().await;
         assert!(!runtime.status().available);
         assert_eq!(runtime.status().generation, u64::MAX.to_string());
@@ -381,9 +415,9 @@ mod tests {
         assert!(Runtime::open(config.clone(), None).await.is_err());
         fs::write(&config, good.to_string()).unwrap();
         for bytes in [
-            b"abcdefghijklmnopqrstuvwxyz012345\nextra".to_vec(),
-            b"abcdefghijklmnopqrstuvwxyz012345\r\n".to_vec(),
-            b"abcdefghijklmnopqrstuvwxyz012345 ".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef\nextra".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef\r\n".to_vec(),
+            b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFabcdef ".to_vec(),
         ] {
             fs::write(&token, bytes).unwrap();
             assert!(Runtime::open(config.clone(), None).await.is_err());
