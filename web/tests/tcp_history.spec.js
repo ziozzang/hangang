@@ -104,6 +104,26 @@ test('active and recent TCP panels preserve 64-bit values, filter and localize d
   expect(calls.some(call => call.search.includes(token))).toBe(false);
 });
 
+test('maximum 64-bit byte values wrap visibly on desktop and narrow screens', async ({ page }) => {
+  const max = '18446744073709551615';
+  await fixture(page, {
+    active: activeBatch([activeRecord('1', { bytes_upstream: max, bytes_downstream: max })]),
+    recent: recentBatch([recentRecord('2', { bytes_upstream: max, bytes_downstream: max })]),
+  });
+  const formatted = '18,446,744,073,709,551,615';
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const selector of ['#tcp-active-rows tr td:last-child', '#tcp-recent-rows tr td:last-child']) {
+      const cell = page.locator(selector);
+      await expect(cell).toContainText(`upstream ${formatted} B · downstream ${formatted} B`);
+      const shape = await cell.evaluate(element => ({ client: element.clientWidth, scroll: element.scrollWidth,
+        whiteSpace: getComputedStyle(element).whiteSpace }));
+      expect(shape.whiteSpace).toBe('normal');
+      expect(shape.scroll, `${selector} clips bytes at ${width}px`).toBeLessThanOrEqual(shape.client + 1);
+    }
+  }
+});
+
 test('SSE updates phases and completions, process replacement clears old rows, logout scrubs metadata', async ({ page }) => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });

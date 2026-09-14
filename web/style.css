@@ -226,6 +226,7 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 .tcp-history-note { margin: 0; padding: 0 20px 12px; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .tcp-history-table { min-width: 900px; }
 .tcp-history-table td { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+.tcp-history-table td:last-child { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
 .tcp-history-table td small { display: block; }
 .tcp-history-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; }
 .tcp-history-actions [hidden] { display: none; }
