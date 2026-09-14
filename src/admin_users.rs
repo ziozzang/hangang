@@ -265,6 +265,31 @@ impl ConfigOperationState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReleaseState {
+    NotApplicable,
+    Protected,
+    Pending,
+    Acknowledged,
+}
+impl ConfigReleaseState {
+    fn parse_work(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "acknowledged" => Ok(Self::Acknowledged),
+            _ => anyhow::bail!("invalid local release state"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ConfigReleaseWork {
+    pub release_id: String,
+    pub receipt: crate::config_store::SequencedCommitReceipt,
+    pub state: ConfigReleaseState,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigAcceptRequest {
     pub receipt_version: u8,
@@ -289,7 +314,12 @@ pub struct ConfigOperation {
     pub authority_epoch: Option<String>,
     pub state: ConfigOperationState,
     pub finished_at_unix_ms: Option<i64>,
+    pub release_state: ConfigReleaseState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<String>,
 }
+
+const CONFIG_OPERATION_SELECT: &str = "SELECT o.id,o.operation_id,o.authority_id,o.actor_kind,o.actor_user_id,o.accepted_at_unix_ms,o.expected_revision,o.candidate_sha256,o.store_kind,o.authority_epoch,o.state,o.finished_at_unix_ms,o.receipt_version,r.release_id,r.state,r.authority_id,r.acceptance_seq,r.epoch,r.revision,r.candidate_sha256,r.prepared_at_unix_ms,r.acknowledged_at_unix_ms FROM admin_config_operations o LEFT JOIN admin_config_releases r ON r.operation_id=o.operation_id";
 
 #[derive(Debug, Serialize)]
 pub struct ConfigOperationPage {
@@ -394,7 +424,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 5,
+            version <= 6,
             "administrator user database schema is newer than this binary"
         );
         if version < 2 {
@@ -511,6 +541,36 @@ impl Store {
             transaction.execute_batch("ALTER TABLE admin_config_operations ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1 CHECK(receipt_version IN (1,2));
                 PRAGMA user_version=5;")?;
         }
+        if version < 6 {
+            transaction.execute_batch(
+                "CREATE TABLE admin_config_releases (
+                    operation_id TEXT PRIMARY KEY REFERENCES admin_config_operations(operation_id) ON DELETE CASCADE,
+                    release_id TEXT NOT NULL UNIQUE,
+                    authority_id TEXT NOT NULL,
+                    acceptance_seq INTEGER NOT NULL CHECK(acceptance_seq BETWEEN 1 AND 9007199254740991),
+                    epoch TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 9007199254740991),
+                    candidate_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','acknowledged')),
+                    prepared_at_unix_ms INTEGER NOT NULL CHECK(prepared_at_unix_ms BETWEEN 0 AND 9007199254740991),
+                    acknowledged_at_unix_ms INTEGER CHECK(acknowledged_at_unix_ms BETWEEN 0 AND 9007199254740991),
+                    CHECK((state='pending' AND acknowledged_at_unix_ms IS NULL)
+                       OR (state='acknowledged' AND acknowledged_at_unix_ms IS NOT NULL))
+                );
+                CREATE TRIGGER admin_v2_release_delete_guard
+                BEFORE DELETE ON admin_config_operations
+                WHEN OLD.receipt_version=2 AND NOT EXISTS (
+                    SELECT 1 FROM admin_config_releases r
+                    WHERE r.operation_id=OLD.operation_id AND r.state='acknowledged'
+                )
+                BEGIN SELECT RAISE(ABORT,'V2 release acknowledgement required'); END;
+                CREATE TRIGGER admin_v2_release_version_guard
+                BEFORE UPDATE OF receipt_version ON admin_config_operations
+                WHEN OLD.receipt_version=2 AND NEW.receipt_version<>2
+                BEGIN SELECT RAISE(ABORT,'V2 release version is immutable'); END;
+                PRAGMA user_version=6;",
+            )?;
+        }
         let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
@@ -557,7 +617,8 @@ impl Store {
         );
         verify_config_history(&transaction, config_next, config_count, &ids_digest)?;
         {
-            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations ORDER BY id")?;
+            let mut statement =
+                transaction.prepare(&format!("{CONFIG_OPERATION_SELECT} ORDER BY o.id"))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let record = read_config_operation(row)?;
@@ -567,6 +628,12 @@ impl Store {
                 );
             }
         }
+        let orphaned_releases: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM admin_config_releases r LEFT JOIN admin_config_operations o ON o.operation_id=r.operation_id WHERE o.operation_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(orphaned_releases == 0, "orphaned local release work");
         transaction.commit()?;
         Ok(Self {
             path,
@@ -971,7 +1038,7 @@ impl Store {
                 Some(id) => id,
                 None => crate::config_store::canonical_operation_id(&authority_id, u64::try_from(next_id)?)?,
             };
-            let record=ConfigOperation{id:next_id,operation_id,receipt_version:request.receipt_version,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None};
+            let record=ConfigOperation{id:next_id,operation_id,receipt_version:request.receipt_version,authority_id,actor_kind:actor_kind(&authority),actor_user_id,accepted_at_unix_ms:now_ms()?,expected_revision:request.expected_revision,candidate_sha256:request.candidate_sha256,store_kind:request.store_kind,authority_epoch:request.authority_epoch,state:ConfigOperationState::Accepted,finished_at_unix_ms:None,release_state:if request.receipt_version==2 {ConfigReleaseState::Protected}else{ConfigReleaseState::NotApplicable},release_id:None};
             ensure!(valid_config_operation(&record),"invalid local config operation");
             transaction.execute("INSERT INTO admin_config_operations(id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'accepted',NULL,?11)",params![record.id,record.operation_id,record.authority_id,record.actor_kind.as_str(),record.actor_user_id,record.accepted_at_unix_ms,i64::try_from(record.expected_revision)?,record.candidate_sha256,record.store_kind.as_str(),record.authority_epoch,record.receipt_version])?;
             verified_hasher.update(next_id.to_be_bytes());
@@ -1002,10 +1069,154 @@ impl Store {
             let changed=transaction.execute("UPDATE admin_config_operations SET state=?1,finished_at_unix_ms=?2 WHERE operation_id=?3 AND state='accepted'",params![state.as_str(),now_ms()?,operation_id])?;
             if changed!=1 {return Err(ConfigOperationConflict.into());}
             transaction.execute("UPDATE admin_config_operation_meta SET history_revision=history_revision+1 WHERE singleton=1",[])?;
-            let record=transaction.query_row("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations WHERE operation_id=?1",params![operation_id],read_config_operation)?;
+            let record=transaction.query_row(&format!("{CONFIG_OPERATION_SELECT} WHERE o.operation_id=?1"),params![operation_id],read_config_operation)?;
             transaction.commit()?;
             Ok(record)
         }).await?
+    }
+
+    /// Internal lookup for reconciliation. API callers must independently
+    /// authorize both before and after the read.
+    pub async fn config_operation(&self, operation_id: &str) -> Result<Option<ConfigOperation>> {
+        ensure!(
+            valid_lower_hex(operation_id, 32),
+            "invalid local operation identity"
+        );
+        let path = self.path.clone();
+        let operation_id = operation_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let operation = find_config_operation(&transaction, &operation_id)?;
+            transaction.commit()?;
+            Ok(operation)
+        })
+        .await?
+    }
+
+    /// Returns stable local work even when the remote receipt has already
+    /// disappeared. Absence is not evidence of a remote release or commit.
+    pub async fn config_release(&self, operation_id: &str) -> Result<Option<ConfigReleaseWork>> {
+        Ok(self
+            .config_operation(operation_id)
+            .await?
+            .as_ref()
+            .and_then(release_work_from_operation))
+    }
+
+    /// Trusted internal equivalent of an account-authorized release intent.
+    pub async fn prepare_config_release(
+        &self,
+        operation_id: &str,
+        receipt: &crate::config_store::SequencedCommitReceipt,
+    ) -> Result<ConfigReleaseWork> {
+        self.prepare_config_release_authorized(MutationAuthority::System, operation_id, receipt)
+            .await
+    }
+
+    /// Linearizes account authority and durable release identity in the same
+    /// local writer transaction. No SQL receipt or pin is mutated here.
+    pub async fn prepare_config_release_authorized(
+        &self,
+        authority: MutationAuthority,
+        operation_id: &str,
+        receipt: &crate::config_store::SequencedCommitReceipt,
+    ) -> Result<ConfigReleaseWork> {
+        if !valid_lower_hex(operation_id, 32) {
+            return Err(ConfigOperationConflict.into());
+        }
+        let path = self.path.clone();
+        let operation_id = operation_id.to_owned();
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_mutation(&transaction, &authority)?;
+            let operation = find_config_operation(&transaction, &operation_id)?
+                .ok_or(ConfigOperationConflict)?;
+            if !receipt_matches_operation(&operation, &receipt) {
+                return Err(ConfigOperationConflict.into());
+            }
+            if let Some(existing) = release_work_from_operation(&operation) {
+                if existing.receipt != receipt {
+                    return Err(ConfigOperationConflict.into());
+                }
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            let revision: i64 = transaction.query_row(
+                "SELECT history_revision FROM admin_config_operation_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            ensure!((0..MAX_SAFE_ID).contains(&revision), "local config operation history revision exhausted");
+            let release_id = random_hex_id()?;
+            transaction.execute(
+                "INSERT INTO admin_config_releases(operation_id,release_id,authority_id,acceptance_seq,epoch,revision,candidate_sha256,state,prepared_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8)",
+                params![operation_id,release_id,receipt.stamp.authority_id,i64::try_from(receipt.stamp.acceptance_seq)?,receipt.epoch,i64::try_from(receipt.revision)?,receipt.stamp.candidate_sha256,now_ms()?],
+            )?;
+            transaction.execute("UPDATE admin_config_operation_meta SET history_revision=history_revision+1 WHERE singleton=1", [])?;
+            let prepared = find_config_operation(&transaction, &operation_id)?
+                .and_then(|operation| release_work_from_operation(&operation))
+                .ok_or(ConfigOperationConflict)?;
+            ensure!(prepared.receipt == receipt && prepared.state == ConfigReleaseState::Pending, "local release work changed during preparation");
+            transaction.commit()?;
+            Ok(prepared)
+        })
+        .await?
+    }
+
+    /// Trusted internal acknowledgement after exact SQL release evidence was
+    /// obtained. Repeating the same work is idempotent while its local row is
+    /// retained; a later authorized local prune may remove that row.
+    pub async fn acknowledge_config_release(
+        &self,
+        work: &ConfigReleaseWork,
+    ) -> Result<ConfigReleaseWork> {
+        if !valid_lower_hex(&work.release_id, 32)
+            || !matches!(
+                work.state,
+                ConfigReleaseState::Pending | ConfigReleaseState::Acknowledged
+            )
+        {
+            return Err(ConfigOperationConflict.into());
+        }
+        let path = self.path.clone();
+        let work = work.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = find_config_operation(&transaction, &work.receipt.stamp.operation_id)?
+                .and_then(|operation| release_work_from_operation(&operation))
+                .ok_or(ConfigOperationConflict)?;
+            if current.release_id != work.release_id || current.receipt != work.receipt {
+                return Err(ConfigOperationConflict.into());
+            }
+            if current.state == ConfigReleaseState::Acknowledged {
+                transaction.commit()?;
+                return Ok(current);
+            }
+            let revision: i64 = transaction.query_row(
+                "SELECT history_revision FROM admin_config_operation_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            ensure!((0..MAX_SAFE_ID).contains(&revision), "local config operation history revision exhausted");
+            let changed = transaction.execute(
+                "UPDATE admin_config_releases SET state='acknowledged',acknowledged_at_unix_ms=?1 WHERE operation_id=?2 AND release_id=?3 AND state='pending'",
+                params![now_ms()?,work.receipt.stamp.operation_id,work.release_id],
+            )?;
+            ensure!(changed == 1, "local release state changed during acknowledgement");
+            transaction.execute("UPDATE admin_config_operation_meta SET history_revision=history_revision+1 WHERE singleton=1", [])?;
+            let acknowledged = find_config_operation(&transaction, &work.receipt.stamp.operation_id)?
+                .and_then(|operation| release_work_from_operation(&operation))
+                .ok_or(ConfigOperationConflict)?;
+            ensure!(acknowledged.state == ConfigReleaseState::Acknowledged && acknowledged.release_id == work.release_id && acknowledged.receipt == work.receipt, "local release acknowledgement mismatch");
+            transaction.commit()?;
+            Ok(acknowledged)
+        })
+        .await?
     }
 
     pub async fn config_operations(
@@ -1026,7 +1237,7 @@ impl Store {
             let (authority_id,started_at,next_id,stored_records,history_revision,pruned_through,ids_digest):(String,i64,i64,i64,i64,i64,String)=transaction.query_row("SELECT authority_id,started_at_unix_ms,next_id,stored_records,history_revision,pruned_through,retained_ids_sha256 FROM admin_config_operation_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
             ensure!(valid_lower_hex(&authority_id,32) && (0..=MAX_SAFE_ID).contains(&started_at) && (1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..=MAX_SAFE_ID).contains(&history_revision) && (0..next_id).contains(&pruned_through) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
             let (oldest_id,_)=verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
-            let mut statement=transaction.prepare("SELECT id,operation_id,authority_id,actor_kind,actor_user_id,accepted_at_unix_ms,expected_revision,candidate_sha256,store_kind,authority_epoch,state,finished_at_unix_ms,receipt_version FROM admin_config_operations WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let mut statement=transaction.prepare(&format!("{CONFIG_OPERATION_SELECT} WHERE o.id>?1 ORDER BY o.id LIMIT ?2"))?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_config_operation)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.authority_id==authority_id),"local config operation authority mismatch");
             ensure!(records.windows(2).all(|pair|pair[0].id<pair[1].id),"local config operation page ordering inconsistent");
@@ -1056,9 +1267,9 @@ impl Store {
             ensure!((1..=MAX_SAFE_ID+1).contains(&next_id) && (0..=CONFIG_OPERATION_CAPACITY).contains(&stored_records) && (0..MAX_SAFE_ID).contains(&history_revision) && (0..next_id).contains(&pruned_through) && valid_lower_hex(&ids_digest,64),"local config operation metadata inconsistent");
             verify_config_history(&transaction,next_id,stored_records,&ids_digest)?;
             if through_id<=0 || through_id>=next_id || expected_latest_id!=next_id-1 || expected_history_revision!=u64::try_from(history_revision)? {return Err(ConfigOperationConflict.into());}
-            let deleted=transaction.execute("DELETE FROM admin_config_operations WHERE id<=?1 AND state IN ('candidate_activated','conflict','failed')",params![through_id])?;
+            let deleted=transaction.execute("DELETE FROM admin_config_operations WHERE id<=?1 AND state IN ('candidate_activated','conflict','failed') AND (receipt_version=1 OR EXISTS (SELECT 1 FROM admin_config_releases r WHERE r.operation_id=admin_config_operations.operation_id AND r.state='acknowledged'))",params![through_id])?;
             if deleted==0 {return Err(ConfigOperationConflict.into());}
-            let retained_unresolved:i64=transaction.query_row("SELECT COUNT(*) FROM admin_config_operations WHERE id<=?1 AND state IN ('accepted','indeterminate')",params![through_id],|row|row.get(0))?;
+            let retained_unresolved:i64=transaction.query_row("SELECT COUNT(*) FROM admin_config_operations WHERE id<=?1 AND (state IN ('accepted','indeterminate') OR (receipt_version=2 AND NOT EXISTS (SELECT 1 FROM admin_config_releases r WHERE r.operation_id=admin_config_operations.operation_id AND r.state='acknowledged')))",params![through_id],|row|row.get(0))?;
             let digest=retained_ids_sha256(&transaction)?;
             transaction.execute("UPDATE admin_config_operation_meta SET stored_records=stored_records-?1,history_revision=history_revision+1,pruned_through=?2,retained_ids_sha256=?3 WHERE singleton=1",params![i64::try_from(deleted)?,pruned_through.max(through_id),digest])?;
             let record=append_audit(&transaction,audit_record(AuditAction::ConfigOperationsPrune,actor_kind(&authority),actor_id,None,None,None,false,u64::try_from(deleted)?,Some(through_id))?)?;
@@ -1066,6 +1277,19 @@ impl Store {
             Ok(ConfigOperationPruneResult{pruned_records:u64::try_from(deleted)?,retained_unresolved:u64::try_from(retained_unresolved)?,record})
         }).await?
     }
+}
+
+fn find_config_operation(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+) -> Result<Option<ConfigOperation>> {
+    Ok(transaction
+        .query_row(
+            &format!("{CONFIG_OPERATION_SELECT} WHERE o.operation_id=?1"),
+            params![operation_id],
+            read_config_operation,
+        )
+        .optional()?)
 }
 
 fn valid_session_token(token: &str) -> bool {
@@ -1125,15 +1349,82 @@ fn valid_config_operation(record: &ConfigOperation) -> bool {
                 .finished_at_unix_ms
                 .is_some_and(|time| (0..=MAX_SAFE_ID).contains(&time)),
         }
+        && match (
+            record.receipt_version,
+            record.release_state,
+            &record.release_id,
+        ) {
+            (1, ConfigReleaseState::NotApplicable, None)
+            | (2, ConfigReleaseState::Protected, None) => true,
+            (2, ConfigReleaseState::Pending | ConfigReleaseState::Acknowledged, Some(id)) => {
+                record.state == ConfigOperationState::CandidateActivated && valid_lower_hex(id, 32)
+            }
+            _ => false,
+        }
+}
+
+fn receipt_matches_operation(
+    operation: &ConfigOperation,
+    receipt: &crate::config_store::SequencedCommitReceipt,
+) -> bool {
+    operation.receipt_version == 2
+        && operation.store_kind == ConfigStoreKind::SharedStore
+        && operation.state == ConfigOperationState::CandidateActivated
+        && operation.authority_id == receipt.stamp.authority_id
+        && u64::try_from(operation.id).ok() == Some(receipt.stamp.acceptance_seq)
+        && operation.operation_id == receipt.stamp.operation_id
+        && operation.candidate_sha256 == receipt.stamp.candidate_sha256
+        && operation.authority_epoch.as_deref() == Some(receipt.epoch.as_str())
+        && operation.expected_revision.checked_add(1) == Some(receipt.revision)
+        && receipt.revision <= MAX_SAFE_ID as u64
+        && valid_lower_hex(&receipt.epoch, 32)
+}
+
+fn release_work_from_operation(operation: &ConfigOperation) -> Option<ConfigReleaseWork> {
+    let release_id = operation.release_id.clone()?;
+    let epoch = operation.authority_epoch.clone()?;
+    let revision = operation.expected_revision.checked_add(1)?;
+    Some(ConfigReleaseWork {
+        release_id,
+        receipt: crate::config_store::SequencedCommitReceipt {
+            epoch,
+            revision,
+            stamp: crate::config_store::SequencedOperationStamp {
+                authority_id: operation.authority_id.clone(),
+                acceptance_seq: u64::try_from(operation.id).ok()?,
+                operation_id: operation.operation_id.clone(),
+                candidate_sha256: operation.candidate_sha256.clone(),
+            },
+        },
+        state: operation.release_state,
+    })
 }
 
 fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOperation> {
     let expected_revision: i64 = row.get(6)?;
+    let release_id: Option<String> = row.get(13)?;
+    let stored_release_state: Option<String> = row.get(14)?;
+    let receipt_authority: Option<String> = row.get(15)?;
+    let receipt_sequence: Option<i64> = row.get(16)?;
+    let receipt_epoch: Option<String> = row.get(17)?;
+    let receipt_revision: Option<i64> = row.get(18)?;
+    let receipt_digest: Option<String> = row.get(19)?;
+    let prepared_at: Option<i64> = row.get(20)?;
+    let acknowledged_at: Option<i64> = row.get(21)?;
+    let receipt_version: u8 =
+        u8::try_from(row.get::<_, i64>(12)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let release_state = match (&release_id, stored_release_state.as_deref()) {
+        (None, None) if receipt_version == 1 => ConfigReleaseState::NotApplicable,
+        (None, None) if receipt_version == 2 => ConfigReleaseState::Protected,
+        (Some(_), Some(value)) => {
+            ConfigReleaseState::parse_work(value).map_err(|_| rusqlite::Error::InvalidQuery)?
+        }
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
     let record = ConfigOperation {
         id: row.get(0)?,
         operation_id: row.get(1)?,
-        receipt_version: u8::try_from(row.get::<_, i64>(12)?)
-            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        receipt_version,
         authority_id: row.get(2)?,
         actor_kind: AuditActorKind::parse(&row.get::<_, String>(3)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -1148,8 +1439,54 @@ fn read_config_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigOper
         state: ConfigOperationState::parse(&row.get::<_, String>(10)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         finished_at_unix_ms: row.get(11)?,
+        release_state,
+        release_id,
     };
-    if !valid_config_operation(&record) {
+    let stored_receipt = match (
+        receipt_authority,
+        receipt_sequence,
+        receipt_epoch,
+        receipt_revision,
+        receipt_digest,
+    ) {
+        (None, None, None, None, None) if record.release_id.is_none() => None,
+        (
+            Some(authority_id),
+            Some(acceptance_seq),
+            Some(epoch),
+            Some(revision),
+            Some(candidate_sha256),
+        ) => Some(crate::config_store::SequencedCommitReceipt {
+            epoch,
+            revision: u64::try_from(revision).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            stamp: crate::config_store::SequencedOperationStamp {
+                authority_id,
+                acceptance_seq: u64::try_from(acceptance_seq)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                operation_id: record.operation_id.clone(),
+                candidate_sha256,
+            },
+        }),
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    if !valid_config_operation(&record)
+        || match (record.release_state, prepared_at, acknowledged_at) {
+            (ConfigReleaseState::NotApplicable | ConfigReleaseState::Protected, None, None) => {
+                false
+            }
+            (ConfigReleaseState::Pending, Some(prepared), None) => {
+                !(0..=MAX_SAFE_ID).contains(&prepared)
+            }
+            (ConfigReleaseState::Acknowledged, Some(prepared), Some(acknowledged)) => {
+                !(0..=MAX_SAFE_ID).contains(&prepared) || !(0..=MAX_SAFE_ID).contains(&acknowledged)
+            }
+            _ => true,
+        }
+        || stored_receipt
+            .as_ref()
+            .is_some_and(|receipt| !receipt_matches_operation(&record, receipt))
+        || (stored_receipt.is_some() != record.release_id.is_some())
+    {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(record)
@@ -1605,6 +1942,19 @@ mod tests {
         }
     }
 
+    fn v2_receipt(operation: &ConfigOperation) -> crate::config_store::SequencedCommitReceipt {
+        crate::config_store::SequencedCommitReceipt {
+            epoch: operation.authority_epoch.clone().unwrap(),
+            revision: operation.expected_revision + 1,
+            stamp: crate::config_store::SequencedOperationStamp {
+                authority_id: operation.authority_id.clone(),
+                acceptance_seq: operation.id as u64,
+                operation_id: operation.operation_id.clone(),
+                candidate_sha256: operation.candidate_sha256.clone(),
+            },
+        }
+    }
+
     fn store() -> (tempfile::TempDir, Arc<Store>) {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1633,7 +1983,7 @@ mod tests {
             .latest_id;
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2;").unwrap();
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2;").unwrap();
         let migrated = Store::open(path.clone()).unwrap();
         assert_eq!(
             migrated
@@ -1664,7 +2014,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -1806,6 +2156,12 @@ mod tests {
             )
             .await
             .unwrap();
+        let receipt = v2_receipt(&first);
+        let work = store
+            .prepare_config_release(&first.operation_id, &receipt)
+            .await
+            .unwrap();
+        store.acknowledge_config_release(&work).await.unwrap();
         store
             .finish_config(&third.operation_id, ConfigOperationState::Indeterminate)
             .await
@@ -1965,7 +2321,10 @@ mod tests {
         let connection = connection(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
+                "DROP TRIGGER admin_v2_release_delete_guard;
+            DROP TRIGGER admin_v2_release_version_guard;
+            DROP TABLE admin_config_releases;
+            ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
             ALTER TABLE admin_config_operation_meta DROP COLUMN pruned_through;
             ALTER TABLE admin_config_operation_meta DROP COLUMN retained_ids_sha256;
             ALTER TABLE admin_config_operations DROP COLUMN receipt_version;
@@ -2028,7 +2387,10 @@ mod tests {
         let connection = connection(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
+                "DROP TRIGGER admin_v2_release_delete_guard;
+            DROP TRIGGER admin_v2_release_version_guard;
+            DROP TABLE admin_config_releases;
+            ALTER TABLE admin_config_operation_meta DROP COLUMN history_revision;
             ALTER TABLE admin_config_operation_meta DROP COLUMN pruned_through;
             ALTER TABLE admin_config_operation_meta DROP COLUMN retained_ids_sha256;
             ALTER TABLE admin_config_operations DROP COLUMN receipt_version;
@@ -2181,7 +2543,7 @@ mod tests {
             .unwrap();
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2; CREATE TABLE admin_config_operation_meta(dummy INTEGER);").unwrap();
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2; CREATE TABLE admin_config_operation_meta(dummy INTEGER);").unwrap();
         assert!(Store::open(path.clone()).is_err());
         let connection = connection(&path).unwrap();
         assert_eq!(
@@ -2374,7 +2736,7 @@ mod tests {
         connection(&path)
             .unwrap()
             .execute_batch(
-                "DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1;",
+                "DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1;",
             )
             .unwrap();
         drop(store);
@@ -2434,7 +2796,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -2453,7 +2815,7 @@ mod tests {
             .unwrap();
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1; CREATE TABLE admin_audit_meta(dummy INTEGER);").unwrap();
+        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; DROP TABLE admin_audit; DROP TABLE admin_audit_meta; PRAGMA user_version=1; CREATE TABLE admin_audit_meta(dummy INTEGER);").unwrap();
         assert!(Store::open(path.clone()).is_err());
         let connection = connection(&path).unwrap();
         assert_eq!(
@@ -3498,7 +3860,7 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
         let connection = connection(&path).unwrap();
-        connection.execute_batch("PRAGMA user_version=4;").unwrap();
+        connection.execute_batch("DROP TRIGGER admin_v2_release_delete_guard; DROP TRIGGER admin_v2_release_version_guard; DROP TABLE admin_config_releases; PRAGMA user_version=4;").unwrap();
         assert!(
             Store::open(path.clone()).is_err(),
             "duplicate migration column must fail"
@@ -3568,14 +3930,475 @@ mod tests {
                 params![accepted.operation_id, accepted.id],
             )
             .unwrap();
-        connection.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE admin_config_operations SET receipt_version=3 WHERE id=1; PRAGMA ignore_check_constraints=OFF;").unwrap();
-        assert!(Store::open(path.clone()).is_err());
-        connection
-            .execute(
-                "UPDATE admin_config_operations SET receipt_version=2 WHERE id=1",
-                [],
-            )
-            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE admin_config_operations SET receipt_version=1 WHERE id=1",
+                    [],
+                )
+                .is_err()
+        );
         assert!(Store::open(path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn v2_release_work_is_exact_stable_and_fenced_by_live_admin() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        let receipt = v2_receipt(&accepted);
+        assert!(
+            store
+                .prepare_config_release(&accepted.operation_id, &receipt)
+                .await
+                .is_err()
+        );
+        store
+            .finish_config(
+                &accepted.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        for mismatch in [
+            crate::config_store::SequencedCommitReceipt {
+                revision: receipt.revision + 1,
+                ..receipt.clone()
+            },
+            crate::config_store::SequencedCommitReceipt {
+                epoch: "c".repeat(32),
+                ..receipt.clone()
+            },
+            crate::config_store::SequencedCommitReceipt {
+                stamp: crate::config_store::SequencedOperationStamp {
+                    candidate_sha256: "d".repeat(64),
+                    ..receipt.stamp.clone()
+                },
+                ..receipt.clone()
+            },
+            crate::config_store::SequencedCommitReceipt {
+                stamp: crate::config_store::SequencedOperationStamp {
+                    acceptance_seq: receipt.stamp.acceptance_seq + 1,
+                    ..receipt.stamp.clone()
+                },
+                ..receipt.clone()
+            },
+        ] {
+            assert!(
+                store
+                    .prepare_config_release(&accepted.operation_id, &mismatch)
+                    .await
+                    .unwrap_err()
+                    .is::<ConfigOperationConflict>()
+            );
+        }
+        let before = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap()
+            .history_revision;
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .prepare_config_release_authorized(
+                    MutationAuthority::Session(login.token),
+                    &accepted.operation_id,
+                    &receipt
+                )
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        assert_eq!(
+            store
+                .config_operations(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .history_revision,
+            before
+        );
+        let work = store
+            .prepare_config_release(&accepted.operation_id, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(work.state, ConfigReleaseState::Pending);
+        assert!(valid_lower_hex(&work.release_id, 32));
+        assert_eq!(
+            store
+                .prepare_config_release(&accepted.operation_id, &receipt)
+                .await
+                .unwrap(),
+            work
+        );
+        let reopened = Store::open(directory.path().join("accounts.sqlite3")).unwrap();
+        assert_eq!(
+            reopened
+                .config_release(&accepted.operation_id)
+                .await
+                .unwrap(),
+            Some(work.clone())
+        );
+        assert_eq!(
+            reopened
+                .config_operation(&accepted.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .release_state,
+            ConfigReleaseState::Pending
+        );
+        let wrong = ConfigReleaseWork {
+            release_id: "e".repeat(32),
+            ..work.clone()
+        };
+        assert!(
+            reopened
+                .acknowledge_config_release(&wrong)
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationConflict>()
+        );
+        let acknowledged = reopened.acknowledge_config_release(&work).await.unwrap();
+        assert_eq!(acknowledged.state, ConfigReleaseState::Acknowledged);
+        assert_eq!(
+            reopened.acknowledge_config_release(&work).await.unwrap(),
+            acknowledged
+        );
+        assert_eq!(
+            Store::open(directory.path().join("accounts.sqlite3"))
+                .unwrap()
+                .config_release(&accepted.operation_id)
+                .await
+                .unwrap(),
+            Some(acknowledged)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_local_history_cannot_prune_without_acknowledged_release() {
+        let (directory, store) = store();
+        let legacy = store
+            .accept_config(MutationAuthority::System, config_request())
+            .await
+            .unwrap();
+        let protected = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        store
+            .finish_config(
+                &legacy.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_config(
+                &protected.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM admin_config_operations WHERE id=?1",
+                    params![protected.id]
+                )
+                .is_err()
+        );
+        let page = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        let pruned = store
+            .prune_config_operations(
+                MutationAuthority::System,
+                protected.id,
+                protected.id,
+                page.history_revision,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pruned.pruned_records, 1);
+        assert_eq!(pruned.retained_unresolved, 1);
+        assert!(
+            store
+                .config_operation(&legacy.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .config_operation(&protected.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .release_state,
+            ConfigReleaseState::Protected
+        );
+        let retained = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .prune_config_operations(
+                    MutationAuthority::System,
+                    protected.id,
+                    protected.id,
+                    retained.history_revision
+                )
+                .await
+                .unwrap_err()
+                .is::<ConfigOperationConflict>()
+        );
+        let work = store
+            .prepare_config_release(&protected.operation_id, &v2_receipt(&protected))
+            .await
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM admin_config_operations WHERE id=?1",
+                    params![protected.id]
+                )
+                .is_err()
+        );
+        store.acknowledge_config_release(&work).await.unwrap();
+        let page = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        let pruned = store
+            .prune_config_operations(
+                MutationAuthority::System,
+                protected.id,
+                protected.id,
+                page.history_revision,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pruned.pruned_records, 1);
+        assert_eq!(pruned.retained_unresolved, 0);
+        assert!(
+            store
+                .config_release(&protected.operation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            Store::open(path)
+                .unwrap()
+                .config_operations(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .stored_records,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_local_acknowledgement_preserves_pending_work_and_protection() {
+        let (directory, store) = store();
+        let operation = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        store
+            .finish_config(
+                &operation.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        let work = store
+            .prepare_config_release(&operation.operation_id, &v2_receipt(&operation))
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let connection = connection(&path).unwrap();
+        connection.execute_batch("CREATE TRIGGER block_local_release_ack BEFORE UPDATE OF state ON admin_config_releases WHEN NEW.state='acknowledged' BEGIN SELECT RAISE(ABORT,'injected local acknowledgement failure'); END;").unwrap();
+        let before = store
+            .config_operations(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert!(store.acknowledge_config_release(&work).await.is_err());
+        let reopened = Store::open(path.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .config_release(&operation.operation_id)
+                .await
+                .unwrap(),
+            Some(work.clone())
+        );
+        assert_eq!(
+            reopened
+                .config_operations(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .history_revision,
+            before.history_revision
+        );
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM admin_config_operations WHERE id=?1",
+                    params![operation.id]
+                )
+                .is_err()
+        );
+        connection
+            .execute_batch("DROP TRIGGER block_local_release_ack")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .acknowledge_config_release(&work)
+                .await
+                .unwrap()
+                .state,
+            ConfigReleaseState::Acknowledged
+        );
+    }
+
+    #[tokio::test]
+    async fn release_requires_candidate_activated_v2_and_never_infers_other_outcomes() {
+        let (_directory, store) = store();
+        let legacy = store
+            .accept_config(MutationAuthority::System, config_request())
+            .await
+            .unwrap();
+        store
+            .finish_config(
+                &legacy.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .prepare_config_release(
+                    &legacy.operation_id,
+                    &v2_receipt(&ConfigOperation {
+                        receipt_version: 2,
+                        authority_epoch: Some("b".repeat(32)),
+                        store_kind: ConfigStoreKind::SharedStore,
+                        ..legacy.clone()
+                    })
+                )
+                .await
+                .is_err()
+        );
+        for state in [
+            ConfigOperationState::Conflict,
+            ConfigOperationState::Failed,
+            ConfigOperationState::Indeterminate,
+        ] {
+            let operation = store
+                .accept_config(MutationAuthority::System, v2_config_request())
+                .await
+                .unwrap();
+            store
+                .finish_config(&operation.operation_id, state)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .prepare_config_release(&operation.operation_id, &v2_receipt(&operation))
+                    .await
+                    .unwrap_err()
+                    .is::<ConfigOperationConflict>()
+            );
+            assert_eq!(
+                store
+                    .config_operation(&operation.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .release_state,
+                ConfigReleaseState::Protected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_to_v6_release_migration_preserves_rows_and_rolls_back_ddl_failure() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let operation = store
+            .accept_config(MutationAuthority::System, v2_config_request())
+            .await
+            .unwrap();
+        store
+            .finish_config(
+                &operation.operation_id,
+                ConfigOperationState::CandidateActivated,
+            )
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let connection = connection(&path).unwrap();
+        connection.execute_batch("DROP TRIGGER admin_v2_release_delete_guard; DROP TRIGGER admin_v2_release_version_guard; DROP TABLE admin_config_releases; PRAGMA user_version=5; CREATE TABLE admin_config_releases(dummy INTEGER);").unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        connection
+            .execute_batch("DROP TABLE admin_config_releases")
+            .unwrap();
+        drop(connection);
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(
+            migrated.session(login.token).await.unwrap().unwrap().id,
+            login.user.id
+        );
+        assert_eq!(
+            migrated
+                .config_operation(&operation.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .release_state,
+            ConfigReleaseState::Protected
+        );
+        let work = migrated
+            .prepare_config_release(&operation.operation_id, &v2_receipt(&operation))
+            .await
+            .unwrap();
+        assert_eq!(work.state, ConfigReleaseState::Pending);
     }
 }
