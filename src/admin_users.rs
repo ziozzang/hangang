@@ -5233,4 +5233,92 @@ mod tests {
             100001
         );
     }
+
+    #[tokio::test]
+    async fn v6_to_v7_migration_failure_preserves_accounts_and_retries_atomically() {
+        let (directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        drop(store);
+        let db = connection(&path).unwrap();
+        remove_v7_audit_metadata(&db);
+        db.execute_batch("PRAGMA user_version=6; CREATE TABLE admin_audit_v7(dummy INTEGER);")
+            .unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM pragma_table_info('admin_audit_meta') WHERE name='policy_revision'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        db.execute_batch("DROP TABLE admin_audit_v7").unwrap();
+        drop(db);
+        let migrated = Store::open(path).unwrap();
+        assert_eq!(
+            migrated.session(login.token).await.unwrap().unwrap().id,
+            root.id
+        );
+        assert_eq!(
+            migrated
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_session_cannot_publish_audit_policy() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .set_audit_policy(MutationAuthority::Session(login.token), 0, drop_policy())
+                .await
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
+        assert_eq!(
+            store
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        assert_eq!(
+            store
+                .audit_page(MutationAuthority::System, 0, 100)
+                .await
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
 }
