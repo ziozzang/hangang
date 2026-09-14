@@ -28,6 +28,7 @@ const TCP_FD: u8 = 4;
 const CONFIG_SNAPSHOT_FD: u8 = 5;
 const DOCKER_LOCK_FD: u8 = 7;
 const WORKLOAD_HTTP_FD: u8 = 8;
+const PUBLIC_HTTP_FD: u8 = 9;
 const FREEZE_EXPORT: u8 = 16;
 const RESUME: u8 = 17;
 const COMMIT: u8 = 18;
@@ -64,6 +65,7 @@ pub enum DescriptorRole {
     Admin(SocketAddr),
     Tcp(SocketAddr),
     WorkloadHttp(SocketAddr),
+    PublicHttp(SocketAddr),
     ConfigLock,
     DockerLock,
     ConfigSnapshot,
@@ -206,7 +208,7 @@ impl ControlChannel {
                         DescriptorRole::ConfigLock => lock = true,
                         DescriptorRole::DockerLock => {}
                         DescriptorRole::ConfigSnapshot => snapshot = true,
-                        DescriptorRole::Tcp(address) | DescriptorRole::WorkloadHttp(address) => {
+                        DescriptorRole::Tcp(address) | DescriptorRole::WorkloadHttp(address) | DescriptorRole::PublicHttp(address) => {
                             if !listener_addresses.insert(address) {
                                 return Err(invalid_data("duplicate listener address in handoff"));
                             }
@@ -315,6 +317,10 @@ fn encode_descriptor(role: DescriptorRole) -> [u8; FRAME_LEN] {
             frame[8] = ADMIN_FD;
             Some(address)
         }
+        DescriptorRole::PublicHttp(address) => {
+            frame[8] = PUBLIC_HTTP_FD;
+            Some(address)
+        }
         DescriptorRole::WorkloadHttp(address) => {
             frame[8] = WORKLOAD_HTTP_FD;
             Some(address)
@@ -389,6 +395,7 @@ fn decode_descriptor(frame: &[u8; FRAME_LEN]) -> io::Result<DescriptorRole> {
         ADMIN_FD => DescriptorRole::Admin(address),
         TCP_FD => DescriptorRole::Tcp(address),
         WORKLOAD_HTTP_FD => DescriptorRole::WorkloadHttp(address),
+        PUBLIC_HTTP_FD => DescriptorRole::PublicHttp(address),
         _ => return Err(invalid_data("invalid descriptor role")),
     })
 }
@@ -497,7 +504,7 @@ fn receive_frame(socket: BorrowedFd<'_>) -> io::Result<ProtocolMessage> {
     }
 
     match frame[8] {
-        PUBLIC_FD | ADMIN_FD | TCP_FD | ACME_HTTP_FD | WORKLOAD_HTTP_FD => {
+        PUBLIC_FD | ADMIN_FD | TCP_FD | ACME_HTTP_FD | WORKLOAD_HTTP_FD | PUBLIC_HTTP_FD => {
             if descriptors.len() != 1 {
                 return Err(invalid_data("descriptor frame must carry exactly one fd"));
             }

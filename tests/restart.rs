@@ -21,6 +21,7 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
     let (admin, admin_address) = listener();
     let (tcp, tcp_address) = listener();
     let (workload, workload_address) = listener();
+    let (named_public, named_public_address) = listener();
     let snapshot = tempfile::tempfile().unwrap();
     let lock = tempfile::tempfile().unwrap();
     let docker_lock = tempfile::tempfile().unwrap();
@@ -41,6 +42,7 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
                 workload.as_fd(),
             )
             .unwrap();
+        sender.send_descriptor(DescriptorRole::PublicHttp(named_public_address), named_public.as_fd()).unwrap();
         sender
             .send_descriptor(DescriptorRole::ConfigSnapshot, snapshot.as_fd())
             .unwrap();
@@ -55,7 +57,8 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
     });
 
     let received = receiver.receive_export(Duration::from_secs(1)).unwrap();
-    assert_eq!(received.len(), 7);
+    assert_eq!(received.len(), 8);
+    assert!(received.iter().any(|item| item.role == DescriptorRole::PublicHttp(named_public_address)));
     assert!(
         received
             .iter()

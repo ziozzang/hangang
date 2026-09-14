@@ -3978,6 +3978,11 @@ fn load_optional(path: &Path) -> StoreResult<Option<Config>> {
 }
 
 pub(crate) fn ensure_reader_compatibility(config: &Config) -> StoreResult<()> {
+    if !config.public_http.is_empty() || config.http.iter().any(|route| !route.listener_ids.is_empty()) {
+        return Err(StoreError::Invalid(anyhow!(
+            "public listener scopes require fleet reader capability coordination; use local file authority until it is available"
+        )));
+    }
     if config.has_named_members() {
         return Err(StoreError::Invalid(anyhow!(
             "named pool members require fleet reader capability coordination; use local file authority until it is available"

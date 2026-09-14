@@ -581,6 +581,10 @@ impl Manager {
         tls: Option<Arc<rustls::ServerConfig>>,
         authority: Option<ConfigAuthority>,
     ) -> anyhow::Result<Config> {
+        if self.externally_managed {
+            anyhow::ensure!(config.public_http.is_empty() && config.http.iter().all(|route| route.listener_ids.is_empty()),
+                "public listener scopes require local file authority; controller listener ownership is not supported");
+        }
         if self.config_store.is_some() {
             crate::config_store::ensure_reader_compatibility(&config)?;
         }

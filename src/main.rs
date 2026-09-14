@@ -411,6 +411,7 @@ async fn run(args: Args) -> Result<()> {
     let mut inherited_docker_lock = None;
     let mut inherited_config = None;
     let mut inherited_tcp = Vec::new();
+    let mut inherited_public_http_addresses = std::collections::HashSet::new();
     let mut inherited_workload_addresses = std::collections::HashSet::new();
     if let Some(channel) = &channel {
         let channel = channel.clone();
@@ -444,6 +445,10 @@ async fn run(args: Args) -> Result<()> {
                         inherited_admin = Some(descriptor.fd);
                     }
                     DescriptorRole::Tcp(address) => inherited_tcp.push((address, descriptor.fd)),
+                    DescriptorRole::PublicHttp(address) => {
+                        inherited_public_http_addresses.insert(address);
+                        inherited_tcp.push((address, descriptor.fd));
+                    }
                     DescriptorRole::WorkloadHttp(address) => {
                         inherited_workload_addresses.insert(address);
                         inherited_tcp.push((address, descriptor.fd));
@@ -492,8 +497,12 @@ async fn run(args: Args) -> Result<()> {
                 .tcp
                 .iter()
                 .any(|route| route.enabled && route.listen == *address);
+            let public_http = inherited.config.public_http.iter()
+                .any(|listener| listener.enabled && listener.listen == *address);
             anyhow::ensure!(
-                workload != tcp && workload == inherited_workload_addresses.contains(address),
+                usize::from(workload) + usize::from(tcp) + usize::from(public_http) == 1
+                && workload == inherited_workload_addresses.contains(address)
+                && public_http == inherited_public_http_addresses.contains(address),
                 "inherited listener role disagrees with frozen configuration"
             );
         }
@@ -1056,6 +1065,7 @@ async fn run(args: Args) -> Result<()> {
         anyhow::bail!("workload TLS material did not become ready within 10 seconds");
     }
     tcp.open_gate();
+    tls_watchers.push(tokio::spawn(hangang::certificates::watch_public(active.clone(), cancel.clone())));
     if args.config_tls {
         tls_watchers.push(tokio::spawn(hangang::certificates::watch(
             active.clone(),
@@ -1526,6 +1536,9 @@ async fn lifecycle_wait(
                         .any(|listener| listener.enabled && listener.listen == address)
                     {
                         DescriptorRole::WorkloadHttp(address)
+                    } else if snapshot.config.public_http.iter()
+                        .any(|listener| listener.enabled && listener.listen == address) {
+                        DescriptorRole::PublicHttp(address)
                     } else {
                         DescriptorRole::Tcp(address)
                     };

@@ -807,6 +807,12 @@ impl Proxy {
         // probe decision, routing and the document's settings all come from
         // the same activation.
         let snapshot = self.active.load_full();
+        if request.extensions().get::<crate::public_http::Evidence>()
+            .is_some_and(|evidence| !evidence.current(&snapshot)) {
+            self.metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(context) = traffic.as_mut() { self.record_response_head(context, 503); }
+            return Ok(response(503, "public listener configuration retired"));
+        }
         // A workload identity is only an extension created by the mandatory
         // mTLS listener. Client-supplied lookalike fields must not participate
         // in route predicates, external auth, Lua, or eventual forwarding.
@@ -844,12 +850,15 @@ impl Proxy {
                     .rejected_requests
                     .fetch_add(1, Ordering::Relaxed);
                 if let Some(context) = traffic.as_mut() {
-                    let trusted_proxies: &[ipnet::IpNet] = snapshot
+                    let trusted_proxies: &[ipnet::IpNet] = request.extensions()
+                        .get::<crate::public_http::Evidence>()
+                        .map(|evidence| evidence.trusted_proxy_cidrs())
+                        .unwrap_or_else(|| snapshot
                         .settings
                         .trusted_proxy_cidrs
                         .as_deref()
                         .map(Vec::as_slice)
-                        .unwrap_or(&self.trusted_proxies);
+                        .unwrap_or(&self.trusted_proxies));
                     let direct_workload = request
                         .extensions()
                         .get::<crate::workload_http::Evidence>()
@@ -996,12 +1005,15 @@ impl Proxy {
         // peer is a trusted proxy, so deny rules, external-auth client IP, the
         // cache partition, and the regenerated forwarding headers all reflect
         // the real client rather than the fronting proxy.
-        let trusted_proxies: &[ipnet::IpNet] = snapshot
+        let trusted_proxies: &[ipnet::IpNet] = request.extensions()
+                        .get::<crate::public_http::Evidence>()
+                        .map(|evidence| evidence.trusted_proxy_cidrs())
+                        .unwrap_or_else(|| snapshot
             .settings
             .trusted_proxy_cidrs
             .as_deref()
             .map(Vec::as_slice)
-            .unwrap_or(&self.trusted_proxies);
+            .unwrap_or(&self.trusted_proxies));
         let edge = match self.resolve_edge(
             &request,
             peer,
@@ -2482,6 +2494,9 @@ fn basic_match_path<B>(
     host_regex: Option<&regex::Regex>,
     path: &str,
 ) -> bool {
+    if !crate::resource_guard::listener_matches(route, request) {
+        return false;
+    }
     let constrained_host = route.host.is_some() || !route.hosts.is_empty() || host_regex.is_some();
     if (constrained_host
         && !crate::resource_guard::host_matches(
