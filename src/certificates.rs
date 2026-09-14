@@ -242,6 +242,103 @@ pub async fn watch(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationToken) {
     }
 }
 
+/// Reload named public listeners independently; a failed set retains its last
+/// verified resolver and cannot affect another listener.
+pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut observations: std::collections::HashMap<String, Observation> = Default::default();
+    let mut attempts: std::collections::HashMap<String, Attempt> = Default::default();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let snapshot = active.load_full();
+        observations.retain(|id, _| snapshot.public_http_tls.contains_key(id));
+        attempts.retain(|id, _| snapshot.public_http_tls.contains_key(id));
+        for listener in snapshot
+            .config
+            .public_http
+            .iter()
+            .filter(|l| l.enabled && !l.certificates.is_empty())
+        {
+            let Some(target) = snapshot.public_http_tls.get(&listener.id).cloned() else {
+                continue;
+            };
+            let id = listener.id.clone();
+            let files = listener.certificates.clone();
+            let inspected = files.clone();
+            let Ok(Ok(fingerprint)) =
+                tokio::task::spawn_blocking(move || fingerprint(&inspected)).await
+            else {
+                observations.remove(&id);
+                continue;
+            };
+            let now = Instant::now();
+            if observations.get(&id).is_some_and(|seen| {
+                Arc::ptr_eq(&seen.target, &target)
+                    && seen.files == files
+                    && seen.fingerprint == fingerprint
+                    && now.duration_since(seen.checked_at) < FULL_VERIFY_INTERVAL
+            }) {
+                continue;
+            }
+            observations.insert(
+                id.clone(),
+                Observation {
+                    target: target.clone(),
+                    files: files.clone(),
+                    fingerprint,
+                    checked_at: now,
+                },
+            );
+            let checked = files.clone();
+            let Ok(Ok(material)) =
+                tokio::task::spawn_blocking(move || read_material(&checked)).await
+            else {
+                continue;
+            };
+            if attempts.get(&id).is_some_and(|seen| {
+                Arc::ptr_eq(&seen.target, &target)
+                    && seen.files == files
+                    && seen.digest == material.digest
+            }) {
+                continue;
+            }
+            attempts.insert(
+                id.clone(),
+                Attempt {
+                    target: target.clone(),
+                    files: files.clone(),
+                    digest: material.digest,
+                },
+            );
+            let Ok(Ok(config)) = tokio::task::spawn_blocking(move || {
+                crate::tls::sni_server_config(material.certificates)
+            })
+            .await
+            else {
+                continue;
+            };
+            let current = active.load_full();
+            if current
+                .config
+                .public_http
+                .iter()
+                .any(|l| l.enabled && l.id == id && l.certificates == files)
+                && current
+                    .public_http_tls
+                    .get(&id)
+                    .is_some_and(|slot| Arc::ptr_eq(slot, &target))
+            {
+                target.store(Arc::new(config));
+            }
+        }
+    }
+}
+
 struct Attempt {
     target: Arc<ArcSwap<rustls::ServerConfig>>,
     files: Vec<CertificateFiles>,

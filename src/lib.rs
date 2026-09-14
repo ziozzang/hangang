@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod policy;
 pub mod pool_member;
 pub mod proxy;
+pub mod public_listener_config;
 pub mod redis_store;
 pub mod restart;
 pub mod store;

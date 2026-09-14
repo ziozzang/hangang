@@ -4197,6 +4197,7 @@ mod tests {
             http: vec![],
             tcp: vec![],
             workload_http: Vec::new(),
+            public_http: Vec::new(),
             cache: Some(Default::default()),
             settings: Default::default(),
             cache_generation_floor: 0,

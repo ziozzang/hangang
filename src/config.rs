@@ -29,6 +29,8 @@ pub struct Config {
     pub geoip_database: Option<crate::geoip_runtime::Source>,
     #[serde(default)]
     pub http: Vec<HttpRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_http: Vec<crate::public_listener_config::Listener>,
     #[serde(default)]
     pub tcp: Vec<TcpRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -199,6 +201,8 @@ fn is_legacy_access_mode(mode: &AccessMode) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct HttpRoute {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listener_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_legacy_access_mode")]
     pub access_mode: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -679,6 +683,36 @@ impl Config {
                 );
             }
         }
+        ensure!(
+            self.public_http.len() <= 64,
+            "at most 64 public HTTP listeners"
+        );
+        let mut public_ids = HashSet::new();
+        let mut public_addresses = HashSet::new();
+        for listener in &self.public_http {
+            listener.validate()?;
+            ensure!(
+                public_ids.insert(listener.id.as_str()),
+                "duplicate public HTTP listener id"
+            );
+            if listener.enabled {
+                ensure!(
+                    public_addresses.insert(listener.listen),
+                    "duplicate public HTTP listener address"
+                );
+                ensure!(
+                    !workload_addresses.contains(&listener.listen),
+                    "public HTTP listener conflicts with workload HTTP listener"
+                );
+                ensure!(
+                    !self
+                        .tcp
+                        .iter()
+                        .any(|r| r.enabled && r.listen == listener.listen),
+                    "public HTTP listener conflicts with TCP listener"
+                );
+            }
+        }
         let workload_identity_headers: HashSet<String> = self
             .http
             .iter()
@@ -726,6 +760,28 @@ impl Config {
         let mut resources: std::collections::HashMap<&str, &HttpRoute> = Default::default();
         let mut jwt_policies = std::collections::HashSet::new();
         for r in &self.http {
+            ensure!(
+                r.listener_ids.len() <= 64,
+                "route {} has too many listener IDs",
+                r.id
+            );
+            let mut route_listener_ids = HashSet::new();
+            for id in &r.listener_ids {
+                ensure!(
+                    route_listener_ids.insert(id),
+                    "route {} has duplicate listener ID",
+                    r.id
+                );
+                ensure!(
+                    id == "default" || public_ids.contains(id.as_str()),
+                    "route {} references unknown public HTTP listener {id}",
+                    r.id
+                );
+            }
+            ensure!(
+                r.workload_auth.is_none() || r.listener_ids.is_empty(),
+                "workload_auth route cannot select public HTTP listeners"
+            );
             if let Some(workload) = &r.workload_auth {
                 workload.validate()?;
                 ensure!(
@@ -813,7 +869,8 @@ impl Config {
                             && prior.basic_auth == r.basic_auth
                             && prior.auth == r.auth
                             && prior.jwt_auth == r.jwt_auth
-                            && prior.workload_auth == r.workload_auth,
+                            && prior.workload_auth == r.workload_auth
+                            && effective_public_listeners(prior) == effective_public_listeners(r),
                         "routes sharing a resource_id must share policy and authenticators"
                     );
                 }
@@ -1216,6 +1273,7 @@ impl Config {
                         && resource_hosts_preserved(old, new)
                         && new.path_prefix == old.path_prefix
                         && new.path_match == old.path_match
+                        && effective_public_listeners(new) == effective_public_listeners(old)
                 }),
                 "resource {} scope cannot be removed or moved; first publish enforce=false at its existing scope",
                 policy.resource_id
@@ -1279,6 +1337,14 @@ impl Config {
 
 // Host aliases may be added or reordered without releasing an existing scope.
 // Prove containment structurally; never guess containment between regex/globs.
+pub fn effective_public_listeners(route: &HttpRoute) -> std::collections::BTreeSet<&str> {
+    if route.listener_ids.is_empty() {
+        ["default"].into_iter().collect()
+    } else {
+        route.listener_ids.iter().map(String::as_str).collect()
+    }
+}
+
 fn resource_hosts_preserved(old: &HttpRoute, new: &HttpRoute) -> bool {
     let unrestricted = |route: &HttpRoute| {
         route.host.is_none() && route.hosts.is_empty() && route.host_regex.is_none()
@@ -1373,6 +1439,8 @@ pub struct Snapshot {
     pub jwt_routes: std::collections::HashMap<String, std::sync::Arc<HttpRoute>>,
     pub http_workload_tls:
         std::collections::HashMap<String, std::sync::Arc<crate::workload_material::Slot>>,
+    pub public_http_tls:
+        std::collections::HashMap<String, std::sync::Arc<arc_swap::ArcSwap<rustls::ServerConfig>>>,
     pub sni_regex: std::collections::HashMap<String, Vec<regex::Regex>>,
     pub upstream_tls: std::collections::HashMap<String, std::sync::Arc<rustls::ClientConfig>>,
     // Fingerprints of the exact custom CA certificates used by prepared TLS.
@@ -1970,6 +2038,31 @@ impl Snapshot {
                 },
             )
         };
+        let mut public_http_tls = std::collections::HashMap::new();
+        for listener in config
+            .public_http
+            .iter()
+            .filter(|listener| listener.enabled && !listener.certificates.is_empty())
+        {
+            let existing = previous
+                .filter(|old| {
+                    old.config.public_http.iter().any(|prior| {
+                        prior.enabled
+                            && prior.id == listener.id
+                            && prior.listen == listener.listen
+                            && prior.certificates == listener.certificates
+                    })
+                })
+                .and_then(|old| old.public_http_tls.get(&listener.id));
+            let slot = if let Some(existing) = existing {
+                existing.clone()
+            } else {
+                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(crate::certificates::load(
+                    &listener.certificates,
+                )?))
+            };
+            public_http_tls.insert(listener.id.clone(), slot);
+        }
         let mut next = Self {
             retirements: Default::default(),
             retired_members: previous
@@ -1981,6 +2074,7 @@ impl Snapshot {
             workload_routes,
             jwt_routes,
             http_workload_tls,
+            public_http_tls,
             sni_regex: regexes.sni,
             upstream_tls,
             upstream_trust,
@@ -2216,6 +2310,51 @@ mod tests {
     fn route() -> Config {
         serde_json::from_str(r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080"]}]}"#)
             .unwrap()
+    }
+    #[test]
+    fn named_public_listener_validation_and_legacy_wire() {
+        let mut config = route();
+        let wire = serde_json::to_value(&config).unwrap();
+        assert!(wire.get("public_http").is_none());
+        assert!(wire["http"][0].get("listener_ids").is_none());
+        let listener: crate::public_listener_config::Listener =
+            serde_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap();
+        assert!(listener.enabled);
+        config.public_http.push(listener.clone());
+        config.http[0].listener_ids = vec!["edge".into()];
+        config.validate().unwrap();
+        config.http[0].listener_ids.push("edge".into());
+        assert!(config.validate().is_err());
+        config.http[0].listener_ids = vec!["missing".into()];
+        assert!(config.validate().is_err());
+        config.http[0].listener_ids.clear();
+        config.public_http.push(listener.clone());
+        assert!(config.validate().is_err());
+        config.public_http[1].id = "other".into();
+        assert!(config.validate().is_err());
+        config.public_http[1].enabled = false;
+        config.validate().unwrap();
+        config.public_http[1].id = "default".into();
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn protected_scope_cannot_move_between_public_listeners() {
+        let mut old = route();
+        old.http[0].resource_policy = Some(
+            serde_json::from_str(
+                r#"{"resource_id":"private","principal":{"source":"basic"},"allow":[]}"#,
+            )
+            .unwrap(),
+        );
+        let mut next = old.clone();
+        next.http[0].listener_ids = vec!["default".into()];
+        next.validate_transition_from(&old).unwrap();
+        next.http[0].listener_ids = vec!["edge".into()];
+        assert!(next.validate_transition_from(&old).is_err());
+        next.http[0].resource_policy.as_mut().unwrap().enforce = false;
+        next.validate_transition_from(&old).unwrap_err();
+        old.http[0].resource_policy.as_mut().unwrap().enforce = false;
+        next.validate_transition_from(&old).unwrap();
     }
     #[test]
     fn activation_defaults_preserve_legacy_json_and_disabled_policy_round_trips() {

@@ -3294,6 +3294,7 @@ mod tests {
 
     fn route() -> HttpRoute {
         HttpRoute {
+            listener_ids: Vec::new(),
             access_mode: Default::default(),
             resource_policy: None,
             language_policy: None,
