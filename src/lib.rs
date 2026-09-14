@@ -5,6 +5,7 @@ pub mod api_spec;
 pub mod balance;
 pub mod basic_auth;
 pub mod config;
+pub mod config_receipt_release;
 pub mod config_store;
 pub mod country_metrics;
 pub mod country_observation;

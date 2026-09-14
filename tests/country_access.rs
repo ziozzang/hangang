@@ -21,6 +21,11 @@ use std::{
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
+// These fixtures exercise one active instance each. Serialize independent test
+// instances because their periodic watchers share the process-wide verifier's
+// try-acquire limiter; otherwise unrelated tests can consume every initial tick.
+static VERIFIER_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Fixture {
     metrics: Arc<Metrics>,
     traffic: Arc<hangang::traffic::TrafficHistory>,
@@ -202,6 +207,7 @@ fn basic_credential() -> String {
 #[tokio::test]
 async fn observation_records_and_counters_use_the_admission_result_without_blocking_passive_errors()
 {
+    let _verification = VERIFIER_FIXTURE.lock().await;
     use hangang::country_observation::State;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("country.mmdb");
@@ -311,6 +317,7 @@ fn protected_route(origin: std::net::SocketAddr, allow: &str) -> Value {
 
 #[tokio::test]
 async fn country_admission_uses_trusted_ip_and_fails_closed_on_database_damage() {
+    let _verification = VERIFIER_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("country.mmdb");
     std::fs::write(&file, fresh_fixture()).unwrap();
@@ -404,6 +411,7 @@ async fn country_admission_uses_trusted_ip_and_fails_closed_on_database_damage()
 
 #[tokio::test]
 async fn protected_resource_shadow_cannot_skip_country_policy() {
+    let _verification = VERIFIER_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("country.mmdb");
     std::fs::write(&file, fresh_fixture()).unwrap();
@@ -454,6 +462,7 @@ async fn protected_resource_shadow_cannot_skip_country_policy() {
 
 #[tokio::test]
 async fn changed_country_source_is_pending_until_its_own_verification() {
+    let _verification = VERIFIER_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let first_file = dir.path().join("first.mmdb");
     let next_file = dir.path().join("next.mmdb");
@@ -502,6 +511,7 @@ async fn changed_country_source_is_pending_until_its_own_verification() {
 
 #[tokio::test]
 async fn country_denial_precedes_only_if_cached_shortcut() {
+    let _verification = VERIFIER_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("country.mmdb");
     std::fs::write(&file, fresh_fixture()).unwrap();

@@ -776,6 +776,24 @@ impl Manager {
                 .finish_config(&operation.operation_id, state)
                 .await
                 .map_err(|_| ConfigOperationUnavailable)?;
+            if state == ConfigOperationState::CandidateActivated
+                && operation.receipt_version == 2
+                && let Some(store) = self.config_store.as_ref()
+                && store.supports_receipt_release_v2()
+                && crate::config_receipt_release::release(
+                    &users,
+                    store.as_ref(),
+                    crate::admin_users::MutationAuthority::System,
+                    &operation.operation_id,
+                )
+                .await
+                .is_err()
+            {
+                // The configuration is already committed and activated. A
+                // release failure must not relabel it as a failed write or
+                // encourage the client to replay that configuration mutation.
+                tracing::warn!("configuration receipt release pending; local operation retained");
+            }
         }
         outcome
     }
@@ -1102,6 +1120,7 @@ impl Admin {
                 || path == "/v1/config/validate"
                 || path == "/v1/config/operations"
                 || path == "/v1/config/operations/prune"
+                || path == "/v1/config/operations/release"
                 || path == "/v1/config/operation-proof"
                 || path == "/v1/config/commit-receipt"
                 || path == "/v1/config/commit-receipt-v2"
@@ -1238,6 +1257,9 @@ impl Admin {
         }
         if path == "/v1/config/operations/prune" {
             return Ok(self.handle_config_operation_prune(req, &actor).await);
+        }
+        if path == "/v1/config/operations/release" {
+            return Ok(self.handle_config_operation_release(req, &actor).await);
         }
         if path == "/v1/config/operations" {
             if req.method() != hyper::Method::GET {
@@ -3159,6 +3181,91 @@ impl Admin {
                 "proof":proof, "server_time_unix_ms":observed_ms,
             }),
         )
+    }
+
+    async fn handle_config_operation_release(
+        &self,
+        req: Request<Incoming>,
+        actor: &AdminActor,
+    ) -> Response<Body> {
+        if req.method() != hyper::Method::POST {
+            return problem(405, "Method Not Allowed", "POST required");
+        }
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Operation Query",
+                "release does not accept query parameters",
+            );
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Release {
+            operation_id: String,
+        }
+        let body: Release = match read_json(req, 4096).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        };
+        if body.operation_id.len() != 32
+            || !body
+                .operation_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return problem(
+                400,
+                "Invalid Operation Identity",
+                "operation_id must be 32 lowercase hexadecimal characters",
+            );
+        }
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        let Some(store) = self
+            .manager
+            .config_store
+            .as_ref()
+            .filter(|s| s.supports_receipt_release_v2())
+        else {
+            return problem(
+                501,
+                "Receipt Release Unsupported",
+                "this configuration store does not support V2 receipt release",
+            );
+        };
+        let result = crate::config_receipt_release::release(
+            &self.users,
+            store.as_ref(),
+            actor.mutation_authority(),
+            &body.operation_id,
+        )
+        .await;
+        // Accepted work can finish after logout. Do not disclose its result to
+        // an actor whose session was revoked during the remote transaction.
+        if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+            return account_problem(error);
+        }
+        match result {
+            Ok(work) => auth_json(
+                200,
+                &serde_json::json!({
+                    "scope":"instance", "operation_id":body.operation_id,
+                    "release_id":work.release_id, "release_state":"acknowledged",
+                }),
+            ),
+            Err(error)
+                if error.is::<crate::admin_users::ConfigOperationConflict>()
+                    || error.is::<crate::admin_users::AuthorizationRevoked>() =>
+            {
+                account_problem(error)
+            }
+            Err(_) => problem(
+                503,
+                "Receipt Release Unconfirmed",
+                "release could not be confirmed; retained local work must be inspected before explicit recovery, not automatically retried",
+            ),
+        }
     }
 
     async fn handle_config_operation_prune(

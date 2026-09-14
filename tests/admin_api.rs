@@ -5316,6 +5316,7 @@ async fn sequenced_commit_receipt_is_historical_after_later_http_write() {
     let authority = first["authority_id"].as_str().unwrap();
     let seq = first["id"].as_u64().unwrap();
     assert_eq!(first["receipt_version"], 2);
+    assert_eq!(first["release_state"], "acknowledged");
     assert_eq!(
         first["operation_id"],
         hangang::config_store::canonical_operation_id(authority, seq).unwrap()
@@ -5367,6 +5368,108 @@ async fn sequenced_commit_receipt_is_historical_after_later_http_write() {
     assert_eq!(status, 200);
     assert!(json(&body)["receipt"].is_null());
     assert_eq!(json(&body)["stored_records"], 2);
+}
+
+#[tokio::test]
+async fn receipt_release_failure_preserves_successful_configuration_and_allows_online_recovery() {
+    use hangang::config_store::{ConfigStore, SqliteConfigStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SqliteConfigStore::open(dir.path().join("config.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let initial = Config::default();
+    store.bootstrap(initial.clone()).await.unwrap();
+    let (address, manager) = server_on(
+        dir.path().join("seed.json"),
+        initial,
+        Some(store.clone()),
+        false,
+        64,
+        16,
+    )
+    .await;
+    manager.reload_file().await.unwrap();
+    let db = rusqlite::Connection::open(manager.state_path.with_extension("admin-users.sqlite3"))
+        .unwrap();
+    db.execute_batch("CREATE TRIGGER inject_ack_failure BEFORE UPDATE ON admin_config_releases WHEN NEW.state='acknowledged' BEGIN SELECT RAISE(ABORT,'injected local ACK failure'); END;").unwrap();
+    let route = r#"{"id":"released","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(address, "POST", "/v1/routes/http", Some(route), Some(0))
+            .await
+            .0,
+        201
+    );
+    assert_eq!(manager.active.load().config.revision, 1);
+    let records = config_operation_records(address).await;
+    assert_eq!(records[0]["state"], "candidate_activated");
+    assert_eq!(records[0]["release_state"], "pending");
+    let payload = serde_json::json!({"operation_id":records[0]["operation_id"]}).to_string();
+    let endpoint = "/v1/config/operations/release";
+    assert_eq!(
+        request(address, "POST", endpoint, Some(&payload), None)
+            .await
+            .0,
+        503
+    );
+    db.execute_batch("DROP TRIGGER inject_ack_failure;")
+        .unwrap();
+    let (status, headers, body) = request(address, "POST", endpoint, Some(&payload), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(json(&body)["release_state"], "acknowledged");
+    assert_eq!(json(&body)["release_id"], records[0]["release_id"]);
+    assert_eq!(
+        config_operation_records(address).await[0]["release_state"],
+        "acknowledged"
+    );
+    assert_eq!(
+        request(address, "POST", endpoint, Some(&payload), None)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(manager.active.load().config.revision, 1);
+    assert_eq!(
+        store.load_latest().await.unwrap().unwrap().config.revision,
+        1
+    );
+}
+
+#[tokio::test]
+async fn receipt_release_endpoint_rejects_unsupported_invalid_and_revoked_requests() {
+    let (address, _, _dir) = server().await;
+    let endpoint = "/v1/config/operations/release";
+    let payload = r#"{"operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    assert_eq!(
+        request(address, "POST", endpoint, Some(payload), None)
+            .await
+            .0,
+        501
+    );
+    assert_eq!(request(address, "GET", endpoint, None, None).await.0, 405);
+    for body in [
+        r#"{"operation_id":"bad"}"#,
+        r#"{"operation_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        r#"{"operation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","extra":true}"#,
+    ] {
+        assert_eq!(
+            request(address, "POST", endpoint, Some(body), None).await.0,
+            400
+        );
+    }
+    assert_eq!(
+        request_with_token(address, "POST", endpoint, Some(payload), None, None)
+            .await
+            .0,
+        401
+    );
+    let token = account_admin_token(address).await;
+    let mut pending =
+        admitted_config_mutation_waiting_for_body(address, "POST", endpoint, &token, payload).await;
+    revoke_account_session(address, &token).await;
+    assert_eq!(finish_user_mutation(&mut pending, payload).await, 403);
 }
 
 #[tokio::test]
