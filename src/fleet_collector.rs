@@ -106,6 +106,7 @@ fn load(path: &Path, forbidden: Option<[u8; 32]>) -> Result<Vec<Spec>> {
             crate::fleet_observer::valid_node_id(&peer.node_id),
             "invalid fleet node id"
         );
+        ensure!(peer.endpoint.len() <= 2048, "fleet endpoint too long");
         let url = reqwest::Url::parse(&peer.endpoint)
             .map_err(|_| anyhow::anyhow!("invalid fleet endpoint"))?;
         ensure!(
@@ -450,6 +451,14 @@ mod tests {
             .unwrap();
             assert!(load(&path, None).is_err(), "accepted {bad}");
         }
+        fs::write(
+            &path,
+            serde_json::json!({"peers":[{"node_id":"one",
+            "endpoint":format!("https://{}", "a".repeat(2049)),"token_file":secret}]})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(load(&path, None).is_err());
         fs::write(
             &path,
             serde_json::json!({"peers":[
