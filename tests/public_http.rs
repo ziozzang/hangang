@@ -119,8 +119,13 @@ async fn request(stream: &mut TcpStream) -> String {
 }
 
 async fn status_for(listen: SocketAddr, path: &str) -> String {
+    status_with(listen, path, "").await
+}
+
+async fn status_with(listen: SocketAddr, path: &str, headers: &str) -> String {
     let mut stream = TcpStream::connect(listen).await.unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -240,6 +245,11 @@ async fn public_listener_cannot_reach_unscoped_default_route() {
             .await
             .starts_with("HTTP/1.1 404")
     );
+    assert!(
+        status_with(listen, "/default", "X-Hangang-Listener: default\r\n")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
     running.shutdown().await;
     origin_task.abort();
 }
@@ -289,6 +299,57 @@ async fn named_https_listener_serves_scoped_route() {
         String::from_utf8(response)
             .unwrap()
             .starts_with("HTTP/1.1 200")
+    );
+    running.shutdown().await;
+    origin_task.abort();
+}
+
+#[tokio::test]
+async fn forwarded_headers_require_listener_specific_proxy_trust() {
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let (backend, origin_task) = origin().await;
+    let mut candidate = config(listen, backend);
+    // This global setting is deliberately broad; named listeners must use
+    // their own explicit trust policy rather than inheriting it.
+    candidate.settings.trusted_proxy_cidrs = Some(vec!["127.0.0.0/8".parse().unwrap()]);
+    candidate.settings.https_redirect_code = Some(426);
+    candidate.http[0].require_tls = true;
+    candidate.http.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "client-filter", "path_prefix": "/filtered", "listener_ids": ["edge"],
+            "deny_cidrs": ["8.8.8.0/24"], "backends": [format!("http://{backend}")]
+        }))
+        .unwrap(),
+    );
+    let running = start(candidate.clone(), bound).await;
+    let spoof = "X-Forwarded-Proto: https\r\nX-Forwarded-For: 8.8.8.8\r\n";
+    assert!(
+        status_with(listen, "/edge", spoof)
+            .await
+            .starts_with("HTTP/1.1 426")
+    );
+    assert!(
+        status_with(listen, "/filtered", spoof)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+
+    // Updating this listener's policy creates a new evidence generation.
+    candidate.revision = 2;
+    candidate.public_http[0]
+        .trusted_proxy_cidrs
+        .push("127.0.0.0/8".parse().unwrap());
+    running.publish(candidate).await;
+    assert!(
+        status_with(listen, "/edge", spoof)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        status_with(listen, "/filtered", spoof)
+            .await
+            .starts_with("HTTP/1.1 403")
     );
     running.shutdown().await;
     origin_task.abort();
