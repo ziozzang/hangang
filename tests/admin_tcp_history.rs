@@ -146,6 +146,140 @@ fn data(frame: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn drop_only_tcp_recent_policy_keeps_api_cursor_private_and_sse_counter_visible() {
+    let (base, client, manager, _directory, server) = fixture().await;
+    let credentials = serde_json::json!({"username":"operator","password":"correct horse battery"});
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::POST,
+            "/v1/auth/bootstrap",
+            Some(SYSTEM_TOKEN),
+            Some(credentials.clone())
+        )
+        .await
+        .status(),
+        201
+    );
+    let login = call(
+        &client,
+        &base,
+        reqwest::Method::POST,
+        "/v1/auth/login",
+        None,
+        Some(credentials),
+    )
+    .await;
+    let token = login.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut stream = call(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/v1/events",
+        Some(&token),
+        None,
+    )
+    .await;
+    let mut pending = Vec::new();
+    assert!(
+        frame(&mut stream, &mut pending)
+            .await
+            .starts_with("event: status\n")
+    );
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "revision":1,"settings":{"tcp_recent_recording":{"default_action":"drop","rules":[]}}
+    }))
+    .unwrap();
+    manager
+        .active
+        .store(Arc::new(Snapshot::new(config).unwrap()));
+    let history = manager.metrics.tcp_history.clone();
+    let guard = history.begin_with_policy(
+        "127.0.0.1:41000".parse().unwrap(),
+        "127.0.0.1:11235".parse().unwrap(),
+        manager.active.clone(),
+    );
+    drop(guard);
+    let recent = call(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/v1/connections/tcp/recent?after=0",
+        Some(&token),
+        None,
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap();
+    assert!(recent["records"].as_array().unwrap().is_empty());
+    assert_eq!(recent["latest_event_id"], "0");
+    assert_eq!(recent["next_after"], "0");
+    assert_eq!(recent["filtered_total"], "1");
+    assert_eq!(recent["omitted_total"], "0");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let next = frame(&mut stream, &mut pending).await;
+            if next.starts_with("event: tcp_connections\n") {
+                let batch = data(&next);
+                if batch["recent"]["filtered_total"] == "1" {
+                    assert!(batch["recent"]["records"].as_array().unwrap().is_empty());
+                    assert_eq!(batch["recent"]["next_after"], "0");
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "revision":2,"settings":{"tcp_recent_recording":{"default_action":"record","rules":[]}}
+    }))
+    .unwrap();
+    manager
+        .active
+        .store(Arc::new(Snapshot::new(config).unwrap()));
+    drop(history.begin_with_policy(
+        "127.0.0.1:41001".parse().unwrap(),
+        "127.0.0.1:11235".parse().unwrap(),
+        manager.active.clone(),
+    ));
+    let recorded = call(
+        &client,
+        &base,
+        reqwest::Method::GET,
+        "/v1/connections/tcp/recent?after=0",
+        Some(&token),
+        None,
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap();
+    assert_eq!(recorded["records"][0]["event_id"], "1");
+    assert_eq!(recorded["records"][0]["policy_revision"], "2");
+    assert_eq!(recorded["filtered_total"], "1");
+    assert_eq!(
+        call(
+            &client,
+            &base,
+            reqwest::Method::GET,
+            "/v1/connections/tcp/recent",
+            None,
+            None
+        )
+        .await
+        .status(),
+        401
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn tcp_history_is_admin_only_lossless_and_session_fenced() {
     let (base, client, manager, _directory, server) = fixture().await;
     let active_path = "/v1/connections/tcp/active";

@@ -101,6 +101,111 @@ async fn echo_origin() -> (SocketAddr, JoinHandle<()>) {
     (address, task)
 }
 
+async fn publish_recording_policy(fixture: &Fixture, revision: u64, policy: Value) {
+    let mut document = serde_json::to_value(fixture.active.load().config.clone()).unwrap();
+    document["revision"] = json!(revision);
+    if !document["settings"].is_object() {
+        document["settings"] = json!({});
+    }
+    document["settings"]["tcp_recent_recording"] = policy;
+    let config: Config = serde_json::from_value(document).unwrap();
+    let prepared = fixture.manager.prepare(&config).await.unwrap();
+    fixture
+        .active
+        .store(Arc::new(Snapshot::new(config).unwrap()));
+    fixture.manager.commit(prepared).await;
+}
+
+#[tokio::test]
+async fn held_completion_uses_current_policy_without_consuming_filtered_event_id() {
+    let (backend, origin) = echo_origin().await;
+    let fixture = Fixture::new(backend, json!({}), Duration::ZERO, 8).await;
+    let mut first = TcpStream::connect(fixture.front).await.unwrap();
+    first.write_all(b"held").await.unwrap();
+    until(|| fixture.active_rows()["records"][0]["phase"] == "forwarding").await;
+    publish_recording_policy(
+        &fixture,
+        1,
+        json!({
+            "default_action":"record",
+            "rules":[{"id":"drop-completed-route","action":"drop",
+                      "match":{"route_ids":["observed"],"route_matched":true,
+                               "outcomes":["eof"]}}]
+        }),
+    )
+    .await;
+    first.shutdown().await.unwrap();
+    let mut answer = Vec::new();
+    first.read_to_end(&mut answer).await.unwrap();
+    assert_eq!(answer, b"held");
+    until(|| {
+        fixture.active_rows()["records"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let dropped = fixture.recent();
+    assert!(dropped["records"].as_array().unwrap().is_empty());
+    assert_eq!(dropped["latest_event_id"], "0");
+    assert_eq!(dropped["filtered_total"], "1");
+    assert_eq!(dropped["omitted_total"], "0");
+    publish_recording_policy(&fixture, 2, json!({"default_action":"record","rules":[]})).await;
+    let mut second = TcpStream::connect(fixture.front).await.unwrap();
+    second.write_all(b"next").await.unwrap();
+    second.shutdown().await.unwrap();
+    let mut next = Vec::new();
+    second.read_to_end(&mut next).await.unwrap();
+    until(|| fixture.recent()["records"].as_array().unwrap().len() == 1).await;
+    let recorded = fixture.recent();
+    assert_eq!(recorded["records"][0]["event_id"], "1");
+    assert_eq!(recorded["records"][0]["policy_revision"], "2");
+    assert_eq!(recorded["filtered_total"], "1");
+    fixture.manager.shutdown(Duration::ZERO).await;
+    origin.abort();
+}
+
+#[tokio::test]
+async fn early_ip_denial_uses_canonical_peer_and_final_outcome_filter() {
+    let (backend, origin) = echo_origin().await;
+    let fixture = Fixture::new(
+        backend,
+        json!({"deny_cidrs":["127.0.0.0/8"]}),
+        Duration::ZERO,
+        8,
+    )
+    .await;
+    publish_recording_policy(
+        &fixture,
+        1,
+        json!({
+            "default_action":"record",
+            "rules":[{"id":"hide-denied-local","action":"drop","match":{
+                "listen_addresses":[fixture.front],"peer_cidrs":["127.0.0.0/8"],
+                "route_matched":false,"outcomes":["ip_denied"]}}]
+        }),
+    )
+    .await;
+    let _client = TcpStream::connect(fixture.front).await.unwrap();
+    until(|| fixture.recent()["filtered_total"] == "1").await;
+    assert_eq!(fixture.recent()["latest_event_id"], "0");
+    assert!(
+        fixture.active_rows()["records"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    publish_recording_policy(&fixture, 2, json!({"default_action":"record","rules":[]})).await;
+    let _client = TcpStream::connect(fixture.front).await.unwrap();
+    until(|| fixture.recent()["records"].as_array().unwrap().len() == 1).await;
+    let row = &fixture.recent()["records"][0];
+    assert_eq!(row["outcome"], "ip_denied");
+    assert_eq!(row["policy_revision"], "2");
+    assert_eq!(fixture.recent()["filtered_total"], "1");
+    fixture.manager.shutdown(Duration::ZERO).await;
+    origin.abort();
+}
+
 #[tokio::test]
 async fn active_then_half_close_records_exact_both_directions_and_pinned_route() {
     let (backend, origin) = echo_origin().await;

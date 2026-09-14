@@ -7,7 +7,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -15,7 +15,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Serialize, Serializer};
+use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::country_observation::Observation;
 
@@ -35,7 +36,7 @@ pub enum Phase {
     Forwarding,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Eof,
@@ -128,6 +129,8 @@ pub struct RecentRecord {
     pub bytes_upstream: String,
     pub bytes_downstream: String,
     pub outcome: Outcome,
+    #[serde(serialize_with = "optional_decimal")]
+    pub policy_revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +167,8 @@ pub struct RecentBatch {
     pub dropped_total: u64,
     #[serde(serialize_with = "decimal")]
     pub omitted_total: u64,
+    #[serde(serialize_with = "decimal")]
+    pub filtered_total: u64,
     pub retention_seconds: u64,
     pub capacity: usize,
 }
@@ -206,6 +211,7 @@ struct State {
     active_untracked: u64,
     omitted_total: u64,
     dropped_total: u64,
+    filtered_total: u64,
 }
 
 pub struct History {
@@ -244,6 +250,26 @@ impl History {
     /// full history changes no admission decision: the returned guard merely
     /// tracks an omitted connection count until it is dropped.
     pub fn begin(self: &Arc<Self>, peer: SocketAddr, listen: SocketAddr) -> Guard {
+        self.begin_inner(peer, listen, None)
+    }
+
+    /// Production observations resolve the current policy at completion.
+    /// This stores an authority pointer, never an accepted snapshot.
+    pub fn begin_with_policy(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        listen: SocketAddr,
+        active: Arc<ArcSwap<crate::config::Snapshot>>,
+    ) -> Guard {
+        self.begin_inner(peer, listen, Some(active))
+    }
+
+    fn begin_inner(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        listen: SocketAddr,
+        policy_source: Option<Arc<ArcSwap<crate::config::Snapshot>>>,
+    ) -> Guard {
         let now = Instant::now();
         let started_at_unix_ms = unix_ms();
         let mut state = self.lock();
@@ -271,6 +297,10 @@ impl History {
                     id: Some(id),
                     untracked: false,
                     outcome: Outcome::Interrupted,
+                    listen,
+                    peer_ip: peer.ip().to_canonical(),
+                    route_id: None,
+                    policy_source,
                 };
             }
         }
@@ -281,6 +311,10 @@ impl History {
             id: None,
             untracked: true,
             outcome: Outcome::Interrupted,
+            listen,
+            peer_ip: peer.ip().to_canonical(),
+            route_id: None,
+            policy_source,
         }
     }
 
@@ -401,6 +435,7 @@ impl History {
             gap,
             dropped_total: state.dropped_total,
             omitted_total: state.omitted_total,
+            filtered_total: state.filtered_total,
             retention_seconds: self.retention.as_secs(),
             capacity: self.recent_capacity,
         }
@@ -433,6 +468,10 @@ pub struct Guard {
     id: Option<u64>,
     untracked: bool,
     outcome: Outcome,
+    listen: SocketAddr,
+    peer_ip: IpAddr,
+    route_id: Option<String>,
+    policy_source: Option<Arc<ArcSwap<crate::config::Snapshot>>>,
 }
 
 impl Guard {
@@ -442,6 +481,7 @@ impl Guard {
 
     pub fn set_route(&mut self, route: &str) {
         let route = bounded_id(route, 128);
+        self.route_id = Some(route.clone());
         self.with_entry(|entry| entry.route_id = Some(route));
     }
 
@@ -483,6 +523,29 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        // Resolve one current activation before touching the history lock.
+        // A long-lived stream follows the policy at completion, and no old
+        // Snapshot/TLS material is retained in the completion record.
+        let decision = if !self.untracked {
+            self.policy_source.as_ref().map(|source| {
+                let snapshot = source.load_full();
+                let action = snapshot.settings.tcp_recent_recording.as_ref().map_or(
+                    crate::tcp_recording::Action::Record,
+                    |policy| {
+                        policy.action(crate::tcp_recording::Input {
+                            listen: self.listen,
+                            peer_ip: self.peer_ip,
+                            route_id: self.route_id.as_deref(),
+                            route_matched: self.route_id.is_some(),
+                            outcome: self.outcome,
+                        })
+                    },
+                );
+                (action, snapshot.config.revision)
+            })
+        } else {
+            None
+        };
         let mut state = self.history.lock();
         if self.untracked {
             state.active_untracked = state.active_untracked.saturating_sub(1);
@@ -492,6 +555,13 @@ impl Drop for Guard {
         let Some(entry) = state.active.remove(&id) else {
             return;
         };
+        if decision
+            .as_ref()
+            .is_some_and(|(action, _)| *action == crate::tcp_recording::Action::Drop)
+        {
+            state.filtered_total = state.filtered_total.saturating_add(1);
+            return;
+        }
         let now = Instant::now();
         let ended_at_unix_ms = unix_ms().max(entry.started_at_unix_ms);
         let Some(event_id) = state.latest_event_id.checked_add(1) else {
@@ -517,6 +587,7 @@ impl Drop for Guard {
             bytes_upstream,
             bytes_downstream,
             outcome: self.outcome,
+            policy_revision: decision.map(|(_, revision)| revision),
         };
         self.history.prune(&mut state, now);
         state.recent.push_back(RecentEntry {
@@ -586,6 +657,8 @@ mod tests {
         assert_eq!(first.records.len(), 1);
         assert_eq!(first.records[0].connection_id, 2);
         assert_eq!(first.records[0].event_id, 1);
+        assert_eq!(first.records[0].policy_revision, None);
+        assert_eq!(first.filtered_total, 0);
         drop(old);
         let second = history.recent(Some(first.next_after), 128);
         assert_eq!(second.records.len(), 1);
@@ -610,6 +683,31 @@ mod tests {
         drop(first);
         assert_eq!(history.recent(None, 128).records.len(), 1);
         assert_eq!(history.recent(None, 128).omitted_total, 1);
+        assert_eq!(history.recent(None, 128).filtered_total, 0);
+    }
+
+    #[test]
+    fn untracked_overflow_does_not_increment_policy_filtered_counter() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "revision": 7,
+            "settings": {"tcp_recent_recording": {"default_action":"drop","rules":[]}}
+        }))
+        .unwrap();
+        let active = Arc::new(ArcSwap::from_pointee(
+            crate::config::Snapshot::new(config).unwrap(),
+        ));
+        let history = history(1, 4);
+        let tracked = history.begin_with_policy(peer(1000), peer(8000), active.clone());
+        let untracked = history.begin_with_policy(peer(1001), peer(8000), active);
+        assert!(untracked.bytes().is_none());
+        drop(untracked);
+        assert_eq!(history.recent(None, 128).filtered_total, 0);
+        assert_eq!(history.recent(None, 128).omitted_total, 1);
+        drop(tracked);
+        let batch = history.recent(None, 128);
+        assert_eq!(batch.filtered_total, 1);
+        assert_eq!(batch.latest_event_id, 0);
+        assert!(batch.records.is_empty());
     }
 
     #[test]

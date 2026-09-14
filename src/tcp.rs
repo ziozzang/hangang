@@ -900,9 +900,10 @@ fn spawn_accept_loop(
                             listener_role(&active.load().config, address),
                             ListenerRole::Tcp
                         ) {
-                            let mut history = metrics.tcp_history.begin(
+                            let mut history = metrics.tcp_history.begin_with_policy(
                                 SocketAddr::new(peer.ip().to_canonical(), peer.port()),
                                 address,
+                                active.clone(),
                             );
                             history.set_outcome(Outcome::IoError);
                         }
@@ -1044,7 +1045,9 @@ fn spawn_accept_loop(
                 });
                 continue;
             }
-            let mut history = metrics.tcp_history.begin(peer, address);
+            let mut history = metrics
+                .tcp_history
+                .begin_with_policy(peer, address, active.clone());
             if routing_cache
                 .as_ref()
                 .is_none_or(|routes| !Weak::ptr_eq(&routes.source, &Arc::downgrade(&snapshot)))
