@@ -36,6 +36,39 @@ class TcpRecordingOpenApi(unittest.TestCase):
         self.assertEqual(SCHEMAS['Settings']['properties']['tcp_recent_recording']['anyOf'][0]['$ref'],
                          '#/components/schemas/TcpRecentRecordingPolicy')
 
+    def test_rule_ids_are_absolute_ended_and_unmatched_routes_have_no_ids(self):
+        rule = SCHEMAS['TcpRecentRecordingRule']
+        criteria = SCHEMAS['TcpRecentRecordingMatch']
+        for schema in (rule['properties']['id'], criteria['properties']['route_ids']['items']):
+            pattern = re.compile(schema['pattern'])
+            self.assertIsNotNone(pattern.match('raw.route-1'))
+            for bad in ('raw\n', 'raw\r', 'raw/', 'raw '):
+                self.assertIsNone(pattern.match(bad), bad)
+        condition = criteria['allOf'][0]
+        self.assertEqual(condition['if']['properties']['route_matched']['const'], False)
+        self.assertEqual(condition['if']['required'], ['route_matched'])
+        self.assertEqual(condition['then']['properties']['route_ids']['maxItems'], 0)
+
+    def test_actual_draft202012_examples_when_validator_is_installed(self):
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            self.skipTest('jsonschema is not installed in this environment')
+        schema = {'$schema':'https://json-schema.org/draft/2020-12/schema',
+                  'components':{'schemas':SCHEMAS},
+                  '$ref':'#/components/schemas/TcpRecentRecordingRule'}
+        validator = Draft202012Validator(schema)
+        good = {'id':'raw','action':'record',
+                'match':{'route_matched':False,'route_ids':[]}}
+        self.assertTrue(validator.is_valid(good))
+        for bad in (
+            {'id':'raw\n','action':'record','match':{}},
+            {'id':'raw','action':'record','match':{'route_ids':['old\n']}},
+            {'id':'raw','action':'record',
+             'match':{'route_matched':False,'route_ids':['old']}},
+        ):
+            self.assertFalse(validator.is_valid(bad), bad)
+
 
 if __name__ == '__main__':
     unittest.main()
