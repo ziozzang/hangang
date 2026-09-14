@@ -109,3 +109,39 @@ test('Korean policy controls retain an editable draft across locale changes', as
   await page.locator('#locale-select').selectOption('ko');
   await expect(page.locator('#config-editor')).toHaveValue(/"id": "ko-rule"/);
 });
+
+for (const [label, rule] of [
+  ['outcome newline', { id: 'safe', action: 'drop', match: { outcomes: ['eof\ndial_failed'] } }],
+  ['route ID newline', { id: 'safe', action: 'drop', match: { route_ids: ['one\ntwo'] } }],
+  ['listen newline', { id: 'safe', action: 'drop', match: { listen_addresses: ['127.0.0.1:9000\n127.0.0.1:9001'] } }],
+  ['CIDR newline', { id: 'safe', action: 'drop', match: { peer_cidrs: ['192.0.2.0/24\n198.51.100.0/24'] } }],
+  ['rule ID newline', { id: 'safe\n', action: 'drop', match: {} }],
+  ['unknown condition', { id: 'safe', action: 'drop', match: { future_condition: ['value'] } }],
+]) test(`malformed imported TCP ${label} stays raw and cannot be normalized by another native edit`, async ({ page }) => {
+  const { writes } = await fixture(page);
+  const original = JSON.parse(await page.locator('#config-editor').inputValue());
+  const malformed = { default_action: 'record', rules: [rule] };
+  await page.locator('#config-editor').fill(JSON.stringify({ ...original, settings: {
+    ...original.settings, tcp_recent_recording: malformed,
+  } }));
+  await expect(page.locator('#tcp-recording-message')).toContainText('invalid');
+  await page.locator('#setting-health_path').fill('/changed');
+  const staged = JSON.parse(await page.locator('#config-editor').inputValue());
+  expect(staged.settings.tcp_recent_recording).toEqual(malformed);
+  await page.locator('#apply-config').click();
+  await expect(page.locator('#config-message')).toContainText('TCP completion recording:');
+  expect(writes).toHaveLength(0);
+});
+
+test('existing policy with port zero remains natively editable', async ({ page }) => {
+  const initial = { default_action: 'record', rules: [{ id: 'zero', action: 'drop', match: {
+    listen_addresses: ['127.0.0.1:0', '[::1]:0'] } }] };
+  const { writes } = await fixture(page, initial);
+  await expect(page.locator('#tcp-recording-message')).toBeEmpty();
+  const card = page.locator('#tcp-recording-rules .user-card').first();
+  await expect(card.getByLabel('Listen addresses (one IP:port per line)')).toHaveValue('127.0.0.1:0\n[::1]:0');
+  await card.getByLabel('Rule ID').fill('zero-edited');
+  await page.locator('#apply-config').click();
+  await expect(page.locator('#config-message')).toContainText('Revision 8 is active');
+  expect(writes[0].body.settings.tcp_recent_recording.rules[0].match.listen_addresses).toEqual(['127.0.0.1:0', '[::1]:0']);
+});

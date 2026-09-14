@@ -155,7 +155,7 @@ export function startLive(token, onStatus, onUnauthorized, admin) {
             if (admin && active() && !tcpCaughtUp) {
               tcpCaughtUp = true;
               fetchTcpPage('/v1/connections/tcp/recent?limit=128', token, onUnauthorized, active,
-                batch => recordTcpRecent(batch, false), 'recent', true);
+                (batch, metadataFresh) => recordTcpRecent(batch, false, metadataFresh), 'recent', true);
             }
           } else if (event === 'traffic' && admin) recordTraffic(data);
           else if (event === 'tcp_connections' && admin) {
@@ -395,7 +395,7 @@ function recordTcpActive(batch, pageAfter = null) {
   else tcpActivePage += 1;
   renderTcpHistory();
 }
-function recordTcpRecent(batch, replace) {
+function recordTcpRecent(batch, replace, metadataFresh = true) {
   if (!batch || !tcpProcessMatches(batch.process_id) || !Array.isArray(batch.records)
     || batch.records.length > 128 || !tcpTime(batch.server_time_unix_ms)
     || !decimalU64(batch.next_after) || !decimalU64(batch.latest_event_id)) return;
@@ -411,7 +411,16 @@ function recordTcpRecent(batch, replace) {
     merged.set(row.event_id, { ...row, expiresAt: previous ? Math.min(previous.expiresAt, expiry) : expiry });
   }
   tcpRecent = [...merged.values()].sort((a, b) => BigInt(a.event_id) > BigInt(b.event_id) ? -1 : 1).slice(0, 256);
-  tcpRecentBatch = { ...batch, filtered_total: decimalU64(batch.filtered_total) ? batch.filtered_total : null,
+  // A catch-up GET can contain missing/older counters than a live frame that
+  // arrived while the GET was pending. Its rows still close the cursor window.
+  if (!metadataFresh && tcpRecentBatch) { renderTcpHistory(); return; }
+  const filtered = decimalU64(batch.filtered_total) ? batch.filtered_total : null;
+  // The post-connect catch-up GET may finish after a newer SSE frame. This
+  // process-lifetime counter cannot decrease within the same process.
+  const previousFiltered = tcpRecentBatch?.process_id === batch.process_id ? tcpRecentBatch.filtered_total : null;
+  const filteredTotal = filtered !== null && decimalU64(previousFiltered) && BigInt(previousFiltered) > BigInt(filtered)
+    ? previousFiltered : filtered;
+  tcpRecentBatch = { ...batch, filtered_total: filteredTotal,
     retention, updatedAt: receivedAt };
   renderTcpHistory();
 }
@@ -436,7 +445,7 @@ async function fetchTcpPage(path, token, onUnauthorized, active, onBatch, reques
     // change. Never let their old process ID replace a newer live process.
     if (requestedProcess !== tcpProcess && (requestedProcess !== null || batch?.process_id !== tcpProcess)) return;
     if (active() && !controller.signal.aborted && generation === (requestKind === 'active' ? tcpActiveRequestVersion : tcpRecentRequestVersion)
-      && (manualPage || streamVersion === tcpStreamVersion)) onBatch(batch);
+      && (manualPage || streamVersion === tcpStreamVersion)) onBatch(batch, streamVersion === tcpStreamVersion);
   } catch (_) {
     if (active() && !controller.signal.aborted) display(requestKind === 'active' ? '#tcp-active-note' : '#tcp-recent-note', () => t('TCP history could not be refreshed. Displayed records may be stale.'));
   } finally { tcpFetches.delete(controller); }

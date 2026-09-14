@@ -283,6 +283,38 @@ test('one bounded post-connect read recovers a completion between initial GET an
   expect(calls.filter(call => call.path === '/v1/connections/tcp/recent')).toHaveLength(2);
 });
 
+for (const staleFiltered of ['1', undefined]) test(`late catch-up GET with ${staleFiltered ?? 'missing'} count cannot roll back newer SSE TCP metadata`, async ({ page }) => {
+  let releaseStream, releaseCatchup, catchupStarted;
+  const streamGate = new Promise(resolve => { releaseStream = resolve; });
+  const catchupGate = new Promise(resolve => { releaseCatchup = resolve; });
+  const catchupSeen = new Promise(resolve => { catchupStarted = resolve; });
+  let recentCalls = 0;
+  await fixture(page, {
+    recentHandler: route => {
+      recentCalls += 1;
+      if (recentCalls === 1) return route.fulfill({ json: recentBatch([], { filtered_total: '0' }) });
+      catchupStarted();
+      return catchupGate.then(() => route.fulfill({ json: recentBatch([], { dropped_total: '0',
+        ...(staleFiltered === undefined ? {} : { filtered_total: staleFiltered }) }) }).catch(() => {}));
+    },
+    stream: async route => { await streamGate; return route.fulfill({ contentType: 'text/event-stream', body:
+      event('status', { revision: 1, http_routes: 0, tcp_routes: 1, uptime_seconds: 11,
+        instance: { id: processId }, state: { ready: true }, metrics: { requests_total: 1, active_connections: 0 } }) +
+      event('tcp_connections', { active: activeBatch([]), recent: recentBatch([], { dropped_total: '4', filtered_total: '9' }) }) }); },
+  });
+  await expect(page.locator('#tcp-recent-note')).toContainText('0 intentionally filtered completions');
+  releaseStream();
+  await catchupSeen;
+  await expect(page.locator('#tcp-recent-note')).toContainText('9 intentionally filtered completions');
+  const catchupResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/connections/tcp/recent' && response.status() === 200);
+  releaseCatchup();
+  await catchupResponse;
+  await page.waitForTimeout(100); // Allow the fulfilled JSON/body continuation to render.
+  await expect(page.locator('#tcp-recent-note')).toContainText('9 intentionally filtered completions');
+  await expect(page.locator('#tcp-recent-note')).toContainText('4 expired/evicted');
+  await expect(page.locator('#tcp-recent-rows tr')).toHaveCount(0);
+});
+
 test('an old manual active page cannot replace a newer process observed over SSE', async ({ page }) => {
   let releaseOld, releaseNew;
   const oldPage = new Promise(resolve => { releaseOld = resolve; });

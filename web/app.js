@@ -4107,7 +4107,18 @@ function tcpRecordingDraftFromWire(policy) {
       typeof rule.id !== 'string' || !['record', 'drop'].includes(rule.action)) bad();
     for (const key of TCP_RECORDING_FIELDS) if (rule.match[key] !== undefined && !Array.isArray(rule.match[key])) bad();
     if (rule.match.route_matched != null && typeof rule.match.route_matched !== 'boolean') bad();
-    for (const key of TCP_RECORDING_FIELDS) if ((rule.match[key] ?? []).some(value => typeof value !== 'string')) bad();
+    if (!/^[A-Za-z0-9._-]{1,64}$(?![\s\S])/.test(rule.id)) bad();
+    const validWire = {
+      listen_addresses: tcpRecordingAddress,
+      peer_cidrs: recordingCidr,
+      route_ids: value => /^[A-Za-z0-9._-]{1,128}$(?![\s\S])/.test(value),
+      outcomes: value => TCP_RECORDING_OUTCOMES.has(value),
+    };
+    for (const key of TCP_RECORDING_FIELDS) {
+      const values = rule.match[key] ?? [];
+      if (values.length > 64 || values.some(value => typeof value !== 'string' || value.trim() !== value ||
+        /[\r\n]/.test(value) || !validWire[key](value))) bad();
+    }
     return { id: rule.id, action: rule.action,
       listen_addresses: (rule.match.listen_addresses ?? []).join('\n'), peer_cidrs: (rule.match.peer_cidrs ?? []).join('\n'),
       route_ids: (rule.match.route_ids ?? []).join('\n'), outcomes: (rule.match.outcomes ?? []).join('\n'),
@@ -4121,9 +4132,9 @@ function tcpRecordingAddress(value) {
     const scoped = /^([0-9a-fA-F:.]+)(?:%(\d+))?$/.exec(bracketed[1]);
     if (!scoped || !scoped[1].includes(':') || (scoped[2] && (scoped[2].length > 10 || Number(scoped[2]) > 4294967295))) return false;
     try { new URL(`http://[${scoped[1]}]/`); } catch { return false; }
-    return Number(bracketed[2]) > 0 && Number(bracketed[2]) <= 65535;
+    return Number(bracketed[2]) <= 65535;
   }
-  return !!ipv4 && ipv4[1].split('.').every(part => Number(part) <= 255) && Number(ipv4[2]) > 0 && Number(ipv4[2]) <= 65535;
+  return !!ipv4 && ipv4[1].split('.').every(part => Number(part) <= 255) && Number(ipv4[2]) <= 65535;
 }
 function tcpRecordingPolicyFromDraft(draft) {
   if (!draft || !['record', 'drop'].includes(draft.default_action) || draft.rules.length > 64)
@@ -4134,13 +4145,13 @@ function tcpRecordingPolicyFromDraft(draft) {
       throw new Error(t('Invalid {field}; use at most 64 entries.', { field: t(label) }));
     return values; };
   const rules = draft.rules.map(rule => {
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(rule.id) || ids.has(rule.id) || !['record', 'drop'].includes(rule.action))
+    if (!/^[A-Za-z0-9._-]{1,64}$(?![\s\S])/.test(rule.id) || ids.has(rule.id) || !['record', 'drop'].includes(rule.action))
       throw new Error(t('TCP recording rule IDs must be unique ASCII names of 1–64 characters.'));
     ids.add(rule.id);
     const match = {
       listen_addresses: lines(rule.listen_addresses, 'Listen addresses', tcpRecordingAddress),
       peer_cidrs: lines(rule.peer_cidrs, 'Peer CIDRs', recordingCidr),
-      route_ids: lines(rule.route_ids, 'Route IDs', value => /^[A-Za-z0-9._-]{1,128}$/.test(value)),
+      route_ids: lines(rule.route_ids, 'Route IDs', value => /^[A-Za-z0-9._-]{1,128}$(?![\s\S])/.test(value)),
       outcomes: lines(rule.outcomes, 'Outcomes', value => TCP_RECORDING_OUTCOMES.has(value)),
     };
     if (rule.route_matched === 'true') match.route_matched = true;
