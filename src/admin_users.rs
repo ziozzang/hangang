@@ -5321,4 +5321,82 @@ mod tests {
             2
         );
     }
+
+    #[tokio::test]
+    async fn persisted_filter_matches_authenticated_actor_and_allocated_target_exactly() {
+        let (_directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = AuditPolicy {
+            default_action: AuditFilterAction::Drop,
+            rules: vec![AuditFilterRule {
+                id: "record-root-to-three".into(),
+                action: AuditFilterAction::Record,
+                criteria: AuditFilterMatch {
+                    actions: vec![AccountAuditAction::Create],
+                    actor_kinds: vec![AuditActorKind::Account],
+                    actor_user_ids: vec![root.id],
+                    target_user_ids: vec![3],
+                },
+            }],
+        };
+        store
+            .set_audit_policy(MutationAuthority::System, 0, policy)
+            .await
+            .unwrap();
+        let first = store
+            .create(
+                MutationAuthority::Session(login.token.clone()),
+                "first".into(),
+                "second secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, 2);
+        let second = store
+            .create(
+                MutationAuthority::Session(login.token),
+                "second".into(),
+                "third secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, 3);
+        store
+            .create(
+                MutationAuthority::System,
+                "system".into(),
+                "fourth secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let page = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.filtered_total, 2);
+        let creates: Vec<_> = page
+            .records
+            .iter()
+            .filter(|row| row.action == AuditAction::Create)
+            .collect();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].actor_kind, AuditActorKind::Account);
+        assert_eq!(creates[0].actor_user_id, Some(root.id));
+        assert_eq!(creates[0].target_user_id, Some(second.id));
+    }
 }
