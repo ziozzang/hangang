@@ -13,6 +13,7 @@ pub mod country_policy;
 pub mod discovery;
 pub mod docker;
 pub mod docker_connections;
+pub mod fleet_collector;
 pub mod fleet_observer;
 pub mod geoip;
 pub mod geoip_runtime;

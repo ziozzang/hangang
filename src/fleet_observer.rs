@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 const CONFIG_MAX: usize = 16 * 1024;
-const TOKEN_MAX: usize = 257;
+pub(crate) const TOKEN_MAX: usize = 257;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +58,7 @@ pub struct Identity {
     pub generation: String,
 }
 
-fn secure_read(path: &Path, cap: usize) -> Result<Vec<u8>> {
+pub(crate) fn secure_read(path: &Path, cap: usize) -> Result<Vec<u8>> {
     ensure!(path.is_absolute(), "observer file path must be absolute");
     let file = OpenOptions::new()
         .read(true)
@@ -105,24 +105,17 @@ fn secure_read(path: &Path, cap: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn load(path: &Path) -> Result<(String, Vec<u8>)> {
-    let raw = secure_read(path, CONFIG_MAX)?;
-    let config: FileConfig =
-        serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("invalid observer config"))?;
-    ensure!(
-        (1..=64).contains(&config.node_id.len())
-            && config
-                .node_id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
-        "invalid observer node id"
-    );
-    let mut token = secure_read(&config.token_file, TOKEN_MAX)?;
+pub(crate) fn valid_node_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+}
+
+pub(crate) fn parse_token(mut token: Vec<u8>) -> Result<Vec<u8>> {
     if token.last() == Some(&b'\n') {
         token.pop();
     }
-    // Admin session bearers are exactly 43 base64url characters
-    // (admin_users::valid_session_token). Keep this credential shape disjoint.
     ensure!(
         (48..=256).contains(&token.len())
             && token
@@ -130,7 +123,18 @@ fn load(path: &Path) -> Result<(String, Vec<u8>)> {
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(c)),
         "invalid observer token"
     );
-    Ok((config.node_id, token))
+    Ok(token)
+}
+
+fn load(path: &Path) -> Result<(String, Vec<u8>)> {
+    let raw = secure_read(path, CONFIG_MAX)?;
+    let config: FileConfig =
+        serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("invalid observer config"))?;
+    ensure!(valid_node_id(&config.node_id), "invalid observer node id");
+    let token = secure_read(&config.token_file, TOKEN_MAX)?;
+    // Admin session bearers are exactly 43 base64url characters
+    // (admin_users::valid_session_token). Keep this credential shape disjoint.
+    Ok((config.node_id, parse_token(token)?))
 }
 
 impl Runtime {
