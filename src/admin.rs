@@ -810,6 +810,7 @@ impl Manager {
 }
 #[derive(Clone)]
 pub struct Admin {
+    pub fleet_observer: Option<Arc<crate::fleet_observer::Runtime>>,
     pub acme_status: Option<Arc<std::sync::RwLock<crate::acme_runtime::Status>>>,
     pub file_tls_enabled: bool,
     pub manager: Arc<Manager>,
@@ -829,6 +830,8 @@ pub struct Admin {
     /// Separate from static assets, so a slow unauthenticated asset reader
     /// cannot consume every login and first-run setup permit.
     pub auth_requests: Arc<tokio::sync::Semaphore>,
+    /// Dedicated bounded responses for the narrow observer credential.
+    pub observer_requests: Arc<tokio::sync::Semaphore>,
     /// Long-lived SSE readers never consume the ordinary request budget.
     pub events: Arc<Semaphore>,
 }
@@ -837,6 +840,7 @@ impl Admin {
     pub const PUBLIC_REQUEST_LIMIT: usize = 16;
     pub const AUTH_REQUEST_LIMIT: usize = 8;
     pub const EVENT_STREAM_LIMIT: usize = 32;
+    pub const OBSERVER_REQUEST_LIMIT: usize = 8;
 
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
         if let Some(response) = public_asset(&req) {
@@ -849,6 +853,25 @@ impl Admin {
                     "public asset capacity exhausted",
                 ));
             };
+            return Ok(crate::proxy::retain_request_permit(response, permit));
+        }
+        if req.uri().path() == "/v1/fleet/observation" {
+            let Ok(permit) = self.observer_requests.clone().try_acquire_owned() else {
+                let mut response =
+                    problem(503, "Service Unavailable", "observer capacity exhausted");
+                response
+                    .headers_mut()
+                    .insert("cache-control", "no-store".parse().unwrap());
+                return Ok(response);
+            };
+            let mut response = self.handle_fleet_observation(req);
+            response
+                .headers_mut()
+                .insert("cache-control", "no-store".parse().unwrap());
+            if response.status() != hyper::StatusCode::OK {
+                drop(permit);
+                return Ok(response);
+            }
             return Ok(crate::proxy::retain_request_permit(response, permit));
         }
         if matches!(
@@ -911,6 +934,51 @@ impl Admin {
             return Ok(response);
         }
         Ok(crate::proxy::retain_request_permit(response, permit))
+    }
+
+    fn handle_fleet_observation(&self, req: Request<Incoming>) -> Response<Body> {
+        let Some(token) = sole_bearer(req.headers()).filter(|token| !token.is_empty()) else {
+            return observer_unauthorized();
+        };
+        let Some(runtime) = &self.fleet_observer else {
+            return problem(503, "Observer Unavailable", "local observer unavailable");
+        };
+        if !runtime.status().available {
+            return problem(503, "Observer Unavailable", "local observer unavailable");
+        }
+        let Some(identity) = runtime.authenticate(token) else {
+            return observer_unauthorized();
+        };
+        if req.method() != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET required");
+        }
+        if req.uri().query().is_some() {
+            return problem(
+                400,
+                "Invalid Observer Query",
+                "query parameters are not accepted",
+            );
+        }
+        let snapshot = self.manager.active.load_full();
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "node_id": identity.node_id,
+            "observer_generation": identity.generation,
+            "instance_id": instance_id(),
+            "configuration_source": if self.manager.externally_managed { "kubernetes" } else if self.manager.config_store.is_some() { "shared" } else { "file" },
+            "revision": snapshot.config.revision.to_string(),
+            "config_digest": config_digest(&snapshot.config),
+            "ready": self.manager.ready.load(Ordering::Acquire),
+            "store_epoch": self.manager.config_store.as_ref().and_then(|_| self.manager.recorded_epoch()).map(|epoch| epoch.to_string()),
+        });
+        // A reload may withdraw or rotate the credential while the response
+        // is constructed. Never return an observation under an old generation.
+        if runtime.authenticate(token).as_ref().is_none_or(|current| {
+            current.generation != identity.generation || current.node_id != identity.node_id
+        }) {
+            return problem(503, "Observer Unavailable", "local observer unavailable");
+        }
+        auth_json(200, &value)
     }
 
     fn status_value(&self) -> (serde_json::Value, u64) {
@@ -1140,6 +1208,7 @@ impl Admin {
         };
         let Some(actor) = actor else {
             let is_new = path == "/v1/status"
+                || path == "/v1/fleet/observer-status"
                 || path == "/v1/geoip/status"
                 || path == "/v1/geoip/lookup"
                 || path == "/v1/connections/tcp/active"
@@ -1927,6 +1996,31 @@ impl Admin {
             let (status, revision) = self.status_value();
             return Ok(json_value(200, &status, Some(revision)));
         }
+        if path == "/v1/fleet/observer-status" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            if req.uri().query().is_some() {
+                return Ok(problem(
+                    400,
+                    "Invalid Observer Query",
+                    "query parameters are not accepted",
+                ));
+            }
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            let status = self.fleet_observer.as_ref().map(|runtime| runtime.status());
+            return Ok(auth_json(
+                200,
+                &serde_json::json!({
+                    "configured": status.as_ref().is_some_and(|s| s.configured),
+                    "available": status.as_ref().is_some_and(|s| s.available),
+                    "node_id": status.as_ref().and_then(|s| s.node_id.as_ref()),
+                    "generation": status.as_ref().map(|s| s.generation.as_str()),
+                }),
+            ));
+        }
         if path == "/v1/util/hash-password" {
             if req.method() != hyper::Method::POST {
                 return Ok(problem(405, "Method Not Allowed", "POST required"));
@@ -2460,6 +2554,18 @@ fn sole_bearer(headers: &hyper::HeaderMap) -> Option<&str> {
         return None;
     }
     value.to_str().ok()?.strip_prefix("Bearer ")
+}
+
+fn observer_unauthorized() -> Response<Body> {
+    let mut response = problem(
+        401,
+        "Unauthorized",
+        "a valid observer bearer token is required",
+    );
+    response
+        .headers_mut()
+        .insert("www-authenticate", "Bearer".parse().unwrap());
+    response
 }
 
 fn viewer_allowed(path: &str, method: &hyper::Method) -> bool {

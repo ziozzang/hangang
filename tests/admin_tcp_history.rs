@@ -54,6 +54,7 @@ async fn fixture() -> (
         store_health: Default::default(),
     });
     let admin = Arc::new(Admin {
+        fleet_observer: None,
         acme_status: None,
         file_tls_enabled: false,
         manager: manager.clone(),
@@ -68,6 +69,7 @@ async fn fixture() -> (
         requests: Arc::new(tokio::sync::Semaphore::new(8)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(Admin::PUBLIC_REQUEST_LIMIT)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
+        observer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
         events: Arc::new(tokio::sync::Semaphore::new(Admin::EVENT_STREAM_LIMIT)),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

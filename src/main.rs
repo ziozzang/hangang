@@ -103,6 +103,9 @@ struct Args {
     admin_socket: Option<PathBuf>,
     #[arg(long, env = "HANGANG_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// Private dynamically reloaded local fleet observer credential file.
+    #[arg(long)]
+    fleet_observer_config: Option<PathBuf>,
     /// Instance-local administrator account database (private SQLite file).
     #[arg(long)]
     admin_users_db: Option<PathBuf>,
@@ -731,6 +734,10 @@ async fn run(args: Args) -> Result<()> {
         }
     }
     if args.check {
+        if let Some(path) = args.fleet_observer_config.clone() {
+            let _ =
+                hangang::fleet_observer::Runtime::open(path, args.admin_token.as_deref()).await?;
+        }
         config.validate()?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             hangang::certificates::load(&config.certificates)?;
@@ -746,11 +753,16 @@ async fn run(args: Args) -> Result<()> {
     }
     let token = args
         .admin_token
+        .clone()
         .context("set HANGANG_ADMIN_TOKEN (at least 16 bytes)")?;
     anyhow::ensure!(
         token.len() >= 16,
         "admin token must contain at least 16 bytes"
     );
+    let fleet_observer = match args.fleet_observer_config.clone() {
+        Some(path) => Some(hangang::fleet_observer::Runtime::open(path, Some(&token)).await?),
+        None => None,
+    };
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -984,6 +996,7 @@ async fn run(args: Args) -> Result<()> {
     };
     let users = Arc::new(hangang::admin_users::Store::open(users_db_path)?);
     let admin = Admin {
+        fleet_observer: fleet_observer.clone(),
         traffic,
         events: Arc::new(tokio::sync::Semaphore::new(32)),
         acme_status: acme.as_ref().map(|runtime| runtime.status.clone()),
@@ -991,6 +1004,7 @@ async fn run(args: Args) -> Result<()> {
         requests: Arc::new(tokio::sync::Semaphore::new(64)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(Admin::PUBLIC_REQUEST_LIMIT)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
+        observer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
         manager: manager.clone(),
         token: Arc::new(token),
         users,
@@ -1003,6 +1017,8 @@ async fn run(args: Args) -> Result<()> {
         docker: Some(docker.clone()),
     };
     let cancel = CancellationToken::new();
+    let fleet_observer_task =
+        fleet_observer.map(|runtime| tokio::spawn(runtime.watch(cancel.clone())));
     let discovery_task = tokio::spawn(discovery.watch(manager.active.clone(), cancel.clone()));
     let watcher = if let Some(options) = controller_options {
         let sink = Arc::new(KubernetesSink {
@@ -1231,6 +1247,9 @@ async fn run(args: Args) -> Result<()> {
     }
     let _ = watcher.await;
     let _ = discovery_task.await;
+    if let Some(task) = fleet_observer_task {
+        let _ = task.await;
+    }
     for watcher in tls_watchers {
         let _ = watcher.await;
     }

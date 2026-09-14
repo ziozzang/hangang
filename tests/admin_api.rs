@@ -88,6 +88,31 @@ async fn server_on_with_traffic(
     public_limit: usize,
     event_fixture: EventFixture,
 ) -> (std::net::SocketAddr, Arc<Manager>) {
+    server_on_with_observer(
+        state_path,
+        config,
+        config_store,
+        externally_managed,
+        request_limit,
+        public_limit,
+        event_fixture,
+        None,
+        Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
+    )
+    .await
+}
+
+async fn server_on_with_observer(
+    state_path: std::path::PathBuf,
+    config: Config,
+    config_store: Option<Arc<dyn hangang::config_store::ConfigStore>>,
+    externally_managed: bool,
+    request_limit: usize,
+    public_limit: usize,
+    event_fixture: EventFixture,
+    fleet_observer: Option<Arc<hangang::fleet_observer::Runtime>>,
+    observer_requests: Arc<tokio::sync::Semaphore>,
+) -> (std::net::SocketAddr, Arc<Manager>) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         state_path.parent().unwrap(),
@@ -116,6 +141,7 @@ async fn server_on_with_traffic(
         store_health: Default::default(),
     });
     let admin = Arc::new(Admin {
+        fleet_observer,
         acme_status: None,
         file_tls_enabled: false,
         manager: manager.clone(),
@@ -142,6 +168,7 @@ async fn server_on_with_traffic(
         requests: Arc::new(tokio::sync::Semaphore::new(request_limit)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(public_limit)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
+        observer_requests,
         events: Arc::new(tokio::sync::Semaphore::new(event_fixture.limit)),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -220,6 +247,297 @@ async fn request_with_token(
         .to_bytes()
         .to_vec();
     (status, headers, bytes)
+}
+
+#[tokio::test]
+async fn fleet_observer_disabled_is_admin_only_and_redacted() {
+    let (address, _, _dir) = server().await;
+    let (status, headers, body) =
+        request(address, "GET", "/v1/fleet/observer-status", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({"configured":false,"available":false,"node_id":null,"generation":null})
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observer-status",
+            None,
+            None,
+            None
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request(address, "GET", "/v1/fleet/observation", None, None)
+            .await
+            .0,
+        503
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/fleet/observation", None, None, None)
+            .await
+            .0,
+        401
+    );
+}
+
+#[tokio::test]
+async fn fleet_observer_is_narrow_and_has_independent_admission() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    const OBSERVER_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz012345ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    let config = Config::default();
+    hangang::store::save(state_path.clone(), config.clone())
+        .await
+        .unwrap();
+    let token_path = dir.path().join("observer.token");
+    let file_path = dir.path().join("observer.json");
+    fs::write(&token_path, OBSERVER_TOKEN).unwrap();
+    fs::write(
+        &file_path,
+        serde_json::json!({"node_id":"edge.a","token_file":token_path}).to_string(),
+    )
+    .unwrap();
+    for path in [&token_path, &file_path] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let runtime = hangang::fleet_observer::Runtime::open(file_path.clone(), Some(TOKEN))
+        .await
+        .unwrap();
+    let observer_budget = Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT));
+    let (address, manager) = server_on_with_observer(
+        state_path,
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+        EventFixture {
+            traffic: Arc::new(hangang::traffic::TrafficHistory::default()),
+            limit: Admin::EVENT_STREAM_LIMIT,
+        },
+        Some(runtime),
+        observer_budget.clone(),
+    )
+    .await;
+    let (status, headers, body) = request_with_token(
+        address,
+        "GET",
+        "/v1/fleet/observation",
+        None,
+        None,
+        Some(OBSERVER_TOKEN),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let value = json(&body);
+    assert_eq!(value.as_object().unwrap().len(), 9);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["node_id"], "edge.a");
+    assert_eq!(value["observer_generation"], "1");
+    assert_eq!(value["configuration_source"], "file");
+    assert_eq!(value["revision"], "0");
+    assert_eq!(value["ready"], true);
+    assert_eq!(value["store_epoch"], serde_json::Value::Null);
+    assert_eq!(value["instance_id"].as_str().unwrap().len(), 16);
+    assert_eq!(value["config_digest"].as_str().unwrap().len(), 16);
+    assert!(
+        !body
+            .windows(OBSERVER_TOKEN.len())
+            .any(|w| w == OBSERVER_TOKEN.as_bytes())
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/config",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/config",
+            Some("{}"),
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observation",
+            None,
+            None,
+            Some(TOKEN)
+        )
+        .await
+        .0,
+        401
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "POST",
+            "/v1/fleet/observation",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observation?x=1",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observer-status",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        401
+    );
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let wire = format!(
+            "GET /v1/fleet/observation HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {OBSERVER_TOKEN}\r\nAuthorization: Bearer {OBSERVER_TOKEN}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(wire.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let head = String::from_utf8_lossy(&response);
+        assert!(
+            head.starts_with("HTTP/1.1 401"),
+            "duplicate Authorization must fail"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("cache-control: no-store")
+        );
+    }
+    assert_eq!(manager.active.load().config.revision, 0);
+    let permits: Vec<_> = (0..Admin::OBSERVER_REQUEST_LIMIT)
+        .map(|_| observer_budget.clone().try_acquire_owned().unwrap())
+        .collect();
+    let (status, headers, _) = request_with_token(
+        address,
+        "GET",
+        "/v1/fleet/observation",
+        None,
+        None,
+        Some(OBSERVER_TOKEN),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        request(address, "GET", "/v1/status", None, None).await.0,
+        200
+    );
+    drop(permits);
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observation",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/auth/bootstrap",
+            Some(r#"{"username":"operator","password":"correct horse battery"}"#),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            "/v1/users",
+            Some(r#"{"username":"viewer","password":"viewer password 123","role":"viewer"}"#),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (_, _, body) = request_with_token(
+        address,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"viewer","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observer-status",
+            None,
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
+    fs::write(&token_path, viewer_token.as_bytes()).unwrap();
+    assert!(
+        hangang::fleet_observer::Runtime::open(file_path, Some(TOKEN))
+            .await
+            .is_err(),
+        "an actual account session must not be accepted as an observer credential"
+    );
 }
 
 fn json(bytes: &[u8]) -> serde_json::Value {
