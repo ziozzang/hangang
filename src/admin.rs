@@ -1620,11 +1620,12 @@ impl Admin {
             if req.method() != hyper::Method::GET {
                 return Ok(problem(405, "Method Not Allowed", "GET required"));
             }
-            let Some((offset, limit)) = certificate_inventory_query(req.uri().query()) else {
+            let Some((offset, limit, listener_id)) = certificate_inventory_query(req.uri().query())
+            else {
                 return Ok(problem(
                     400,
                     "Bad Request",
-                    "invalid certificate offset or limit",
+                    "invalid certificate inventory query",
                 ));
             };
             static READS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
@@ -1640,23 +1641,44 @@ impl Admin {
                 ));
             };
             let snapshot = self.manager.active.load_full();
-            let total = snapshot.config.certificates.len();
-            let files: Vec<_> = snapshot
-                .config
-                .certificates
+            let selected = if listener_id == "default" {
+                None
+            } else {
+                let Some(listener) = snapshot
+                    .config
+                    .public_http
+                    .iter()
+                    .find(|item| item.id == listener_id)
+                else {
+                    return Ok(problem(404, "Not Found", "public listener not found"));
+                };
+                Some(listener)
+            };
+            let inventory_files = selected.map_or(&snapshot.config.certificates, |listener| {
+                &listener.certificates
+            });
+            let total = inventory_files.len();
+            let files: Vec<_> = inventory_files
                 .iter()
                 .skip(offset)
                 .take(limit)
                 .cloned()
                 .collect();
-            let configured_tls = self.file_tls_enabled && snapshot.certificates.is_some();
+            let configured_tls = selected.map_or_else(
+                || self.file_tls_enabled && snapshot.certificates.is_some(),
+                |listener| listener.enabled && snapshot.public_http_tls.contains_key(&listener.id),
+            );
             let revision = snapshot.config.revision;
             let now = crate::certificate_inventory::now_unix_ms();
-            let acme = self.acme_status.as_ref().map(|status| {
-                crate::certificate_inventory::InProcessAcme::from(
-                    status.read().expect("status lock").clone(),
-                )
-            });
+            let acme = selected
+                .is_none()
+                .then(|| self.acme_status.as_ref())
+                .flatten()
+                .map(|status| {
+                    crate::certificate_inventory::InProcessAcme::from(
+                        status.read().expect("status lock").clone(),
+                    )
+                });
             let mode = if total > 0 {
                 "configured_files"
             } else if acme.is_some() {
@@ -1682,6 +1704,7 @@ impl Admin {
                 200,
                 &crate::certificate_inventory::Inventory {
                     revision,
+                    listener_id,
                     mode,
                     total,
                     offset,
@@ -2529,34 +2552,47 @@ fn tcp_history_query(query: Option<&str>) -> Option<(Option<u64>, usize)> {
     Some((after, limit))
 }
 
-fn certificate_inventory_query(query: Option<&str>) -> Option<(usize, usize)> {
+fn certificate_inventory_query(query: Option<&str>) -> Option<(usize, usize, String)> {
     let mut offset = 0;
     let mut limit = 32;
+    let mut listener_id = "default".to_owned();
     let mut seen_offset = false;
     let mut seen_limit = false;
+    let mut seen_listener_id = false;
     if let Some(query) = query {
         for pair in query.split('&') {
             let (name, value) = pair.split_once('=')?;
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
             match name {
-                "offset" if !seen_offset => {
+                "offset"
+                    if !seen_offset
+                        && !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
                     offset = value.parse().ok()?;
                     seen_offset = true;
                 }
-                "limit" if !seen_limit => {
+                "limit"
+                    if !seen_limit
+                        && !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
                     limit = value.parse().ok()?;
                     if !(1..=crate::certificate_inventory::PAGE_LIMIT).contains(&limit) {
                         return None;
                     }
                     seen_limit = true;
                 }
+                "listener_id"
+                    if !seen_listener_id && crate::public_listener_config::valid_id(value) =>
+                {
+                    listener_id = value.to_owned();
+                    seen_listener_id = true;
+                }
                 _ => return None,
             }
         }
     }
-    Some((offset, limit))
+    Some((offset, limit, listener_id))
 }
 
 fn operations_query(query: Option<&str>) -> Option<(usize, usize)> {

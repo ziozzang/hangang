@@ -18,6 +18,7 @@ const MAX_STATUS_BYTES: usize = 64 * 1024;
 #[derive(Serialize)]
 pub struct Inventory {
     pub revision: u64,
+    pub listener_id: String,
     pub mode: &'static str,
     pub total: usize,
     pub offset: usize,

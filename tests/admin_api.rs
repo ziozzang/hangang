@@ -1050,6 +1050,116 @@ async fn certificate_inventory_is_admin_only_bounded_and_does_not_claim_unconfig
 }
 
 #[tokio::test]
+async fn certificate_inventory_scopes_named_listeners_without_id_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["scope.test".into()]).unwrap();
+    let certificate = |name: &str| {
+        let cert_file = dir.path().join(format!("{name}.crt"));
+        let key_file = dir.path().join(format!("{name}.key"));
+        std::fs::write(&cert_file, pair.cert.pem()).unwrap();
+        std::fs::write(&key_file, pair.signing_key.serialize_pem()).unwrap();
+        CertificateFiles {
+            id: "same".into(),
+            hosts: vec!["scope.test".into()],
+            default: false,
+            enabled: true,
+            cert_file,
+            key_file,
+            issuer_status_file: None,
+        }
+    };
+    let mut config = Config::default();
+    config.certificates.push(certificate("legacy"));
+    config.public_http = vec![
+        hangang::public_listener_config::Listener {
+            id: "active".into(),
+            listen: "127.0.0.1:28031".parse().unwrap(),
+            enabled: true,
+            certificates: vec![certificate("active")],
+            trusted_proxy_cidrs: vec![],
+        },
+        hangang::public_listener_config::Listener {
+            id: "inactive".into(),
+            listen: "127.0.0.1:28032".parse().unwrap(),
+            enabled: false,
+            certificates: vec![certificate("inactive")],
+            trusted_proxy_cidrs: vec![],
+        },
+    ];
+    let (address, _) = server_on(
+        dir.path().join("state.json"),
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    for path in ["/v1/certificates", "/v1/certificates?listener_id=default"] {
+        let (status, _, body) = request(address, "GET", path, None, None).await;
+        assert_eq!(status, 200);
+        let result = json(&body);
+        assert_eq!(result["listener_id"], "default");
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["certificates"][0]["id"], "same");
+        assert_eq!(result["certificates"][0]["tls_binding"], "unknown");
+    }
+    let (status, _, body) = request(
+        address,
+        "GET",
+        "/v1/certificates?listener_id=active&limit=1",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let result = json(&body);
+    assert_eq!(result["listener_id"], "active");
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["certificates"][0]["id"], "same");
+    assert_eq!(result["certificates"][0]["tls_binding"], "configured");
+    assert!(result["in_process_acme"].is_null());
+    let (_, _, body) = request(
+        address,
+        "GET",
+        "/v1/certificates?listener_id=active&offset=1",
+        None,
+        None,
+    )
+    .await;
+    assert!(json(&body)["certificates"].as_array().unwrap().is_empty());
+    let (status, _, body) = request(
+        address,
+        "GET",
+        "/v1/certificates?listener_id=inactive",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["certificates"][0]["tls_binding"], "unknown");
+    for path in [
+        "/v1/certificates?listener_id=",
+        "/v1/certificates?listener_id=bad%20id",
+        "/v1/certificates?listener_id=active&listener_id=inactive",
+    ] {
+        assert_eq!(request(address, "GET", path, None, None).await.0, 400);
+    }
+    assert_eq!(
+        request(
+            address,
+            "GET",
+            "/v1/certificates?listener_id=missing",
+            None,
+            None
+        )
+        .await
+        .0,
+        404
+    );
+}
+
+#[tokio::test]
 async fn operations_are_admin_only_paginated_and_reflect_backend_state() {
     let config: Config = serde_json::from_value(serde_json::json!({
         "http": [{
