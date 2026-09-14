@@ -1672,7 +1672,7 @@ impl Admin {
             let now = crate::certificate_inventory::now_unix_ms();
             let acme = selected
                 .is_none()
-                .then(|| self.acme_status.as_ref())
+                .then_some(self.acme_status.as_ref())
                 .flatten()
                 .map(|status| {
                     crate::certificate_inventory::InProcessAcme::from(
