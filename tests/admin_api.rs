@@ -736,6 +736,14 @@ async fn http_recording_policy_is_validated_revisioned_and_persisted_with_config
     );
     // Recording preferences must not suppress configuration recovery evidence.
     assert_eq!(config_operation_records(address).await.len(), 1);
+    let (status, _, public_summary) = request(address, "GET", "/v1/status", None, None).await;
+    assert_eq!(status, 200);
+    assert!(
+        json(&public_summary)["settings"]
+            .get("http_recording")
+            .is_none()
+    );
+    assert!(!String::from_utf8_lossy(&public_summary).contains("retain-errors"));
     config["revision"] = 1.into();
     for invalid in [
         serde_json::json!({"default_action":"record","rules":[{"id":"bad","action":"drop","match":{"status_ranges":[{"min":599,"max":400}]}}]}),

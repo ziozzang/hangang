@@ -906,6 +906,22 @@ impl Admin {
     fn status_value(&self) -> (serde_json::Value, u64) {
         let snapshot = self.manager.active.load();
         let metrics = &self.manager.metrics;
+        // Status/SSE is also available to viewers. Keep its historical
+        // settings summary explicit: recording rules belong to the
+        // administrator-only configuration read, not every status tick.
+        let settings = &snapshot.config.settings;
+        let mut settings_summary = serde_json::json!({
+            "trusted_proxy_cidrs": settings.trusted_proxy_cidrs,
+            "remove_response_headers": settings.remove_response_headers,
+            "https_redirect_code": settings.https_redirect_code,
+            "upstream_timeout_ms": settings.upstream_timeout_ms,
+            "allow_dot_segments": settings.allow_dot_segments,
+            "health_path": settings.health_path,
+        });
+        settings_summary
+            .as_object_mut()
+            .expect("settings summary is an object")
+            .retain(|_, value| !value.is_null());
         let status = serde_json::json!({
             "revision": snapshot.config.revision,
             "http_routes": snapshot.config.http.len(),
@@ -949,7 +965,7 @@ impl Admin {
                 "id": instance_id(),
                 "config_digest": config_digest(&snapshot.config),
             },
-            "settings": snapshot.config.settings,
+            "settings": settings_summary,
             "store": self.manager.config_store.as_ref().map(|_| {
                 let health = self.manager.store_health.report();
                 serde_json::json!({
