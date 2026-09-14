@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use hangang::{
-    certificates::{CertificateFiles, watch_public},
+    certificates::{CertificateFiles, load, load_public, watch_public},
     config::{Config, Snapshot},
     public_listener_config::Listener,
 };
@@ -245,4 +245,74 @@ async fn named_watcher_rotates_one_listener_and_keeps_last_good_on_invalid_files
     ));
     cancel.cancel();
     watcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn named_material_budget_rejects_actual_bytes_and_keeps_last_good() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["alpha.test".into()]).unwrap();
+    let alpha = cert(dir.path(), "alpha", &pair);
+    let mut config = Config::default();
+    config
+        .public_http
+        .push(listener("edge", 28006, vec![alpha.clone()]));
+    let active = Arc::new(ArcSwap::from_pointee(Snapshot::new(config).unwrap()));
+    let cancel = CancellationToken::new();
+    let watcher = tokio::spawn(watch_public(active.clone(), cancel.clone()));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let last_good = active.load().public_http_tls["edge"].load_full();
+    let mut padded = pair.cert.pem().into_bytes();
+    padded.resize(1024 * 1024, b'\n');
+    std::fs::write(&alpha.cert_file, padded).unwrap();
+    assert!(load_public(&[alpha.clone()]).is_err());
+    assert!(
+        load(&[alpha]).is_ok(),
+        "legacy global TLS retains its 16 MiB budget"
+    );
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert!(Arc::ptr_eq(
+        &last_good,
+        &active.load().public_http_tls["edge"].load_full()
+    ));
+    assert!(
+        handshake(
+            active.load().public_http_tls["edge"].load_full(),
+            client(&[&pair]),
+            "alpha.test"
+        )
+        .await
+    );
+    cancel.cancel();
+    watcher.await.unwrap();
+}
+
+#[test]
+fn named_certificate_count_is_aggregate_across_listeners() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["alpha.test".into()]).unwrap();
+    let base = cert(dir.path(), "base", &pair);
+    let certificates = |prefix: &str| {
+        (0..513)
+            .map(|i| {
+                let mut entry = base.clone();
+                entry.id = format!("{prefix}{i}");
+                entry.default = true;
+                entry.enabled = false;
+                entry.hosts.clear();
+                entry
+            })
+            .collect()
+    };
+    let mut config = Config::default();
+    config.public_http = vec![
+        listener("one", 28007, certificates("a")),
+        listener("two", 28008, certificates("b")),
+    ];
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("1024 named public TLS certificates")
+    );
 }

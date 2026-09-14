@@ -25,6 +25,7 @@ const MAX_HOST_BYTES: usize = 253;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PUBLIC_TOTAL_BYTES: usize = 1024 * 1024;
 const FULL_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +121,13 @@ pub fn load(certificates: &[CertificateFiles]) -> Result<rustls::ServerConfig> {
     let material = read_material(certificates)?;
     crate::tls::sni_server_config(material.certificates)
         .context("validate configured TLS certificate set")
+}
+
+/// Named public listener material is bounded independently of legacy TLS.
+pub fn load_public(certificates: &[CertificateFiles]) -> Result<rustls::ServerConfig> {
+    let material = read_material_with_limit(certificates, MAX_PUBLIC_TOTAL_BYTES)?;
+    crate::tls::sni_server_config(material.certificates)
+        .context("validate configured public TLS certificate set")
 }
 
 /// Poll certificate files and atomically replace only the still-current TLS
@@ -249,6 +257,7 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observations: std::collections::HashMap<String, Observation> = Default::default();
     let mut attempts: std::collections::HashMap<String, Attempt> = Default::default();
+    let mut last_errors: std::collections::HashMap<String, String> = Default::default();
     loop {
         tokio::select! {
             biased;
@@ -258,6 +267,7 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
         let snapshot = active.load_full();
         observations.retain(|id, _| snapshot.public_http_tls.contains_key(id));
         attempts.retain(|id, _| snapshot.public_http_tls.contains_key(id));
+        last_errors.retain(|id, _| snapshot.public_http_tls.contains_key(id));
         for listener in snapshot
             .config
             .public_http
@@ -295,10 +305,26 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
                 },
             );
             let checked = files.clone();
-            let Ok(Ok(material)) =
-                tokio::task::spawn_blocking(move || read_material(&checked)).await
-            else {
-                continue;
+            let material = match tokio::task::spawn_blocking(move || {
+                read_material_with_limit(&checked, MAX_PUBLIC_TOTAL_BYTES)
+            })
+            .await
+            {
+                Ok(Ok(material)) => material,
+                Ok(Err(error)) => {
+                    report_once(
+                        last_errors.entry(id.clone()).or_default(),
+                        &format!("public listener {id}: {error}"),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    report_once(
+                        last_errors.entry(id.clone()).or_default(),
+                        &format!("public listener {id} TLS task failed: {error}"),
+                    );
+                    continue;
+                }
             };
             if attempts.get(&id).is_some_and(|seen| {
                 Arc::ptr_eq(&seen.target, &target)
@@ -334,6 +360,7 @@ pub async fn watch_public(active: Arc<ArcSwap<Snapshot>>, cancel: CancellationTo
                     .is_some_and(|slot| Arc::ptr_eq(slot, &target))
             {
                 target.store(Arc::new(config));
+                last_errors.remove(&id);
             }
         }
     }
@@ -439,6 +466,13 @@ impl FileFingerprint {
 }
 
 fn read_material(certificates: &[CertificateFiles]) -> Result<LoadedMaterial> {
+    read_material_with_limit(certificates, MAX_TOTAL_BYTES)
+}
+
+fn read_material_with_limit(
+    certificates: &[CertificateFiles],
+    max_total_bytes: usize,
+) -> Result<LoadedMaterial> {
     validate_set(certificates)?;
     let mut total = 0usize;
     let mut digest = Sha256::new();
@@ -461,14 +495,22 @@ fn read_material(certificates: &[CertificateFiles]) -> Result<LoadedMaterial> {
             certificate.key_file.as_os_str().as_encoded_bytes(),
         );
         let cert_pem = read_bounded(&certificate.cert_file, &certificate.id, "certificate")?;
-        let key_pem = read_bounded(&certificate.key_file, &certificate.id, "private key")?;
         total = total
             .checked_add(cert_pem.len())
-            .and_then(|value| value.checked_add(key_pem.len()))
             .context("TLS certificate set size overflow")?;
         ensure!(
-            total <= MAX_TOTAL_BYTES,
-            "TLS certificate set exceeds 16 MiB"
+            total <= max_total_bytes,
+            "TLS certificate set exceeds {} MiB",
+            max_total_bytes / (1024 * 1024)
+        );
+        let key_pem = read_bounded(&certificate.key_file, &certificate.id, "private key")?;
+        total = total
+            .checked_add(key_pem.len())
+            .context("TLS certificate set size overflow")?;
+        ensure!(
+            total <= max_total_bytes,
+            "TLS certificate set exceeds {} MiB",
+            max_total_bytes / (1024 * 1024)
         );
         digest_field(&mut digest, &cert_pem);
         digest_field(&mut digest, &key_pem);

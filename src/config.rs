@@ -687,6 +687,14 @@ impl Config {
             self.public_http.len() <= 64,
             "at most 64 public HTTP listeners"
         );
+        ensure!(
+            self.public_http
+                .iter()
+                .map(|listener| listener.certificates.len())
+                .sum::<usize>()
+                <= 1024,
+            "at most 1024 named public TLS certificates across all listeners"
+        );
         let mut public_ids = HashSet::new();
         let mut public_addresses = HashSet::new();
         for listener in &self.public_http {
@@ -2078,9 +2086,9 @@ impl Snapshot {
             let slot = if let Some(existing) = existing {
                 existing.clone()
             } else {
-                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(crate::certificates::load(
-                    &listener.certificates,
-                )?))
+                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                    crate::certificates::load_public(&listener.certificates)?,
+                ))
             };
             public_http_tls.insert(listener.id.clone(), slot);
         }
