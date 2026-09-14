@@ -48,6 +48,9 @@ pub struct Settings {
     /// Response-head metadata selection shared by the ring and access trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_recording: Option<crate::http_recording::Policy>,
+    /// Completion-history selection for accepted raw TCP connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_recent_recording: Option<crate::tcp_recording::Policy>,
     /// Peers whose `X-Forwarded-For`/`X-Forwarded-Proto` are trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_proxy_cidrs: Option<Vec<ipnet::IpNet>>,
@@ -73,6 +76,9 @@ impl Settings {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(policy) = &self.http_recording {
+            policy.validate()?;
+        }
+        if let Some(policy) = &self.tcp_recent_recording {
             policy.validate()?;
         }
         if let Some(cidrs) = &self.trusted_proxy_cidrs {
@@ -127,6 +133,7 @@ impl Settings {
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
     pub http_recording: Option<std::sync::Arc<crate::http_recording::CompiledPolicy>>,
+    pub tcp_recent_recording: Option<std::sync::Arc<crate::tcp_recording::CompiledPolicy>>,
     pub trusted_proxy_cidrs: Option<std::sync::Arc<Vec<ipnet::IpNet>>>,
     pub remove_response_headers: Option<std::sync::Arc<Vec<hyper::header::HeaderName>>>,
     pub https_redirect_code: Option<u16>,
@@ -141,6 +148,11 @@ impl PreparedSettings {
         Ok(Self {
             http_recording: settings
                 .http_recording
+                .as_ref()
+                .map(|policy| policy.compile().map(std::sync::Arc::new))
+                .transpose()?,
+            tcp_recent_recording: settings
+                .tcp_recent_recording
                 .as_ref()
                 .map(|policy| policy.compile().map(std::sync::Arc::new))
                 .transpose()?,
@@ -473,6 +485,9 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
+        if let Some(policy) = &self.settings.tcp_recent_recording {
+            policy.validate_listeners(&self.tcp)?;
+        }
         if let Some(source) = &self.geoip_database {
             source.validate().context("geoip_database")?;
         }
