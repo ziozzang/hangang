@@ -892,6 +892,7 @@ impl Admin {
             "revision": snapshot.config.revision,
             "http_routes": snapshot.config.http.len(),
             "tcp_routes": snapshot.config.tcp.len(),
+            "geoip_metrics": metrics.geoip.snapshot(),
             "workload_materials": snapshot.tcp_inbound_tls.iter().map(|(id, slot)|
                 serde_json::json!({"kind":"tcp", "id":id, "ready":slot.load().is_some()}))
                 .chain(snapshot.http_workload_tls.iter().map(|(id, slot)|

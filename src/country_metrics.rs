@@ -9,6 +9,23 @@ use std::{
 
 use crate::country_observation::{Observation, State};
 
+#[derive(serde::Serialize)]
+pub struct Snapshot {
+    pub http: ProtocolSnapshot,
+    pub tcp: ProtocolSnapshot,
+}
+
+#[derive(serde::Serialize)]
+pub struct ProtocolSnapshot {
+    pub known: u64,
+    pub unknown: u64,
+    pub unavailable: u64,
+    pub allowed: u64,
+    pub denied: u64,
+    pub admission_unavailable: u64,
+    pub countries: std::collections::BTreeMap<String, u64>,
+}
+
 const PROTOCOLS: [&str; 2] = ["http", "tcp"];
 const LOOKUP_RESULTS: [&str; 3] = ["known", "unknown", "unavailable"];
 const ADMISSION_RESULTS: [&str; 3] = ["allowed", "denied", "unavailable"];
@@ -76,6 +93,42 @@ fn country_index(code: &str) -> Option<usize> {
 }
 
 impl Counters {
+    /// A bounded, approximate concurrent snapshot for status/SSE. The same
+    /// atomics back the Prometheus scrape; no address or route labels exist.
+    pub fn snapshot(&self) -> Snapshot {
+        let protocol = |index: usize| {
+            let mut countries = std::collections::BTreeMap::new();
+            for country in 0..COUNTRY_COUNT {
+                let count = self.countries[index][country].load(Ordering::Relaxed);
+                if count > 0 {
+                    let code = format!(
+                        "{}{}",
+                        (b'A' + (country / 26) as u8) as char,
+                        (b'A' + (country % 26) as u8) as char
+                    );
+                    countries.insert(code, count);
+                }
+            }
+            let unknown = self.countries[index][UNKNOWN_COUNTRY].load(Ordering::Relaxed);
+            if unknown > 0 {
+                countries.insert("unknown".into(), unknown);
+            }
+            ProtocolSnapshot {
+                known: self.lookups[index][0].load(Ordering::Relaxed),
+                unknown: self.lookups[index][1].load(Ordering::Relaxed),
+                unavailable: self.lookups[index][2].load(Ordering::Relaxed),
+                allowed: self.admissions[index][0].load(Ordering::Relaxed),
+                denied: self.admissions[index][1].load(Ordering::Relaxed),
+                admission_unavailable: self.admissions[index][2].load(Ordering::Relaxed),
+                countries,
+            }
+        };
+        Snapshot {
+            http: protocol(0),
+            tcp: protocol(1),
+        }
+    }
+
     /// Count a completed lookup and, only for an enforced route policy, its
     /// admission decision. A passive database failure has `decision: None`.
     pub fn observe(
@@ -163,6 +216,33 @@ impl Counters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_snapshot_bounds_country_map_and_matches_prometheus_counters() {
+        let counters = Counters::default();
+        for first in b'A'..=b'Z' {
+            for second in b'A'..=b'Z' {
+                let code = format!("{}{}", first as char, second as char);
+                counters.observe(
+                    Protocol::Http,
+                    &observation(State::Known, Some(&code)),
+                    Some(Decision::Denied),
+                );
+            }
+        }
+        counters.observe(Protocol::Http, &observation(State::Unknown, None), None);
+        counters.observe(Protocol::Tcp, &observation(State::Unavailable, None), None);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.http.countries.len(), 677);
+        assert_eq!(snapshot.http.known, 676);
+        assert_eq!(snapshot.http.denied, 676);
+        assert_eq!(snapshot.http.unknown, 1);
+        assert_eq!(snapshot.tcp.unavailable, 1);
+        assert_eq!(snapshot.tcp.admission_unavailable, 0);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains(&"a".repeat(64)));
+        assert!(json.len() < 8192);
+    }
 
     fn observation(state: State, country: Option<&str>) -> Observation {
         Observation {

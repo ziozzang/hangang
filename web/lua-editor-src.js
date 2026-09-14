@@ -12,6 +12,7 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { tags } from '@lezer/highlight';
 
 const policyMembers = [
+  ['geoip', '()', 'Read the immutable admission observation: state, country, generation_sha256 and error_code.'],
   ['api_version', 'number', 'Current Hangang Lua API version (1).'],
   ['header', '(name)', 'Read one request header value or nil.'],
   ['method', '()', 'Read the request method.'],
@@ -22,6 +23,7 @@ const policyMembers = [
   ['reject', '(status_400_to_599)', 'Reject this request with a 4xx or 5xx status.'],
 ];
 const bodyMembers = [
+  ['geoip', '()', 'Read the immutable admission observation: state, country, generation_sha256 and error_code.'],
   ['api_version', 'number', 'Current Hangang Lua API version (1).'],
   ['body', '()', 'Read the bounded complete body or record as a binary-safe string.'],
   ['phase', '()', 'Return request or response.'],

@@ -125,7 +125,7 @@ impl CompiledCountryPolicy {
         self.evaluate_code(country.as_ref().map(CountryCode::as_str))
     }
 
-    fn evaluate_code(&self, country: Option<&str>) -> bool {
+    pub(crate) fn evaluate_code(&self, country: Option<&str>) -> bool {
         if !self.enforce {
             return true;
         }

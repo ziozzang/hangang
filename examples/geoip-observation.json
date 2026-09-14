@@ -1,0 +1,25 @@
+{
+  "revision": 0,
+  "tcp": [],
+  "geoip_database": {
+    "file": "/var/lib/hangang/GeoLite2-Country.mmdb"
+  },
+  "http": [
+    {
+      "id": "country-observation",
+      "host": "country.example.test",
+      "access_mode": "public",
+      "backends": [
+        "http://127.0.0.1:8081"
+      ],
+      "lua": "local observed = hangang.geoip()\n-- This is address metadata, never an authenticated identity.\nhangang.set_header(\"x-example-country-state\", observed.state)\nhangang.set_header(\"x-example-country\", observed.country or \"unknown\")\n",
+      "response_transform": {
+        "mode": "ndjson",
+        "max_buffer_bytes": 16384,
+        "max_output_bytes": 16384,
+        "set_headers": { "content-type": "application/x-ndjson" },
+        "lua": "local observed = hangang.geoip()\nlocal document = hangang.json_decode(hangang.body())\ndocument.gateway_country = observed.country or hangang.null\ndocument.gateway_country_state = observed.state\nreturn hangang.json_encode(document)\n"
+      }
+    }
+  ]
+}

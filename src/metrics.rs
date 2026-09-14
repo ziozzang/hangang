@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Default)]
 pub struct Metrics {
+    pub geoip: crate::country_metrics::Counters,
     pub requests: AtomicU64,
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
@@ -111,6 +112,7 @@ impl Metrics {
         ] {
             out.push_str(&format!("# HELP hangang_{name} Hangang {name}.\n# TYPE hangang_{name} {kind}\nhangang_{name} {}\n", value.load(Ordering::Relaxed)));
         }
+        self.geoip.render(&mut out);
         out
     }
 }

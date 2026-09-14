@@ -23,6 +23,7 @@ pub struct TrafficRecord {
     pub peer_ip: String,
     pub peer_port: u16,
     pub client_ip: String,
+    pub geoip: crate::country_observation::Observation,
     pub method: String,
     pub path: String,
     pub route_id: Option<String>,
@@ -37,6 +38,7 @@ pub struct TrafficInput<'a> {
     pub peer_ip: IpAddr,
     pub peer_port: u16,
     pub client_ip: IpAddr,
+    pub geoip: Option<&'a crate::country_observation::Observation>,
     pub method: &'a str,
     pub path: &'a str,
     pub route_id: Option<&'a str>,
@@ -111,6 +113,13 @@ impl TrafficHistory {
             peer_ip: input.peer_ip.to_string(),
             peer_port: input.peer_port,
             client_ip: input.client_ip.to_string(),
+            // Observations contain only fixed-shape country metadata. Never
+            // let an invalid caller insert unbounded strings into the ring.
+            geoip: input
+                .geoip
+                .filter(|value| value.validate().is_ok())
+                .cloned()
+                .unwrap_or_default(),
             method: bounded_ascii(input.method, 16),
             path: bounded_path(input.path),
             route_id: input.route_id.map(|id| bounded_ascii(id, 128)),
@@ -196,8 +205,13 @@ impl TrafficHistory {
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        let server_time_unix_ms =
-            server_time_unix_ms.max(records.last().map_or(0, |record| record.timestamp_unix_ms));
+        let server_time_unix_ms = server_time_unix_ms.max(
+            records
+                .iter()
+                .map(|record| record.timestamp_unix_ms)
+                .max()
+                .unwrap_or(0),
+        );
         TrafficBatch {
             records,
             server_time_unix_ms,
@@ -250,8 +264,52 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn clock_rollback_cannot_make_any_returned_record_newer_than_batch_time() {
+        let history = TrafficHistory::default();
+        history.record(input("/first"));
+        history.record(input("/second"));
+        let future = history.state.lock().unwrap().records[0]
+            .record
+            .timestamp_unix_ms
+            + 60_000;
+        {
+            let mut state = history.state.lock().unwrap();
+            state.records[0].record.timestamp_unix_ms = future;
+            state.records[1].record.timestamp_unix_ms = future - 30_000;
+        }
+        let batch = history.snapshot_since(None, 128);
+        assert_eq!(batch.records.len(), 2);
+        assert!(
+            batch
+                .records
+                .iter()
+                .all(|record| record.timestamp_unix_ms <= batch.server_time_unix_ms)
+        );
+    }
+
+    #[test]
+    fn malformed_country_metadata_cannot_enter_the_bounded_ring() {
+        let history = TrafficHistory::default();
+        let observed = crate::country_observation::Observation {
+            state: crate::country_observation::State::Known,
+            country: Some("x".repeat(100_000)),
+            generation_sha256: Some("a".repeat(64)),
+            error_code: Some("/private/operator/database.mmdb".into()),
+        };
+        let mut request = input("/public");
+        request.geoip = Some(&observed);
+        history.record(request);
+        let batch = history.snapshot_since(None, 128);
+        assert_eq!(batch.records[0].geoip, Default::default());
+        let json = serde_json::to_string(&batch).unwrap();
+        assert!(!json.contains("/private"));
+        assert!(json.len() < 1024);
+    }
+
     fn input<'a>(path: &'a str) -> TrafficInput<'a> {
         TrafficInput {
+            geoip: None,
             peer_ip: "192.0.2.5".parse().unwrap(),
             peer_port: 12345,
             client_ip: "198.51.100.7".parse().unwrap(),

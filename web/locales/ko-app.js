@@ -32,6 +32,7 @@ export default {
   'Optional Lua after operations, at most 16 KiB. Completion offers body, phase and JSON helpers; routing and header helpers are unavailable. Ctrl+Space (macOS: Alt+i) opens suggestions; Ctrl/⌘+Z undoes; Tab moves focus.': '작업 후 실행하는 선택적 Lua입니다(최대 16 KiB). 자동 완성에는 본문, 단계, JSON 도우미가 표시되며 라우팅 및 헤더 도우미는 사용할 수 없습니다. Ctrl+Space(macOS: Alt+i)로 제안을 열고 Ctrl/⌘+Z로 되돌립니다. Tab은 다음 항목으로 이동합니다.',
   'Optional request policy Lua, at most 16 KiB. Completion offers request, header, backend and reject helpers; body helpers are unavailable. Disables route caching. Ctrl+Space (macOS: Alt+i) opens suggestions; Ctrl/⌘+Z undoes; Tab moves focus.': '선택적 요청 정책 Lua입니다(최대 16 KiB). 자동 완성에는 요청, 헤더, 백엔드, 거부 도우미가 표시되며 본문 도우미는 사용할 수 없습니다. 경로 캐싱을 비활성화합니다. Ctrl+Space(macOS: Alt+i)로 제안을 열고 Ctrl/⌘+Z로 되돌립니다. Tab은 다음 항목으로 이동합니다.',
   'Current Hangang Lua API version (1).': '현재 Hangang Lua API 버전(1).',
+  'Read the immutable admission observation: state, country, generation_sha256 and error_code.': '접근 판정 시점의 읽기 전용 관측값(state, country, generation_sha256, error_code)을 읽습니다.',
   'Read one request header value or nil.': '요청 헤더 값 하나를 읽거나 없으면 nil을 반환합니다.',
   'Read the request method.': '요청 메서드를 읽습니다.',
   'Read the request path.': '요청 경로를 읽습니다.',

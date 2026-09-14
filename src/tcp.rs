@@ -974,31 +974,21 @@ fn spawn_accept_loop(
                     task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                // Country policy is admission on the selected SNI route, not
-                // a listener-wide prefilter or a reason to try another route.
-                // It uses the canonical accepted peer; TCP has no trusted
-                // forwarded-address mechanism. A missing/stale database or a
-                // lookup error is distinct from a successfully unknown IP.
-                if let Some(policy) = &country_policy
-                    && policy.enforced()
-                {
-                    let Some(database) = geoip.as_ref().and_then(|slot| slot.load()) else {
-                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    };
-                    let Ok(country) = database.lookup(peer.ip()) else {
-                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    };
-                    if !policy.evaluate(country) {
-                        task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                }
-                // Country is an admission decision only. Holding the slot for
-                // the forwarding lifetime would retain every replaced MMDB
-                // generation until its old TCP streams finish.
+                // Observe the accepted peer once on the selected SNI route.
+                // Copy only metadata, then release the slot before forwarding.
+                let observation = crate::country_observation::capture(geoip.as_ref(), peer.ip());
                 drop(geoip);
+                let country_decision = country_policy.as_ref().filter(|policy| policy.enforced())
+                    .map(|policy| match observation.policy_country() {
+                        Ok(country) if policy.evaluate_code(country) => crate::country_metrics::Decision::Allowed,
+                        Ok(_) => crate::country_metrics::Decision::Denied,
+                        Err(_) => crate::country_metrics::Decision::Unavailable,
+                    });
+                task_metrics.geoip.observe(crate::country_metrics::Protocol::Tcp, &observation, country_decision);
+                if matches!(country_decision, Some(crate::country_metrics::Decision::Denied | crate::country_metrics::Decision::Unavailable)) {
+                    task_metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 let _route_permit =
                     match crate::admission::acquire(&counter, route.max_connections) {
                         Ok(permit) => permit,

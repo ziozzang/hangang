@@ -22,6 +22,8 @@ use std::{
 use tokio::{net::TcpListener, task::JoinHandle};
 
 struct Fixture {
+    metrics: Arc<Metrics>,
+    traffic: Arc<hangang::traffic::TrafficHistory>,
     front: String,
     origin_hits: Arc<AtomicUsize>,
     active: Arc<ArcSwap<Snapshot>>,
@@ -79,7 +81,10 @@ async fn fixture(
     let snapshot = Snapshot::new(config).unwrap();
     let active = Arc::new(ArcSwap::from_pointee(snapshot));
     let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 2));
-    let proxy = Proxy::new(active.clone(), policy.clone(), Arc::new(Metrics::default()));
+    let metrics = Arc::new(Metrics::default());
+    let traffic = Arc::new(hangang::traffic::TrafficHistory::default());
+    let proxy = Proxy::new(active.clone(), policy.clone(), metrics.clone())
+        .with_traffic_history(traffic.clone());
     let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let front = format!("http://{}", front_listener.local_addr().unwrap());
     let front_task = tokio::spawn(async move {
@@ -97,6 +102,8 @@ async fn fixture(
         }
     });
     Fixture {
+        metrics,
+        traffic,
         front,
         origin_hits,
         active,
@@ -190,6 +197,104 @@ fn basic_credential() -> String {
             .collect::<String>()
     };
     format!("alice:{}:{}", hex(salt), hex(&digest.finalize()))
+}
+
+#[tokio::test]
+async fn observation_records_and_counters_use_the_admission_result_without_blocking_passive_errors()
+{
+    use hangang::country_observation::State;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("country.mmdb");
+    std::fs::write(&file, fresh_fixture()).unwrap();
+    let fixture = fixture(
+        |origin| {
+            json!([{
+                "id":"observed", "access_mode":"public", "backends":[format!("http://{origin}")],
+                "country_policy":{"allow":["GB"],"on_unknown":"deny"}
+            }])
+        },
+        &file,
+        true,
+    )
+    .await;
+    assert_eq!(status(&fixture, "81.2.69.160").await, 503);
+    let slot = fixture.active.load().geoip.clone().unwrap();
+    let (cancel, worker) = start_watcher(&fixture, slot.clone());
+    wait_ready(&slot).await;
+    let digest = slot.load().unwrap().status().generation_sha256.clone();
+    assert_eq!(status(&fixture, "81.2.69.160").await, 200);
+    assert_eq!(status(&fixture, "2001:220::1").await, 403);
+    assert_eq!(status(&fixture, "127.0.0.1").await, 403);
+    let current = fixture.active.load_full();
+    let mut config = current.config.clone();
+    config.http[0].country_policy = None;
+    config.revision += 1;
+    let next = Snapshot::replace(config, &current).unwrap();
+    next.activated();
+    fixture.active.store(Arc::new(next));
+    std::fs::write(&file, b"invalid").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while slot.status().error_code != Some("invalid_database") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status(&fixture, "81.2.69.160").await, 200);
+    let rows = fixture.traffic.snapshot_since(None, 128).records;
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0].geoip.state, State::Unavailable);
+    assert_eq!(rows[0].geoip.error_code.as_deref(), Some("pending"));
+    assert_eq!(rows[1].geoip.country.as_deref(), Some("GB"));
+    assert_eq!(rows[2].geoip.country.as_deref(), Some("KR"));
+    assert_eq!(rows[3].geoip.state, State::Unknown);
+    for row in &rows[1..4] {
+        assert_eq!(
+            row.geoip.generation_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+    }
+    assert_eq!(rows[4].geoip.state, State::Unavailable);
+    assert_eq!(
+        rows[4].geoip.error_code.as_deref(),
+        Some("invalid_database")
+    );
+    assert_eq!(
+        rows[4].status, 200,
+        "passive observation is not an access policy"
+    );
+    let counts = fixture.metrics.geoip.snapshot();
+    assert_eq!(
+        (
+            counts.http.known,
+            counts.http.unknown,
+            counts.http.unavailable
+        ),
+        (2, 1, 2)
+    );
+    assert_eq!(
+        (
+            counts.http.allowed,
+            counts.http.denied,
+            counts.http.admission_unavailable
+        ),
+        (1, 2, 1)
+    );
+    assert_eq!(counts.http.countries.len(), 3);
+    let text = fixture.metrics.render();
+    assert!(
+        text.contains("hangang_geoip_lookups_total{protocol=\"http\",result=\"unavailable\"} 2")
+    );
+    assert!(
+        text.contains(
+            "hangang_geoip_admission_total{protocol=\"http\",decision=\"unavailable\"} 1"
+        )
+    );
+    assert!(!text.contains(&digest));
+    assert!(!text.contains("81.2.69.160"));
+    cancel.cancel();
+    worker.await.unwrap();
+    fixture.close().await;
 }
 
 fn protected_route(origin: std::net::SocketAddr, allow: &str) -> Value {

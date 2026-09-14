@@ -6,6 +6,8 @@ pub mod balance;
 pub mod basic_auth;
 pub mod config;
 pub mod config_store;
+pub mod country_metrics;
+pub mod country_observation;
 pub mod country_policy;
 pub mod discovery;
 pub mod docker;

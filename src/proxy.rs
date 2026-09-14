@@ -137,6 +137,7 @@ pub struct Proxy {
 struct ShutdownGuard(CancellationToken);
 
 struct TrafficContext {
+    geoip: crate::country_observation::Observation,
     peer_ip: IpAddr,
     peer_port: u16,
     client_ip: IpAddr,
@@ -151,6 +152,7 @@ struct TrafficContext {
 impl TrafficContext {
     fn new(request: &Request<Incoming>, peer: SocketAddr) -> Self {
         Self {
+            geoip: Default::default(),
             peer_ip: peer.ip(),
             peer_port: peer.port(),
             client_ip: peer.ip(),
@@ -172,6 +174,7 @@ impl TrafficContext {
 
     fn record(&self, history: &crate::traffic::TrafficHistory, status: u16) {
         history.record(crate::traffic::TrafficInput {
+            geoip: Some(&self.geoip),
             peer_ip: self.peer_ip,
             peer_port: self.peer_port,
             client_ip: self.client_ip,
@@ -1174,22 +1177,36 @@ impl Proxy {
             ));
         }
 
-        // Acquire one immutable country generation at admission. Missing or
-        // unhealthy data is an availability failure, never an unknown country.
-        // `peer` already contains the trusted-proxy effective client address.
-        if let Some(policy) = &runtime.country_policy
-            && policy.enforced()
-        {
-            let Some(database) = snapshot.geoip.as_ref().and_then(|slot| slot.load()) else {
-                return Ok(response(503, "country database unavailable"));
-            };
-            let country = match database.lookup(peer.ip()) {
-                Ok(country) => country,
-                Err(_) => return Ok(response(503, "country database unavailable")),
-            };
-            if !policy.evaluate(country) {
+        // One copied observation supplies admission, telemetry and every Lua
+        // phase. It never retains the database or performs per-record lookups.
+        let geoip = crate::country_observation::capture(snapshot.geoip.as_ref(), peer.ip());
+        if let Some(context) = traffic {
+            context.geoip = geoip.clone();
+        }
+        let country_decision = runtime
+            .country_policy
+            .as_ref()
+            .filter(|policy| policy.enforced())
+            .map(|policy| match geoip.policy_country() {
+                Ok(country) if policy.evaluate_code(country) => {
+                    crate::country_metrics::Decision::Allowed
+                }
+                Ok(_) => crate::country_metrics::Decision::Denied,
+                Err(_) => crate::country_metrics::Decision::Unavailable,
+            });
+        self.metrics.geoip.observe(
+            crate::country_metrics::Protocol::Http,
+            &geoip,
+            country_decision,
+        );
+        match country_decision {
+            Some(crate::country_metrics::Decision::Denied) => {
                 return Ok(response(403, "client country denied"));
             }
+            Some(crate::country_metrics::Decision::Unavailable) => {
+                return Ok(response(503, "country database unavailable"));
+            }
+            _ => {}
         }
 
         // Native language preference filtering is an access decision on the
@@ -1632,6 +1649,7 @@ impl Proxy {
             strip_hop_by_hop(&mut visible_headers);
             strip_forwarding_headers(&mut visible_headers);
             let input = PolicyInput {
+                geoip: geoip.clone(),
                 script: script.clone(),
                 method: request.method().as_str().to_owned(),
                 path: request.uri().path().to_owned(),
@@ -1810,11 +1828,12 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                result = crate::transform_body::transform(
+                result = crate::transform_body::transform_with_geoip(
                 body,
                 config.clone(),
                 self.policy.clone(),
                 "request",
+                geoip.clone(),
                 transform_budget.clone().expect("transform budget"),
                 self.metrics.clone(),
                 ) => result,
@@ -2284,11 +2303,12 @@ impl Proxy {
                         retired.record(&self.metrics);
                         return Ok(crate::proxy::response(503, "route authorization retired"));
                     }
-                    result = crate::transform_body::transform(
+                    result = crate::transform_body::transform_with_geoip(
                     body,
                     config.clone(),
                     self.policy.clone(),
                     "response",
+                    geoip.clone(),
                     transform_budget.clone().expect("transform budget"),
                     self.metrics.clone(),
                     ) => result,

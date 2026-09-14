@@ -399,6 +399,7 @@ async fn saturated_lua_transform_is_503_then_recovers_without_hiding_script_erro
         tokio::spawn(async move {
             policy
                 .transform(TransformInput {
+                    geoip: Default::default(),
                     script: "return 'held'".into(),
                     body: b"x".to_vec(),
                     phase: "response".into(),
