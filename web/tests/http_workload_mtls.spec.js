@@ -86,6 +86,8 @@ test('listener create, edit, activation and removal are staged through full-conf
   expect(current().workload_http).toEqual([listener]);
 
   await page.locator('#workload-http-list [data-workload-id="orders"]').getByRole('button', { name: 'Edit' }).click();
+  await expect(page.locator('#workload-http-message')).not.toHaveClass(/is-error/);
+  await expect(form.locator('[name="id"]')).toBeFocused();
   await form.locator('[name="handshake_timeout_ms"]').fill('7000');
   await form.getByRole('button', { name: 'Stage listener in document' }).click();
   await page.locator('#workload-http-list [data-workload-id="orders"]').getByRole('button', { name: 'Deactivate' }).click();
