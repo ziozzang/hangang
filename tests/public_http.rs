@@ -243,3 +243,53 @@ async fn public_listener_cannot_reach_unscoped_default_route() {
     running.shutdown().await;
     origin_task.abort();
 }
+
+#[tokio::test]
+async fn named_https_listener_serves_scoped_route() {
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let (backend, origin_task) = origin().await;
+    let material = tempfile::tempdir().unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_file = material.path().join("server.pem");
+    let key_file = material.path().join("server.key");
+    std::fs::write(&cert_file, certificate.cert.pem()).unwrap();
+    std::fs::write(&key_file, certificate.signing_key.serialize_pem()).unwrap();
+    let mut candidate = config(listen, backend);
+    candidate.public_http[0].certificates.push(
+        serde_json::from_value(serde_json::json!({
+        "id": "localhost", "hosts": [], "default": true,
+            "cert_file": cert_file, "key_file": key_file
+        }))
+        .unwrap(),
+    );
+    let running = start(candidate, bound).await;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let stream = TcpStream::connect(listen).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(name, stream).await.unwrap();
+    tls.write_all(b"GET /edge HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200")
+    );
+    running.shutdown().await;
+    origin_task.abort();
+}
