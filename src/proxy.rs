@@ -141,8 +141,11 @@ struct TrafficContext {
     peer_ip: IpAddr,
     peer_port: u16,
     client_ip: IpAddr,
-    method: String,
-    path: String,
+    // Method/URI clones share their parsed backing storage with the request.
+    // The full path remains available for policy matching without allocating
+    // another potentially long attacker-controlled path per active request.
+    method: Method,
+    uri: Uri,
     route_id: Option<String>,
     protocol: &'static str,
     tls: bool,
@@ -156,8 +159,8 @@ impl TrafficContext {
             peer_ip: peer.ip(),
             peer_port: peer.port(),
             client_ip: peer.ip(),
-            method: request.method().as_str().to_owned(),
-            path: request.uri().path().to_owned(),
+            method: request.method().clone(),
+            uri: request.uri().clone(),
             route_id: None,
             protocol: if request.version() == Version::HTTP_2 {
                 "h2"
@@ -179,8 +182,8 @@ impl TrafficContext {
                 peer_ip: self.peer_ip,
                 peer_port: self.peer_port,
                 client_ip: self.client_ip,
-                method: &self.method,
-                path: &self.path,
+                method: self.method.as_str(),
+                path: self.uri.path(),
                 route_id: self.route_id.as_deref(),
                 status,
                 response_head_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -738,8 +741,8 @@ impl Proxy {
             crate::http_recording::Action::Record,
             |policy| {
                 policy.action(crate::http_recording::Input {
-                    method: &context.method,
-                    path: &context.path,
+                    method: context.method.as_str(),
+                    path: context.uri.path(),
                     route_id: context.route_id.as_deref(),
                     status,
                     peer_ip: context.peer_ip,
@@ -760,8 +763,8 @@ impl Proxy {
         if self.access_log {
             // The trace has the same bounded, query-free metadata as the ring.
             // In particular, never emit a raw Host or a path-and-query.
-            let method = crate::traffic::bounded_ascii(&context.method, 16);
-            let path = crate::traffic::bounded_path(&context.path);
+            let method = crate::traffic::bounded_ascii(context.method.as_str(), 16);
+            let path = crate::traffic::bounded_path(context.uri.path());
             let route = context
                 .route_id
                 .as_deref()
