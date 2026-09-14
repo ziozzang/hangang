@@ -376,3 +376,35 @@ test('late traffic snapshot after logout cannot restore listener provenance', as
   await expect(page.locator('#activity-rows')).toBeEmpty();
   await expect(page.locator('#activity-panel')).toBeHidden();
 });
+
+test('request history rejects malformed known listener kinds without losing valid workload IDs', async ({ page }) => {
+  const longPublicId = 'a'.repeat(65);
+  const longWorkloadId = 'b'.repeat(129);
+  const cases = [
+    [11, { kind: 'public', id: 'default' }, 'Listener unknown'],
+    [12, { kind: 'public', id: 'edge:port' }, 'Listener unknown'],
+    [13, { kind: 'public', id: longPublicId }, 'Listener unknown'],
+    [14, { kind: 'default', id: 'edge' }, 'Listener unknown'],
+    [15, { kind: 'default', id: null }, 'Listener unknown'],
+    [16, { kind: 'workload', id: 'private:edge' }, 'Workload mTLS listener: private:edge'],
+    [17, { kind: 'workload', id: longWorkloadId }, 'Listener unknown'],
+    [18, { kind: 'workload', id: 'private edge' }, 'Listener unknown'],
+  ];
+  await fixtures(page, { snapshot: traffic(cases.map(([id, listener]) => record(id, { route_id: 'shared', listener }))) });
+  await signIn(page);
+  for (const [id, , label] of cases) await expect(page.locator(`#activity-rows tr[data-id="${id}"] .traffic-listener`)).toHaveText(label);
+  await expect(page.locator('#activity-rows')).not.toContainText(longPublicId);
+  await expect(page.locator('#activity-rows')).not.toContainText(longWorkloadId);
+  await page.locator('#activity-search').fill('private:edge');
+  await expect(page.locator('#activity-rows tr')).toHaveCount(1);
+  await expect(page.locator('#activity-rows tr')).toHaveAttribute('data-id', '16');
+});
+
+test('live traffic event carries listener provenance into request detail', async ({ page }) => {
+  await fixtures(page, { snapshot: traffic([]), stream: route => route.fulfill({ contentType: 'text/event-stream', body:
+    event('status', statusAt(11, 1)) + event('traffic', traffic([record(7, { route_id: 'shared', listener: { kind: 'public', id: 'edge' } })])) }) });
+  await signIn(page);
+  const row = page.locator('#activity-rows tr[data-id="7"]');
+  await expect(row.locator('.traffic-listener')).toHaveText('Public listener: edge');
+  await expect(row.locator('td').nth(2)).toHaveAttribute('title', /Public listener: edge/);
+});
