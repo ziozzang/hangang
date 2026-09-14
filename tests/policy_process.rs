@@ -704,7 +704,7 @@ async fn geoip_userdata_is_read_only_and_identical_in_policy_and_body_workers() 
             "{field} was writable"
         );
     }
-    request.script = "assert(hangang.geoip().country == 'GB')".into();
+    request.script = "assert(hangang.geoip().country == 'GB'); return nil".into();
     pool.evaluate(request).await?;
 
     for phase in ["request", "response"] {
@@ -727,7 +727,7 @@ async fn geoip_userdata_is_read_only_and_identical_in_policy_and_body_workers() 
         error_code: None,
     };
     let mut request = input(
-        "local geo = hangang.geoip(); assert(geo.state == 'unknown' and geo.country == nil and geo.generation_sha256 ~= nil)",
+        "local geo = hangang.geoip(); assert(geo.state == 'unknown' and geo.country == nil and geo.generation_sha256 ~= nil); return nil",
     );
     request.geoip = unknown;
     pool.evaluate(request).await?;
@@ -738,7 +738,7 @@ async fn geoip_userdata_is_read_only_and_identical_in_policy_and_body_workers() 
         error_code: Some("invalid_record".to_owned()),
     };
     let mut request = input(
-        "local geo = hangang.geoip(); assert(geo.state == 'unavailable' and geo.country == nil and geo.error_code == 'invalid_record')",
+        "local geo = hangang.geoip(); assert(geo.state == 'unavailable' and geo.country == nil and geo.error_code == 'invalid_record'); return nil",
     );
     request.geoip = unavailable;
     pool.evaluate(request).await?;
