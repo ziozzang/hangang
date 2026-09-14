@@ -392,7 +392,7 @@ function scrubRenderedData() {
   destroyLuaEditors();
   for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog']) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
   state.editing = null;
-  for (const id of ['metric-grid', 'secondary-metric-grid', 'cache-metric-grid', 'http-routes', 'tcp-routes', 'certificate-list', 'certificate-acme-state', 'certificate-inventory', 'certificate-inventory-pages', 'route-form-fields', 'user-list']) $(`#${id}`).replaceChildren();
+  for (const id of ['metric-grid', 'secondary-metric-grid', 'security-diagnostics-grid', 'cache-metric-grid', 'http-routes', 'tcp-routes', 'certificate-list', 'certificate-acme-state', 'certificate-inventory', 'certificate-inventory-pages', 'route-form-fields', 'user-list']) $(`#${id}`).replaceChildren();
   $('#certificate-inventory-count').textContent = '—';
   for (const id of ['runtime-state', 'configuration-source', 'uptime', 'last-sync', 'acme-state', 'server-version', 'process-id', 'instance-id', 'instance-digest', 'store-state', 'store-reason', 'store-confirmed', 'store-epoch', 'store-revision', 'cache-state', 'cache-memory-policy', 'cache-disk-policy', 'cache-active-fills', 'cache-generation', 'cache-purge-scope']) $(`#${id}`).textContent = '—';
   for (const id of ['acme-detail', 'update-detail', 'metrics-output', 'health-result', 'session-result', 'utility-hash-message', 'store-state-detail', 'store-reason-help', 'store-grace', 'store-detail']) $(`#${id}`).textContent = '';
@@ -666,6 +666,7 @@ function renderStatus(data, record = true) {
   });
   grid.replaceChildren(...cards.slice(0, 4));
   $('#secondary-metric-grid').replaceChildren(...cards.slice(4));
+  renderSecurityDiagnostics(metrics);
   const draining = Boolean(data.state?.draining);
   $('#restart-server').hidden = !isAdmin() || !data.state?.supervised;
   $('#restart-server').disabled = draining;
@@ -686,6 +687,42 @@ function renderStatus(data, record = true) {
   $('#uptime').textContent = uptime;
   $('#uptime-small').textContent = t('Uptime {uptime}', { uptime });
   $('#last-sync').textContent = new Date().toLocaleTimeString(getLocale());
+}
+
+function renderSecurityDiagnostics(metrics) {
+  const groups = [
+    [t('Denied'), [
+      ['jwt_auth_rejections_total', 'JWT authentication rejections'],
+      ['http_mtls_rejections_total', 'HTTP mTLS rejections'],
+      ['tcp_mtls_rejections_total', 'TCP mTLS rejections'],
+      ['workload_auth_rejections_total', 'Workload authentication rejections'],
+    ]],
+    [t('Unavailable or at capacity'), [
+      ['jwt_auth_unavailable_total', 'JWT authentication unavailable'],
+      ['jwt_auth_capacity_rejections_total', 'JWT authentication capacity rejections'],
+    ]],
+    [t('Existing streams terminated'), [
+      ['http_mtls_lease_terminations_total', 'HTTP mTLS stream terminations'],
+      ['tcp_mtls_lease_terminations_total', 'TCP mTLS stream terminations'],
+      ['workload_route_terminations_total', 'Workload route terminations'],
+    ]],
+  ];
+  const root = $('#security-diagnostics-grid');
+  root.replaceChildren(...groups.map(([heading, entries]) => {
+    const group = document.createElement('div'); group.className = 'security-diagnostics-group';
+    const title = document.createElement('h3'); title.textContent = heading;
+    group.append(title);
+    for (const [field, label] of entries) {
+      const row = document.createElement('div'); row.className = 'security-diagnostics-row';
+      row.dataset.metric = field;
+      const name = document.createElement('span'); name.textContent = t(label);
+      const count = document.createElement('strong');
+      const value = metrics[field];
+      count.textContent = Number.isSafeInteger(value) && value >= 0 ? formatNumber(value) : '—';
+      row.append(name, count); group.append(row);
+    }
+    return group;
+  }));
 }
 
 /**

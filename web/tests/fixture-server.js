@@ -33,4 +33,4 @@ async function file(response, name) {
   response.end(data);
 }
 
-server.listen(41739, '127.0.0.1');
+server.listen(Number(process.env.HANGANG_UI_TEST_PORT || 41739), '127.0.0.1');

@@ -231,3 +231,13 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 .tcp-history-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; }
 .tcp-history-actions [hidden] { display: none; }
 @media(max-width:700px) { .tcp-history-panel .section-heading { align-items: flex-start; }.tcp-history-panel .activity-toolbar { flex-wrap: wrap; }.tcp-history-panel .activity-search { width: 100%; } }
+
+.security-diagnostics { margin-top: 16px; overflow: hidden; }
+.security-diagnostics .section-heading { padding-bottom: 12px; }
+.security-diagnostics-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 0; border-top: 1px solid var(--line); }
+.security-diagnostics-group { padding: 14px 18px 16px; min-width: 0; }
+.security-diagnostics-group + .security-diagnostics-group { border-left: 1px solid var(--line); }
+.security-diagnostics-group h3 { margin: 0 0 10px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.security-diagnostics-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 5px 0; font-size: 11px; }
+.security-diagnostics-row strong { flex: none; font: 600 12px var(--mono); font-variant-numeric: tabular-nums; }
+@media(max-width:700px) { .security-diagnostics-grid { grid-template-columns: 1fr; }.security-diagnostics-group + .security-diagnostics-group { border-left: 0; border-top: 1px solid var(--line); } }

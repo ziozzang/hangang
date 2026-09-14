@@ -1,5 +1,7 @@
 // English source text is the key. Technical identifiers and user data remain untranslated.
 export default {
+  'Security diagnostics': '보안 진단',
+  'Cumulative counters for this instance. A dash means the server did not report a valid count. JWT stream terminations appear in the summary above.': '이 인스턴스의 누적 계수입니다. 대시는 서버가 유효한 계수를 보고하지 않았음을 뜻합니다. JWT 스트림 종료는 위 요약에 표시됩니다.',
   'Hangang Console': '한강 콘솔',
   'Hangang console home': '한강 콘솔 홈',
   'Skip to content': '본문으로 건너뛰기',

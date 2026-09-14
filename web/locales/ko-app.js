@@ -1,6 +1,18 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  'Denied': '인증·접근 거부',
+  'Unavailable or at capacity': '사용 불가 또는 용량 초과',
+  'Existing streams terminated': '기존 스트림 종료',
+  'JWT authentication rejections': 'JWT 인증 거부',
+  'HTTP mTLS rejections': 'HTTP mTLS 거부',
+  'TCP mTLS rejections': 'TCP mTLS 거부',
+  'Workload authentication rejections': '워크로드 인증 거부',
+  'JWT authentication unavailable': 'JWT 인증 사용 불가',
+  'JWT authentication capacity rejections': 'JWT 인증 용량 거부',
+  'HTTP mTLS stream terminations': 'HTTP mTLS 스트림 종료',
+  'TCP mTLS stream terminations': 'TCP mTLS 스트림 종료',
+  'Workload route terminations': '워크로드 경로 종료',
   'HTTP request recording policy': 'HTTP 요청 기록 정책',
   'Ordered rules choose whether completed HTTP response headers enter this instance’s short-lived request ring and optional access trace. The first match wins; blank conditions match all. This does not control durable account audit, configuration receipts or TCP history. Health probes are excluded. Query strings, raw Host, payloads and body completion are not recorded here.': '순서 규칙으로 HTTP 응답 헤더가 완성된 요청을 이 인스턴스의 짧은 보관 링과 선택적 접근 추적에 기록할지 정합니다. 첫 일치 규칙이 적용되며 빈 조건은 모두 일치합니다. 영구 계정 감사·구성 영수증·TCP 이력에는 적용되지 않습니다. 상태 확인 요청은 제외됩니다. 여기에는 쿼리 문자열·원본 Host·본문·본문 완료가 기록되지 않습니다.',
   'Configure HTTP recording policy': 'HTTP 기록 정책 설정',
