@@ -1,5 +1,7 @@
 // English source text is the key. Technical identifiers and user data remain untranslated.
 export default {
+  'Filter IP, method, path, route, listener…': 'IP, 메서드, 경로, 라우트, 리스너 필터…',
+
   'Each entry requires id, hosts, cert_file, and key_file. Paths must be absolute files readable by Hangang. The default CLI listener needs --config-tls; named HTTPS listeners serve their own configured certificate files. Certificate and private-key PEM content is never stored in configuration.': '각 항목에는 id, hosts, cert_file, key_file이 필요합니다. 경로는 한강이 읽을 수 있는 절대 파일 경로여야 합니다. 기본 CLI 리스너에는 --config-tls가 필요하며 이름 있는 HTTPS 리스너는 자체 인증서 파일을 제공합니다. 인증서와 개인 키 PEM 내용은 구성에 저장되지 않습니다.',
 
   'Certificate listener': '인증서 리스너',

@@ -286,6 +286,25 @@ function renderGeoMetrics(geoip) {
   section.append(grid);
   $('.prometheus-table-wrap').before(section);
 }
+const publicListenerId = /^[A-Za-z0-9._-]{1,64}$/;
+const workloadListenerId = /^[A-Za-z0-9._:-]{1,128}$/;
+function normalizeTrafficListener(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'unknown', id: null };
+  if (value.kind === 'default' && value.id === 'default') return { kind: 'default', id: 'default' };
+  if (value.kind === 'public' && typeof value.id === 'string' && value.id !== 'default' && publicListenerId.test(value.id)) return { kind: 'public', id: value.id };
+  if (value.kind === 'workload' && typeof value.id === 'string' && workloadListenerId.test(value.id)) return { kind: 'workload', id: value.id };
+  return { kind: 'unknown', id: null };
+}
+function trafficListenerLabel(listener) {
+  if (listener.kind === 'default') return t('Default CLI listener');
+  if (listener.kind === 'public') return t('Public listener: {id}', { id: listener.id });
+  if (listener.kind === 'workload') return t('Workload mTLS listener: {id}', { id: listener.id });
+  return t('Listener unknown');
+}
+function trafficRequestDetail(record) {
+  return `${record.protocol || '—'}${record.tls ? ' · TLS' : ''} · ${trafficListenerLabel(record.listener)}`;
+}
+
 function recordTraffic(batch) {
   if (!Array.isArray(batch?.records)) return;
   retention = Math.max(1, Math.min(3600, Number(batch.retention_seconds) || 60));
@@ -303,7 +322,7 @@ function recordTraffic(batch) {
       peer_ip: source.peer_ip, peer_port: source.peer_port, client_ip: source.client_ip,
       method: source.method, path, route_id: source.route_id, status: source.status,
       response_head_ms: source.response_head_ms, protocol: source.protocol, tls: source.tls,
-      geoip: source.geoip,
+      geoip: source.geoip, listener: normalizeTrafficListener(source.listener),
       policy_revision: Number.isSafeInteger(source.policy_revision) && source.policy_revision >= 0 ? source.policy_revision : null };
     const age = Number.isFinite(serverNow) ? Math.max(0, serverNow - Number(record.timestamp_unix_ms)) : 0;
     const expiresAt = receivedAt + Math.max(0, retention * 1000 - age);
@@ -554,6 +573,8 @@ function renderRecordingRevision(cell, record) {
     ? t('Recording policy revision unreported')
     : t('Recording policy at configuration revision #{revision}', { revision: record.policy_revision });
   cell.append(detail);
+  const listener = document.createElement('small'); listener.className = 'traffic-listener';
+  listener.textContent = trafficListenerLabel(record.listener); cell.append(listener);
 }
 
 function renderActivity() {
@@ -568,6 +589,7 @@ function renderActivity() {
       row.cells[1].querySelector('small').textContent = t('peer {address}', { address: `${record.peer_ip}:${record.peer_port}` });
       renderCountry(row.cells[1], record);
       renderRecordingRevision(row.cells[3], record);
+      row.cells[2].title = trafficRequestDetail(record);
       row.cells[5].textContent = `${number(record.response_head_ms)} ms`;
     }
     const visible = $('#activity-rows').children.length;
@@ -580,7 +602,9 @@ function renderActivity() {
     const geo = countryObservation(record);
     if (query.startsWith('country:')) return geo.country?.toLowerCase() === query.slice(8).trim();
     if (query.startsWith('state:')) return geo.state === query.slice(6).trim();
-    return [record.client_ip,record.peer_ip,record.method,record.path,record.route_id,record.status,geo.country,geo.state,countryLabel(geo)]
+    return [record.client_ip,record.peer_ip,record.method,record.path,record.route_id,record.status,
+      record.listener.kind,record.listener.id,record.listener.id && `listener:${record.listener.id}`,trafficListenerLabel(record.listener),
+      geo.country,geo.state,countryLabel(geo)]
       .join(' ').toLowerCase().includes(query);
   });
   $('#activity-rows').replaceChildren(...filtered.map(record => {
@@ -590,7 +614,7 @@ function renderActivity() {
     const ip = cell(record.client_ip || record.peer_ip || '—');
     const peer = document.createElement('small'); peer.textContent = t("peer {address}", { address: `${record.peer_ip}:${record.peer_port}` }); ip.append(peer);
     renderCountry(ip, record);
-    const request = cell(''); const method = document.createElement('span'); method.className = 'http-method'; method.textContent = record.method; request.append(method, document.createTextNode(record.path || '/')); request.title = `${record.protocol}${record.tls ? ' · TLS' : ''}`;
+    const request = cell(''); const method = document.createElement('span'); method.className = 'http-method'; method.textContent = record.method; request.append(method, document.createTextNode(record.path || '/')); request.title = trafficRequestDetail(record);
     renderRecordingRevision(cell(''), record);
     const status = cell(''); const badge = document.createElement('span'); badge.className = `status-code${record.status >= 500 ? ' is-error' : record.status >= 400 ? ' is-warning' : ''}`; badge.textContent = String(record.status); status.append(badge);
     cell(`${number(record.response_head_ms)} ms`);

@@ -1,4 +1,9 @@
 export default {
+  'Public listener: {id}': '공개 리스너: {id}',
+  'Workload mTLS listener: {id}': '워크로드 mTLS 리스너: {id}',
+  'Listener unknown': '리스너 알 수 없음',
+  'Default CLI listener': '기본 CLI 리스너',
+
   'Recording-filter coverage is unknown on this server.': '이 서버의 기록 필터 적용 범위를 알 수 없습니다.',
   '{count} HTTP response records intentionally omitted by recording policy on this instance; this is partial history.': '이 인스턴스에서 HTTP 응답 기록 {count}건을 기록 정책에 따라 의도적으로 생략했습니다. 이 이력은 부분적입니다.',
   'No HTTP response records have been intentionally omitted by recording policy on this instance.': '이 인스턴스에서 기록 정책에 따라 의도적으로 생략된 HTTP 응답 기록은 없습니다.',

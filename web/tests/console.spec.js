@@ -41,7 +41,7 @@ async function fixtures(page, { account = false, viewer = false, stream, snapsho
     if (url.pathname === '/v1/auth/logout') return route.fulfill({ status: 204, body: '' });
     if (url.pathname === '/v1/status') return route.fulfill({ json: status });
     if (url.pathname === '/v1/update/status') return route.fulfill({ json: { enabled: false, phase: 'idle' } });
-    if (url.pathname === '/v1/traffic') return route.fulfill({ json: typeof snapshot === 'function' ? snapshot() : snapshot });
+    if (url.pathname === '/v1/traffic') return route.fulfill({ json: typeof snapshot === 'function' ? await snapshot() : snapshot });
     if (url.pathname === '/v1/events') {
       if (stream) return stream(route, calls);
       return route.fulfill({ status: 503, body: 'stream unavailable' });
@@ -208,7 +208,7 @@ test('locale changes translate paused rows without admitting new or expired traf
   await signIn(page);
   const rows = page.locator('#activity-rows tr');
   await expect(rows).toHaveCount(1);
-  await expect(rows.first().locator('td').nth(3)).toHaveText('UnmatchedRecording policy revision unreported');
+  await expect(rows.first().locator('td').nth(3)).toHaveText('UnmatchedRecording policy revision unreportedListener unknown');
   await page.locator('#activity-pause').click();
   release();
   await expect(page.locator('#activity-note')).toContainText('1 expired / evicted');
@@ -317,4 +317,62 @@ test('theme persists only by user choice, command search navigates, and narrow d
   await page.setViewportSize({ width: 390, height: 844 });
   const dimensions = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width + 1);
+});
+
+test('request history attributes the same route on default, public and workload listeners', async ({ page }) => {
+  const rows = [
+    record(1, { route_id: 'shared', listener: { kind: 'default', id: 'default' } }),
+    record(2, { route_id: 'shared', listener: { kind: 'public', id: 'edge' } }),
+    record(3, { route_id: 'shared', listener: { kind: 'workload', id: 'private-edge' } }),
+    record(4, { route_id: 'shared' }),
+    record(5, { route_id: 'shared', listener: { kind: 'invented', id: '<img src=x onerror=alert(1)>' } }),
+  ];
+  await fixtures(page, { snapshot: traffic(rows) });
+  await signIn(page);
+  const activity = page.locator('#activity-rows tr');
+  await expect(activity).toHaveCount(5);
+  await expect(activity.filter({ has: page.locator('.traffic-listener', { hasText: 'Default CLI listener' }) })).toHaveCount(1);
+  await expect(activity.filter({ has: page.locator('.traffic-listener', { hasText: 'Public listener: edge' }) })).toHaveCount(1);
+  await expect(activity.filter({ has: page.locator('.traffic-listener', { hasText: 'Workload mTLS listener: private-edge' }) })).toHaveCount(1);
+  await expect(activity.filter({ has: page.locator('.traffic-listener', { hasText: 'Listener unknown' }) })).toHaveCount(2);
+  await expect(page.locator('#activity-rows img')).toHaveCount(0);
+  await expect(page.locator('#activity-rows')).not.toContainText('<img');
+  await expect(activity.filter({ has: page.locator('.traffic-listener', { hasText: 'Public listener: edge' }) }).locator('td').nth(2)).toHaveAttribute('title', /Public listener: edge/);
+  await page.locator('#activity-search').fill('listener:edge');
+  await expect(activity).toHaveCount(1);
+  await page.locator('#activity-search').fill('default');
+  await expect(activity).toHaveCount(1);
+  await page.locator('#activity-search').fill('unknown');
+  await expect(activity).toHaveCount(2);
+});
+
+test('paused Korean request history translates listener provenance while keeping exact IDs', async ({ page }) => {
+  await fixtures(page, { snapshot: traffic([
+    record(1, { listener: { kind: 'public', id: 'edge' } }),
+    record(2, { listener: { kind: 'workload', id: 'orders' } }),
+    record(3),
+  ]) });
+  await signIn(page);
+  await page.locator('#activity-pause').click();
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#activity-rows .traffic-listener')).toContainText(['리스너 알 수 없음', '워크로드 mTLS 리스너: orders', '공개 리스너: edge']);
+  await expect(page.locator('#activity-search')).toHaveAttribute('placeholder', 'IP, 메서드, 경로, 라우트, 리스너 필터…');
+  await page.locator('#activity-pause').click();
+  await page.locator('#activity-search').fill('orders');
+  await expect(page.locator('#activity-rows tr')).toHaveCount(1);
+});
+
+test('late traffic snapshot after logout cannot restore listener provenance', async ({ page }) => {
+  let release, waiting = false;
+  await fixtures(page, { snapshot: async () => { waiting = true; await new Promise(resolve => { release = resolve; });
+    return traffic([record(1, { listener: { kind: 'public', id: 'edge' } })]); } });
+  await signIn(page);
+  await expect.poll(() => waiting).toBe(true);
+  await page.locator('#logout-button').click();
+  const staleResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/traffic');
+  release();
+  await staleResponse;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(page.locator('#activity-rows')).toBeEmpty();
+  await expect(page.locator('#activity-panel')).toBeHidden();
 });
