@@ -59,7 +59,7 @@ export function resetConsole() {
   display('#activity-count', () => t("Waiting for request metadata")); display('#activity-updated', () => '—'); $('#activity-search').value = '';
   display('#activity-pause', () => t("Pause view")); $('#activity-pause').setAttribute('aria-pressed', 'false');
   display('#activity-note', () => t("Only this instance. Buffered records expire automatically."));
-  $('#prometheus-rows').replaceChildren(); $('#security-content').replaceChildren();
+  $('#prometheus-rows').replaceChildren(); $('#geoip-metrics')?.remove(); $('#security-content').replaceChildren();
   display('#overview-health', () => t("Connecting to gateway")); display('#overview-detail', () => t("Waiting for runtime telemetry")); display('#flow-mode', () => t("Waiting"));
   if ($('#command-dialog').open) $('#command-dialog').close();
 }
@@ -172,8 +172,8 @@ export function recordStatus(data) {
   display('#overview-health', () => data.state?.draining ? t("Gateway is draining") : ready ? t("Gateway is accepting traffic") : t("Gateway is not ready"));
   display('#overview-detail', () => t("HTTP routes: {http} \u00b7 TCP routes: {tcp}", { http: number(data.http_routes ?? 0), tcp: number(data.tcp_routes ?? 0) }));
   if (!connected) setStream(() => t("Polling · 5s fallback"), true);
-  metricsSummary = { metrics, rates };
-  renderChart(); renderPrometheus(metrics, rates);
+  metricsSummary = { metrics, rates, geoip: data.geoip_metrics };
+  renderChart(); renderPrometheus(metrics, rates); renderGeoMetrics(metricsSummary.geoip);
 }
 function renderChart() {
   const empty = !samples.length; $('#chart-empty').hidden = !empty;
@@ -199,6 +199,49 @@ function renderPrometheus(metrics, rates) {
     return row;
   });
   $('#prometheus-rows').replaceChildren(...rows);
+}
+function validGeoMetrics(value) {
+  if (!value || typeof value !== 'object') return false;
+  const count = (n) => Number.isSafeInteger(n) && n >= 0;
+  for (const protocol of ['http', 'tcp']) {
+    const entry = value[protocol];
+    if (!entry || typeof entry !== 'object' || !entry.countries || typeof entry.countries !== 'object') return false;
+    if (!['known','unknown','unavailable','allowed','denied','admission_unavailable'].every(key => count(entry[key]))) return false;
+    const countries = Object.entries(entry.countries);
+    if (countries.length > 677 || !countries.every(([country, total]) => (country === 'unknown' || /^[A-Z]{2}$/.test(country)) && count(total))) return false;
+  }
+  return true;
+}
+function renderGeoMetrics(geoip) {
+  $('#geoip-metrics')?.remove();
+  if (!validGeoMetrics(geoip)) return; // Old servers do not report these counters.
+  const section = document.createElement('section'); section.id = 'geoip-metrics';
+  const heading = document.createElement('h3'); heading.textContent = t('GeoIP observations · this instance');
+  const note = document.createElement('p'); note.textContent = t('Approximate country lookups. Unavailable lookup and enforced policy denial are different outcomes.');
+  section.append(heading, note);
+  const grid = document.createElement('div'); grid.className = 'metric-grid';
+  for (const [key, label] of [['http', 'HTTP'], ['tcp', 'TCP']]) {
+    const entry = geoip[key];
+    const card = document.createElement('article'); card.className = 'metric';
+    const title = document.createElement('h4'); title.textContent = label;
+    const lookup = document.createElement('p'); lookup.textContent = t('Lookups · known {known} · unknown {unknown} · unavailable {unavailable}', {
+      known: number(entry.known), unknown: number(entry.unknown), unavailable: number(entry.unavailable),
+    });
+    const admission = document.createElement('p'); admission.textContent = t('Enforced policy · allowed {allowed} · denied {denied} · unavailable {unavailable}', {
+      allowed: number(entry.allowed), denied: number(entry.denied), unavailable: number(entry.admission_unavailable),
+    });
+    const top = Object.entries(entry.countries).filter(([country]) => country !== 'unknown')
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 10);
+    const breakdown = document.createElement('p'); breakdown.textContent = top.length
+      ? t('Top observed countries: {countries}', { countries: top.map(([country, total]) => `${country} ${number(total)}`).join(' · ') })
+      : t('No known-country observations yet.');
+    const omitted = Object.keys(entry.countries).filter(country => country !== 'unknown').length - top.length;
+    card.append(title, lookup, admission, breakdown);
+    if (omitted > 0) { const more = document.createElement('p'); more.textContent = t('{count} more country codes in /metrics', { count: number(omitted) }); card.append(more); }
+    grid.append(card);
+  }
+  section.append(grid);
+  $('.prometheus-table-wrap').before(section);
 }
 function recordTraffic(batch) {
   if (!Array.isArray(batch?.records)) return;
@@ -230,6 +273,47 @@ function renderActivityCount(count, total, filtered) {
   display('#activity-count', () => t(filtered ? 'Recent requests: {count} of {total}' : 'Recent requests: {count}', { count: number(count), total: number(total) }));
 }
 
+// Older servers omit geoip. Treat that as unobserved, never as a country miss.
+// Bound and validate every value before it reaches a label or search text.
+function countryObservation(record) {
+  const value = record.geoip;
+  const absent = { state: 'not_checked', country: null, digest: null, error: null };
+  if (!value || typeof value !== 'object') return absent;
+  const { state, country, generation_sha256: digest, error_code: error } = value;
+  if (state === 'not_checked' || state === 'not_configured') {
+    return country == null && digest == null && error == null
+      ? { state, country: null, digest: null, error: null } : absent;
+  }
+  if (state === 'known' || state === 'unknown') {
+    if (!/^[0-9a-f]{64}$/.test(digest || '') || error != null) return absent;
+    if (state === 'known' && /^[A-Z]{2}$/.test(country || '')) return { state, country, digest, error: null };
+    if (state === 'unknown' && country == null) return { state, country: null, digest, error: null };
+    return absent;
+  }
+  if (state === 'unavailable' && country == null && (digest == null || /^[0-9a-f]{64}$/.test(digest)) && /^[a-z_]{1,40}$/.test(error || '')) {
+    return { state, country: null, digest, error };
+  }
+  return absent;
+}
+
+function countryLabel(observation) {
+  switch (observation.state) {
+    case 'known': return t('Country estimate: {country}', { country: observation.country });
+    case 'unknown': return t('Country estimate: unknown');
+    case 'unavailable': return t('GeoIP unavailable ({code})', { code: observation.error });
+    case 'not_configured': return t('GeoIP not configured');
+    default: return t('GeoIP not checked');
+  }
+}
+
+function renderCountry(cell, record) {
+  const observation = countryObservation(record);
+  let detail = cell.querySelector('.geoip-observation');
+  if (!detail) { detail = document.createElement('span'); detail.className = 'geoip-observation'; cell.append(detail); }
+  detail.textContent = countryLabel(observation);
+  detail.title = observation.digest ? t('Database generation SHA-256: {digest}', { digest: observation.digest }) : '';
+}
+
 function renderActivity() {
   records = records.filter(record => performance.now() < record.expiresAt);
   if (paused) {
@@ -240,6 +324,7 @@ function renderActivity() {
       const record = valid.get(row.dataset.id);
       row.cells[0].textContent = new Date(record.timestamp_unix_ms).toLocaleTimeString(getLocale() === 'ko' ? 'ko-KR' : 'en-US');
       row.cells[1].querySelector('small').textContent = t('peer {address}', { address: `${record.peer_ip}:${record.peer_port}` });
+      renderCountry(row.cells[1], record);
       if (!record.route_id) row.cells[3].textContent = t('Unmatched');
       row.cells[5].textContent = `${number(record.response_head_ms)} ms`;
     }
@@ -249,13 +334,20 @@ function renderActivity() {
     return;
   }
   const query = $('#activity-search').value.trim().toLowerCase();
-  const filtered = records.filter(record => [record.client_ip,record.peer_ip,record.method,record.path,record.route_id,record.status].join(' ').toLowerCase().includes(query));
+  const filtered = records.filter(record => {
+    const geo = countryObservation(record);
+    if (query.startsWith('country:')) return geo.country?.toLowerCase() === query.slice(8).trim();
+    if (query.startsWith('state:')) return geo.state === query.slice(6).trim();
+    return [record.client_ip,record.peer_ip,record.method,record.path,record.route_id,record.status,geo.country,geo.state,countryLabel(geo)]
+      .join(' ').toLowerCase().includes(query);
+  });
   $('#activity-rows').replaceChildren(...filtered.map(record => {
     const tr = document.createElement('tr'); tr.dataset.id = String(record.id);
     const cell = (text) => { const td = document.createElement('td'); td.textContent = text; tr.append(td); return td; };
     cell(new Date(record.timestamp_unix_ms).toLocaleTimeString(getLocale() === 'ko' ? 'ko-KR' : 'en-US'));
     const ip = cell(record.client_ip || record.peer_ip || '—');
     const peer = document.createElement('small'); peer.textContent = t("peer {address}", { address: `${record.peer_ip}:${record.peer_port}` }); ip.append(peer);
+    renderCountry(ip, record);
     const request = cell(''); const method = document.createElement('span'); method.className = 'http-method'; method.textContent = record.method; request.append(method, document.createTextNode(record.path || '/')); request.title = `${record.protocol}${record.tls ? ' · TLS' : ''}`;
     cell(record.route_id || t("Unmatched"));
     const status = cell(''); const badge = document.createElement('span'); badge.className = `status-code${record.status >= 500 ? ' is-error' : record.status >= 400 ? ' is-warning' : ''}`; badge.textContent = String(record.status); status.append(badge);
@@ -335,7 +427,7 @@ window.addEventListener('hangang:localechange', () => {
   renderChart();
   if (expiryTimer) renderActivity();
   renderSecuritySummary();
-  if (metricsSummary) renderPrometheus(metricsSummary.metrics, metricsSummary.rates);
+  if (metricsSummary) { renderPrometheus(metricsSummary.metrics, metricsSummary.rates); renderGeoMetrics(metricsSummary.geoip); }
   applyTheme(document.documentElement.dataset.theme || 'light');
   if ($('#command-dialog').open) renderCommands();
 });
