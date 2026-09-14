@@ -598,11 +598,27 @@ async fn generation_bump_reclaims_disk_rows_and_a_restart_keeps_the_generation()
 
     // A restart under the bumped configuration reopens the same database and
     // keeps the entry written after the bump.
+    let old_runtime = Arc::downgrade(&runtime);
     drop(runtime);
     let previous = f.active.load_full();
     f.active
         .store(Arc::new(Snapshot::new(previous.config.clone()).unwrap()));
     drop(previous);
+    // The disk cache has one exclusive file owner. A response from the old
+    // front may briefly retain its snapshot after its fill has published; a
+    // real restart closes that owner before the new process opens the file.
+    // Wait for that precise handoff, rather than treating a lock-contention
+    // miss as evidence that the persisted entry disappeared.
+    for _ in 0..200 {
+        if old_runtime.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        old_runtime.upgrade().is_none(),
+        "previous cache runtime still owns the disk database"
+    );
     assert_eq!(text(&c, &f, "/public").await, second);
     assert_eq!(f.origin.load(Ordering::SeqCst), 2);
     assert_eq!(stats(&f.active).await.errors, 0);
