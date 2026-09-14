@@ -811,6 +811,7 @@ impl Manager {
 #[derive(Clone)]
 pub struct Admin {
     pub fleet_observer: Option<Arc<crate::fleet_observer::Runtime>>,
+    pub fleet_collector: Option<Arc<crate::fleet_collector::Runtime>>,
     pub acme_status: Option<Arc<std::sync::RwLock<crate::acme_runtime::Status>>>,
     pub file_tls_enabled: bool,
     pub manager: Arc<Manager>,
@@ -1208,6 +1209,7 @@ impl Admin {
         };
         let Some(actor) = actor else {
             let is_new = path == "/v1/status"
+                || path == "/v1/fleet/observations"
                 || path == "/v1/fleet/observer-status"
                 || path == "/v1/geoip/status"
                 || path == "/v1/geoip/lookup"
@@ -2019,6 +2021,38 @@ impl Admin {
                     "node_id": status.as_ref().and_then(|s| s.node_id.as_ref()),
                     "generation": status.as_ref().map(|s| s.generation.as_str()),
                 }),
+            ));
+        }
+        if path == "/v1/fleet/observations" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            if req.uri().query().is_some() {
+                return Ok(problem(
+                    400,
+                    "Invalid Fleet Query",
+                    "query parameters are not accepted",
+                ));
+            }
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            return Ok(auth_json(
+                200,
+                &self.fleet_collector.as_ref().map_or_else(
+                    || {
+                        serde_json::json!({
+                            "configured":false,
+                            "available":false,
+                            "generation":null,
+                            "expected_nodes":0,
+                            "fresh_nodes":0,
+                            "stale_after_seconds":60,
+                            "nodes":[],
+                        })
+                    },
+                    |runtime| runtime.status(),
+                ),
             ));
         }
         if path == "/v1/util/hash-password" {

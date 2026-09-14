@@ -106,6 +106,9 @@ struct Args {
     /// Private dynamically reloaded local fleet observer credential file.
     #[arg(long)]
     fleet_observer_config: Option<PathBuf>,
+    /// Private dynamically reloaded allowlist of remote fleet observers.
+    #[arg(long)]
+    fleet_inventory_config: Option<PathBuf>,
     /// Instance-local administrator account database (private SQLite file).
     #[arg(long)]
     admin_users_db: Option<PathBuf>,
@@ -738,6 +741,10 @@ async fn run(args: Args) -> Result<()> {
             let _ =
                 hangang::fleet_observer::Runtime::open(path, args.admin_token.as_deref()).await?;
         }
+        if let Some(path) = args.fleet_inventory_config.clone() {
+            let _ =
+                hangang::fleet_collector::Runtime::open(path, args.admin_token.as_deref()).await?;
+        }
         config.validate()?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             hangang::certificates::load(&config.certificates)?;
@@ -761,6 +768,10 @@ async fn run(args: Args) -> Result<()> {
     );
     let fleet_observer = match args.fleet_observer_config.clone() {
         Some(path) => Some(hangang::fleet_observer::Runtime::open(path, Some(&token)).await?),
+        None => None,
+    };
+    let fleet_collector = match args.fleet_inventory_config.clone() {
+        Some(path) => Some(hangang::fleet_collector::Runtime::open(path, Some(&token)).await?),
         None => None,
     };
     let mut options = std::fs::OpenOptions::new();
@@ -996,6 +1007,7 @@ async fn run(args: Args) -> Result<()> {
     };
     let users = Arc::new(hangang::admin_users::Store::open(users_db_path)?);
     let admin = Admin {
+        fleet_collector: fleet_collector.clone(),
         fleet_observer: fleet_observer.clone(),
         traffic,
         events: Arc::new(tokio::sync::Semaphore::new(32)),
@@ -1019,6 +1031,8 @@ async fn run(args: Args) -> Result<()> {
     let cancel = CancellationToken::new();
     let fleet_observer_task =
         fleet_observer.map(|runtime| tokio::spawn(runtime.watch(cancel.clone())));
+    let fleet_collector_task =
+        fleet_collector.map(|runtime| tokio::spawn(runtime.watch(cancel.clone())));
     let discovery_task = tokio::spawn(discovery.watch(manager.active.clone(), cancel.clone()));
     let watcher = if let Some(options) = controller_options {
         let sink = Arc::new(KubernetesSink {
@@ -1248,6 +1262,9 @@ async fn run(args: Args) -> Result<()> {
     let _ = watcher.await;
     let _ = discovery_task.await;
     if let Some(task) = fleet_observer_task {
+        let _ = task.await;
+    }
+    if let Some(task) = fleet_collector_task {
         let _ = task.await;
     }
     for watcher in tls_watchers {

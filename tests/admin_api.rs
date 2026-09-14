@@ -98,6 +98,7 @@ async fn server_on_with_traffic(
         ObserverFixture {
             event_fixture,
             runtime: None,
+            collector: None,
             requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
         },
     )
@@ -107,6 +108,7 @@ async fn server_on_with_traffic(
 struct ObserverFixture {
     event_fixture: EventFixture,
     runtime: Option<Arc<hangang::fleet_observer::Runtime>>,
+    collector: Option<Arc<hangang::fleet_collector::Runtime>>,
     requests: Arc<tokio::sync::Semaphore>,
 }
 
@@ -122,6 +124,7 @@ async fn server_on_with_observer(
     let ObserverFixture {
         event_fixture,
         runtime: fleet_observer,
+        collector: fleet_collector,
         requests: observer_requests,
     } = fixture;
     use std::os::unix::fs::PermissionsExt;
@@ -153,6 +156,7 @@ async fn server_on_with_observer(
     });
     let admin = Arc::new(Admin {
         fleet_observer,
+        fleet_collector,
         acme_status: None,
         file_tls_enabled: false,
         manager: manager.clone(),
@@ -299,6 +303,95 @@ async fn fleet_observer_disabled_is_admin_only_and_redacted() {
 }
 
 #[tokio::test]
+async fn fleet_collector_disabled_is_admin_only_and_has_fixed_shape() {
+    let (address, _, _dir) = server().await;
+    let (status, headers, body) =
+        request(address, "GET", "/v1/fleet/observations", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({"configured":false,"available":false,"generation":null,"expected_nodes":0,"fresh_nodes":0,"stale_after_seconds":60,"nodes":[]})
+    );
+    assert_eq!(
+        request_with_token(address, "GET", "/v1/fleet/observations", None, None, None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        request(address, "POST", "/v1/fleet/observations", None, None)
+            .await
+            .0,
+        405
+    );
+    assert_eq!(
+        request(address, "GET", "/v1/fleet/observations?x=1", None, None)
+            .await
+            .0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn fleet_collector_reports_configured_unknown_without_network_on_read() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    const PEER_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz012345ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    let config = Config::default();
+    hangang::store::save(state_path.clone(), config.clone())
+        .await
+        .unwrap();
+    let token_path = dir.path().join("peer.token");
+    let inventory_path = dir.path().join("inventory.json");
+    fs::write(&token_path, PEER_TOKEN).unwrap();
+    fs::write(&inventory_path, serde_json::json!({"peers":[{"node_id":"edge.a","endpoint":"https://127.0.0.1:1","token_file":token_path}]}).to_string()).unwrap();
+    for path in [&token_path, &inventory_path] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let runtime = hangang::fleet_collector::Runtime::open(inventory_path, Some(TOKEN))
+        .await
+        .unwrap();
+    let (address, _) = server_on_with_observer(
+        state_path,
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+        ObserverFixture {
+            event_fixture: EventFixture {
+                traffic: Arc::new(hangang::traffic::TrafficHistory::default()),
+                limit: Admin::EVENT_STREAM_LIMIT,
+            },
+            runtime: None,
+            collector: Some(runtime),
+            requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
+        },
+    )
+    .await;
+    let (status, headers, body) =
+        request(address, "GET", "/v1/fleet/observations", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let value = json(&body);
+    assert_eq!(value["configured"], true);
+    assert_eq!(value["available"], true);
+    assert_eq!(value["generation"], "1");
+    assert_eq!(value["expected_nodes"], 1);
+    assert_eq!(value["fresh_nodes"], 0);
+    assert_eq!(value["stale_after_seconds"], 60);
+    assert_eq!(value["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(value["nodes"][0]["node_id"], "edge.a");
+    assert_eq!(value["nodes"][0]["endpoint"], "https://127.0.0.1:1");
+    assert_eq!(value["nodes"][0]["condition"], "unknown");
+    assert!(value["nodes"][0]["observation"].is_null());
+    assert!(value["nodes"][0]["last_error"].is_null());
+    assert!(value["nodes"][0]["age_seconds"].is_null());
+}
+
+#[tokio::test]
 async fn fleet_observer_is_narrow_and_has_independent_admission() {
     use std::{fs, os::unix::fs::PermissionsExt};
     const OBSERVER_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz012345ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
@@ -336,6 +429,7 @@ async fn fleet_observer_is_narrow_and_has_independent_admission() {
                 limit: Admin::EVENT_STREAM_LIMIT,
             },
             runtime: Some(runtime),
+            collector: None,
             requests: observer_budget.clone(),
         },
     )
@@ -464,6 +558,19 @@ async fn fleet_observer_is_narrow_and_has_independent_admission() {
                 .contains("cache-control: no-store")
         );
     }
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observations",
+            None,
+            None,
+            Some(OBSERVER_TOKEN)
+        )
+        .await
+        .0,
+        401
+    );
     assert_eq!(manager.active.load().config.revision, 0);
     let permits: Vec<_> = (0..Admin::OBSERVER_REQUEST_LIMIT)
         .map(|_| observer_budget.clone().try_acquire_owned().unwrap())
@@ -531,6 +638,7 @@ async fn fleet_observer_is_narrow_and_has_independent_admission() {
     )
     .await;
     let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
+    assert_eq!(request_with_token(address, "GET", "/v1/fleet/observations", None, None, Some(&viewer_token)).await.0, 403);
     assert_eq!(
         request_with_token(
             address,

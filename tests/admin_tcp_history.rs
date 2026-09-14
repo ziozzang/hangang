@@ -55,6 +55,7 @@ async fn fixture() -> (
     });
     let admin = Arc::new(Admin {
         fleet_observer: None,
+        fleet_collector: None,
         acme_status: None,
         file_tls_enabled: false,
         manager: manager.clone(),
