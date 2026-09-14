@@ -4519,6 +4519,13 @@ function resetConfigOperations() {
 function validConfigOperationsPage(data, after) {
   const safe = (value) => Number.isSafeInteger(value) && value >= 0;
   const idValue = (value) => typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
+  const validRelease = (record) => {
+    if (record.receipt_version !== 2) return (record.release_state === undefined || record.release_state === 'not_applicable') && record.release_id == null;
+    if (record.release_state === undefined) return record.release_id == null;
+    if (record.release_state === 'protected') return record.release_id == null;
+    return ['pending', 'acknowledged'].includes(record.release_state) &&
+      record.state === 'candidate_activated' && idValue(record.release_id);
+  };
   if (!isObject(data) || data.scope !== 'instance' || !idValue(data.authority_id) ||
     !Array.isArray(data.coverage) || data.coverage.length !== 2 ||
     !['acceptance', 'local_outcome'].every((name) => data.coverage.includes(name)) ||
@@ -4551,9 +4558,7 @@ function validConfigOperationsPage(data, after) {
     ['local_file', 'shared_store'].includes(record.store_kind) &&
     (record.authority_epoch == null || idValue(record.authority_epoch)) &&
     ['accepted', 'candidate_activated', 'conflict', 'failed', 'indeterminate'].includes(record.state) &&
-    (record.release_state === undefined || ['not_applicable', 'protected', 'pending', 'acknowledged'].includes(record.release_state)) &&
-    (record.release_id == null || idValue(record.release_id)) &&
-    (record.receipt_version === 2 || record.release_state === undefined || record.release_state === 'not_applicable'));
+    validRelease(record));
 }
 
 function configOperationReleaseState(record) {

@@ -9,7 +9,7 @@ const operation = (id, state = 'candidate_activated') => ({
   store_kind: 'local_file', authority_epoch: null, state, release_state: 'not_applicable', release_id: null,
 });
 
-async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, holdExportPage = false, changedHistory = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false, v2Release = false, missingReleaseState = false, releaseStatus = 200, delayedRelease = false } = {}) {
+async function fixture(page, { locale = 'en', accounts = false, unavailable = false, delayed = false, delayedPrune = false, holdExportPage = false, changedHistory = false, invalid = false, longHistory = false, changedAuthority = false, historyGap = false, pruneConflict = false, noTerminal = false, v2Release = false, missingReleaseState = false, invalidReleaseState = null, releaseStatus = 200, delayedRelease = false } = {}) {
   const calls = [];
   let pruned = false;
   let released = false;
@@ -40,13 +40,19 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
         : longHistory ? Array.from({ length: 100 }, (_, index) => operation(after + index + 1))
         : after ? [operation(101, 'indeterminate')] : Array.from({ length: 100 }, (_, index) =>
           operation(index + 1, noTerminal ? 'accepted' : index === 0 ? 'accepted' : index === 1 ? 'failed' : 'candidate_activated'));
-      if (v2Release) for (const record of rows.filter((record) => record.id === 3 || record.id === 4)) {
+      if (v2Release) for (const record of rows.filter((record) => record.id === 3 || (!noTerminal && record.id === 4))) {
         if (noTerminal && record.id === 3) { record.state = 'candidate_activated'; record.finished_at_unix_ms = record.accepted_at_unix_ms + 1000; }
         record.receipt_version = 2; record.store_kind = 'shared_store'; record.authority_epoch = 'c'.repeat(32);
         record.operation_id = record.id.toString(16).padStart(16, '0') + 'd'.repeat(16);
         record.release_state = released ? 'acknowledged' : record.id === 3 ? 'protected' : 'pending';
         record.release_id = released ? 'e'.repeat(32) : record.id === 4 ? 'f'.repeat(32) : null;
         if (missingReleaseState && record.id === 3) { delete record.release_state; delete record.release_id; }
+        if (invalidReleaseState && record.id === 3) {
+          if (invalidReleaseState === 'ack_without_id') { record.release_state = 'acknowledged'; record.release_id = null; }
+          if (invalidReleaseState === 'accepted_ack') { record.state = 'accepted'; record.finished_at_unix_ms = null; record.release_state = 'acknowledged'; record.release_id = 'e'.repeat(32); }
+          if (invalidReleaseState === 'protected_with_id') { record.release_state = 'protected'; record.release_id = 'e'.repeat(32); }
+          if (invalidReleaseState === 'not_applicable') { record.release_state = 'not_applicable'; record.release_id = null; }
+        }
       }
       if (historyGap && !after) rows.shift();
       for (const record of rows) record.authority_id = authorityId;
@@ -307,6 +313,7 @@ test('V2 protection release is explicit, acknowledged, and separate from SQL rec
   await page.locator('[data-view="config-operations"]').click();
   const row = page.locator('#config-operations-rows tr').nth(2);
   await expect(row).toContainText('SQL receipt protected');
+  await expect(page.locator('#config-operations-rows tr').nth(3)).toContainText('Release pending');
   await row.getByRole('button', { name: 'Release SQL receipt protection' }).click();
   await expect(page.locator('#confirm-message')).toContainText('does not delete a SQL receipt');
   await page.locator('#confirm-dialog [value="cancel"]').click();
@@ -326,9 +333,17 @@ test('V2 missing release state stays protected and is not eligible for local pru
   await expect(page.locator('#config-operations-rows tr').nth(2)).toContainText('protection retained');
   await expect(page.locator('#config-operations-rows tr').nth(2).getByRole('button')).toHaveCount(0);
   await expect(page.locator('#config-operations-prune')).toBeDisabled();
-  await expect(page.locator('#config-operations-rows tr').nth(3)).toContainText('Release pending');
-  await expect(page.locator('#config-operations-rows tr').nth(3)).toContainText('Release ID:');
+  await expect(page.locator('#config-operations-message')).not.toContainText('response is invalid');
 });
+
+for (const invalidReleaseState of ['ack_without_id', 'accepted_ack', 'protected_with_id', 'not_applicable'])
+  test(`malformed V2 release state ${invalidReleaseState} hides history and cannot enable pruning`, async ({ page }) => {
+    await fixture(page, { v2Release: true, invalidReleaseState });
+    await page.locator('[data-view="config-operations"]').click();
+    await expect(page.locator('#config-operations-message')).toContainText('response is invalid');
+    await expect(page.locator('#config-operations-rows')).toBeEmpty();
+    await expect(page.locator('#config-operations-prune')).toBeDisabled();
+  });
 
 test('503 release outcome refreshes history without replaying mutation', async ({ page }) => {
   const { calls } = await fixture(page, { v2Release: true, releaseStatus: 503 });
