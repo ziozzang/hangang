@@ -2014,7 +2014,7 @@ fn migrate_sqlite_receipt_pins(connection: &rusqlite::Connection) -> StoreResult
         if version == Some(2) {
             return sqlite_receipt_schema_ready(connection);
         }
-        if version.is_some_and(|version| version > 2 || version < 1) {
+        if version.is_some_and(|version| !(1..=2).contains(&version)) {
             return Err(StoreError::Invalid(anyhow!(
                 "unsupported receipt schema version"
             )));
@@ -2038,7 +2038,7 @@ fn migrate_sqlite_receipt_pins(connection: &rusqlite::Connection) -> StoreResult
         )
         .optional()
         .map_err(sqlite_error)?;
-    if version.is_some_and(|version| version > 2 || version < 1) {
+    if version.is_some_and(|version| !(1..=2).contains(&version)) {
         return Err(StoreError::Invalid(anyhow!(
             "unsupported receipt schema version"
         )));
