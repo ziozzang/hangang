@@ -389,6 +389,12 @@ async fn fleet_collector_reports_configured_unknown_without_network_on_read() {
     assert!(value["nodes"][0]["observation"].is_null());
     assert!(value["nodes"][0]["last_error"].is_null());
     assert!(value["nodes"][0]["age_seconds"].is_null());
+    assert!(
+        !body
+            .windows(PEER_TOKEN.len())
+            .any(|w| w == PEER_TOKEN.as_bytes())
+    );
+    assert!(!String::from_utf8_lossy(&body).contains(token_path.to_str().unwrap()));
 }
 
 #[tokio::test]
@@ -638,7 +644,19 @@ async fn fleet_observer_is_narrow_and_has_independent_admission() {
     )
     .await;
     let viewer_token = json(&body)["token"].as_str().unwrap().to_owned();
-    assert_eq!(request_with_token(address, "GET", "/v1/fleet/observations", None, None, Some(&viewer_token)).await.0, 403);
+    assert_eq!(
+        request_with_token(
+            address,
+            "GET",
+            "/v1/fleet/observations",
+            None,
+            None,
+            Some(&viewer_token)
+        )
+        .await
+        .0,
+        403
+    );
     assert_eq!(
         request_with_token(
             address,
