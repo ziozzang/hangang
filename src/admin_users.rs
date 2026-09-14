@@ -11,6 +11,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::OpenOptions,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -118,6 +119,7 @@ pub enum AuditAction {
     Delete,
     Prune,
     ConfigOperationsPrune,
+    PolicyChange,
 }
 impl AuditAction {
     fn as_str(self) -> &'static str {
@@ -129,6 +131,7 @@ impl AuditAction {
             Self::Delete => "delete",
             Self::Prune => "prune",
             Self::ConfigOperationsPrune => "config_operations_prune",
+            Self::PolicyChange => "policy_change",
         }
     }
     fn parse(value: &str) -> Result<Self> {
@@ -140,12 +143,13 @@ impl AuditAction {
             "delete" => Ok(Self::Delete),
             "prune" => Ok(Self::Prune),
             "config_operations_prune" => Ok(Self::ConfigOperationsPrune),
+            "policy_change" => Ok(Self::PolicyChange),
             _ => anyhow::bail!("invalid stored audit action"),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditActorKind {
     System,
@@ -167,6 +171,144 @@ impl AuditActorKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuditAction {
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFilterAction {
+    Record,
+    Drop,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditFilterMatch {
+    #[serde(default)]
+    pub actions: Vec<AccountAuditAction>,
+    #[serde(default)]
+    pub actor_kinds: Vec<AuditActorKind>,
+    #[serde(default)]
+    pub actor_user_ids: Vec<i64>,
+    #[serde(default)]
+    pub target_user_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditFilterRule {
+    pub id: String,
+    pub action: AuditFilterAction,
+    #[serde(rename = "match")]
+    pub criteria: AuditFilterMatch,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditPolicy {
+    pub default_action: AuditFilterAction,
+    #[serde(default)]
+    pub rules: Vec<AuditFilterRule>,
+}
+
+impl Default for AuditPolicy {
+    fn default() -> Self {
+        Self {
+            default_action: AuditFilterAction::Record,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl AuditPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.rules.len() <= 64, "too many account audit rules");
+        let mut ids = HashSet::new();
+        for rule in &self.rules {
+            ensure!(
+                !rule.id.is_empty()
+                    && rule.id.len() <= 64
+                    && rule
+                        .id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                    && ids.insert(&rule.id),
+                "invalid or duplicate account audit rule ID"
+            );
+            let m = &rule.criteria;
+            ensure!(
+                m.actions.len() <= 64
+                    && m.actor_kinds.len() <= 64
+                    && m.actor_user_ids.len() <= 64
+                    && m.target_user_ids.len() <= 64,
+                "account audit rule match list exceeds capacity"
+            );
+            ensure!(
+                m.actor_user_ids
+                    .iter()
+                    .chain(&m.target_user_ids)
+                    .all(|id| (1..=MAX_SAFE_ID).contains(id)),
+                "invalid account audit user ID"
+            );
+            ensure!(
+                unique(&m.actions)
+                    && unique(&m.actor_kinds)
+                    && unique(&m.actor_user_ids)
+                    && unique(&m.target_user_ids),
+                "duplicate account audit match value"
+            );
+        }
+        ensure!(
+            serde_json::to_vec(self)?.len() <= 65_536,
+            "account audit policy too large"
+        );
+        Ok(())
+    }
+
+    fn decision(&self, record: &AuditRecord) -> AuditFilterAction {
+        let action = match record.action {
+            AuditAction::Create => AccountAuditAction::Create,
+            AuditAction::Update => AccountAuditAction::Update,
+            AuditAction::Delete => AccountAuditAction::Delete,
+            _ => return AuditFilterAction::Record,
+        };
+        self.rules
+            .iter()
+            .find(|rule| {
+                let m = &rule.criteria;
+                (m.actions.is_empty() || m.actions.contains(&action))
+                    && (m.actor_kinds.is_empty() || m.actor_kinds.contains(&record.actor_kind))
+                    && (m.actor_user_ids.is_empty()
+                        || record
+                            .actor_user_id
+                            .is_some_and(|id| m.actor_user_ids.contains(&id)))
+                    && (m.target_user_ids.is_empty()
+                        || record
+                            .target_user_id
+                            .is_some_and(|id| m.target_user_ids.contains(&id)))
+            })
+            .map_or(self.default_action, |rule| rule.action)
+    }
+}
+
+fn unique<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
+    values.iter().collect::<HashSet<_>>().len() == values.len()
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditPolicyObservation {
+    pub scope: &'static str,
+    pub revision: u64,
+    pub policy: AuditPolicy,
+    pub filtered_total: u64,
+    pub last_changed_at_unix_ms: i64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct AuditUserState {
     pub role: Role,
@@ -186,12 +328,18 @@ pub struct AuditRecord {
     pub password_changed: bool,
     pub affected_count: u64,
     pub through_id: Option<i64>,
+    pub policy_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_snapshot: Option<AuditPolicy>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AuditPage {
     pub scope: &'static str,
-    pub coverage: [&'static str; 6],
+    pub coverage: [&'static str; 7],
+    pub policy_revision: u64,
+    pub filtered_total: u64,
+    pub coverage_filtered: bool,
     pub started_at_unix_ms: i64,
     pub records: Vec<AuditRecord>,
     pub next_after: i64,
@@ -424,7 +572,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            version <= 6,
+            version <= 7,
             "administrator user database schema is newer than this binary"
         );
         if version < 2 {
@@ -571,6 +719,9 @@ impl Store {
                 PRAGMA user_version=6;",
             )?;
         }
+        if version < 7 {
+            migrate_audit_filter_v7(&transaction)?;
+        }
         let release_guards: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='admin_config_operations' AND name IN ('admin_v2_release_delete_guard','admin_v2_release_version_guard')",
             [],
@@ -580,6 +731,12 @@ impl Store {
             release_guards == 2,
             "local V2 release deletion guards missing"
         );
+        let filter_guard: i64 = transaction.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='admin_audit' AND name='admin_audit_policy_revision_guard'", [], |row| row.get(0))?;
+        ensure!(
+            filter_guard == 1,
+            "account audit policy revision guard missing"
+        );
+        let filter = policy_state(&transaction)?;
         let (next_user_id,next_audit_id,stored_records,pruned_through,started_at):(i64,i64,i64,i64,i64)=transaction.query_row("SELECT next_user_id,next_audit_id,stored_records,pruned_through,started_at_unix_ms FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
         let max_user_id: i64 =
             transaction.query_row("SELECT COALESCE(MAX(id),0) FROM users", [], |row| {
@@ -603,13 +760,17 @@ impl Store {
             "administrator audit metadata inconsistent"
         );
         {
-            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit ORDER BY id")?;
+            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id,policy_revision,policy_json FROM admin_audit ORDER BY id")?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let record = read_audit_record(row)?;
                 ensure!(
                     record.id > pruned_through,
                     "administrator audit history crosses pruned range"
+                );
+                ensure!(
+                    record.policy_revision <= filter.revision,
+                    "administrator audit row references future policy revision"
                 );
             }
         }
@@ -837,7 +998,7 @@ impl Store {
             let id=allocate_user_id(&transaction)?;
             transaction.execute("INSERT INTO users(id,username,salt,password_hash,role,enabled,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,1,?6,?6)",params![id,username,salt.as_slice(),hash.as_slice(),role.as_str(),now])?;
             let user=User{id,username,role,enabled:true};
-            append_audit(&transaction, audit_record(AuditAction::Create, actor_kind(&authority), actor_id, Some(id), None, Some(AuditUserState{role,enabled:true}), true, 1, None)?)?;
+            append_account_audit(&transaction, audit_record(AuditAction::Create, actor_kind(&authority), actor_id, Some(id), None, Some(AuditUserState{role,enabled:true}), true, 1, None)?)?;
             transaction.commit()?;Ok(Some(user))
         }).await?
     }
@@ -887,7 +1048,7 @@ impl Store {
                 if !next_enabled || next_role!=user.role {transaction.execute("DELETE FROM sessions WHERE user_id=?1",params![id])?;}
             }
             user.role=next_role;user.enabled=next_enabled;
-            append_audit(&transaction, audit_record(AuditAction::Update, actor_kind(&authority), actor_id, Some(id), Some(before), Some(AuditUserState{role:next_role,enabled:next_enabled}), password_changed, 1, None)?)?;
+            append_account_audit(&transaction, audit_record(AuditAction::Update, actor_kind(&authority), actor_id, Some(id), Some(before), Some(AuditUserState{role:next_role,enabled:next_enabled}), password_changed, 1, None)?)?;
             transaction.commit()?;Ok((Change::Applied,Some(user)))
         }).await?
     }
@@ -920,7 +1081,7 @@ impl Store {
                 }
             }
             transaction.execute("DELETE FROM users WHERE id=?1", params![id])?;
-            append_audit(
+            append_account_audit(
                 &transaction,
                 audit_record(
                     AuditAction::Delete,
@@ -943,6 +1104,60 @@ impl Store {
         .await?
     }
 
+    pub async fn audit_policy(
+        &self,
+        authority: MutationAuthority,
+    ) -> Result<AuditPolicyObservation> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            authorize_mutation(&transaction, &authority)?;
+            let observation = policy_state(&transaction)?;
+            transaction.commit()?;
+            Ok(observation)
+        })
+        .await?
+    }
+
+    pub async fn set_audit_policy(
+        &self,
+        authority: MutationAuthority,
+        expected_revision: u64,
+        policy: AuditPolicy,
+    ) -> Result<AuditPolicyObservation> {
+        policy.validate()?;
+        ensure!(
+            expected_revision <= MAX_SAFE_ID as u64,
+            "invalid account audit policy revision"
+        );
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection(&path)?;
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let actor_id = authorize_mutation(&transaction, &authority)?;
+            let current = policy_state(&transaction)?;
+            if current.revision != expected_revision { return Err(AuditConflict.into()); }
+            if current.policy == policy {
+                transaction.commit()?;
+                return Ok(current);
+            }
+            ensure!(current.revision < MAX_SAFE_ID as u64, "account audit policy revision exhausted");
+            let next_revision = current.revision + 1;
+            let changed_at = now_ms()?;
+            let json = serde_json::to_string(&policy)?;
+            let changed = transaction.execute("UPDATE admin_audit_meta SET policy_revision=?1,policy_json=?2,last_changed_at_unix_ms=?3 WHERE singleton=1", params![i64::try_from(next_revision)?,json,changed_at])?;
+            ensure!(changed == 1, "account audit policy metadata update failed");
+            let mut receipt = audit_record(AuditAction::PolicyChange, actor_kind(&authority), actor_id, None, None, None, false, 0, None)?;
+            receipt.policy_snapshot = Some(policy.clone());
+            append_audit(&transaction, receipt)?;
+            let observation = policy_state(&transaction)?;
+            transaction.commit()?;
+            Ok(observation)
+        }).await?
+    }
+
     pub async fn audit_page(
         &self,
         authority: MutationAuthority,
@@ -959,15 +1174,16 @@ impl Store {
             let transaction=connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
             authorize_mutation(&transaction,&authority)?;
             let (started_at,pruned_through,next_audit_id,stored_records):(i64,i64,i64,i64)=transaction.query_row("SELECT started_at_unix_ms,pruned_through,next_audit_id,stored_records FROM admin_audit_meta WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let filter = policy_state(&transaction)?;
             let oldest_id:Option<i64>=transaction.query_row("SELECT MIN(id) FROM admin_audit",[],|row|row.get(0))?;
-            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            let mut statement=transaction.prepare("SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id,policy_revision,policy_json FROM admin_audit WHERE id>?1 ORDER BY id LIMIT ?2")?;
             let mut records=statement.query_map(params![after,i64::try_from(limit+1)?],read_audit_record)?.collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(records.iter().all(|record|record.id>pruned_through),"administrator audit history crosses pruned range");
             let has_more=records.len()>limit;
             records.truncate(limit);
             let next_after=records.last().map_or(after,|record|record.id);
             drop(statement);
-            let page=AuditPage{scope:"instance",coverage:["bootstrap","create","update","delete","prune","config_operations_prune"],started_at_unix_ms:started_at,records,next_after,oldest_id,latest_id:next_audit_id-1,pruned_through,truncated:after<pruned_through,stored_records,capacity:AUDIT_CAPACITY,writes_available:stored_records<AUDIT_CAPACITY && next_audit_id<=MAX_SAFE_ID,server_time_unix_ms:now_ms()?,has_more};
+            let page=AuditPage{scope:"instance",coverage:["bootstrap","create","update","delete","prune","config_operations_prune","policy_change"],policy_revision:filter.revision,filtered_total:filter.filtered_total,coverage_filtered:filter.filtered_total>0,started_at_unix_ms:started_at,records,next_after,oldest_id,latest_id:next_audit_id-1,pruned_through,truncated:after<pruned_through,stored_records,capacity:AUDIT_CAPACITY,writes_available:stored_records<AUDIT_CAPACITY && next_audit_id<=MAX_SAFE_ID,server_time_unix_ms:now_ms()?,has_more};
             transaction.commit()?;
             Ok(page)
         }).await?
@@ -1539,6 +1755,53 @@ fn retained_ids_sha256(transaction: &Transaction<'_>) -> Result<String> {
     Ok(hex_digest(scan_config_ids(transaction)?.3))
 }
 
+fn migrate_audit_filter_v7(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch("ALTER TABLE admin_audit_meta ADD COLUMN policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(policy_revision BETWEEN 0 AND 9007199254740991);
+        ALTER TABLE admin_audit_meta ADD COLUMN policy_json TEXT NOT NULL DEFAULT '{\"default_action\":\"record\",\"rules\":[]}';
+        ALTER TABLE admin_audit_meta ADD COLUMN filtered_total INTEGER NOT NULL DEFAULT 0 CHECK(filtered_total BETWEEN 0 AND 9007199254740991);
+        ALTER TABLE admin_audit_meta ADD COLUMN last_changed_at_unix_ms INTEGER NOT NULL DEFAULT 0 CHECK(last_changed_at_unix_ms BETWEEN 0 AND 9007199254740991);
+        CREATE TABLE admin_audit_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(id BETWEEN 1 AND 9007199254740991),
+            time_unix_ms INTEGER NOT NULL CHECK(time_unix_ms BETWEEN 0 AND 9007199254740991),
+            action TEXT NOT NULL CHECK(action IN ('baseline','bootstrap','create','update','delete','prune','config_operations_prune','policy_change')),
+            actor_kind TEXT NOT NULL CHECK(actor_kind IN ('system','account')),
+            actor_user_id INTEGER CHECK(actor_user_id BETWEEN 1 AND 9007199254740991),
+            target_user_id INTEGER CHECK(target_user_id BETWEEN 1 AND 9007199254740991),
+            before_role TEXT CHECK(before_role IN ('admin','viewer')),
+            before_enabled INTEGER CHECK(before_enabled IN (0,1)),
+            after_role TEXT CHECK(after_role IN ('admin','viewer')),
+            after_enabled INTEGER CHECK(after_enabled IN (0,1)),
+            password_changed INTEGER NOT NULL CHECK(password_changed IN (0,1)),
+            affected_count INTEGER NOT NULL CHECK(affected_count BETWEEN 0 AND 9007199254740991),
+            through_id INTEGER CHECK(through_id BETWEEN 1 AND 9007199254740991),
+            policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(policy_revision BETWEEN 0 AND 9007199254740991),
+            policy_json TEXT,
+            CHECK((actor_kind='system' AND actor_user_id IS NULL) OR (actor_kind='account' AND actor_user_id IS NOT NULL)),
+            CHECK((before_role IS NULL AND before_enabled IS NULL) OR (before_role IS NOT NULL AND before_enabled IS NOT NULL)),
+            CHECK((after_role IS NULL AND after_enabled IS NULL) OR (after_role IS NOT NULL AND after_enabled IS NOT NULL)),
+            CHECK((action='policy_change' AND policy_json IS NOT NULL AND policy_revision>0) OR (action!='policy_change' AND policy_json IS NULL)),
+            CHECK(COALESCE(
+                (action='baseline' AND actor_kind='system' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND through_id IS NULL)
+                OR (action='bootstrap' AND actor_kind='system' AND target_user_id IS NOT NULL AND before_role IS NULL AND after_role='admin' AND after_enabled=1 AND password_changed=1 AND affected_count=1 AND through_id IS NULL)
+                OR (action='create' AND target_user_id IS NOT NULL AND before_role IS NULL AND after_role IS NOT NULL AND after_enabled=1 AND password_changed=1 AND affected_count=1 AND through_id IS NULL)
+                OR (action='update' AND target_user_id IS NOT NULL AND before_role IS NOT NULL AND after_role IS NOT NULL AND affected_count=1 AND through_id IS NULL)
+                OR (action='delete' AND target_user_id IS NOT NULL AND before_role IS NOT NULL AND after_role IS NULL AND password_changed=0 AND affected_count=1 AND through_id IS NULL)
+                OR (action='prune' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND affected_count>0 AND through_id IS NOT NULL AND through_id<id)
+                OR (action='config_operations_prune' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND affected_count>0 AND through_id IS NOT NULL)
+                OR (action='policy_change' AND target_user_id IS NULL AND before_role IS NULL AND after_role IS NULL AND password_changed=0 AND affected_count=0 AND through_id IS NULL)
+            ,0))
+        );
+        INSERT INTO admin_audit_v7(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id)
+          SELECT id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id FROM admin_audit ORDER BY id;
+        DROP TABLE admin_audit;
+        ALTER TABLE admin_audit_v7 RENAME TO admin_audit;
+        CREATE TRIGGER admin_audit_policy_revision_guard BEFORE INSERT ON admin_audit
+          WHEN NEW.policy_revision != (SELECT policy_revision FROM admin_audit_meta WHERE singleton=1)
+          BEGIN SELECT RAISE(ABORT,'account audit policy revision mismatch'); END;
+        PRAGMA user_version=7;")?;
+    Ok(())
+}
+
 fn migrate_config_retention_v4(transaction: &Transaction<'_>) -> Result<()> {
     let (next_id, stored_records): (i64, i64) = transaction.query_row(
         "SELECT next_id,stored_records FROM admin_config_operation_meta WHERE singleton=1",
@@ -1699,7 +1962,48 @@ fn audit_record(
         password_changed,
         affected_count,
         through_id,
+        policy_revision: 0,
+        policy_snapshot: None,
     })
+}
+
+fn policy_state(transaction: &Transaction<'_>) -> Result<AuditPolicyObservation> {
+    let (revision, json, filtered_total, last_changed): (i64, String, i64, i64) = transaction.query_row(
+        "SELECT policy_revision,policy_json,filtered_total,last_changed_at_unix_ms FROM admin_audit_meta WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    ensure!(
+        (0..=MAX_SAFE_ID).contains(&revision)
+            && (0..=MAX_SAFE_ID).contains(&filtered_total)
+            && (0..=MAX_SAFE_ID).contains(&last_changed)
+            && json.len() <= 65_536,
+        "invalid stored account audit policy metadata"
+    );
+    let policy: AuditPolicy = serde_json::from_str(&json)?;
+    policy.validate()?;
+    Ok(AuditPolicyObservation {
+        scope: "instance",
+        revision: revision as u64,
+        policy,
+        filtered_total: filtered_total as u64,
+        last_changed_at_unix_ms: last_changed,
+    })
+}
+
+fn append_account_audit(transaction: &Transaction<'_>, record: AuditRecord) -> Result<()> {
+    let state = policy_state(transaction)?;
+    if state.policy.decision(&record) == AuditFilterAction::Drop {
+        ensure!(
+            state.filtered_total < MAX_SAFE_ID as u64,
+            "account audit filtered counter exhausted"
+        );
+        let changed = transaction.execute("UPDATE admin_audit_meta SET filtered_total=filtered_total+1 WHERE singleton=1 AND filtered_total<?1", params![MAX_SAFE_ID])?;
+        ensure!(changed == 1, "account audit filtered counter update failed");
+    } else {
+        append_audit(transaction, record)?;
+    }
+    Ok(())
 }
 
 fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Result<AuditRecord> {
@@ -1720,6 +2024,10 @@ fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Resul
         return Err(AuditCapacity.into());
     }
     record.id = id;
+    let schema_version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version >= 7 {
+        record.policy_revision = policy_state(transaction)?.revision;
+    }
     ensure!(
         valid_audit_record(&record),
         "invalid administrator audit event"
@@ -1728,8 +2036,18 @@ fn append_audit(transaction: &Transaction<'_>, mut record: AuditRecord) -> Resul
     let before_enabled = record.before.map(|s| i64::from(s.enabled));
     let after_role = record.after.map(|s| s.role.as_str());
     let after_enabled = record.after.map(|s| i64::from(s.enabled));
-    transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id])?;
-    transaction.execute("UPDATE admin_audit_meta SET next_audit_id=?1,stored_records=stored_records+1 WHERE singleton=1", params![id+1])?;
+    if schema_version >= 7 {
+        let snapshot = record
+            .policy_snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id,policy_revision,policy_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id,i64::try_from(record.policy_revision)?,snapshot])?;
+    } else {
+        transaction.execute("INSERT INTO admin_audit(id,time_unix_ms,action,actor_kind,actor_user_id,target_user_id,before_role,before_enabled,after_role,after_enabled,password_changed,affected_count,through_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![id,record.time_unix_ms,record.action.as_str(),record.actor_kind.as_str(),record.actor_user_id,record.target_user_id,before_role,before_enabled,after_role,after_enabled,i64::from(record.password_changed),i64::try_from(record.affected_count)?,record.through_id])?;
+    }
+    let changed = transaction.execute("UPDATE admin_audit_meta SET next_audit_id=?1,stored_records=stored_records+1 WHERE singleton=1", params![id+1])?;
+    ensure!(changed == 1, "administrator audit metadata update failed");
     Ok(record)
 }
 
@@ -1769,6 +2087,22 @@ fn read_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
         affected_count: u64::try_from(row.get::<_, i64>(11)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         through_id: row.get(12)?,
+        policy_revision: u64::try_from(row.get::<_, i64>(13)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        policy_snapshot: row
+            .get::<_, Option<String>>(14)?
+            .map(|json| {
+                if json.len() > 65_536 {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let policy: AuditPolicy =
+                    serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                policy
+                    .validate()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(policy)
+            })
+            .transpose()?,
     };
     if !valid_audit_record(&record) {
         return Err(rusqlite::Error::InvalidQuery);
@@ -1780,6 +2114,8 @@ fn valid_audit_record(record: &AuditRecord) -> bool {
     if !(1..=MAX_SAFE_ID).contains(&record.id)
         || !(0..=MAX_SAFE_ID).contains(&record.time_unix_ms)
         || record.affected_count > MAX_SAFE_ID as u64
+        || record.policy_revision > MAX_SAFE_ID as u64
+        || (record.action != AuditAction::PolicyChange && record.policy_snapshot.is_some())
         || record
             .actor_user_id
             .is_some_and(|id| !(1..=MAX_SAFE_ID).contains(&id))
@@ -1856,6 +2192,19 @@ fn valid_audit_record(record: &AuditRecord) -> bool {
                 && !record.password_changed
                 && record.affected_count > 0
                 && record.through_id.is_some()
+        }
+        AuditAction::PolicyChange => {
+            record.target_user_id.is_none()
+                && record.before.is_none()
+                && record.after.is_none()
+                && !record.password_changed
+                && record.affected_count == 0
+                && record.through_id.is_none()
+                && record.policy_revision > 0
+                && record
+                    .policy_snapshot
+                    .as_ref()
+                    .is_some_and(|policy| policy.validate().is_ok())
         }
     }
 }
@@ -1972,6 +2321,18 @@ mod tests {
         (directory, store)
     }
 
+    fn remove_v7_audit_metadata(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER admin_audit_policy_revision_guard;
+            ALTER TABLE admin_audit_meta DROP COLUMN policy_revision;
+            ALTER TABLE admin_audit_meta DROP COLUMN policy_json;
+            ALTER TABLE admin_audit_meta DROP COLUMN filtered_total;
+            ALTER TABLE admin_audit_meta DROP COLUMN last_changed_at_unix_ms;",
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn v2_to_v3_keeps_users_sessions_and_account_audit() {
         let (directory, store) = store();
@@ -1992,7 +2353,9 @@ mod tests {
             .latest_id;
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2;").unwrap();
+        let old = connection(&path).unwrap();
+        remove_v7_audit_metadata(&old);
+        old.execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2;").unwrap();
         let migrated = Store::open(path.clone()).unwrap();
         assert_eq!(
             migrated
@@ -2023,7 +2386,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -2322,6 +2685,7 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
         let connection = connection(&path).unwrap();
+        remove_v7_audit_metadata(&connection);
         connection
             .execute_batch(
                 "DROP TRIGGER admin_v2_release_delete_guard;
@@ -2388,6 +2752,7 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
         let connection = connection(&path).unwrap();
+        remove_v7_audit_metadata(&connection);
         connection
             .execute_batch(
                 "DROP TRIGGER admin_v2_release_delete_guard;
@@ -2546,7 +2911,9 @@ mod tests {
             .unwrap();
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
-        connection(&path).unwrap().execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2; CREATE TABLE admin_config_operation_meta(dummy INTEGER);").unwrap();
+        let old = connection(&path).unwrap();
+        remove_v7_audit_metadata(&old);
+        old.execute_batch("DROP TABLE admin_config_releases; DROP TABLE admin_config_operations; DROP TABLE admin_config_operation_meta; PRAGMA user_version=2; CREATE TABLE admin_config_operation_meta(dummy INTEGER);").unwrap();
         assert!(Store::open(path.clone()).is_err());
         let connection = connection(&path).unwrap();
         assert_eq!(
@@ -2763,7 +3130,8 @@ mod tests {
                 "update",
                 "delete",
                 "prune",
-                "config_operations_prune"
+                "config_operations_prune",
+                "policy_change"
             ]
         );
         let second = reopened
@@ -2799,7 +3167,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -3869,6 +4237,7 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
         let connection = connection(&path).unwrap();
+        remove_v7_audit_metadata(&connection);
         connection.execute_batch("DROP TRIGGER admin_v2_release_delete_guard; DROP TRIGGER admin_v2_release_version_guard; DROP TABLE admin_config_releases; PRAGMA user_version=4;").unwrap();
         assert!(
             Store::open(path.clone()).is_err(),
@@ -4371,6 +4740,7 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         drop(store);
         let connection = connection(&path).unwrap();
+        remove_v7_audit_metadata(&connection);
         connection.execute_batch("DROP TRIGGER admin_v2_release_delete_guard; DROP TRIGGER admin_v2_release_version_guard; DROP TABLE admin_config_releases; PRAGMA user_version=5; CREATE TABLE admin_config_releases(dummy INTEGER);").unwrap();
         assert!(Store::open(path.clone()).is_err());
         assert_eq!(
@@ -4429,7 +4799,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(
             connection
@@ -4441,5 +4811,265 @@ mod tests {
                 .unwrap(),
             operation.operation_id
         );
+    }
+
+    fn drop_policy() -> AuditPolicy {
+        AuditPolicy {
+            default_action: AuditFilterAction::Drop,
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn account_audit_filter_is_first_match_and_requires_all_specified_fields() {
+        let mut policy = drop_policy();
+        policy.rules = vec![
+            AuditFilterRule {
+                id: "record-target".into(),
+                action: AuditFilterAction::Record,
+                criteria: AuditFilterMatch {
+                    actions: vec![AccountAuditAction::Create],
+                    actor_kinds: vec![AuditActorKind::Account],
+                    actor_user_ids: vec![1],
+                    target_user_ids: vec![2],
+                },
+            },
+            AuditFilterRule {
+                id: "drop-create".into(),
+                action: AuditFilterAction::Drop,
+                criteria: AuditFilterMatch {
+                    actions: vec![AccountAuditAction::Create],
+                    ..AuditFilterMatch::default()
+                },
+            },
+        ];
+        policy.validate().unwrap();
+        let make = |actor_kind, actor, target, action| {
+            audit_record(
+                action,
+                actor_kind,
+                actor,
+                Some(target),
+                None,
+                None,
+                false,
+                1,
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            policy.decision(&make(
+                AuditActorKind::Account,
+                Some(1),
+                2,
+                AuditAction::Create
+            )),
+            AuditFilterAction::Record
+        );
+        assert_eq!(
+            policy.decision(&make(
+                AuditActorKind::Account,
+                Some(1),
+                3,
+                AuditAction::Create
+            )),
+            AuditFilterAction::Drop
+        );
+        assert_eq!(
+            policy.decision(&make(AuditActorKind::System, None, 2, AuditAction::Create)),
+            AuditFilterAction::Drop
+        );
+        assert_eq!(
+            policy.decision(&make(
+                AuditActorKind::Account,
+                Some(1),
+                2,
+                AuditAction::Update
+            )),
+            AuditFilterAction::Drop
+        );
+        assert_eq!(
+            policy.decision(&make(AuditActorKind::System, None, 2, AuditAction::Prune)),
+            AuditFilterAction::Record
+        );
+        policy.rules[1].id = policy.rules[0].id.clone();
+        assert!(policy.validate().is_err());
+        policy.rules[1].id = "bad space".into();
+        assert!(policy.validate().is_err());
+        policy.rules[1].id = "valid".into();
+        policy.rules[1].criteria.target_user_ids = vec![0];
+        assert!(policy.validate().is_err());
+        assert!(
+            serde_json::from_str::<AuditPolicy>(
+                r#"{"default_action":"record","rules":[],"unknown":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_drop_is_durable_without_consuming_audit_ids_and_history_is_explicit() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let initial = store.audit_policy(MutationAuthority::System).await.unwrap();
+        assert_eq!(initial.revision, 0);
+        assert_eq!(initial.filtered_total, 0);
+        assert_eq!(initial.last_changed_at_unix_ms, 0);
+        let changed = store
+            .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+            .await
+            .unwrap();
+        assert_eq!(changed.revision, 1);
+        assert_eq!(changed.policy.default_action, AuditFilterAction::Drop);
+        assert!(changed.last_changed_at_unix_ms > 0);
+        assert_eq!(
+            store
+                .set_audit_policy(MutationAuthority::System, 1, drop_policy())
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(
+            store
+                .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+                .await
+                .unwrap_err()
+                .is::<AuditConflict>()
+        );
+        let first = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "second secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .update(MutationAuthority::System, first.id, None, Some(false), None)
+            .await
+            .unwrap();
+        store
+            .delete(MutationAuthority::System, first.id)
+            .await
+            .unwrap();
+        let page = store
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.filtered_total, 3);
+        assert!(page.coverage_filtered);
+        assert_eq!(page.latest_id, 3);
+        assert_eq!(page.records.len(), 3);
+        assert_eq!(page.records[2].action, AuditAction::PolicyChange);
+        assert_eq!(page.records[2].policy_revision, 1);
+        assert_eq!(page.records[2].policy_snapshot, Some(drop_policy()));
+        assert!(
+            page.records[..2]
+                .iter()
+                .all(|row| row.policy_revision == 0 && row.policy_snapshot.is_none())
+        );
+        let reopened = Store::open(directory.path().join("accounts.sqlite3")).unwrap();
+        assert_eq!(
+            reopened
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .filtered_total,
+            3
+        );
+        let restored = reopened
+            .set_audit_policy(MutationAuthority::System, 1, AuditPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(restored.revision, 2);
+        let user = reopened
+            .create(
+                MutationAuthority::System,
+                "again".into(),
+                "third secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let page = reopened
+            .audit_page(MutationAuthority::System, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(page.latest_id, 5);
+        assert_eq!(page.records[4].action, AuditAction::Create);
+        assert_eq!(page.records[4].target_user_id, Some(user.id));
+        assert_eq!(page.records[4].policy_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn policy_change_and_filtered_counter_failure_roll_back_account_mutations() {
+        let (directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let path = directory.path().join("accounts.sqlite3");
+        let db = connection(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER block_policy_change BEFORE UPDATE OF policy_revision ON admin_audit_meta BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(
+            store
+                .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .revision,
+            0
+        );
+        db.execute_batch("DROP TRIGGER block_policy_change")
+            .unwrap();
+        store
+            .set_audit_policy(MutationAuthority::System, 0, drop_policy())
+            .await
+            .unwrap();
+        db.execute_batch("CREATE TRIGGER block_filtered_counter BEFORE UPDATE OF filtered_total ON admin_audit_meta BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        assert!(
+            store
+                .create(
+                    MutationAuthority::System,
+                    "blocked".into(),
+                    "second secure password".into(),
+                    Role::Viewer
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM users WHERE username='blocked'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .audit_policy(MutationAuthority::System)
+                .await
+                .unwrap()
+                .filtered_total,
+            0
+        );
+        db.execute_batch("DROP TRIGGER block_filtered_counter")
+            .unwrap();
+        assert!(Store::open(path).is_ok());
     }
 }
