@@ -171,12 +171,12 @@ fn valid_id(value: &str, max: usize) -> bool {
 mod tests {
     use super::*;
 
-    fn input(
+    fn input<'a>(
         listen: &str,
         peer_ip: &str,
-        route_id: Option<&str>,
+        route_id: Option<&'a str>,
         outcome: crate::tcp_history::Outcome,
-    ) -> Input<'_> {
+    ) -> Input<'a> {
         Input {
             listen: listen.parse().unwrap(),
             peer_ip: peer_ip.parse().unwrap(),
@@ -246,7 +246,7 @@ mod tests {
             assert!(
                 parsed
                     .as_ref()
-                    .is_err_or(|policy| policy.validate().is_err())
+                    .map_or(true, |policy| policy.validate().is_err())
             );
         }
         let mut policy = Policy::default();
