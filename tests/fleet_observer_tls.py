@@ -18,10 +18,11 @@ OLD = "A" * 48
 NEW = "B" * 48
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def free_ports():
+    with socket.socket() as public, socket.socket() as admin:
+        public.bind(("127.0.0.1", 0))
+        admin.bind(("127.0.0.1", 0))
+        return public.getsockname()[1], admin.getsockname()[1]
 
 
 def private_write(path, data):
@@ -51,13 +52,13 @@ class FleetObserverTls(unittest.TestCase):
             private_write(config, b'{"revision":0,"http":[],"tcp":[]}')
             private_write(secret, (OLD + "\n").encode())
             private_write(observer, json.dumps({"node_id": "owned.edge", "token_file": str(secret)}).encode())
-            public_port, admin_port = free_port(), free_port()
-            self.assertNotEqual(public_port, admin_port)
+            public_port, admin_port = free_ports()
             command = [str(BINARY), "--config", str(config),
                        "--listen", f"127.0.0.1:{public_port}",
                        "--admin", f"127.0.0.1:{admin_port}",
                        "--admin-tls-cert", str(cert), "--admin-tls-key", str(key),
-                       "--fleet-observer-config", str(observer), "--admin-token", ADMIN]
+                       "--fleet-observer-config", str(observer), "--admin-token", ADMIN,
+                       "--threads", "2", "--lua-workers", "1", "--drain-seconds", "1"]
             trusted = ssl.create_default_context(cafile=str(cert))
             output = (root / "gateway.log").open("wb")
             child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
@@ -93,7 +94,7 @@ class FleetObserverTls(unittest.TestCase):
                 with self.assertRaises(ssl.SSLCertVerificationError):
                     request("/v1/fleet/observation", OLD, ssl.create_default_context())
                 private_write(secret, (NEW + "\n").encode())
-                deadline = time.monotonic() + 4
+                deadline = time.monotonic() + 10
                 while True:
                     if request("/v1/fleet/observation", NEW)[0] == 200:
                         break

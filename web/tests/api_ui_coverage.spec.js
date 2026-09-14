@@ -8,7 +8,7 @@ const source = {
   docker: read('../docker.js'),
 };
 
-// Each published operation needs a feature-specific UI surface and a real caller.
+// Each management operation needs a feature-specific UI surface and a real caller.
 // The API reference page alone is deliberately insufficient for any operation
 // except GET /openapi.json. Background auth/session flows have visible state.
 const coverage = new Map([
@@ -76,7 +76,7 @@ const coverage = new Map([
 // unavailable to the browser's administrator session.
 const machineOnly = new Set(['GET /v1/fleet/observation']);
 
-test('every OpenAPI operation has a concrete console surface and caller', async ({ page }) => {
+test('every management OpenAPI operation has a concrete console surface and caller', async ({ page }) => {
   const spec = JSON.parse(read('../../docs/openapi.json'));
   const operations = Object.entries(spec.paths).flatMap(([path, methods]) =>
     Object.keys(methods).filter((method) => /^(get|post|put|patch|delete|head|options)$/.test(method))

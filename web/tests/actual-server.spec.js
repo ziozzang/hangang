@@ -241,4 +241,32 @@ test.describe('actual embedded Hangang server', () => {
     expect(withoutRecording(restored)).toEqual(withoutRecording(original));
   });
 
+  test('local observer capability agrees with the real admin API without a machine credential', async ({ page, request }) => {
+    const response = await request.get(`${base}/v1/fleet/observer-status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(response.status()).toBe(200);
+    expect(response.headers()['cache-control']).toBe('no-store');
+    expect(await response.json()).toEqual({ configured: false, available: false, node_id: null, generation: null });
+    const machineCalls = [];
+    page.on('request', req => {
+      if (new URL(req.url()).pathname === '/v1/fleet/observation') machineCalls.push(req.url());
+    });
+    await page.goto(`${base}/ui/`);
+    if (await page.getByRole('button', { name: 'Use administrator token' }).isVisible()) {
+      await page.getByRole('button', { name: 'Use administrator token' }).click();
+    }
+    await page.getByLabel('Administrator token').fill(token);
+    await page.getByRole('button', { name: 'Connect' }).click();
+    await expect(page.locator('#connection-state')).toHaveText('Connected');
+    await page.locator('[data-view="operations"]').click();
+    await expect(page.locator('#observer-identity-state')).toHaveText('Disabled');
+    await expect(page.locator('#observer-identity-node')).toHaveText('—');
+    await page.locator('#locale-select').selectOption('ko');
+    await expect(page.locator('#observer-identity-title')).not.toHaveText('Node observation identity');
+    await page.locator('#observer-identity-refresh').click();
+    await expect(page.locator('#observer-identity-generation')).toHaveText('—');
+    expect(machineCalls).toEqual([]);
+  });
+
 });
