@@ -25,6 +25,7 @@ let fleetTimer = null;
 let fleetSnapshot = null;
 let fleetRequestedAt = 0;
 let fleetError = '';
+let fleetFilter = 'all';
 const FLEET_POLL_MS = 5000;
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const finiteInteger = (value, max) => Number.isSafeInteger(value) && value >= 0 && value <= max;
@@ -70,8 +71,10 @@ function fleetState(data) {
   const origins = new Set();
   const nodes = [];
   for (const row of data.nodes) {
-    if (!exactKeys(row, ['node_id', 'endpoint', 'condition', 'last_error', 'age_seconds', 'observation'])
+    if (!exactKeys(row, ['node_id', 'endpoint', 'group_id', 'role', 'condition', 'last_error', 'age_seconds', 'observation'])
       || !observerNodeId(row.node_id) || seen.has(row.node_id)
+      || !(row.group_id === null || observerNodeId(row.group_id))
+      || !(row.role === null || observerNodeId(row.role))
       || !safeEndpoint(row.endpoint) || origins.has(row.endpoint)
       || !['unknown', 'fresh', 'stale', 'unavailable', 'identity_mismatch'].includes(row.condition)
       || !safeCode(row.last_error) || !(row.age_seconds === null || finiteInteger(row.age_seconds, Number.MAX_SAFE_INTEGER))
@@ -85,7 +88,7 @@ function fleetState(data) {
     if (observation === undefined) return null;
     seen.add(row.node_id);
     origins.add(row.endpoint);
-    nodes.push({ node_id: row.node_id, endpoint: row.endpoint, condition: row.condition,
+    nodes.push({ node_id: row.node_id, endpoint: row.endpoint, group_id: row.group_id, role: row.role, condition: row.condition,
       last_error: row.last_error, age_seconds: row.age_seconds, observation });
   }
   if (nodes.filter(row => row.condition === 'fresh').length !== data.fresh_nodes) return null;
@@ -102,8 +105,23 @@ function renderFleet() {
   $('#fleet-observations-generation').textContent = fleetSnapshot?.generation === null || fleetSnapshot?.generation === undefined
     ? '—' : formatNumberLocale(BigInt(fleetSnapshot.generation));
   $('#fleet-observations-process').textContent = fleetSnapshot?.process ?? '—';
-  const rows = fleetSnapshot?.nodes ?? [];
-  const fresh = rows.filter(row => fleetCondition(row) === 'fresh').length;
+  const allRows = fleetSnapshot?.nodes ?? [];
+  const groups = [...new Set(allRows.map(row => row.group_id).filter(group => group !== null))].sort();
+  const choices = $('#fleet-observations-group');
+  choices.replaceChildren(new Option(t('All observer peers'), 'all'));
+  if (allRows.some(row => row.group_id === null)) choices.add(new Option(t('Ungrouped observer peers'), 'ungrouped'));
+  for (const group of groups) choices.add(new Option(t('Group {id}', { id: group }), `group:${group}`));
+  if (![...choices.options].some(option => option.value === fleetFilter)) fleetFilter = 'all';
+  choices.value = fleetFilter;
+  choices.disabled = fleetSnapshot?.kind !== 'available';
+  const rows = fleetFilter === 'all' ? allRows : allRows.filter(row => fleetFilter === 'ungrouped'
+    ? row.group_id === null : row.group_id === fleetFilter.slice('group:'.length));
+  const fresh = allRows.filter(row => fleetCondition(row) === 'fresh').length;
+  const selectedFresh = rows.filter(row => fleetCondition(row) === 'fresh').length;
+  $('#fleet-observations-selected-coverage').textContent = fleetSnapshot?.kind === 'available'
+    ? t('Selected reporting: {fresh} of {expected} fresh', {
+      fresh: formatNumberLocale(selectedFresh), expected: formatNumberLocale(rows.length),
+    }) : t('Selected reporting unavailable');
   $('#fleet-observations-coverage').textContent = fleetSnapshot?.kind === 'disabled' ? t('Disabled')
     : fleetSnapshot?.expected === undefined ? '—'
       : t('{fresh} of {expected} fresh', { fresh: formatNumberLocale(fresh), expected: formatNumberLocale(fleetSnapshot.expected) });
@@ -116,6 +134,8 @@ function renderFleet() {
     const tr = node('tr');
     const identity = node('td');
     identity.append(node('strong', '', row.node_id), node('div', 'field-help', row.endpoint));
+    identity.append(node('div', 'field-help', t('Inventory group: {id}', { id: row.group_id ?? t('Unassigned') })));
+    identity.append(node('div', 'field-help', t('Inventory role: {id}', { id: row.role ?? t('Unassigned') })));
     const status = node('td');
     status.append(node('strong', '', t(({ unknown: 'Unknown', fresh: 'Fresh', stale: 'Stale',
       unavailable: 'Unavailable', identity_mismatch: 'Identity mismatch' })[condition])));
@@ -150,6 +170,7 @@ async function fetchFleet() {
     const parsed = fleetState(data);
     if (parsed) {
       fleetSnapshot = parsed;
+      if (parsed.kind !== 'available') fleetFilter = 'all';
       fleetRequestedAt = requestedAt - 1000; // Server ages are truncated to whole seconds.
       fleetError = '';
     } else fleetError = 'Fleet observations response is invalid; showing historical data if available.';
@@ -564,6 +585,7 @@ export function resetOperations() {
   retiredLoading = false;
   observer = null;
   fleetSnapshot = null;
+  fleetFilter = 'all';
   fleetError = '';
   renderFleet();
   $('#observer-identity-message').textContent = '';
@@ -598,3 +620,5 @@ $('#observer-identity-refresh').addEventListener('click', () => { if (!observerL
 
 $('#fleet-observations-refresh').addEventListener('click', () => { if (!fleetLoading) fetchFleet(); });
 document.addEventListener('visibilitychange', () => { if (fleetActive && !document.hidden) { renderFleet(); fetchFleet(); } });
+
+$('#fleet-observations-group').addEventListener('change', event => { fleetFilter = event.target.value; renderFleet(); });

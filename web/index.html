@@ -188,6 +188,8 @@
       <div class="operations-capability"><h3 data-i18n="Collector generation">Collector generation</h3><p id="fleet-observations-generation">—</p></div>
       <div class="operations-capability"><h3 data-i18n="Collector process ID">Collector process ID</h3><p id="fleet-observations-process">—</p></div>
     </div>
+    <div class="field"><label for="fleet-observations-group" data-i18n="View observer group">View observer group</label><select id="fleet-observations-group"><option value="all" data-i18n="All observer peers">All observer peers</option></select><span class="field-help-inline" data-i18n="Group and role are operator-assigned inventory labels, not verified execution roles, capacity, consensus or activation.">Group and role are operator-assigned inventory labels, not verified execution roles, capacity, consensus or activation.</span></div>
+    <p id="fleet-observations-selected-coverage" class="operations-caution" role="status"></p>
     <div id="fleet-observations-message" class="inline-message" role="status" aria-live="polite"></div>
     <div class="operations-table-wrap"><table class="operations-table"><thead><tr><th scope="col" data-i18n="Expected node / endpoint">Expected node / endpoint</th><th scope="col" data-i18n="Observation state / age">Observation state / age</th><th scope="col" data-i18n="Last good process sample">Last good process sample</th><th scope="col" data-i18n="Last attempt error">Last attempt error</th></tr></thead><tbody id="fleet-observations-rows"></tbody></table></div>
     <p id="fleet-observations-empty" class="operations-empty" data-i18n="No expected observer peers are configured.">No expected observer peers are configured.</p>

@@ -596,7 +596,7 @@ const fleetSample = (instance = '0123456789abcdef') => ({
   config_digest: 'fedcba9876543210', ready: true, store_epoch: 'epoch-1',
 });
 const fleetRow = (condition = 'fresh', instance = '0123456789abcdef') => ({
-  node_id: 'edge-1', endpoint: 'https://edge.example.test:9443', condition,
+  node_id: 'edge-1', endpoint: 'https://edge.example.test:9443', group_id: null, role: null, condition,
   last_error: condition === 'identity_mismatch' ? 'identity_mismatch' : null,
   age_seconds: 2, observation: fleetSample(instance),
 });
@@ -817,4 +817,67 @@ test('collector process identity changes independently of generation without mer
   await expect(page.locator('#fleet-observations-process')).toHaveText('bbbbbbbbbbbbbbbb');
   await page.getByRole('button', { name: 'Log out' }).click();
   await expect(page.locator('#fleet-observations-process')).toHaveText('—');
+});
+
+test('local fleet group filter scopes rows and reporting without changing the full headline', async ({ page }) => {
+  const edgeA = { ...fleetRow(), group_id: 'edge-a', role: 'gateway' };
+  const edgeB = { ...fleetRow('unavailable'), node_id: 'edge-2', endpoint: 'https://edge-2.example.test',
+    group_id: 'edge-b', role: 'gateway', last_error: 'transport',
+    observation: { ...fleetSample(), node_id: 'edge-2' } };
+  const ungrouped = { ...fleetRow(), node_id: 'edge-3', endpoint: 'https://edge-3.example.test',
+    group_id: null, role: null, observation: { ...fleetSample(), node_id: 'edge-3', ready: false } };
+  let reply = { ...fleetInventory(), expected_nodes: 3, fresh_nodes: 2, nodes: [edgeA, edgeB, ungrouped] };
+  const calls = await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('2 of 3 fresh');
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting: 2 of 3 fresh');
+  await expect(page.locator('#fleet-observations-group option')).toHaveCount(4);
+  const before = calls.filter(call => call.path === '/v1/fleet/observations').length;
+  await page.locator('#fleet-observations-group').selectOption('group:edge-b');
+  await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(1);
+  await expect(page.locator('#fleet-observations-rows')).toContainText('edge-2');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Inventory role: gateway');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Historical reported ready: Yes');
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting: 0 of 1 fresh');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('2 of 3 fresh');
+  expect(calls.filter(call => call.path === '/v1/fleet/observations')).toHaveLength(before);
+  expect(calls.some(call => call.path === '/v1/fleet/observation')).toBe(false);
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-group')).toHaveValue('group:edge-b');
+  await page.locator('#fleet-observations-group').selectOption('ungrouped');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('edge-3');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('Inventory role: Unassigned');
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting: 1 of 1 fresh');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('선택한 범위의 관찰: 1개 중 1개 최신');
+  await expect(page.locator('#fleet-observations-rows')).toContainText('목록 역할: 미지정');
+  await expect(page.locator('#fleet-observations-group option[value="group:edge-a"]')).toHaveText('그룹 edge-a');
+});
+
+test('withdrawn or malformed roster cannot keep a selected group as current coverage', async ({ page }) => {
+  let reply = fleetInventory({ ...fleetRow(), group_id: 'edge-a', role: 'gateway' });
+  await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await page.locator('#fleet-observations-group').selectOption('group:edge-a');
+  reply = { ...fleetInventory(), available: false, expected_nodes: null, fresh_nodes: null,
+    generation: '10', nodes: [] };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-group')).toHaveValue('all');
+  await expect(page.locator('#fleet-observations-group')).toBeDisabled();
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting unavailable');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+  reply = { ...fleetInventory(), generation: '11', nodes: [{ ...fleetRow(), group_id: 'edge-1\n', role: 'gateway' }] };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+  await expect(page.locator('#fleet-observations-group')).toHaveValue('all');
+  await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(0);
+  reply = { ...fleetInventory(), generation: '1', observer_instance_id: 'bbbbbbbbbbbbbbbb',
+    nodes: [{ ...fleetRow(), group_id: 'edge-b', role: 'gateway' }] };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-group option[value="group:edge-b"]')).toHaveCount(1);
+  await expect(page.locator('#fleet-observations-group option[value="group:edge-a"]')).toHaveCount(0);
+  await page.locator('#fleet-observations-group').selectOption('group:edge-b');
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.locator('#fleet-observations-group')).toHaveValue('all');
+  await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(0);
 });

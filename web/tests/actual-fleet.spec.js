@@ -12,6 +12,9 @@ test('native fleet UI matches three owned HTTPS peers without browser-held machi
   const snapshot = await response.json();
   expect(snapshot.expected_nodes).toBe(3);
   expect(snapshot.fresh_nodes).toBe(1);
+  expect(Object.fromEntries(snapshot.nodes.map(row => [row.node_id, [row.group_id, row.role]]))).toEqual({
+    'good-edge': ['edge-a', 'gateway'], 'expected-edge': ['edge-b', 'gateway'], 'tls-edge': [null, null],
+  });
   const mutations = [];
   const peerRequests = [];
   page.on('request', req => {
@@ -34,6 +37,8 @@ test('native fleet UI matches three owned HTTPS peers without browser-held machi
   for (const expected of snapshot.nodes) {
     const row = rows.filter({ has: page.locator('td:first-child > strong', { hasText: new RegExp(`^${expected.node_id}$`) }) });
     await expect(row).toContainText(expected.endpoint);
+    await expect(row).toContainText(`Inventory group: ${expected.group_id ?? 'Unassigned'}`);
+    await expect(row).toContainText(`Inventory role: ${expected.role ?? 'Unassigned'}`);
     if (expected.observation) {
       await expect(row).toContainText(expected.observation.instance_id);
       await expect(row).toContainText(expected.observation.config_digest);
@@ -41,10 +46,21 @@ test('native fleet UI matches three owned HTTPS peers without browser-held machi
   }
   await expect(rows.filter({ hasText: 'expected-edge' })).toContainText('Identity mismatch');
   await expect(rows.filter({ hasText: 'tls-edge' })).toContainText('Unavailable');
+  await page.locator('#fleet-observations-group').selectOption('group:edge-a');
+  await expect(rows).toHaveCount(1);
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting: 1 of 1 fresh');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 3 fresh');
+  await page.locator('#fleet-observations-group').selectOption('group:edge-b');
+  await expect(rows).toHaveCount(1);
+  await expect(page.locator('#fleet-observations-selected-coverage')).toHaveText('Selected reporting: 0 of 1 fresh');
+  await page.locator('#fleet-observations-group').selectOption('ungrouped');
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText('tls-edge');
   await page.locator('#locale-select').selectOption('ko');
   await expect(page.locator('#fleet-observations-title')).not.toHaveText('Fleet observations');
   await page.locator('#fleet-observations-refresh').click();
-  await expect(rows).toHaveCount(3);
+  await expect(rows).toHaveCount(1);
+  await expect(page.locator('#fleet-observations-group')).toHaveValue('ungrouped');
   await expect(page.locator('#fleet-observations-process')).toHaveText(snapshot.observer_instance_id);
   expect(mutations).toEqual([]);
   expect(peerRequests).toEqual([]);
