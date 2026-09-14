@@ -50,14 +50,17 @@ function fleetObservation(value, id) {
 }
 function fleetState(data) {
   if (!isObject(data) || typeof data.configured !== 'boolean' || typeof data.available !== 'boolean'
-    || !finiteInteger(data.expected_nodes, 64) || !finiteInteger(data.fresh_nodes, 64)
-    || data.fresh_nodes > data.expected_nodes || data.stale_after_seconds !== 60
-    || !Array.isArray(data.nodes) || data.nodes.length > 64 || data.nodes.length !== data.expected_nodes) return null;
+    || data.stale_after_seconds !== 60 || !Array.isArray(data.nodes) || data.nodes.length > 64) return null;
   const generation = data.generation === null ? null : observerDecimal(data.generation) ? data.generation : undefined;
   if (generation === undefined) return null;
   if (!data.configured) return !data.available && generation === null && data.expected_nodes === 0
-    && data.fresh_nodes === 0 ? { kind: 'disabled', generation, nodes: [] } : null;
+    && data.fresh_nodes === 0 && data.nodes.length === 0 ? { kind: 'disabled', generation, nodes: [] } : null;
   if (generation === null) return null;
+  // A failed inventory reload cannot certify either the expected roster or its coverage.
+  if (!data.available) return data.expected_nodes === null && data.fresh_nodes === null
+    && data.nodes.length === 0 ? { kind: 'unavailable', generation, nodes: [] } : null;
+  if (!finiteInteger(data.expected_nodes, 64) || !finiteInteger(data.fresh_nodes, 64)
+    || data.fresh_nodes > data.expected_nodes || data.nodes.length !== data.expected_nodes) return null;
   const seen = new Set();
   const nodes = [];
   for (const row of data.nodes) {
@@ -72,7 +75,7 @@ function fleetState(data) {
     nodes.push({ ...row, observation });
   }
   if (nodes.filter(row => row.condition === 'fresh').length !== data.fresh_nodes) return null;
-  return { kind: data.available ? 'available' : 'unavailable', generation, nodes, expected: data.expected_nodes };
+  return { kind: 'available', generation, nodes, expected: data.expected_nodes };
 }
 function fleetCondition(row) {
   if (row.condition !== 'fresh' || fleetError) return row.condition === 'fresh' && fleetError ? 'stale' : row.condition;

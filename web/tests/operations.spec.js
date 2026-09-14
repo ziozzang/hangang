@@ -712,3 +712,42 @@ test('fresh sample ages to historical without a new server response', async ({ p
   await expect(page.locator('#fleet-observations-coverage')).toContainText('0');
   await expect(page.locator('#fleet-observations-rows')).toContainText('과거에 보고된 준비 상태');
 });
+
+test('unavailable inventory has unknown coverage, distinct from a valid empty roster', async ({ page }) => {
+  let reply = fleetInventory();
+  await fixture(page, false, rows, [], undefined, route => route.fulfill({ json: reply }));
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('1 of 1 fresh');
+  reply = {
+    configured: true, available: false, generation: '10', expected_nodes: null,
+    fresh_nodes: null, stale_after_seconds: 60, nodes: [],
+  };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-state')).toHaveText('Inventory unavailable');
+  await expect(page.locator('#fleet-observations-generation')).toHaveText('10');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+  await expect(page.locator('#fleet-observations-rows tr')).toHaveCount(0);
+  await expect(page.locator('#fleet-observations-empty')).toBeHidden();
+  reply = {
+    configured: true, available: true, generation: '11', expected_nodes: 0,
+    fresh_nodes: 0, stale_after_seconds: 60, nodes: [],
+  };
+  await page.locator('#fleet-observations-refresh').click();
+  await expect(page.locator('#fleet-observations-state')).toHaveText('Inventory available');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('0 of 0 fresh');
+  await expect(page.locator('#fleet-observations-empty')).toBeVisible();
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('0개 중 0개 최신');
+});
+
+test('available inventory with null counts is unknown rather than an empty success', async ({ page }) => {
+  await fixture(page, false, rows, [], undefined, {
+    configured: true, available: true, generation: '1', expected_nodes: null,
+    fresh_nodes: null, stale_after_seconds: 60, nodes: [],
+  });
+  await page.locator('a[href="#operations"]').click();
+  await expect(page.locator('#fleet-observations-state')).toHaveText('Unknown');
+  await expect(page.locator('#fleet-observations-coverage')).toHaveText('—');
+  await expect(page.locator('#fleet-observations-empty')).toBeHidden();
+  await expect(page.locator('#fleet-observations-message')).toContainText('invalid');
+});
