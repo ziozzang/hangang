@@ -7,7 +7,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('HANGANG_BINARY', ROOT / 'target/debug/hangang')).resolve()
-EXPECT = os.environ.get('HANGANG_COOKIE_EXPECT', 'pass')
 
 
 def free_ports(count):
@@ -28,9 +27,13 @@ def certificate(root):
     return cert, key
 
 
-def cookie_names(handler):
+def cookie_evidence(handler):
     values = handler.headers.get_all('Cookie', [])
-    return sorted({part.split('=', 1)[0].strip() for value in values for part in value.split(';') if '=' in part})
+    # PHP-style stacks expose the first Cookie field. A compliant H2-to-H1 bridge
+    # joins cookie crumbs into one field before reaching this origin.
+    first = values[0] if values else ''
+    names = sorted({part.split('=', 1)[0].strip() for part in first.split(';') if '=' in part})
+    return names, len(values)
 
 
 class Origin(BaseHTTPRequestHandler):
@@ -44,20 +47,22 @@ class Origin(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers(); self.wfile.write(body)
     def do_GET(self):
-        names = cookie_names(self)
+        names, field_count = cookie_evidence(self)
         if self.path == '/seed':
             return self.reply(200, {'seed': True}, (
                 'wordpress_test_cookie=WP%20Cookie%20check; Path=/; Secure; SameSite=Lax',
-                'wordpress_logged_in=owned-session; Path=/; Secure; HttpOnly; SameSite=Lax'))
+                'wordpress_logged_in=owned-session; Path=/; Secure; HttpOnly; SameSite=Lax',
+                'wordpress_sec_seed=seed-sec; Path=/; Secure; HttpOnly; SameSite=Lax',
+                'wordpress_settings=editor%3Dtinymce; Path=/; Secure; SameSite=Lax'))
         if self.path == '/account':
             ok = {'wordpress_sec','wordpress_pref'}.issubset(names)
-            return self.reply(200 if ok else 401, {'cookie_names': names})
+            return self.reply(200 if ok else 401, {'cookie_names': names, 'cookie_field_count': field_count})
         self.reply(404, {})
     def do_POST(self):
         size = int(self.headers.get('Content-Length', '0')); body = self.rfile.read(size).decode()
-        names = cookie_names(self)
-        ok = self.path == '/login' and {'wordpress_test_cookie','wordpress_logged_in'}.issubset(names)
-        self.reply(200 if ok else 403, {'method':'POST','body':body,'cookie_names':names,'set_cookie_count':2}, (
+        names, field_count = cookie_evidence(self)
+        ok = self.path == '/login' and {'wordpress_test_cookie','wordpress_logged_in','wordpress_sec_seed','wordpress_settings'}.issubset(names)
+        self.reply(200 if ok else 403, {'method':'POST','body':body,'cookie_names':names,'cookie_field_count':field_count}, (
             'wordpress_sec=owned-sec; Path=/; Secure; HttpOnly; SameSite=Lax',
             'wordpress_pref=dashboard; Path=/; Secure; SameSite=Lax'))
 
@@ -70,7 +75,6 @@ def stop(child):
 
 
 def main():
-    if EXPECT not in ('pass','fail'): raise RuntimeError('HANGANG_COOKIE_EXPECT must be pass or fail')
     with ExitStack() as stack:
         root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='hangang-cookie-browser-')))
         public, admin, origin_port, fixture_port = free_ports(4)
@@ -99,10 +103,10 @@ def main():
         try:
             subprocess.run(['npx','playwright','test','tests/actual-cookie.spec.js','--workers=1','--reporter=line','--output',artifacts],
                 cwd=ROOT/'web',env={**os.environ,'HANGANG_UI_TEST_PORT':str(fixture_port),
-                'HANGANG_COOKIE_ACTUAL_BASE':f'https://localhost:{public}','HANGANG_COOKIE_EXPECT':EXPECT},check=True)
+                'HANGANG_COOKIE_ACTUAL_BASE':f'https://localhost:{public}'},check=True)
         except BaseException:
             print(f'Cookie browser artifacts retained at {artifacts}',flush=True); raise
         else: shutil.rmtree(artifacts)
-    print(f'Owned Chromium H2/H1 cookie regression: expected {EXPECT} observed')
+    print('Owned Chromium H2/H1 cookie round-trip passed')
 
 if __name__ == '__main__': main()
