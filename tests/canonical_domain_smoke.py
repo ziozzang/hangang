@@ -124,7 +124,7 @@ def main():
         etag, original = current()
         invalid = copy.deepcopy(original)
         invalid['http'][0]['canonical_domain']['host'] = 'outside.test'
-        require(publish(invalid, etag) == 400, 'off-group destination accepted')
+        require(publish(invalid, etag) == 422, 'off-group destination did not return validation error')
         require(current() == (etag, original), 'invalid publication changed live state')
         disabled = copy.deepcopy(original)
         disabled['http'][0]['canonical_domain']['enabled'] = False

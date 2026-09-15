@@ -739,7 +739,7 @@ test('editing native fields preserves advanced route properties and refreshes th
   await expect(page.getByLabel('Concurrent request limit')).toHaveValue('5');
   await expect(sectionByTitle(page, 'External authorization')).toHaveJSProperty('open', true);
   await expect(page.getByLabel('Authorization URL')).toHaveValue('http://auth.internal/check');
-  await page.getByLabel('Path prefix').fill('/api/'); await page.getByRole('button', { name: 'Save route' }).click();
+  await page.getByLabel('Path prefix', { exact: true }).fill('/api/'); await page.getByRole('button', { name: 'Save route' }).click();
   const update = calls.find((call) => call.path === '/v1/routes/http/api' && call.method === 'PUT');
   expect(update.headers['if-match']).toBe('"8"');
   expect(JSON.parse(update.body)).toMatchObject({ id: 'api', path_prefix: '/api/', max_requests: 5, auth: { ...auth, forward_response: false }, future_field: { keep: true } });
@@ -877,7 +877,7 @@ test('edits bounded request and response transformations with native controls an
   await page.getByLabel('Response transform output limit').fill('16384');
   await page.getByLabel('Response transform set headers').fill('x-transformed: yes');
   await page.getByLabel('Response transform remove headers').fill('x-internal');
-  await page.getByLabel('Path prefix').fill('/stream');
+  await page.getByLabel('Path prefix', { exact: true }).fill('/stream');
   await page.getByRole('button', { name: 'Save route' }).click();
   const update = calls.find(call => call.path === '/v1/routes/http/api' && call.method === 'PUT');
   expect(JSON.parse(update.body)).toMatchObject({

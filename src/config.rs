@@ -974,6 +974,7 @@ impl Config {
                     canonical.host.len() <= 253
                         && !canonical.host.is_empty()
                         && canonical.host.is_ascii()
+                        && canonical.host.parse::<std::net::IpAddr>().is_err()
                         && canonical.host == canonical.host.to_ascii_lowercase()
                         && !canonical.host.ends_with('.')
                         && !canonical.host.contains([':', '@'])
@@ -2513,6 +2514,13 @@ mod tests {
             bad.http[0].canonical_domain.as_mut().unwrap().host = invalid.into();
             assert!(bad.validate().is_err(), "{invalid:?}");
         }
+        let mut ip_group = config.clone();
+        ip_group.http[0].hosts.push("192.0.2.1".into());
+        ip_group.http[0].canonical_domain.as_mut().unwrap().host = "192.0.2.1".into();
+        assert!(
+            ip_group.validate().is_err(),
+            "canonical target must be a DNS host"
+        );
         for status in [200, 303, 426] {
             let mut bad = config.clone();
             bad.http[0].canonical_domain.as_mut().unwrap().status = status;

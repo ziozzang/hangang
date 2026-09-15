@@ -37,6 +37,7 @@ fn config(revision: u64, id: &str) -> Config {
             cache: None,
             host: None,
             hosts: Vec::new(),
+            canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
             headers: BTreeMap::new(),

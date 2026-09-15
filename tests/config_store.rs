@@ -60,6 +60,7 @@ fn config(revision: u64, id: &str) -> Config {
             id: id.into(),
             host: None,
             hosts: Vec::new(),
+            canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
             max_requests: None,

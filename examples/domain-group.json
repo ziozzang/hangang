@@ -19,10 +19,10 @@
         "scheme": "https",
         "status": 302,
         "path_prefixes": [
-          "/"
+          "/wp-login.php",
+          "/wp-admin"
         ],
         "exclude_path_prefixes": [
-          "/wp-login.php",
           "/wp-admin/admin-ajax.php",
           "/wp-admin/admin-post.php"
         ],
@@ -30,7 +30,8 @@
           "GET",
           "HEAD"
         ]
-      }
+      },
+      "preserve_host": true
     }
   ],
   "tcp": []

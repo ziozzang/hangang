@@ -1998,7 +1998,7 @@ function canonicalDomainSection(route) {
       span2(field('Configure canonical redirect', 'canonical_configured', configured, { checkbox: true, toggles: 'canonical_domain', help: 'Unchecked removes this redirect policy from the route.' })),
       span2(field('Canonical redirect active', 'canonical_enabled', canonical.enabled !== false, { group: 'canonical_domain', checkbox: true, help: 'Inactive keeps the settings but does not redirect requests.' })),
       field('Canonical host', 'canonical_host', canonical.host || '', { group: 'canonical_domain', placeholder: 'example.com', help: 'Exact DNS host that must be the route host or a member of Domain group hosts. Wildcards are not allowed.' }),
-      field('Canonical scheme', 'canonical_scheme', canonical.scheme || 'https', { group: 'canonical_domain', select: [['https', 'HTTPS'], ['http', 'HTTP']] }),
+      field('Redirect destination scheme', 'canonical_scheme', canonical.scheme || 'https', { group: 'canonical_domain', select: [['https', 'HTTPS'], ['http', 'HTTP']], help: 'The canonical host itself is unchanged. Use Require TLS to enforce HTTPS on that host.' }),
       field('Redirect status', 'canonical_status', canonical.status ?? 302, { group: 'canonical_domain', select: [['301', '301'], ['302', '302'], ['307', '307'], ['308', '308']] }),
       field('Redirected methods', 'canonical_methods', (canonical.methods || ['GET', 'HEAD']).join('\n'), { group: 'canonical_domain', textarea: true, help: 'One method per line. Only GET and HEAD are supported.' }),
       field('Included path prefixes', 'canonical_path_prefixes', (canonical.path_prefixes || ['/']).join('\n'), { group: 'canonical_domain', textarea: true, help: 'One absolute path prefix per line. Prefixes match path-segment boundaries: /admin matches /admin and /admin/…, not /administrator.' }),
@@ -2543,6 +2543,7 @@ function routeFromForm() {
       const previous = isObject(route.canonical_domain) ? route.canonical_domain : {};
       const host = text('canonical_host').toLowerCase();
       const exactHost = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$(?![\s\S])/.test(host)
+        && !(host.split('.').length === 4 && host.split('.').every(part => /^(0|[1-9][0-9]{0,2})$/.test(part) && Number(part) <= 255))
         && host.length <= 253 && !host.split('.').some(label => !label || label.length > 63 || label.startsWith('-') || label.endsWith('-'));
       if (!exactHost || host.includes('*') || ![...(route.hosts || []), route.host].filter(Boolean).some(member => member.toLowerCase() === host))
         throw new Error(t('Canonical host must be an exact member of the route host or Domain group hosts'));
