@@ -275,6 +275,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         id: "route".into(),
         host: None,
         hosts: Vec::new(),
+        canonical_domain: None,
         path_prefix: None,
         path_match: Default::default(),
         max_requests: None,
@@ -296,6 +297,41 @@ fn route(backends: Vec<String>) -> HttpRoute {
         response_set_headers: std::collections::BTreeMap::new(),
         response_remove_headers: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn http2_canonical_domain_redirect_preserves_encoded_uri_without_origin_access() {
+    let (backend, seen, backend_task) = upstream("must-not-run").await;
+    let mut alias = route(vec![format!("http://{backend}")]);
+    alias.hosts = vec!["www.example.test".into(), "example.test".into()];
+    alias.require_tls = true;
+    alias.canonical_domain = Some(hangang::config::CanonicalDomain {
+        enabled: true,
+        host: "example.test".into(),
+        scheme: hangang::config::CanonicalScheme::Https,
+        status: 308,
+        path_prefixes: vec!["/wp-login.php".into()],
+        exclude_path_prefixes: vec![],
+        methods: vec!["GET".into(), "HEAD".into()],
+    });
+    let (proxy, policy) = proxy(vec![alias]);
+    let (front, front_task) = frontend_h2(proxy).await;
+    let mut client = h2_client(front).await;
+    let response = client.send_request(Request::builder()
+        .uri(format!("http://{front}/wp-login.php/%2Fkeep?redirect_to=https%3A%2F%2Fevil.test&x=1&x=2"))
+        .header("host", "www.example.test")
+        .body(UnknownLengthBody(Default::default())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), 308);
+    assert_eq!(
+        response.headers()["location"],
+        "https://example.test/wp-login.php/%2Fkeep?redirect_to=https%3A%2F%2Fevil.test&x=1&x=2"
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-hangang-canonical-redirect"], "true");
+    assert!(seen.lock().unwrap().is_empty());
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
 }
 
 fn proxy(routes: Vec<HttpRoute>) -> (Proxy, Arc<PolicyPool>) {

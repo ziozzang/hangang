@@ -1240,6 +1240,21 @@ impl Proxy {
             workload: Some(workload),
             jwt: None,
         });
+        // Canonical-domain policy precedes require_tls so an alias needs only
+        // one redirect. The destination is entirely operator configured; the
+        // request contributes only its already parsed path and query.
+        if let Some(policy) = runtime.route.canonical_domain.as_ref()
+            && let Some(redirect) = canonical_domain_redirect(
+                &request,
+                &edge,
+                canonical_resource_path
+                    .as_deref()
+                    .unwrap_or(request.uri().path()),
+                policy,
+            )
+        {
+            return Ok(redirect);
+        }
         // Enforce TLS for require_tls routes reached over plaintext.
         if runtime.route.require_tls && edge.proto != "https" {
             return Ok(self.https_redirect(
@@ -2471,6 +2486,67 @@ impl Proxy {
     }
 }
 
+fn canonical_domain_redirect(
+    request: &Request<Body>,
+    edge: &EdgeContext,
+    canonical_path: &str,
+    policy: &crate::config::CanonicalDomain,
+) -> Option<Response<Body>> {
+    if !policy.enabled
+        || !policy
+            .methods
+            .iter()
+            .any(|method| method == request.method().as_str())
+        || !policy
+            .path_prefixes
+            .iter()
+            .any(|prefix| canonical_prefix_matches(prefix, canonical_path))
+        || policy
+            .exclude_path_prefixes
+            .iter()
+            .any(|prefix| canonical_prefix_matches(prefix, canonical_path))
+    {
+        return None;
+    }
+    let current = edge
+        .forwarded_host
+        .as_ref()?
+        .to_str()
+        .ok()?
+        .parse::<hyper::http::uri::Authority>()
+        .ok()?;
+    if current.host().eq_ignore_ascii_case(&policy.host) {
+        return None;
+    }
+    let scheme = match policy.scheme {
+        crate::config::CanonicalScheme::Http => "http",
+        crate::config::CanonicalScheme::Https => "https",
+    };
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let location = HeaderValue::from_str(&format!("{scheme}://{}{path}", policy.host)).ok()?;
+    let mut redirect = response(policy.status, "redirecting to canonical domain");
+    redirect.headers_mut().insert(header::LOCATION, location);
+    redirect
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    redirect.headers_mut().insert(
+        HeaderName::from_static("x-hangang-canonical-redirect"),
+        HeaderValue::from_static("true"),
+    );
+    Some(redirect)
+}
+
+fn canonical_prefix_matches(prefix: &str, path: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || (path.starts_with(prefix)
+            && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))
+}
+
 #[derive(Debug)]
 enum InspectError {
     TooLarge,
@@ -3260,6 +3336,122 @@ mod tests {
     use super::*;
     use ipnet::IpNet;
 
+    fn canonical_policy() -> crate::config::CanonicalDomain {
+        crate::config::CanonicalDomain {
+            enabled: true,
+            host: "example.test".into(),
+            scheme: crate::config::CanonicalScheme::Https,
+            status: 302,
+            path_prefixes: vec!["/wp-login.php".into(), "/wp-admin".into()],
+            exclude_path_prefixes: vec!["/wp-admin/admin-ajax.php".into()],
+            methods: vec!["GET".into(), "HEAD".into()],
+        }
+    }
+
+    #[test]
+    fn canonical_redirect_uses_static_target_and_raw_path_query() {
+        let request = Request::builder()
+            .uri("/wp-login.php/%2fkeep?redirect_to=https%3A%2F%2Fevil.test%2Fx&x=1&x=2")
+            .body(full_body(Bytes::new()))
+            .unwrap();
+        // This is the effective host after trusted-proxy resolution; it may
+        // select the alias, but it can never become destination URL text.
+        let edge = EdgeContext {
+            client_ip: "192.0.2.1".parse().unwrap(),
+            proto: "http",
+            forwarded_host: Some(HeaderValue::from_static("www.example.test:8443")),
+            forwarded_port: 8443,
+        };
+        let response = canonical_domain_redirect(
+            &request,
+            &edge,
+            "/wp-login.php/%2fkeep",
+            &canonical_policy(),
+        )
+        .unwrap();
+        assert_eq!(response.status(), 302);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "https://example.test/wp-login.php/%2fkeep?redirect_to=https%3A%2F%2Fevil.test%2Fx&x=1&x=2"
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_exclusions_methods_boundaries_and_loop_guard() {
+        let policy = canonical_policy();
+        let edge = EdgeContext {
+            client_ip: "192.0.2.1".parse().unwrap(),
+            proto: "https",
+            forwarded_host: Some(HeaderValue::from_static("www.example.test")),
+            forwarded_port: 443,
+        };
+        let request = |method, path| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(full_body(Bytes::new()))
+                .unwrap()
+        };
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::GET, "/wp-admin"),
+                &edge,
+                "/wp-admin",
+                &policy
+            )
+            .is_some()
+        );
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::GET, "/wp-admin/tools"),
+                &edge,
+                "/wp-admin/tools",
+                &policy
+            )
+            .is_some()
+        );
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::GET, "/wp-adminx"),
+                &edge,
+                "/wp-adminx",
+                &policy
+            )
+            .is_none()
+        );
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::GET, "/wp-admin/admin-ajax.php/x"),
+                &edge,
+                "/wp-admin/admin-ajax.php/x",
+                &policy
+            )
+            .is_none()
+        );
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::POST, "/wp-login.php"),
+                &edge,
+                "/wp-login.php",
+                &policy
+            )
+            .is_none()
+        );
+        let canonical = EdgeContext {
+            forwarded_host: Some(HeaderValue::from_static("EXAMPLE.test:443")),
+            ..edge
+        };
+        assert!(
+            canonical_domain_redirect(
+                &request(Method::GET, "/wp-login.php"),
+                &canonical,
+                "/wp-login.php",
+                &policy
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn authority_validation_is_strict() {
         let ok = [
@@ -3374,6 +3566,7 @@ mod tests {
             id: "test".into(),
             host: None,
             hosts: Vec::new(),
+            canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
             max_requests: None,

@@ -276,6 +276,9 @@ pub struct HttpRoute {
         deserialize_with = "deserialize_http_hosts"
     )]
     pub hosts: Vec<String>,
+    /// Redirect alias hosts to one operator-selected canonical domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_domain: Option<CanonicalDomain>,
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
@@ -311,6 +314,42 @@ pub struct HttpRoute {
     /// Streaming-safe response header removals (e.g. removing `server`).
     #[serde(default)]
     pub response_remove_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CanonicalScheme {
+    Http,
+    #[default]
+    Https,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalDomain {
+    #[serde(default = "enabled_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+    pub host: String,
+    #[serde(default)]
+    pub scheme: CanonicalScheme,
+    #[serde(default = "canonical_status")]
+    pub status: u16,
+    #[serde(default = "canonical_paths")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default)]
+    pub exclude_path_prefixes: Vec<String>,
+    #[serde(default = "canonical_methods")]
+    pub methods: Vec<String>,
+}
+
+fn canonical_status() -> u16 {
+    302
+}
+fn canonical_paths() -> Vec<String> {
+    vec!["/".into()]
+}
+fn canonical_methods() -> Vec<String> {
+    vec!["GET".into(), "HEAD".into()]
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -930,6 +969,83 @@ impl Config {
                     "duplicate hosts pattern"
                 );
             }
+            if let Some(canonical) = &r.canonical_domain {
+                ensure!(
+                    canonical.host.len() <= 253
+                        && !canonical.host.is_empty()
+                        && canonical.host.is_ascii()
+                        && canonical.host == canonical.host.to_ascii_lowercase()
+                        && !canonical.host.ends_with('.')
+                        && !canonical.host.contains([':', '@'])
+                        && !crate::host_match::is_glob(&canonical.host)
+                        && crate::host_match::validate_pattern(&canonical.host).is_ok(),
+                    "canonical_domain host must be an exact DNS host"
+                );
+                ensure!(
+                    r.host.iter().chain(r.hosts.iter()).any(|host| {
+                        !crate::host_match::is_glob(host)
+                            && host.eq_ignore_ascii_case(&canonical.host)
+                    }),
+                    "canonical_domain host must belong to route exact host or hosts"
+                );
+                ensure!(
+                    !(r.require_tls && canonical.scheme == CanonicalScheme::Http),
+                    "canonical_domain http scheme conflicts with require_tls"
+                );
+                ensure!(
+                    matches!(canonical.status, 301 | 302 | 307 | 308),
+                    "canonical_domain status must be 301, 302, 307 or 308"
+                );
+                ensure!(
+                    !canonical.path_prefixes.is_empty()
+                        && canonical.path_prefixes.len() <= 32
+                        && canonical.exclude_path_prefixes.len() <= 32,
+                    "canonical_domain path prefixes must contain 1..32 includes and at most 32 excludes"
+                );
+                ensure!(
+                    canonical
+                        .path_prefixes
+                        .iter()
+                        .chain(&canonical.exclude_path_prefixes)
+                        .map(String::len)
+                        .sum::<usize>()
+                        <= 64 * 1024,
+                    "canonical_domain path prefix bytes exceed 65536"
+                );
+                let mut includes = std::collections::HashSet::new();
+                let mut excludes = std::collections::HashSet::new();
+                for prefix in &canonical.path_prefixes {
+                    ensure!(
+                        valid_canonical_prefix(prefix),
+                        "canonical_domain path prefix is invalid"
+                    );
+                    ensure!(
+                        includes.insert(prefix),
+                        "canonical_domain include prefix duplicated"
+                    );
+                }
+                for prefix in &canonical.exclude_path_prefixes {
+                    ensure!(
+                        valid_canonical_prefix(prefix),
+                        "canonical_domain path prefix is invalid"
+                    );
+                    ensure!(
+                        excludes.insert(prefix) && !includes.contains(prefix),
+                        "canonical_domain exclude prefix duplicated or conflicts with include"
+                    );
+                }
+                ensure!(
+                    !canonical.methods.is_empty() && canonical.methods.len() <= 2,
+                    "canonical_domain methods must contain 1..2 safe values"
+                );
+                let mut methods = std::collections::HashSet::new();
+                for method in &canonical.methods {
+                    ensure!(
+                        matches!(method.as_str(), "GET" | "HEAD") && methods.insert(method),
+                        "canonical_domain method is invalid or duplicated"
+                    );
+                }
+            }
             if let Some(pattern) = &r.host_regex {
                 ensure!(
                     !pattern.is_empty() && pattern.len() <= 1024,
@@ -1413,6 +1529,18 @@ fn validate_http_match_host(host: &str) -> anyhow::Result<()> {
         "invalid match host"
     );
     Ok(())
+}
+
+fn valid_canonical_prefix(prefix: &str) -> bool {
+    prefix.starts_with('/')
+        && prefix.len() <= 2048
+        && !prefix.contains(['?', '#', '\\'])
+        && !prefix
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+        && !prefix
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
 }
 
 #[derive(Default)]
@@ -2352,6 +2480,69 @@ mod tests {
     fn route() -> Config {
         serde_json::from_str(r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080"]}]}"#)
             .unwrap()
+    }
+    #[test]
+    fn canonical_domain_defaults_and_group_validation_are_strict() {
+        let mut config = route();
+        config.http[0].hosts = vec!["www.example.test".into(), "example.test".into()];
+        config.http[0].canonical_domain = Some(
+            serde_json::from_value(serde_json::json!({
+                "host":"example.test"
+            }))
+            .unwrap(),
+        );
+        config.validate().unwrap();
+        let policy = config.http[0].canonical_domain.as_ref().unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.scheme, CanonicalScheme::Https);
+        assert_eq!(policy.status, 302);
+        assert_eq!(policy.path_prefixes, ["/"]);
+        assert_eq!(policy.methods, ["GET", "HEAD"]);
+
+        for invalid in [
+            "",
+            "*.example.test",
+            "foo?.example.test",
+            "Example.test",
+            "example.test.",
+            "example.test:443",
+            "other.test",
+            "éxample.test",
+        ] {
+            let mut bad = config.clone();
+            bad.http[0].canonical_domain.as_mut().unwrap().host = invalid.into();
+            assert!(bad.validate().is_err(), "{invalid:?}");
+        }
+        for status in [200, 303, 426] {
+            let mut bad = config.clone();
+            bad.http[0].canonical_domain.as_mut().unwrap().status = status;
+            assert!(bad.validate().is_err(), "{status}");
+        }
+        let mut bad = config.clone();
+        bad.http[0].canonical_domain.as_mut().unwrap().methods = vec!["POST".into()];
+        assert!(bad.validate().is_err());
+        bad = config.clone();
+        bad.http[0].canonical_domain.as_mut().unwrap().path_prefixes = vec!["wp-login.php".into()];
+        assert!(bad.validate().is_err());
+        for path in ["/a?b", "/a#b", "/a\\b", "/a b", "/a/../b", "/./a"] {
+            let mut bad = config.clone();
+            bad.http[0].canonical_domain.as_mut().unwrap().path_prefixes = vec![path.into()];
+            assert!(bad.validate().is_err(), "{path:?}");
+        }
+        bad = config.clone();
+        bad.http[0]
+            .canonical_domain
+            .as_mut()
+            .unwrap()
+            .exclude_path_prefixes = vec!["/".into()];
+        assert!(bad.validate().is_err(), "include/exclude exact conflict");
+        bad = config;
+        bad.http[0].require_tls = true;
+        bad.http[0].canonical_domain.as_mut().unwrap().scheme = CanonicalScheme::Http;
+        assert!(
+            bad.validate().is_err(),
+            "canonical policy cannot downgrade require_tls"
+        );
     }
     #[test]
     fn named_public_listener_validation_and_legacy_wire() {
