@@ -46,6 +46,10 @@ test-web:
 	cd web && npm test
 	python3 tests/web_smoke.py
 
+.PHONY: test-canonical-domain
+test-canonical-domain:
+	python3 tests/canonical_domain_smoke.py
+
 .PHONY: test-soak test-static-container test-static-admin-relay-container coverage-postgres
 test-soak:
 	python3 tests/soak.py
