@@ -4175,6 +4175,35 @@ async fn lua_route_rejects_ambiguous_duplicate_headers_but_plain_routes_forward_
 }
 
 #[tokio::test]
+async fn http2_split_cookies_are_joined_before_plain_http1_upstream() {
+    let (backend, seen, backend_task) = upstream("ok").await;
+    let (proxy, policy) = proxy(vec![route(vec![format!("http://{backend}")])]);
+    let (front, front_task) = frontend_h2(proxy).await;
+    let mut client = h2_client(front).await;
+    let request = Request::builder()
+        .uri(format!("http://{front}/wp-login.php"))
+        .header("cookie", "wordpress_test_cookie=WP%20Cookie%20check")
+        .header("cookie", "wordpress_logged_in=fake")
+        .body(UnknownLengthBody(Default::default()))
+        .unwrap();
+    let response = client.send_request(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].headers.get_all("cookie").iter().count(), 1);
+        assert_eq!(
+            seen[0].headers["cookie"],
+            "wordpress_test_cookie=WP%20Cookie%20check; wordpress_logged_in=fake"
+        );
+    }
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn disabled_domain_group_never_selects_its_upstream_and_can_reactivate() {
     let (origin, _, origin_task) = upstream("enabled-again").await;
     for enabled in [false, true] {
