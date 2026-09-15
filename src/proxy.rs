@@ -1014,6 +1014,15 @@ impl Proxy {
         // identity, route matching, cache policy, or authorization. Standard
         // hop headers stay until WebSocket validation and final forwarding.
         drop_client_connection_marked_headers(request.headers_mut());
+        // HTTP/2 may split Cookie into separate fields. All consumers must
+        // see the same RFC 9113 value, including matching, auth and HTTP/1
+        // upstreams on routes without Lua.
+        if join_cookie_headers(request.headers_mut()).is_err() {
+            return Ok(response(
+                StatusCode::BAD_REQUEST.as_u16(),
+                "invalid Cookie header",
+            ));
+        }
         if workload_evidence.is_some() {
             // An authenticated workload is the direct TLS peer. No CIDR-only
             // proxy delegation applies on this listener, and an external auth
@@ -2707,29 +2716,50 @@ fn parse_content_length(value: &HeaderValue) -> Option<u64> {
 /// any other repeated header that is neither hop-by-hop nor a regenerated
 /// forwarding header is rejected.
 fn collapse_duplicate_policy_headers(headers: &mut HeaderMap) -> Result<(), ()> {
-    let mut cookies: Option<Vec<u8>> = None;
+    join_cookie_headers(headers)?;
     for name in headers.keys() {
-        let mut values = headers.get_all(name).iter();
-        let (Some(first), Some(second)) = (values.next(), values.next()) else {
-            continue;
-        };
-        if is_standard_hop_by_hop(name) || is_forwarding_identity_header(name) {
-            continue;
-        }
-        if *name != header::COOKIE {
+        if has_duplicate_header(headers, name.as_str())
+            && !is_standard_hop_by_hop(name)
+            && !is_forwarding_identity_header(name)
+        {
             return Err(());
         }
-        let mut joined = first.as_bytes().to_vec();
-        for value in std::iter::once(second).chain(values) {
-            joined.extend_from_slice(b"; ");
-            joined.extend_from_slice(value.as_bytes());
-        }
-        cookies = Some(joined);
     }
-    if let Some(joined) = cookies {
-        let value = HeaderValue::from_bytes(&joined).map_err(|_| ())?;
-        headers.insert(header::COOKIE, value);
+    Ok(())
+}
+
+/// RFC 9113 section 8.2.3: join Cookie fields with `; ` before exposing
+/// them to a generic application or HTTP/1 peer. Do not apply list joining
+/// to Set-Cookie or any other header. Preserve byte order and sensitivity.
+fn join_cookie_headers(headers: &mut HeaderMap) -> Result<(), ()> {
+    let mut values = headers.get_all(header::COOKIE).iter();
+    let (Some(first), Some(second)) = (values.next(), values.next()) else {
+        return Ok(());
+    };
+    // The ingress parser already enforces its header budget. Each removed
+    // Cookie field includes more framing/name overhead than the two-byte
+    // separator added here (HTTP/2 also accounts for 32 bytes per field).
+    // Thus this representation cannot exceed the admitted header budget.
+    let capacity = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .try_fold(0_usize, |size, value| {
+            size.checked_add(value.as_bytes().len())?.checked_add(2)
+        })
+        .and_then(|size| size.checked_sub(2))
+        .ok_or(())?;
+    let mut joined = Vec::new();
+    joined.try_reserve_exact(capacity).map_err(|_| ())?;
+    joined.extend_from_slice(first.as_bytes());
+    let mut sensitive = first.is_sensitive();
+    for value in std::iter::once(second).chain(values) {
+        joined.extend_from_slice(b"; ");
+        joined.extend_from_slice(value.as_bytes());
+        sensitive |= value.is_sensitive();
     }
+    let mut value = HeaderValue::from_bytes(&joined).map_err(|_| ())?;
+    value.set_sensitive(sensitive);
+    headers.insert(header::COOKIE, value);
     Ok(())
 }
 
@@ -3505,6 +3535,30 @@ mod tests {
                 "{values:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cookie_join_preserves_bytes_sensitivity_and_other_fields() {
+        let mut headers = HeaderMap::new();
+        join_cookie_headers(&mut headers).unwrap();
+        assert!(!headers.contains_key(header::COOKIE));
+        let mut first = HeaderValue::from_bytes(b"a=\xff").unwrap();
+        first.set_sensitive(true);
+        headers.append(header::COOKIE, first);
+        join_cookie_headers(&mut headers).unwrap();
+        assert!(headers[header::COOKIE].is_sensitive());
+        headers.append(header::COOKIE, HeaderValue::from_static("b=2; c=3"));
+        headers.append(header::SET_COOKIE, HeaderValue::from_static("x=1; Path=/"));
+        headers.append(header::SET_COOKIE, HeaderValue::from_static("y=2; Path=/"));
+        headers.append("x-application", HeaderValue::from_static("first"));
+        headers.append("x-application", HeaderValue::from_static("second"));
+        join_cookie_headers(&mut headers).unwrap();
+        assert_eq!(headers[header::COOKIE].as_bytes(), b"a=\xff; b=2; c=3");
+        assert!(headers[header::COOKIE].is_sensitive());
+        assert_eq!(headers.get_all(header::SET_COOKIE).iter().count(), 2);
+        assert_eq!(headers.get_all("x-application").iter().count(), 2);
+        join_cookie_headers(&mut headers).unwrap();
+        assert_eq!(headers[header::COOKIE].as_bytes(), b"a=\xff; b=2; c=3");
     }
 
     #[test]

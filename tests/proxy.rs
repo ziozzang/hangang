@@ -4175,6 +4175,46 @@ async fn lua_route_rejects_ambiguous_duplicate_headers_but_plain_routes_forward_
 }
 
 #[tokio::test]
+async fn http2_cookie_join_precedes_route_matching_and_external_auth() {
+    let (backend, seen, backend_task) = upstream("app").await;
+    let (auth, auth_seen, auth_task) = upstream("allowed").await;
+    let mut configured = route(vec![format!("http://{backend}")]);
+    configured
+        .headers
+        .insert("cookie".into(), "a=1; session=ok".into());
+    configured.auth = Some(hangang::config::ExternalAuth {
+        url: format!("http://{auth}/check"),
+        request_headers: vec!["cookie".into()],
+        response_headers: vec![],
+        timeout_ms: 500,
+        forward_response: false,
+        terminal_response: false,
+    });
+    let (proxy, policy) = proxy(vec![configured]);
+    let (front, front_task) = frontend_h2(proxy).await;
+    let mut client = h2_client(front).await;
+    let request = Request::builder()
+        .uri(format!("http://{front}/account"))
+        .header("cookie", "a=1")
+        .header("cookie", "session=ok")
+        .body(UnknownLengthBody(Default::default()))
+        .unwrap();
+    let response = client.send_request(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    for records in [&auth_seen, &seen] {
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].headers.get_all("cookie").iter().count(), 1);
+        assert_eq!(records[0].headers["cookie"], "a=1; session=ok");
+    }
+    front_task.abort();
+    backend_task.abort();
+    auth_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn http2_split_cookies_are_joined_before_plain_http1_upstream() {
     let (backend, seen, backend_task) = upstream("ok").await;
     let (proxy, policy) = proxy(vec![route(vec![format!("http://{backend}")])]);
