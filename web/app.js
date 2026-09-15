@@ -1990,6 +1990,22 @@ function hostMatchFields(route) {
   return [mode, single, group, regex];
 }
 
+function canonicalDomainSection(route) {
+  const configured = isObject(route.canonical_domain);
+  const canonical = configured ? route.canonical_domain : {};
+  return section({ title: 'Canonical domain redirect', configured,
+    note: 'Redirect selected requests from this domain group to one exact member host. This does not share cookies, sessions, certificates or application state between hosts.', fields: [
+      span2(field('Configure canonical redirect', 'canonical_configured', configured, { checkbox: true, toggles: 'canonical_domain', help: 'Unchecked removes this redirect policy from the route.' })),
+      span2(field('Canonical redirect active', 'canonical_enabled', canonical.enabled !== false, { group: 'canonical_domain', checkbox: true, help: 'Inactive keeps the settings but does not redirect requests.' })),
+      field('Canonical host', 'canonical_host', canonical.host || '', { group: 'canonical_domain', placeholder: 'example.com', help: 'Exact DNS host that must be the route host or a member of Domain group hosts. Wildcards are not allowed.' }),
+      field('Canonical scheme', 'canonical_scheme', canonical.scheme || 'https', { group: 'canonical_domain', select: [['https', 'HTTPS'], ['http', 'HTTP']] }),
+      field('Redirect status', 'canonical_status', canonical.status ?? 302, { group: 'canonical_domain', select: [['301', '301'], ['302', '302'], ['307', '307'], ['308', '308']] }),
+      field('Redirected methods', 'canonical_methods', (canonical.methods || ['GET', 'HEAD']).join('\n'), { group: 'canonical_domain', textarea: true, help: 'One method per line. Only GET and HEAD are supported.' }),
+      field('Included path prefixes', 'canonical_path_prefixes', (canonical.path_prefixes || ['/']).join('\n'), { group: 'canonical_domain', textarea: true, help: 'One absolute path prefix per line. Prefixes match path-segment boundaries: /admin matches /admin and /admin/…, not /administrator.' }),
+      field('Excluded path prefixes', 'canonical_exclude_path_prefixes', (canonical.exclude_path_prefixes || []).join('\n'), { group: 'canonical_domain', textarea: true, help: 'Excluded segment prefixes win over included prefixes. Query strings are preserved but are not matched.' }),
+    ] });
+}
+
 function httpSections(route) {
   const editing = Boolean(state.editing.originalId);
   const auth = isObject(route.auth) ? route.auth : null;
@@ -2012,6 +2028,7 @@ function httpSections(route) {
       span2(field('Denied CIDRs', 'deny_cidrs', (route.deny_cidrs || []).join('\n'), { textarea: true, help: 'One IPv4 or IPv6 network per line (192.0.2.0/24, 2001:db8::/32); at most 1,024.' })),
       span2(field('Require TLS', 'require_tls', Boolean(route.require_tls), { checkbox: true, help: 'Plaintext requests (by terminated transport or, behind a trusted proxy, X-Forwarded-Proto) are answered with the HTTPS redirect configured by --https-redirect-code instead of being proxied.' })),
     ] }),
+    canonicalDomainSection(route),
     section({ title: 'Backends', open: true, fields: [
       backendFields('http', route),
       field('Upstream Host override', 'upstream_host', route.upstream_host || '', { placeholder: 'foo.bar', help: 'HTTP Host / HTTP/2 authority sent upstream; TLS SNI is configured under Upstream connection.' }),
@@ -2522,6 +2539,35 @@ function routeFromForm() {
       if (new Set(route.hosts.map(host => host.toLowerCase())).size !== route.hosts.length) throw new Error(t('Domain group hosts must be distinct, ignoring case'));
     }
     if (hostMode === 'regex' && !route.host_regex?.trim()) throw new Error(t('Enter a host regular expression'));
+    if (checked('canonical_configured')) {
+      const previous = isObject(route.canonical_domain) ? route.canonical_domain : {};
+      const host = text('canonical_host').toLowerCase();
+      const exactHost = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$(?![\s\S])/.test(host)
+        && host.length <= 253 && !host.split('.').some(label => !label || label.length > 63 || label.startsWith('-') || label.endsWith('-'));
+      if (!exactHost || host.includes('*') || ![...(route.hosts || []), route.host].filter(Boolean).some(member => member.toLowerCase() === host))
+        throw new Error(t('Canonical host must be an exact member of the route host or Domain group hosts'));
+      const methods = lines('canonical_methods');
+      if (!methods.length || methods.length > 2 || new Set(methods).size !== methods.length || methods.some(method => !['GET', 'HEAD'].includes(method)))
+        throw new Error(t('Canonical redirect methods must be distinct GET or HEAD values'));
+      const validatePrefixes = (name) => {
+        const values = lines(name);
+        if (values.length > 32 || new Set(values).size !== values.length || values.some(value => new TextEncoder().encode(value).length > 2048 || !value.startsWith('/') || /[?#\\]/.test(value) || [...value].some(character => /\s/u.test(character) || /\p{Cc}/u.test(character)) || value.split('/').some(segment => segment === '.' || segment === '..')))
+          throw new Error(t('Canonical path prefixes must be distinct valid absolute paths'));
+        return values;
+      };
+      const pathPrefixes = validatePrefixes('canonical_path_prefixes');
+      if (!pathPrefixes.length) throw new Error(t('Canonical redirect needs at least one included path prefix'));
+      const excludedPrefixes = validatePrefixes('canonical_exclude_path_prefixes');
+      if (excludedPrefixes.some(prefix => pathPrefixes.includes(prefix))) throw new Error(t('Canonical included and excluded path prefixes must not be identical'));
+      const canonical = { ...previous, host, scheme: raw('canonical_scheme'), status: integer('canonical_status', 'Redirect status', { min: 301, max: 308 }),
+        path_prefixes: pathPrefixes, exclude_path_prefixes: excludedPrefixes, methods };
+      if (!['http', 'https'].includes(canonical.scheme) || ![301, 302, 307, 308].includes(canonical.status)) throw new Error(t('Choose a supported canonical scheme and redirect status'));
+      if (checked('require_tls') && canonical.scheme === 'http') throw new Error(t('HTTP canonical scheme conflicts with Require TLS'));
+      if (checked('canonical_enabled')) { if (Object.hasOwn(previous, 'enabled')) canonical.enabled = true; else delete canonical.enabled; }
+      else canonical.enabled = false;
+      if ([...pathPrefixes, ...excludedPrefixes].reduce((bytes, prefix) => bytes + new TextEncoder().encode(prefix).length, 0) > 65536) throw new Error(t('Canonical path prefixes together must be at most 64 KiB'));
+      route.canonical_domain = canonical;
+    } else delete route.canonical_domain;
     route.path_prefix = optionalText('path_prefix');
     if (route.path_prefix && !route.path_prefix.startsWith('/')) throw new Error(t('Path prefix must start with /'));
     route.path_match = raw('path_match');

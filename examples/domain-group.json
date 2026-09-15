@@ -2,11 +2,35 @@
   "http": [
     {
       "id": "foo-site",
-      "hosts": ["foo.com", "www.foo.com"],
+      "hosts": [
+        "foo.com",
+        "www.foo.com"
+      ],
       "path_prefix": "/",
-      "backends": ["http://127.0.0.1:8081", "http://127.0.0.1:8082"],
+      "backends": [
+        "http://127.0.0.1:8081",
+        "http://127.0.0.1:8082"
+      ],
       "priority": 10,
-      "max_requests": 1024
+      "max_requests": 1024,
+      "canonical_domain": {
+        "enabled": true,
+        "host": "foo.com",
+        "scheme": "https",
+        "status": 302,
+        "path_prefixes": [
+          "/"
+        ],
+        "exclude_path_prefixes": [
+          "/wp-login.php",
+          "/wp-admin/admin-ajax.php",
+          "/wp-admin/admin-post.php"
+        ],
+        "methods": [
+          "GET",
+          "HEAD"
+        ]
+      }
     }
   ],
   "tcp": []
