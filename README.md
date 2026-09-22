@@ -98,6 +98,8 @@ python3 -m http.server 8081 --bind 127.0.0.1 --directory "$HANGANG_DEMO_BACKEND"
 
 From the repository root in your first terminal:
 
+On macOS, append `--allow-unsandboxed-lua` to both Hangang commands below to run this trusted Lua example. This development option does not provide Linux syscall isolation; see [macOS limits](docs/PLATFORMS.md#macos-limits).
+
 ```sh
 umask 077
 export HANGANG_DEMO_DIR="$(mktemp -d)"

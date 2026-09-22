@@ -68,7 +68,7 @@ Hangang은 **대화형 게이트웨이 관리, HTTP/TCP 트래픽 처리, 사용
 
 이 로컬 예제는 작동하는 프록시, Lua 거부 규칙, 관리 콘솔을 보여 줍니다. Git, Rust 1.96 이상, C 컴파일러, Python 3, OpenSSL, curl이 필요합니다. Node.js는 콘솔을 개발할 때만 필요하며 빌드된 자산은 이미 포함되어 있습니다.
 
-Linux amd64 바이너리와 `SHA256SUMS`는 [v0.2.0 릴리스](https://github.com/ziozzang/hangang/releases/tag/v0.2.1)에서 받을 수 있습니다. 압축 파일에는 Hangang과 보조 도구가 들어 있습니다. 압축을 풀기 전에 `sha256sum -c SHA256SUMS`로 검증하세요. 아래 절차는 소스에서 빌드합니다.
+Linux amd64 바이너리와 `SHA256SUMS`는 [v0.2.1 릴리스](https://github.com/ziozzang/hangang/releases/tag/v0.2.1)에서 받을 수 있습니다. 압축 파일에는 Hangang과 보조 도구가 들어 있습니다. 압축을 풀기 전에 `sha256sum -c SHA256SUMS`로 검증하세요. 아래 절차는 소스에서 빌드합니다.
 
 필드별 설명, 실행 중 변경, 문제 해결은 [예제 설정 가이드](examples/README.ko.md)를 읽어 보세요.
 
@@ -93,6 +93,8 @@ python3 -m http.server 8081 --bind 127.0.0.1 --directory "$HANGANG_DEMO_BACKEND"
 ### 3. Hangang 시작
 
 첫 번째 터미널의 저장소 루트에서 다음을 실행합니다.
+
+macOS에서는 아래 두 Hangang 명령에 `--allow-unsandboxed-lua`를 추가해야 이 신뢰할 수 있는 Lua 예제가 실행됩니다. 이 개발 옵션은 Linux syscall 격리를 제공하지 않습니다. [macOS 제한](docs/ko/PLATFORMS.md)을 참고하세요.
 
 ```sh
 umask 077

@@ -47,6 +47,8 @@ python3 -m http.server 8081 --bind 127.0.0.1 --directory "$HANGANG_DEMO_BACKEND"
 
 설정을 비공개이고 쓸 수 있는 runtime directory로 복사하십시오. 추적 중인 예제는 이후 설치에도 유용하도록 변경하지 마십시오.
 
+macOS에서는 아래 두 Hangang 명령에 `--allow-unsandboxed-lua`를 추가해야 이 신뢰할 수 있는 개발 예제가 활성화됩니다. 해당 모드에서는 Linux syscall 격리를 제공하지 않습니다. [플랫폼 제한](../docs/ko/PLATFORMS.md)을 참고하세요.
+
 ```sh
 umask 077
 export HANGANG_DEMO_DIR="$(mktemp -d)"

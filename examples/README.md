@@ -58,6 +58,8 @@ python3 -m http.server 8081 --bind 127.0.0.1 --directory "$HANGANG_DEMO_BACKEND"
 Copy the configuration into a private, writable runtime directory. Keep the
 tracked example unchanged so it remains useful for future installations:
 
+On macOS, append `--allow-unsandboxed-lua` to both Hangang commands below to enable this trusted development example. Linux syscall isolation is unavailable in that mode; see [platform limits](../docs/PLATFORMS.md).
+
 ```sh
 umask 077
 export HANGANG_DEMO_DIR="$(mktemp -d)"
