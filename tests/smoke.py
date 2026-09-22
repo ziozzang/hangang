@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import socket
 import socketserver
 import subprocess
@@ -116,7 +117,7 @@ class Smoke(unittest.TestCase):
         cls.state = Path(cls.temp.name) / "config.json"
         cls.state.write_text('{"revision":0,"http":[],"tcp":[]}')
         cls.log = open(Path(cls.temp.name) / "server.log", "w+")
-        cls.proc = subprocess.Popen([str(BINARY), "--config", str(cls.state), "--listen", f"127.0.0.1:{cls.public}", "--admin", f"127.0.0.1:{cls.admin}", "--threads", "2", "--lua-workers", "1", "--drain-seconds", "2"], env={**os.environ, "HANGANG_ADMIN_TOKEN": TOKEN}, stdout=cls.log, stderr=cls.log)
+        cls.proc = subprocess.Popen([str(BINARY), *shlex.split(os.environ.get("HANGANG_TEST_GATEWAY_ARGS", "")), "--config", str(cls.state), "--listen", f"127.0.0.1:{cls.public}", "--admin", f"127.0.0.1:{cls.admin}", "--threads", "2", "--lua-workers", "1", "--drain-seconds", "2"], env={**os.environ, "HANGANG_ADMIN_TOKEN": TOKEN}, stdout=cls.log, stderr=cls.log)
         try:
             for _ in range(100):
                 if cls.proc.poll() is not None:

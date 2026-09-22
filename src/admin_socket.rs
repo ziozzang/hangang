@@ -46,8 +46,12 @@ pub struct BoundAdminSocket {
 impl BoundAdminSocket {
     pub fn bind(path: &Path) -> Result<Self> {
         let bytes = path.as_os_str().as_bytes();
+        #[cfg(target_os = "macos")]
+        let max_path_bytes = 103;
+        #[cfg(not(target_os = "macos"))]
+        let max_path_bytes = 107;
         ensure!(
-            path.is_absolute() && !bytes.contains(&0) && bytes.len() <= 107,
+            path.is_absolute() && !bytes.contains(&0) && bytes.len() <= max_path_bytes,
             "admin socket path must be absolute and fit the Unix socket path limit"
         );
         let parent = path.parent().context("admin socket path needs a parent")?;
@@ -145,28 +149,59 @@ fn recover_stale_socket(path: &Path) -> Result<()> {
 }
 
 fn probe_socket_nonblocking(path: &Path) -> std::io::Result<()> {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let bytes = path.as_os_str().as_bytes();
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    #[cfg(target_os = "linux")]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let socket_type = libc::SOCK_STREAM;
+    let raw = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Darwin does not implement Linux's atomic SOCK_NONBLOCK/SOCK_CLOEXEC
+    // socket flags. Set the equivalent flags immediately after creation.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if status < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, status | libc::O_NONBLOCK) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let descriptor = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        if descriptor < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, descriptor | libc::FD_CLOEXEC) }
+                < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
     for (destination, source) in address.sun_path.iter_mut().zip(bytes) {
         *destination = *source as libc::c_char;
     }
+    #[cfg(target_os = "linux")]
+    let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    #[cfg(target_os = "macos")]
+    let length: libc::socklen_t = (std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        + bytes.len()
+        + 1)
+    .try_into()
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket path too long"))?;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket path too long")
+        })?;
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     let length = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
     let result = unsafe {
         libc::connect(
-            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            fd.as_raw_fd(),
             (&raw const address).cast::<libc::sockaddr>(),
             length,
         )

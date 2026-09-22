@@ -141,6 +141,15 @@ impl PolicyPool {
         }
     }
 
+    /// macOS development only: retain process/VM quotas without Linux seccomp.
+    #[cfg(target_os = "macos")]
+    pub fn allow_unsandboxed_lua(mut self, allow: bool) -> Self {
+        for slot in &mut self.slots {
+            slot.get_mut().allow_unsandboxed_lua = allow;
+        }
+        self
+    }
+
     pub async fn evaluate(&self, input: PolicyInput) -> Result<Decision> {
         validate_input(&input)?;
         match self.dispatch(WorkerRequest::Evaluate(input)).await? {
@@ -222,6 +231,8 @@ impl PolicyPool {
 
 #[derive(Default)]
 struct WorkerSlot {
+    #[cfg(target_os = "macos")]
+    allow_unsandboxed_lua: bool,
     worker: Option<RunningWorker>,
     retry_after: Option<TokioInstant>,
 }
@@ -280,6 +291,10 @@ impl WorkerSlot {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(target_os = "macos")]
+        if self.allow_unsandboxed_lua {
+            command.arg("--allow-unsandboxed-lua");
+        }
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn policy worker {}", executable.display()))?;
@@ -408,7 +423,13 @@ fn response_matches(request: &WorkerRequest, response: &WorkerResponse) -> bool 
 
 pub fn worker_main() -> Result<()> {
     apply_worker_limits()?;
-    crate::sandbox::install()?;
+    #[cfg(target_os = "macos")]
+    let development_lua = std::env::args().nth(2).as_deref() == Some("--allow-unsandboxed-lua");
+    #[cfg(not(target_os = "macos"))]
+    let development_lua = false;
+    if !development_lua {
+        crate::sandbox::install()?;
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

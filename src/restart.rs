@@ -90,15 +90,13 @@ pub struct ControlChannel {
 
 pub fn control_channel() -> io::Result<(ControlChannel, ControlChannel)> {
     let mut descriptors = [-1; 2];
+    #[cfg(target_os = "linux")]
+    let socket_type = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let socket_type = libc::SOCK_SEQPACKET;
     // SAFETY: `descriptors` has room for the two fds written by socketpair.
-    let result = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-            descriptors.as_mut_ptr(),
-        )
-    };
+    let result =
+        unsafe { libc::socketpair(libc::AF_UNIX, socket_type, 0, descriptors.as_mut_ptr()) };
     if result == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -106,6 +104,14 @@ pub fn control_channel() -> io::Result<(ControlChannel, ControlChannel)> {
     let left = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
     // SAFETY: as above, and this descriptor is distinct from `left`.
     let right = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    // `SOCK_CLOEXEC` is Linux-specific. The non-Linux fallback marks both
+    // ends close-on-exec before exposing either descriptor. Linux retains the
+    // atomic socket creation flag.
+    #[cfg(not(target_os = "linux"))]
+    {
+        set_cloexec(left.as_fd(), true)?;
+        set_cloexec(right.as_fd(), true)?;
+    }
     set_send_timeout(left.as_fd(), Duration::from_secs(15))?;
     set_send_timeout(right.as_fd(), Duration::from_secs(15))?;
     Ok((ControlChannel { fd: left }, ControlChannel { fd: right }))
@@ -431,13 +437,18 @@ fn send_frame_with_flags(
     message.msg_iovlen = 1;
     if let Some(descriptor) = descriptor {
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control.len() * size_of::<usize>();
+        // BSD stores this field as `socklen_t`; Linux uses `usize`.
+        #[allow(clippy::useless_conversion)]
+        let controllen = (control.len() * size_of::<usize>())
+            .try_into()
+            .map_err(|_| invalid_data("supervisor ancillary buffer is too large"))?;
+        message.msg_controllen = controllen;
         // SAFETY: the control buffer was sized with CMSG_SPACE for one RawFd.
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as _;
             ptr::write(
                 libc::CMSG_DATA(header).cast::<RawFd>(),
                 descriptor.as_raw_fd(),
@@ -479,11 +490,21 @@ fn receive_frame(socket: BorrowedFd<'_>) -> io::Result<ProtocolMessage> {
     message.msg_iov = &mut iovec;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len() * size_of::<usize>();
+    // BSD stores this field as `socklen_t`; Linux uses `usize`.
+    #[allow(clippy::useless_conversion)]
+    let controllen = (control.len() * size_of::<usize>())
+        .try_into()
+        .map_err(|_| invalid_data("supervisor ancillary buffer is too large"))?;
+    message.msg_controllen = controllen;
     let received = loop {
         // SAFETY: message points at writable frame and control buffers.
-        let result =
-            unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        // `MSG_CMSG_CLOEXEC` is Linux-specific. The fallback marks every
+        // descriptor CLOEXEC in `received_descriptors` before it escapes.
+        let result = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, flags) };
         if result == -1 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -559,11 +580,11 @@ fn received_descriptors(message: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
             return Err(invalid_data("unexpected supervisor ancillary message"));
         }
         // SAFETY: this computes the fixed cmsghdr length.
-        let header_length = unsafe { libc::CMSG_LEN(0) } as usize;
+        let header_length = unsafe { libc::CMSG_LEN(0) } as _;
         if current.cmsg_len < header_length {
             return Err(invalid_data("invalid SCM_RIGHTS length"));
         }
-        let bytes = current.cmsg_len - header_length;
+        let bytes = (current.cmsg_len - header_length) as usize;
         if bytes == 0 || !bytes.is_multiple_of(size_of::<RawFd>()) {
             return Err(invalid_data("invalid SCM_RIGHTS descriptor data"));
         }

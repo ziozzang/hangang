@@ -1,0 +1,88 @@
+name: Native binary qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.*'
+      - 'build.rs'
+      - 'tools/prepare_release.py'
+      - '.github/workflows/binaries.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.*'
+      - 'build.rs'
+      - 'tools/prepare_release.py'
+      - '.github/workflows/binaries.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            gateway_args: --allow-unsandboxed-lua
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            gateway_args: --allow-unsandboxed-lua
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: always
+      HANGANG_TEST_GATEWAY_ARGS: ${{ matrix.gateway_args || '' }}
+      HANGANG_BINARY: target/${{ matrix.target }}/release/hangang
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustup target add '${{ matrix.target }}'
+      - name: Build native release binaries
+        run: cargo build --locked --release --bins --target '${{ matrix.target }}'
+      - name: Library tests
+        run: cargo test --locked --release --lib --target '${{ matrix.target }}'
+      - name: CLI capability boundaries
+        run: cargo test --locked --release --test cli_about --target '${{ matrix.target }}'
+      - name: Gateway smoke tests
+        run: python3 tests/smoke.py
+      - name: CLI identity
+        shell: bash
+        run: |
+          "$HANGANG_BINARY" --about
+          "$HANGANG_BINARY" --version
+      - name: Prepare unsigned qualification assets
+        run: python3 tools/prepare_release.py --unsigned --target '${{ matrix.target }}' --output dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hangang-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

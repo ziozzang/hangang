@@ -2,6 +2,13 @@
 
 [Project overview](README.md) · [Documentation](docs/README.md)
 
+## Unreleased
+
+- Add native Linux x86-64/ARM64 and macOS Intel/Apple Silicon qualification jobs and platform-specific release packaging.
+- Support ordinary macOS gateway execution; explicitly reject Linux-only supervised replacement. macOS archives exclude IPVS DSR.
+- Require an explicit macOS development opt-in for Lua without Linux syscall isolation; retain Linux sandbox behavior.
+- Document laptop-to-server use, Windows/ARMv7 limitations, and unsigned CI artifact boundaries.
+
 ## 0.2.1 — 2026-09-22
 
 - Discover the latest stable GitHub release with `--check-update`; install signed

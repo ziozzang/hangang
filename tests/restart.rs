@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use hangang::restart::{ControlMessage, DescriptorRole, ProtocolMessage, control_channel};
 use std::{

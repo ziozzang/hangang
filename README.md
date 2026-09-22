@@ -6,6 +6,10 @@
 
 Hangang brings reverse proxying, load balancing, TLS certificate management, access policies, and traffic visibility into one Rust binary. Configure routes in the browser or through the API, inspect live traffic, and extend request handling with Lua—without deploying a separate console service. The console supports English and Korean; this README and the English guides are the reference documentation.
 
+## From laptop to enterprise deployment
+
+Develop and demonstrate on macOS Intel or Apple Silicon, then deploy the same configuration model on Linux x86-64 or ARM64. The native build matrix covers all four targets. **Linux remains the reference for supervised upgrades, syscall-isolated Lua, and IPVS DSR.** macOS offers ordinary gateway execution with explicit limitations; trusted development Lua requires `--allow-unsandboxed-lua`. Native Windows binaries are not available; use a Linux environment such as WSL2. See [platform support and release targets](docs/PLATFORMS.md) for qualification requirements and limits.
+
 ## Why Hangang
 
 - **One place to operate HTTP and TCP.** Manage routes, listeners, backend members, certificates, and activation from the embedded console. The same server exposes a documented management API and OpenAPI specification. See [console coverage](docs/API_UI_COVERAGE.md).

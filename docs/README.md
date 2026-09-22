@@ -6,6 +6,7 @@ English is the reference language. Available Korean pages are full translations 
 
 ## Start here
 
+- [Platforms and native binaries](PLATFORMS.md) — Linux ARM64, macOS laptop support, and Windows limits
 - [First configuration and examples](../examples/README.md) — JSON fields, initial setup, reload, and troubleshooting
 - [Deployment templates](../deploy/README.md) — initial deployment JSON, ports, and persistent state
 - [Documentation guide](DOCUMENTATION.md) — how the documentation is organized

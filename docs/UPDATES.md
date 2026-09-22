@@ -16,6 +16,8 @@ container while preserving its private state volume. Do not add update flags
 to the Compose example without separately designing a writable, verified
 binary activation path.
 
+Supervised binary installation is Linux-only. macOS supports read-only release discovery and manual replacement; see [platform limits](PLATFORMS.md).
+
 ## Continuity and deployment modes
 
 Live configuration, supervised process replacement, and signed binary updates

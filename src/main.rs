@@ -134,6 +134,10 @@ struct Args {
     /// parallelism, clamped to 2..=8 (override for larger policy loads).
     #[arg(long, default_value_t = default_lua_workers())]
     lua_workers: usize,
+    /// macOS development only: allow trusted Lua without Linux syscall isolation.
+    #[cfg(target_os = "macos")]
+    #[arg(long)]
+    allow_unsandboxed_lua: bool,
     #[arg(long, default_value_t = 4096)]
     max_connections: usize,
     #[arg(long, default_value_t = 4096)]
@@ -292,6 +296,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args = Args::parse();
+    #[cfg(not(target_os = "linux"))]
+    anyhow::ensure!(
+        !args.supervised && !args.serve_child,
+        "--supervised is supported only on Linux"
+    );
     if args.about {
         println!(
             "Hangang {}\nSource: {}\nAuthor: {}",
@@ -601,9 +610,23 @@ async fn run(args: Args) -> Result<()> {
     );
     hangang::policy::set_operation_timeout(Duration::from_millis(args.lua_timeout_ms));
     hangang::proxy::set_connect_timeout(Duration::from_millis(args.connect_timeout_ms));
-    let pool = Arc::new(PolicyPool::new(std::env::current_exe()?, args.lua_workers));
+    let pool = PolicyPool::new(std::env::current_exe()?, args.lua_workers);
     // Configuration validation must remain available while data-plane policy slots are busy.
-    let validation_pool = Arc::new(PolicyPool::new(std::env::current_exe()?, 1));
+    let validation_pool = PolicyPool::new(std::env::current_exe()?, 1);
+    #[cfg(target_os = "macos")]
+    let (pool, validation_pool) = {
+        if args.allow_unsandboxed_lua {
+            tracing::warn!(
+                "macOS development Lua enabled: no syscall sandbox or OS address-space limit; use only trusted scripts"
+            );
+        }
+        (
+            pool.allow_unsandboxed_lua(args.allow_unsandboxed_lua),
+            validation_pool.allow_unsandboxed_lua(args.allow_unsandboxed_lua),
+        )
+    };
+    let pool = Arc::new(pool);
+    let validation_pool = Arc::new(validation_pool);
     // A shared-store bootstrap prepares the seed's runtime resources first;
     // the prepared snapshot is reused below instead of preparing it twice.
     let mut prepared_snapshot: Option<Snapshot> = None;

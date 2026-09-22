@@ -6,6 +6,7 @@
 
 ## 먼저 읽기
 
+- [플랫폼과 네이티브 바이너리](PLATFORMS.md) — Linux ARM64, macOS 노트북 지원과 Windows 제한
 - [최초 설정과 예제](../../examples/README.ko.md) — JSON 필드, 최초 설정, 다시 로드와 문제 해결
 - [배포 템플릿 · 영문](../../deploy/README.md) — 초기 배포 JSON, 포트와 영속 상태
 - [문서 작성 규칙 · 영문](../DOCUMENTATION.md) — 문서 구성 방식
