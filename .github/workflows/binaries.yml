@@ -73,6 +73,14 @@ jobs:
         run: cargo test --locked --release --test cli_about --target '${{ matrix.target }}'
       - name: Gateway smoke tests
         run: python3 tests/smoke.py
+      - name: UDP lifecycle smoke tests
+        run: python3 tests/udp_smoke.py
+      - name: Linux supervised handoff and Lua isolation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 tests/restart_smoke.py
+          "$HANGANG_BINARY" --lua-sandbox-check
       - name: CLI identity
         shell: bash
         run: |

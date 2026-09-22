@@ -682,7 +682,8 @@ fn set_cloexec(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
 fn set_send_timeout(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<()> {
     let value = libc::timeval {
         tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
-        tv_usec: timeout.subsec_micros().into(),
+        // subsec_micros is below one million, fitting Darwin's i32 and Linux's i64.
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
     };
     // SAFETY: value is a valid timeval and its size is passed exactly.
     if unsafe {

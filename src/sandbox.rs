@@ -1,7 +1,9 @@
 //! Linux Lua workers use a syscall allowlist after executable initialization.
 //! This complements VM quotas and process replacement; the gateway itself is
 //! never filtered. Unsupported architectures reject worker startup.
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::{Context, ensure};
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
