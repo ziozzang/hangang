@@ -8,6 +8,9 @@ use std::{
 };
 
 fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-release-sign") {
+        return Ok(());
+    }
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
     let first = arguments

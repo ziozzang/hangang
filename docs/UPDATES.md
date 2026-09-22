@@ -1,11 +1,12 @@
 # Signed updates and process replacement
 
-[Documentation](README.md) · [한국어 요약](ko/UPDATES.md)
+[Documentation](README.md) · [한국어](ko/UPDATES.md)
 
 Hangang has a signed release verifier, bounded downloader, atomic Unix
 activation, and a stable-PID supervisor that hands listeners to a ready child.
-Updates remain opt-in. They run only when `--supervised`, `--update-manifest`,
-and an operator-provided update key are configured. Lua cannot request an update
+Updates remain opt-in. They run only when `--supervised`, either
+`--update-manifest` or `--update-github`, and an operator-provided update key
+are configured. Lua cannot request an update
 or supply a release URL.
 
 The sample [Docker Compose deployment](DEPLOYMENT.md) uses a read-only scratch
@@ -47,6 +48,90 @@ rollback link: it does not automatically roll back a later application failure
 or reverse database/schema changes. Check writer/schema compatibility before
 any upgrade. A host, supervisor, or storage failure is outside the planned
 handoff's continuity guarantee.
+
+## GitHub release discovery
+
+The GitHub source uses the latest published stable release from
+`ziozzang/hangang`. Its discovery, platform asset selection, and temporary-file
+replacement workflow draw on [Sugyeol's self-update design](https://github.com/ziozzang/sugyeol/blob/main/selfupdate.go).
+Hangang additionally requires its existing Ed25519-signed manifest and performs
+configuration preflight, readiness-gated replacement, and rollback before readiness.
+
+Check the remote version without loading gateway configuration or installing:
+
+```sh
+hangang --check-update
+hangang --about
+```
+
+`--check-update` prints JSON with the current/latest semantic versions, an
+`update_available` flag, `signed_assets_present`, and a release-page URL. Asset
+presence is not a claim that their signatures have been verified. A GitHub
+network/rate-limit error returns failure instead of claiming the installation
+is current. The public API is queried without credentials; private repositories
+and arbitrary repository overrides are not supported.
+
+Enable automatic checking and installation with an independently provisioned
+base64 Ed25519 public key:
+
+```sh
+export HANGANG_UPDATE_KEY="$(cat /private/update-public-key)"
+hangang --config /private/hangang.json --supervised --update-github \
+  --update-interval-seconds 300
+```
+
+`--update-github` and `--update-manifest` are mutually exclusive. The GitHub
+source uses system HTTPS trust and does not accept `--update-ca`. The existing
+update status/check API and console controls also apply to this source. GitHub
+must provide the following assets for the running target (shown for Linux amd64):
+
+- `hangang-x86_64-unknown-linux-gnu`: the raw executable, not the release tarball.
+- `hangang-x86_64-unknown-linux-gnu.manifest.json`: the signed envelope described below.
+
+A canonical stable `vMAJOR.MINOR.PATCH` release tag is required. Draft and
+prerelease metadata, missing or duplicated assets, mismatched target/URL/size,
+invalid signatures, and downgrades are rejected. The signed manifest version,
+artifact URL, and byte size must agree with the selected release assets; its
+SHA-256 digest is verified while downloading. GitHub release metadata and
+`SHA256SUMS` alone are not authorization to execute a new binary.
+
+Only this GitHub source permits release downloads to redirect from the exact
+repository's `github.com` release path to `release-assets.githubusercontent.com`
+over HTTPS. Generic manifest sources retain same-origin-only redirects.
+Metadata is bounded to 4 MiB, manifests to 64 KiB, and executables to 128 MiB.
+The signing seed never belongs in the gateway runtime or the repository.
+
+`--about` prints the build version, repository URL, and
+`Jioh Jung <jung@jioh.net>`. Companion executables support the same informational
+flag. `--version` remains a single machine-readable version line for update
+preflight compatibility.
+
+## Publish GitHub update assets
+
+The project's release verification key is published in
+[release-public-key.txt](../release-public-key.txt). Provision a reviewed copy
+as the runtime public-key file; downloading an arbitrary replacement key during
+an update would defeat signature trust. Releases before v0.2.1 do not include
+the raw executable and signed manifest required by the GitHub source.
+
+After building the release binaries, prepare assets using the private signing
+seed associated with that public key:
+
+```sh
+make static
+python3 tools/prepare_release.py \
+  --signing-seed-file /private/release-signing/ed25519-seed \
+  --output /private/release-assets
+```
+
+The release preparation tool requires Python 3.11 or newer. The output
+directory must be empty. The tool checks the built version, packages
+the gateway and companions, exports the public key, signs the raw gateway's
+manifest, and writes `SHA256SUMS`. It stages local files only. Publish every
+output file as an asset on the matching `vMAJOR.MINOR.PATCH` GitHub release.
+Keep the signing seed private and backed up outside the repository. The seed
+is never included in the prepared assets. This tool does not deploy a running
+gateway or rotate its configured trust key.
 
 ## Trust bootstrap
 

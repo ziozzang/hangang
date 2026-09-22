@@ -1,6 +1,6 @@
 # Protected HTTP resources
 
-[Documentation](README.md) · [한국어 요약](ko/RESOURCE_POLICY.md)
+[Documentation](README.md) · [한국어](ko/RESOURCE_POLICY.md)
 
 An HTTP route may bind a gateway URL namespace to an authenticated principal and an exact method allowlist using `resource_policy`. This adds authorization to the existing `access_mode: protected` authentication boundary. The namespace is the route's host matcher plus `path_prefix` and `path_match`; it does not depend on route priority, header/JSON predicates, or whether the route is enabled.
 

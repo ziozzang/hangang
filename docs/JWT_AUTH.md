@@ -1,6 +1,6 @@
 # Native access-token authentication
 
-[Documentation](README.md) · [한국어 요약](ko/JWT_AUTH.md)
+[Documentation](README.md) · [한국어](ko/JWT_AUTH.md)
 
 `HttpRoute.jwt_auth` verifies signed OAuth access tokens against operator-selected public keys. It can use local JWKS or retrieve keys through a pinned HTTPS JWKS endpoint or OIDC discovery. The implemented token profile is [RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068); verification follows the issuer, audience, algorithm and token-type boundaries described in [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725.html). OIDC discovery here obtains verification keys. It does not implement a browser authorization-code flow, issue sessions or accept ID tokens as API credentials.
 

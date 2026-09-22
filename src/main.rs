@@ -24,8 +24,17 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug)]
-#[command(version, about = "Hangang asynchronous L4/L7 reverse proxy")]
+#[command(version, author, about = "Hangang asynchronous L4/L7 reverse proxy",
+    after_help = "Source: https://github.com/ziozzang/hangang\nAuthor: Jioh Jung <jung@jioh.net>",
+    group(clap::ArgGroup::new("update_source").args(["update_manifest", "update_github"])))]
 struct Args {
+    /// Print version, project URL, and author without starting the gateway.
+    #[arg(long)]
+    about: bool,
+    /// Read the latest stable public GitHub release; does not install anything.
+    #[arg(long)]
+    check_update: bool,
+
     /// Enable native ACME using a dynamically reloaded private JSON file.
     #[arg(long, conflicts_with_all=["tls_cert", "tls_key", "kubernetes_tls"])]
     acme_config: Option<PathBuf>,
@@ -76,9 +85,12 @@ struct Args {
     /// Signed HTTPS release manifest; enables periodic updates under --supervised.
     #[arg(long,requires_all=["supervised","update_key"])]
     update_manifest: Option<String>,
-    #[arg(long, env = "HANGANG_UPDATE_KEY", requires = "update_manifest")]
+    /// Discover signed release assets from ziozzang/hangang on GitHub.
+    #[arg(long, requires_all=["supervised", "update_key"], conflicts_with="update_ca")]
+    update_github: bool,
+    #[arg(long, env = "HANGANG_UPDATE_KEY", hide_env_values = true)]
     update_key: Option<String>,
-    #[arg(long, requires = "update_manifest")]
+    #[arg(long, requires = "update_source")]
     update_ca: Option<PathBuf>,
     #[arg(long, default_value_t = 300)]
     update_interval_seconds: u64,
@@ -258,6 +270,9 @@ fn hash_basic_credential(username: &str, password: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang") {
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     if std::env::args().nth(1).as_deref() == Some("--lua-sandbox-check") {
         return hangang::sandbox::self_check();
@@ -277,6 +292,31 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args = Args::parse();
+    if args.about {
+        println!(
+            "Hangang {}\nSource: {}\nAuthor: {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_REPOSITORY"),
+            env!("CARGO_PKG_AUTHORS")
+        );
+        return Ok(());
+    }
+    if args.check_update {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let release = runtime.block_on(hangang::github_release::latest())?;
+        let check = release.check(
+            semver::Version::parse(env!("CARGO_PKG_VERSION"))?,
+            env!("HANGANG_TARGET"),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&check)?);
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.update_key.is_none() || args.update_manifest.is_some() || args.update_github,
+        "--update-key requires --update-manifest or --update-github for gateway startup"
+    );
     anyhow::ensure!(
         args.admin_socket.is_none() || (!args.supervised && !args.serve_child),
         "--admin-socket does not support supervised hot restart"
@@ -309,6 +349,12 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "hangang=info".into()),
         )
         .init();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        repository = env!("CARGO_PKG_REPOSITORY"),
+        author = env!("CARGO_PKG_AUTHORS"),
+        "starting Hangang"
+    );
     anyhow::ensure!(
         (1..=64).contains(&args.lua_workers),
         "lua-workers must be 1..64"
@@ -375,11 +421,10 @@ fn main() -> Result<()> {
             args.update_interval_seconds >= 10,
             "update interval must be at least 10 seconds"
         );
-        let update = args
-            .update_manifest
-            .as_ref()
-            .map(|url| hangang::supervisor::UpdateOptions {
-                manifest_url: url.clone(),
+        let update = (args.update_manifest.is_some() || args.update_github).then(|| {
+            hangang::supervisor::UpdateOptions {
+                manifest_url: args.update_manifest.clone(),
+                github: args.update_github,
                 public_key: args.update_key.clone().unwrap(),
                 additional_ca: args.update_ca.clone(),
                 interval: Duration::from_secs(args.update_interval_seconds),
@@ -387,7 +432,8 @@ fn main() -> Result<()> {
                     .update_status_file
                     .clone()
                     .unwrap_or_else(|| args.config.with_extension("update-status.json")),
-            });
+            }
+        });
         runtime.block_on(hangang::supervisor::run(
             std::env::current_exe()?,
             std::env::args_os().skip(1).collect(),
@@ -1030,7 +1076,7 @@ async fn run(args: Args) -> Result<()> {
         token: Arc::new(token),
         users,
         lifecycle: channel.clone(),
-        update_status_path: args.update_manifest.as_ref().map(|_| {
+        update_status_path: (args.update_manifest.is_some() || args.update_github).then(|| {
             args.update_status_file
                 .clone()
                 .unwrap_or_else(|| manager.state_path.with_extension("update-status.json"))

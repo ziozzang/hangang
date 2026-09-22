@@ -2,6 +2,23 @@
 
 [Project overview](README.md) · [Documentation](docs/README.md)
 
+## 0.2.1 — 2026-09-22
+
+- Discover the latest stable GitHub release with `--check-update`; install signed
+  GitHub release assets under the existing supervisor with `--update-github`.
+  An explicitly provisioned Ed25519 trust key remains mandatory for installation.
+- Bind signed manifest version, URL, target, size, and digest to the selected
+  release. Permit only the GitHub release CDN redirect exception; preserve the
+  generic updater's same-origin policy and readiness-gated rollback.
+- Publish a raw update executable, signed manifest, verification public key,
+  checksums, and the companion archive using `tools/prepare_release.py`.
+- Add `--about` with the project URL and `Jioh Jung <jung@jioh.net>` to gateway
+  and companion binaries; keep the gateway's `--version` format stable.
+- Add initial JSON and deployment template READMEs with field explanations,
+  startup, configuration changes, examples, and troubleshooting.
+- Replace existing Korean summaries with full translations, and check translated
+  heading structure, code examples, and table rows against their English sources.
+
 ## 0.2.0 — 2026-09-22
 
 ### Datagram routing

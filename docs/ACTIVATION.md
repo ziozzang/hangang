@@ -1,6 +1,6 @@
 # Activate and deactivate
 
-[Documentation](README.md) · [한국어 요약](ko/ACTIVATION.md)
+[Documentation](README.md) · [한국어](ko/ACTIVATION.md)
 
 HTTP routes, TCP routes, file certificate entries and the global cache policy accept `enabled`. It defaults to `true`; normal serialization omits `true` for compatibility with earlier configuration files. `false` remains in the saved document and survives reloads and restarts. The console provides dedicated actions rather than requiring deletion or JSON editing.
 

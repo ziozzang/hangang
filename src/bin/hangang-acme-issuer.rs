@@ -24,6 +24,7 @@ const MAX_STATUS: usize = 32 * 1024;
 const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
+#[command(author, after_help = hangang::cli_about::FOOTER)]
 struct Args {
     /// Private JSON file specifying exactly one DNS zone and certificate set.
     #[arg(long)]
@@ -542,6 +543,9 @@ async fn serve_http(
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-acme-issuer") {
+        return Ok(());
+    }
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(

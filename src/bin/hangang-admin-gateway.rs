@@ -34,6 +34,7 @@ use tokio::{
 
 #[derive(Parser)]
 #[command(about = "Bounded TCP relay to Hangang's private admin Unix socket")]
+#[command(author, after_help = hangang::cli_about::FOOTER)]
 struct Args {
     #[arg(long)]
     listen: SocketAddr,
@@ -332,6 +333,9 @@ fn validate(args: &Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-admin-gateway") {
+        return Ok(());
+    }
     let args = Args::parse();
     validate(&args)?;
     // Register before binding so PID 1 handles TERM from the first instant

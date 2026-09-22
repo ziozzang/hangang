@@ -1,6 +1,6 @@
 # Native ACME certificates
 
-[Documentation](README.md) · [한국어 요약](ko/ACME.md)
+[Documentation](README.md) · [한국어](ko/ACME.md)
 
 Hangang's acme module issues and renews certificates through ACME v2 using
 the instant-acme client. The default directory is Let's Encrypt production;

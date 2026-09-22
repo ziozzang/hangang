@@ -14,6 +14,7 @@ use tokio::{
 };
 
 #[derive(Parser)]
+#[command(author, after_help = hangang::cli_about::FOOTER)]
 struct Args {
     #[arg(long, requires = "egress_target")]
     egress_unix: Option<PathBuf>,
@@ -31,6 +32,9 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-network-bridge") {
+        return Ok(());
+    }
     let args = Args::parse();
     ensure!(
         args.egress_unix.is_some() || args.dns_listen.is_some(),

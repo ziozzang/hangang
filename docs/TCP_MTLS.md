@@ -1,6 +1,6 @@
 # Authenticated TCP with inbound mutual TLS
 
-[Documentation](README.md) · [한국어 요약](ko/TCP_MTLS.md)
+[Documentation](README.md) · [한국어](ko/TCP_MTLS.md)
 
 `TcpRoute.inbound_tls` terminates client TLS at Hangang and authorizes an exact workload URI before selecting or connecting to an upstream. The upstream receives the decrypted application byte stream. Configure upstream TLS separately if that hop also needs encryption. This feature does not add bytes or HTTP identity headers to an opaque protocol.
 

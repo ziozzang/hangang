@@ -1,6 +1,6 @@
 # Linux IPVS direct routing
 
-[Documentation](README.md) · [한국어 요약](ko/DSR.md)
+[Documentation](README.md) · [한국어](ko/DSR.md)
 
 `hangang-dsr` is a standalone companion for operators who have an explicitly
 designed Linux direct-routing network. It validates a small, strict JSON file

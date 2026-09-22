@@ -1,6 +1,6 @@
 # Docker discovery
 
-[Documentation](README.md) · [한국어 요약](ko/DOCKER.md)
+[Documentation](README.md) · [한국어](ko/DOCKER.md)
 
 Hangang can resolve HTTP and TCP backends from Docker container metadata. Enable it by passing the Docker Unix socket to the daemon:
 

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -762,7 +762,7 @@
                     "supervised": true
                   },
                   "process_id": 4217,
-                  "version": "0.2.0",
+                  "version": "0.2.1",
                   "uptime_seconds": 3600,
                   "instance": {
                     "id": "9f3a1c77d2e04b58",
@@ -835,7 +835,7 @@
                 "example": {
                   "enabled": true,
                   "phase": "idle",
-                  "current_version": "0.2.0",
+                  "current_version": "0.2.1",
                   "last_check_unix": 1788796800,
                   "detail": null
                 }
@@ -4390,7 +4390,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.2.0"
+            "example": "0.2.1"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"
@@ -4610,7 +4610,7 @@
           },
           "current_version": {
             "type": "string",
-            "example": "0.2.0"
+            "example": "0.2.1"
           },
           "last_check_unix": {
             "type": "integer",

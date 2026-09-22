@@ -8,7 +8,8 @@ use std::{ffi::OsString, os::fd::AsFd, path::PathBuf, time::Duration};
 use tokio::process::{Child, Command};
 
 pub struct UpdateOptions {
-    pub manifest_url: String,
+    pub manifest_url: Option<String>,
+    pub github: bool,
     pub public_key: String,
     pub additional_ca: Option<PathBuf>,
     pub interval: Duration,
@@ -356,18 +357,34 @@ async fn stage_candidate(
     } else {
         None
     };
-    let updater = UpdateManager::new_with_ca(
-        TrustKey::from_base64(&options.public_key)?,
-        current.clone(),
-        env!("HANGANG_TARGET"),
-        root,
-    )?;
-    let staged = updater
-        .stage(
-            &options.manifest_url,
-            executable.parent().context("executable parent")?,
-        )
-        .await?;
+    let updater = if options.github {
+        UpdateManager::new_github(
+            TrustKey::from_base64(&options.public_key)?,
+            current.clone(),
+            env!("HANGANG_TARGET"),
+        )?
+    } else {
+        UpdateManager::new_with_ca(
+            TrustKey::from_base64(&options.public_key)?,
+            current.clone(),
+            env!("HANGANG_TARGET"),
+            root,
+        )?
+    };
+    let destination = executable.parent().context("executable parent")?;
+    let staged = if options.github {
+        updater.stage_github(destination).await?
+    } else {
+        updater
+            .stage(
+                options
+                    .manifest_url
+                    .as_deref()
+                    .context("missing update manifest URL")?,
+                destination,
+            )
+            .await?
+    };
     let version = staged.version().clone();
     let reported = bounded_preflight(staged.path(), &[OsString::from("--version")]).await?;
     ensure!(

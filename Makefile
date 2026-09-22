@@ -8,6 +8,7 @@ check-docs:
 	python3 tools/check_docs.py
 	python3 tools/check_publish.py
 	python3 -m unittest discover -s tests -p test_publish_policy.py
+	python3 -m unittest discover -s tests -p test_docs_translation.py
 test:
 	cargo test --locked
 	cargo build --locked

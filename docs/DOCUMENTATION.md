@@ -2,10 +2,10 @@
 
 [Documentation](README.md) · [한국어 안내](README.ko.md)
 
-English is the reference language for Hangang documentation. Korean documents
-provide a translated introduction or a shorter operational summary; each links
-to its English source. Update the English contract first and keep the Korean
-summary consistent with it.
+English is the reference language for Hangang documentation. Korean documents are full translations of their English sources, not summaries.
+Preserve every section, explanation, table, example, prerequisite, failure case,
+and limitation. Each translation links to its English source. Update the English
+contract first and update its existing Korean translation in the same change.
 
 ## Organization
 
@@ -13,7 +13,7 @@ summary consistent with it.
 - `README.ko.md`: Korean introduction and quick start, with the same commands.
 - `docs/README.md`: complete English guide index, organized by user task.
 - `docs/README.ko.md`: Korean navigation to the reference guides.
-- `docs/ko/`: supplementary Korean summaries using the source guide's filename.
+- `docs/ko/`: full Korean translations using the source guide's filename.
 - `docs/openapi.json`: machine-readable management API and configuration schema.
 - `examples/`: runnable examples and their usage instructions.
 - `deploy/`: portable templates; credentials and operator state remain local.
@@ -21,8 +21,9 @@ summary consistent with it.
 Keep existing reference filenames stable. Link to the guide that owns a contract
 instead of repeating its full explanation in several guides. For example, route
 matching belongs in `MATCHING.md`, account sessions in `ADMIN_USERS.md`, and
-publication semantics in `CONFIG_PUBLICATION.md`. A summary may introduce the
-concept, but must link to the detailed contract.
+publication semantics in `CONFIG_PUBLICATION.md`. A cross-reference may introduce the
+concept, but must link to the detailed contract. Translations must not replace
+source explanations with links.
 
 ## Page structure
 
@@ -50,10 +51,13 @@ metric names, CLI flags, and code identifiers unchanged in every language. Use
 identifiers. Distinguish the configured backend from the outbound connection
 policy and the configuration revision from a runtime generation.
 
-English reference pages contain English prose. Language-switch labels and the bilingual terminology table are exceptions. Korean summaries use polite, direct language and clearly
-state that they are summaries, not full translations. Do not interleave a Korean
-summary inside an English reference. Preserve failure conditions and scope when
-summarizing; a local guarantee must never become a fleet-wide guarantee.
+English reference pages contain English prose. Language-switch labels and the bilingual terminology table are exceptions. Korean translations use polite, direct language and retain the original scope
+and detail. Translate prose and headings; preserve executable examples, API
+paths, JSON keys, metric names, flags, and values. Adjust relative Markdown links
+for the translated file's directory. Do not interleave a Korean translation
+inside an English reference. A local guarantee must never become a fleet-wide
+guarantee. Where a Korean translation does not yet exist, link to the English
+guide explicitly rather than presenting a short summary as its translation.
 
 ## Claims and examples
 
@@ -80,6 +84,7 @@ git diff --cached --check
 
 The documentation checker reads the Git index so ignored local files cannot hide
 broken published links. It checks local link targets, reference-page navigation,
-language placement, and heading structure. It does not validate external website
+language placement, heading structure, and translated section/table/code-block
+parity. Structural parity does not replace a semantic translation review. It does not validate external website
 availability or replace testing commands against a running gateway. Review both
 languages when changing examples, defaults, or failure behavior.

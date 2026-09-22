@@ -1,6 +1,6 @@
 # HTTP workload identity with dedicated mutual TLS
 
-[Documentation](README.md) · [한국어 요약](ko/HTTP_WORKLOAD_MTLS.md)
+[Documentation](README.md) · [한국어](ko/HTTP_WORKLOAD_MTLS.md)
 
 `Config.workload_http` defines dedicated HTTP listeners that terminate TLS and require a client certificate. An HTTP route opts into that verified connection with `workload_auth`. The route must declare `access_mode: "protected"` and have a `resource_policy`. This listener is separate from the ordinary public HTTP/HTTPS and ACME listeners; enabling `workload_auth` does not turn a public listener into mTLS.
 

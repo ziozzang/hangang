@@ -27,6 +27,7 @@ use std::{
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
+#[command(author, after_help = hangang::cli_about::FOOTER)]
 struct Args {
     #[arg(long)]
     config: PathBuf,
@@ -363,6 +364,9 @@ async fn authorize(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-auth-bridge") {
+        return Ok(());
+    }
     let args = Args::parse();
     let initial = tokio::task::spawn_blocking({
         let path = args.config.clone();

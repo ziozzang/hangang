@@ -1,6 +1,6 @@
 # UDP routing and QUIC passthrough
 
-[Documentation](README.md) · [한국어 요약](ko/UDP.md)
+[Documentation](README.md) · [한국어](ko/UDP.md)
 
 Hangang relays UDP datagrams to a configured backend, keeping each client flow
 on the same backend until its idle timeout or a route change. The same relay

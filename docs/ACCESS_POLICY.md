@@ -1,6 +1,6 @@
 # Explicit HTTP access modes
 
-[Documentation](README.md) · [한국어 요약](ko/ACCESS_POLICY.md)
+[Documentation](README.md) · [한국어](ko/ACCESS_POLICY.md)
 
 `HttpRoute.access_mode` records the operator's intended authentication boundary. The gateway validates it before publishing any route or full configuration, including disabled routes. Use resource policies and an authenticator for subject-level authorization.
 

@@ -1,11 +1,12 @@
 [package]
 name = "hangang"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-authors = ["Jioh Jung <ziozzang@users.noreply.github.com>"]
+authors = ["Jioh Jung <jung@jioh.net>"]
 description = "A dynamically configured asynchronous L4/L7 reverse proxy"
+repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
 anyhow = "1"

@@ -10,6 +10,7 @@ use std::{io::Read, path::PathBuf};
     version,
     about = "Validate and reconcile owned Linux IPVS DSR services"
 )]
+#[command(author, after_help = hangang::cli_about::FOOTER)]
 struct Args {
     /// Strict JSON file containing only the explicitly owned VIP services.
     #[arg(long)]
@@ -72,6 +73,9 @@ fn read_config(path: &std::path::Path) -> Result<Config> {
 }
 
 fn main() -> Result<()> {
+    if hangang::cli_about::print_if_requested("hangang-dsr") {
+        return Ok(());
+    }
     let args = Args::parse();
     ensure!(
         args.apply || args.cleanup || args.check,

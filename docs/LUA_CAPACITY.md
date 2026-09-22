@@ -1,6 +1,6 @@
 # Lua capacity reporting
 
-[Documentation](README.md) · [한국어 요약](ko/LUA_CAPACITY.md)
+[Documentation](README.md) · [한국어](ko/LUA_CAPACITY.md)
 
 Route Lua work uses a bounded process pool. When every slot is busy or cooling down after a worker failure, `PolicyPool` rejects immediately; it does not queue an unlimited number of requests or skip the policy. Worker count and deadlines remain the existing process settings. Capacity reporting does not add a request queue.
 

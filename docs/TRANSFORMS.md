@@ -1,6 +1,6 @@
 # Request and response transformations
 
-[Documentation](README.md) · [한국어 요약](ko/TRANSFORMS.md)
+[Documentation](README.md) · [한국어](ko/TRANSFORMS.md)
 
 Hangang supports native body operations and isolated Lua body scripts in both directions. Add `request_transform` or `response_transform` to an HTTP route. Matching, external authorization and the existing route-level `lua` policy run before request body transformation. Native operations run in their configured order, then the optional body Lua script. Responses follow the selected route's response transform. An in-flight stream keeps its original configuration while later requests use a reloaded configuration.
 

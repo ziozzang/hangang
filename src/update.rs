@@ -151,6 +151,7 @@ impl UpdateManager {
             target.into(),
             false,
             additional_root,
+            false,
         )
     }
 
@@ -162,7 +163,32 @@ impl UpdateManager {
         current_version: Version,
         target: impl Into<String>,
     ) -> Result<Self> {
-        Self::build(trust_key, current_version, target.into(), true, None)
+        Self::build(trust_key, current_version, target.into(), true, None, false)
+    }
+
+    /// GitHub release assets may redirect only to GitHub's release CDN.
+    pub fn new_github(
+        trust_key: TrustKey,
+        current_version: Version,
+        target: impl Into<String>,
+    ) -> Result<Self> {
+        Self::build(trust_key, current_version, target.into(), false, None, true)
+    }
+
+    pub async fn stage_github(&self, destination_dir: &Path) -> Result<StagedUpdate> {
+        let release =
+            crate::github_release::fetch(&self.client, crate::github_release::API_URL).await?;
+        let version = release.version()?;
+        if version == self.current_version {
+            return Err(UpToDate { version }.into());
+        }
+        ensure!(
+            version > self.current_version,
+            "GitHub release is older than the running version"
+        );
+        let selection = release.select(&self.target)?;
+        self.stage_selected(&selection.manifest_url, destination_dir, Some(&selection))
+            .await
     }
 
     fn build(
@@ -171,28 +197,10 @@ impl UpdateManager {
         target: String,
         allow_loopback_http: bool,
         additional_root: Option<reqwest::Certificate>,
+        github_assets: bool,
     ) -> Result<Self> {
         ensure!(!target.trim().is_empty(), "update target cannot be empty");
-        let policy = redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error("too many update redirects");
-            }
-            let Some(first) = attempt.previous().first() else {
-                return attempt.error("redirect has no original URL");
-            };
-            if !same_origin(first, attempt.url()) {
-                return attempt.error("cross-origin update redirect is forbidden");
-            }
-            if validate_transport_url(attempt.url(), allow_loopback_http).is_err() {
-                return attempt.error("unsafe update redirect URL");
-            }
-            attempt.follow()
-        });
-        let mut client = Client::builder()
-            .redirect(policy)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .user_agent(concat!("hangang/", env!("CARGO_PKG_VERSION")));
+        let mut client = update_client_builder(allow_loopback_http, github_assets);
         if let Some(root) = additional_root {
             client = client.add_root_certificate(root);
         }
@@ -210,6 +218,16 @@ impl UpdateManager {
     /// candidate in `destination_dir`. Failures and cancellation remove the
     /// partial temporary file.
     pub async fn stage(&self, manifest_url: &str, destination_dir: &Path) -> Result<StagedUpdate> {
+        self.stage_selected(manifest_url, destination_dir, None)
+            .await
+    }
+
+    async fn stage_selected(
+        &self,
+        manifest_url: &str,
+        destination_dir: &Path,
+        expected: Option<&crate::github_release::Selection>,
+    ) -> Result<StagedUpdate> {
         let manifest_url = parse_transport_url(manifest_url, self.allow_loopback_http)
             .context("invalid update manifest URL")?;
         ensure!(
@@ -227,6 +245,20 @@ impl UpdateManager {
             .context("update manifest server returned an error")?;
         let envelope_bytes = read_response_limited(response, MAX_MANIFEST_BYTES, "64 KiB").await?;
         let manifest = self.verify_envelope(&envelope_bytes)?;
+        if let Some(expected) = expected {
+            ensure!(
+                manifest.version == expected.version,
+                "signed manifest version differs from GitHub release tag"
+            );
+            ensure!(
+                manifest.artifact_url == expected.artifact_url,
+                "signed artifact URL differs from selected GitHub asset"
+            );
+            ensure!(
+                manifest.size == expected.artifact_size,
+                "signed artifact size differs from GitHub asset size"
+            );
+        }
         let artifact_url = parse_transport_url(&manifest.artifact_url, self.allow_loopback_http)
             .context("invalid signed artifact URL")?;
 
@@ -504,7 +536,7 @@ impl Drop for RollbackGuard {
     }
 }
 
-async fn read_response_limited(
+pub(crate) async fn read_response_limited(
     mut response: reqwest::Response,
     maximum: u64,
     display_limit: &str,
@@ -643,3 +675,35 @@ fn sync_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
+
+fn update_client_builder(allow_loopback_http: bool, github_assets: bool) -> reqwest::ClientBuilder {
+    let policy = redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 5 {
+            return attempt.error("too many update redirects");
+        }
+        let Some(first) = attempt.previous().first() else {
+            return attempt.error("redirect has no original URL");
+        };
+        let allowed = if github_assets {
+            crate::github_release::asset_redirect_allowed(first, attempt.url())
+        } else {
+            same_origin(first, attempt.url())
+        };
+        if !allowed {
+            return attempt.error("cross-origin update redirect is forbidden");
+        }
+        if validate_transport_url(attempt.url(), allow_loopback_http).is_err() {
+            return attempt.error("unsafe update redirect URL");
+        }
+        attempt.follow()
+    });
+    Client::builder()
+        .redirect(policy)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .user_agent(concat!("hangang/", env!("CARGO_PKG_VERSION")))
+}
+
+#[cfg(test)]
+#[path = "update_github_tests.rs"]
+mod github_tests;

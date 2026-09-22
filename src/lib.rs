@@ -90,3 +90,7 @@ mod tcp_io;
 
 pub mod dsr;
 pub mod udp;
+
+pub mod github_release;
+
+pub mod cli_about;

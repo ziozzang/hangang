@@ -1,6 +1,6 @@
 # Redis configuration store
 
-[Documentation](README.md) · [한국어 요약](ko/REDIS.md)
+[Documentation](README.md) · [한국어](ko/REDIS.md)
 
 Hangang can use Redis as a shared whole-configuration store through
 `RedisConfigStore`. The store keeps one versioned string under the caller's

@@ -1,6 +1,6 @@
 # Scale-out operation
 
-[Documentation](README.md) · [한국어 요약](ko/SCALE_OUT.md)
+[Documentation](README.md) · [한국어](ko/SCALE_OUT.md)
 
 Several instances can serve the same routes behind an external load balancer when they share one
 configuration store (`--database sqlite:…` on one host, PostgreSQL, or Redis). This page states what

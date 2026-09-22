@@ -65,9 +65,12 @@ Comparison sources reviewed on **2026-09-22**. Product editions and configuratio
 This local example demonstrates a working proxy, a Lua rejection rule, and the management console. You need Git, Rust 1.96 or newer, a C compiler, Python 3, OpenSSL, and curl. Node.js is only needed when developing the console; its built assets are already included.
 
 Linux amd64 binaries and `SHA256SUMS` are available in the
-[v0.2.0 release](https://github.com/ziozzang/hangang/releases/tag/v0.2.0).
+[v0.2.1 release](https://github.com/ziozzang/hangang/releases/tag/v0.2.1).
 The archive contains Hangang and its companion tools; verify it with
 `sha256sum -c SHA256SUMS` before extracting. The steps below build from source.
+
+Read the [example configuration guide](examples/README.md) for field-by-field
+explanations, runtime changes, and troubleshooting.
 
 ### 1. Build
 
@@ -133,6 +136,20 @@ Open the HTTP route editor to inspect the Lua policy, then send more requests wh
 | Deploy and operate | Compose templates, administrator accounts, signed updates, account audit | [Deployment](docs/DEPLOYMENT.md), [accounts](docs/ADMIN_USERS.md), [updates](docs/UPDATES.md), [audit](docs/ACCOUNT_AUDIT.md) |
 
 For deployment beyond a local demo, start with the [Compose guide](docs/DEPLOYMENT.md) or [Kubernetes guide](docs/KUBERNETES.md). Supply private credentials, persistent state, and the documented management-listener protection. The [documentation index](docs/README.md) covers feature-specific setup and limitations; [OpenAPI](docs/openapi.json) defines management endpoints and configuration objects.
+
+## Project information and updates
+
+```sh
+hangang --about
+hangang --check-update
+```
+
+`--about` displays the version, repository, and author, Jioh Jung <jung@jioh.net>.
+`--check-update` queries the latest stable GitHub release without installing it.
+For automatic signed installation with readiness-gated process replacement,
+configure `--supervised --update-github` and a trusted public key as described
+in [updates](docs/UPDATES.md). Downloads still require a valid Ed25519 signature;
+release metadata or checksums alone do not authorize installation.
 
 ## Development
 

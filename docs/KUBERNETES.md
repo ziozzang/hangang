@@ -1,6 +1,6 @@
 # Kubernetes Ingress controller
 
-[Documentation](README.md) · [한국어 요약](ko/KUBERNETES.md)
+[Documentation](README.md) · [한국어](ko/KUBERNETES.md)
 
 Hangang can continuously reconcile `networking.k8s.io/v1` Ingress and Service objects into the live proxy configuration. Each proxy replica reads the API independently, so route availability does not depend on a leader. The older `--import-ingress` command remains available for offline conversion.
 

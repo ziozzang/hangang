@@ -1,6 +1,6 @@
 # HTTP response caching
 
-[Documentation](README.md) · [한국어 요약](ko/CACHE.md)
+[Documentation](README.md) · [한국어](ko/CACHE.md)
 
 Hangang provides an opt-in shared response cache with bounded memory storage and optional SQLite persistence. Enable storage once at the top level, then enable freshness policy on each route that may be cached. Both settings are required.
 
