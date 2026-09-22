@@ -91,6 +91,15 @@ routes. UDP socket/session handoff is not implemented; the documented
 [HTTP/TCP supervised continuity](UPDATES.md) must not be interpreted as UDP/QUIC
 upgrade continuity. Read-only container replacement also resets UDP sessions.
 
+## Deferred continuity work
+
+UDP/QUIC continuity across supervised process replacement is recorded as future
+work, outside the v0.2.0 implementation scope. A future implementation needs
+listener ownership transfer and preservation of backend affinity and upstream
+socket mappings, qualified with active UDP and QUIC connections during both
+successful replacement and failed-candidate rollback. Until then, use the
+restart and flow-reset behavior described above when planning maintenance.
+
 ## QUIC boundaries
 
 QUIC endpoints handle TLS, certificates, connection IDs, congestion control,
