@@ -63,7 +63,7 @@ Hangang은 메모리 저장량을 제한하고 선택적으로 SQLite에 영속�
 
 디스크 저장은 절대 경로에 `cache-v1.db`를 만들고 논리 항목 수·크기를 제한하며 SQLite의 4,096바이트 `max_page_count`로 본 파일을 제한합니다. `TRUNCATE` rollback journal을 사용하므로 메모리 부족에 따른 강제 종료처럼 중단된 transaction도 파일을 손상시키지 않고 다음 open 때 rollback됩니다. `-journal` sidecar는 transaction이 바꾼 각 페이지의 이전 내용을 잠시 보유합니다. 페이지 예산은 본 파일 페이지마다 원래 4,096바이트와 8바이트 framing의 journal record를 계산하고 journal header·정렬에 10%를 예약합니다. 따라서 본 파일은 `disk.max_bytes` 절반 아래에 머물고 purge transaction의 최대치도 설정 범위에 들어옵니다. 이전 빌드에서 만든 데이터베이스가 이를 초과하면 수정 전에 거부되므로 다시 만들 수 있는 `cache-v1.db`를 제거해야 합니다. `GET /v1/cache`는 본 파일과 journal을 각각 `disk_bytes`, `disk_journal_bytes`로 보고합니다. 물리 한도에 도달한 insert는 퇴출 후 재시도하고, 빈 DB에도 들어가지 않는 객체는 우회되며 계수에 반영됩니다. 다른 저장 오류는 fail open됩니다. 클라이언트는 origin 응답을 계속 받고 메모리가 활성화되어 있으면 메모리 사본도 계속 사용할 수 있으며 저장 오류 counter가 증가합니다.
 
-실행 중인 각 Hangang 인스턴스마다 전용 cache 디렉터리를 사용하십시오. 절대 경로이고 symlink 구성요소가 없어야 하며 없거나 owner 전용 `0700` 디렉터리여야 합니다. DB는 `0600`으로 만들고 symlink 파일과 application identifier가 없는 DB를 거부하며 관련 없는 파일을 덮어쓰지 않습니다. store 수명 동안 DB에 nonblocking 배타 lock을 잡습니다.
+실행 중인 각 Hangang 인스턴스마다 전용 cache 디렉터리를 사용하십시오. 절대 경로이고 symlink 구성요소가 없어야 하며 없거나 owner 전용 `0700` 디렉터리여야 합니다. DB는 `0600`으로 만들고 symlink 파일과 application identifier가 없는 DB를 거부하며 관련 없는 파일을 덮어쓰지 않습니다. 저장소 수명 동안 비차단 배타 소유권 잠금을 유지합니다. Linux는 데이터베이스 파일을 잠그고, macOS는 SQLite의 데이터베이스 잠금을 방해하지 않도록 별도의 비공개 `0600` 파일인 `cache-v1.db.owner-lock`을 사용합니다. 저장소가 실행 중일 때 이 보조 파일을 그대로 두어야 합니다. 삭제하거나 교체하면 서로 다른 파일을 기준으로 소유권이 나뉠 수 있습니다. 빈 보조 파일에는 캐시 항목이 저장되지 않습니다. 플랫폼별 데이터베이스 잠금 동작은 [SQLite 잠금 방식](https://www.sqlite.org/compile.html#enable_locking_style)을 참고하세요.
 
 일반적으로 디스크 앞에 메모리를 두는 구성을 권장합니다. 메모리 miss는 단일 디스크 I/O gate를 기다리지 않고 시도하며 동시 디스크 접근은 origin으로 우회합니다. 디스크 전용 모드는 용량과 재시작 지속성을 제공하지만 경쟁 때문에 우회할 수 있고 가까운 origin보다 latency가 개선된다는 보장은 없습니다.
 

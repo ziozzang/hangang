@@ -8,6 +8,7 @@
 - Support ordinary macOS gateway execution; explicitly reject Linux-only supervised replacement. macOS archives exclude IPVS DSR.
 - Require an explicit macOS development opt-in for Lua without Linux syscall isolation; retain Linux sandbox behavior.
 - Document laptop-to-server use, Windows/ARMv7 limitations, and unsigned CI artifact boundaries.
+- Use physical temporary state paths on macOS and separate disk-cache ownership locks from SQLite locks.
 
 ## 0.2.1 — 2026-09-22
 

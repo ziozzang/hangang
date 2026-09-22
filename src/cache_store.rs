@@ -742,8 +742,24 @@ fn estimated_pages(size: usize) -> u64 {
 #[derive(Default)]
 struct DiskState {
     connection: Option<Connection>,
+    // On macOS this is a no-follow descriptor for the database identity. The
+    // ownership flock lives on a distinct sidecar because Darwin's flock and
+    // SQLite's POSIX byte-range locks conflict on the database itself.
+    #[cfg(target_os = "macos")]
+    _database_file: Option<File>,
+    // Keep ownership until every database handle above has been dropped.
     _lock_file: Option<File>,
     sequence: i64,
+}
+
+#[cfg(target_os = "macos")]
+fn cache_lock_path(database: &Path) -> PathBuf {
+    let mut name = database
+        .file_name()
+        .expect("disk cache database path has a filename")
+        .to_os_string();
+    name.push(".owner-lock");
+    database.with_file_name(name)
 }
 
 impl DiskStore {
@@ -997,37 +1013,86 @@ impl DiskStore {
                 "disk cache file must not be a symlink"
             );
         }
+        #[cfg(target_os = "macos")]
+        if existed {
+            let metadata = fs::symlink_metadata(&self.path)?;
+            ensure!(metadata.is_file(), "disk cache path is not a regular file");
+            let file_mode = metadata.permissions().mode();
+            ensure!(
+                file_mode & 0o077 == 0 && file_mode & 0o600 == 0o600,
+                "existing disk cache file permissions must be 0600"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        let lock_path = cache_lock_path(&self.path);
+        #[cfg(not(target_os = "macos"))]
+        let lock_path = self.path.clone();
+        #[cfg(target_os = "macos")]
+        let lock_flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        #[cfg(not(target_os = "macos"))]
+        let lock_flags = libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let lock_existed = lock_path.exists();
         let lock_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.path)
+            .custom_flags(lock_flags)
+            .open(&lock_path)
             .context("open disk cache lock file")?;
         ensure!(
             lock_file.metadata()?.is_file(),
             "disk cache path is not a regular file"
         );
         let file_mode = lock_file.metadata()?.permissions().mode();
-        if existed {
+        if lock_existed {
             ensure!(
                 file_mode & 0o077 == 0 && file_mode & 0o600 == 0o600,
                 "existing disk cache file permissions must be 0600"
             );
         } else {
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+            lock_file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         let lock_result =
             unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_result != 0 {
             bail!("disk cache is already owned by another store");
         }
+        #[cfg(target_os = "macos")]
+        let database_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+            .context("open disk cache database file")?;
+        #[cfg(target_os = "macos")]
+        {
+            let metadata = database_file.metadata()?;
+            ensure!(metadata.is_file(), "disk cache path is not a regular file");
+            if existed {
+                let mode = metadata.permissions().mode();
+                ensure!(
+                    mode & 0o077 == 0 && mode & 0o600 == 0o600,
+                    "existing disk cache file permissions must be 0600"
+                );
+            } else {
+                database_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let was_empty = database_file.metadata()?.len() == 0;
+        #[cfg(not(target_os = "macos"))]
         let was_empty = lock_file.metadata()?.len() == 0;
         if !was_empty {
             let budget = self.max_pages.saturating_mul(SQLITE_PAGE_BYTES);
+            #[cfg(target_os = "macos")]
+            let database_size = database_file.metadata()?.len();
+            #[cfg(not(target_os = "macos"))]
+            let database_size = lock_file.metadata()?.len();
             ensure!(
-                lock_file.metadata()?.len() <= budget,
+                database_size <= budget,
                 "existing disk cache database predates the journal-safe quota and is too large; remove cache-v1.db to rebuild it"
             );
         }
@@ -1151,6 +1216,10 @@ impl DiskStore {
         self.refresh_disk_stats(&connection)?;
         state.connection = Some(connection);
         state._lock_file = Some(lock_file);
+        #[cfg(target_os = "macos")]
+        {
+            state._database_file = Some(database_file);
+        }
         Ok(())
     }
 
@@ -1906,6 +1975,54 @@ mod tests {
             b"second"[..]
         );
         assert_eq!(second.stats().await.errors, contended);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_owner_sidecar_is_private_and_serializes_disk_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_directory = directory.path().join("cache");
+        let config = disk_config(cache_directory.clone(), 8);
+        let first = CacheStore::new(config.clone());
+        first.put("key".into(), entry(b"first")).await.unwrap();
+        let sidecar = cache_lock_path(&cache_directory.join("cache-v1.db"));
+        let metadata = fs::metadata(&sidecar).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let second = CacheStore::new(config);
+        second.put("key".into(), entry(b"second")).await.unwrap();
+        assert!(second.get("key").await.unwrap().is_none());
+        assert!(second.stats().await.errors >= 1);
+        assert_eq!(first.get("key").await.unwrap().unwrap().body, b"first");
+        drop(first);
+        assert!(
+            sidecar.exists(),
+            "the owner sidecar must remain after its owner exits"
+        );
+        second.put("key".into(), entry(b"second")).await.unwrap();
+        assert_eq!(second.get("key").await.unwrap().unwrap().body, b"second");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_owner_sidecar_never_follows_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache_directory = directory.path().join("cache");
+        fs::create_dir(&cache_directory).unwrap();
+        fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = cache_directory.join("cache-v1.db");
+        let sidecar = cache_lock_path(&database);
+        let target = directory.path().join("sentinel");
+        fs::write(&target, b"sentinel").unwrap();
+        symlink(&target, &sidecar).unwrap();
+
+        let store = CacheStore::new(disk_config(cache_directory, 8));
+        store.put("key".into(), entry(b"value")).await.unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"sentinel");
+        assert!(store.stats().await.errors >= 1);
     }
 
     #[cfg(unix)]
