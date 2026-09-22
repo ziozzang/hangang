@@ -1994,14 +1994,17 @@ mod tests {
         second.put("key".into(), entry(b"second")).await.unwrap();
         assert!(second.get("key").await.unwrap().is_none());
         assert!(second.stats().await.errors >= 1);
-        assert_eq!(first.get("key").await.unwrap().unwrap().body, b"first");
+        assert_eq!(first.get("key").await.unwrap().unwrap().body, b"first"[..]);
         drop(first);
         assert!(
             sidecar.exists(),
             "the owner sidecar must remain after its owner exits"
         );
         second.put("key".into(), entry(b"second")).await.unwrap();
-        assert_eq!(second.get("key").await.unwrap().unwrap().body, b"second");
+        assert_eq!(
+            second.get("key").await.unwrap().unwrap().body,
+            b"second"[..]
+        );
     }
 
     #[cfg(target_os = "macos")]
