@@ -1,5 +1,7 @@
 # Per-route outbound transport
 
+[Documentation](../../docs/README.md)
+
 See [the configuration](config.json) and [the complete guide](../../docs/UPSTREAM.md). The addresses are documentation placeholders. The first route deliberately demonstrates opt-in certificate verification bypass; remove `insecure_skip_verify` for a trusted origin. The TCP example accepts plain local bytes and originates verified TLS to its backend.
 
 Validate this example without contacting the configured upstreams:

@@ -1,5 +1,7 @@
 # Selective account audit recording
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 The instance-local account audit supports ordered `record` and `drop` rules for successful account creation, update and deletion. Its initial policy records everything. Selecting `default_action: "drop"` explicitly omits every eligible event that matches no rule.
 
 This policy controls the durable account audit. HTTP request history, TCP connection history, access tracing, login/denial events and other management effects have separate recording boundaries; they are not silently covered by these rules.
@@ -52,10 +54,10 @@ The audit's `writes_available` describes capacity to append another record. At t
 
 The setter rechecks administrator authority and compares the revision inside the writer transaction. A changed policy, its mandatory audit receipt and its new revision commit together. A stale revision returns 409. An identical policy at the current revision is a no-op. Unknown query parameters/fields and invalid policies return 400; unavailable storage or audit capacity returns 503. Responses are no-store. A lost response is resolved by reading the policy/history, not automatic mutation replay.
 
-The EN/KO Account audit view provides a native editor for default action, ordered rules, actions and actor/target IDs. It shows cumulative omissions and partial coverage, preserves policy snapshots in history/export, and invalidates delayed responses after view/session changes.
+The English/Korean Account audit view provides a native editor for default action, ordered rules, actions and actor/target IDs. It shows cumulative omissions and partial coverage, preserves policy snapshots in history/export, and invalidates delayed responses after view/session changes.
 
-## Upgrade and remaining boundaries
+## Upgrade and scope boundaries
 
 Account schema 7 installs the policy metadata and audit revision guard atomically. Already-running audited older writers use revision zero; after a policy change, their stale audit inserts are rejected, rolling back the associated transaction. This does not fence pre-audit binaries that never append audit records. Quiesce older management processes for the upgrade; this is not a general mixed-version rollout guarantee.
 
-This local policy does not provide central actor enrollment, tamper-proof external retention, account-only/whole-store restore detection, or a transactional audit of every management backend. The next recording-policy integrations must separately define trusted HTTP client versus socket peer, response-head versus body completion, and TCP active versus completed connection visibility. A filter applied to one output must not be advertised as suppressing another output.
+This local policy does not provide central actor enrollment, tamper-proof external retention, account-only/whole-store restore detection, or a transactional audit of every management backend. Other recording policies separately define trusted HTTP client versus socket peer, response-head versus body completion, and TCP active versus completed connection visibility. A filter applied to one output must not be advertised as suppressing another output.

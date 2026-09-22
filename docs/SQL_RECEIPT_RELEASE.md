@@ -1,5 +1,7 @@
 # V2 receipt protection and completion acknowledgement
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 V2 SQL receipts begin protected, including receipts imported by migration. A receipt can become eligible for future retention only after its originating instance has durably recorded `candidate_activated` and verified the exact SQL commit. This release does **not** delete a receipt, recover receipt capacity, prove fleet activation, or acknowledge an archive.
 
 ## Completion protocol
@@ -23,7 +25,7 @@ Successful governed configuration writes attempt this protocol after recording l
 | `pending` | Stable release work exists; SQL outcome or local acknowledgement is not yet confirmed. |
 | `acknowledged` | SQL release acknowledgement is durable locally. |
 
-`release_id`, when present, identifies the durable work. The dedicated EN/KO operation view displays protection and offers explicit recovery for eligible completed V2 records. A missing release state from an older server is not proof of acknowledgement.
+`release_id`, when present, identifies the durable work. The dedicated English/Korean operation view displays protection and offers explicit recovery for eligible completed V2 records. A missing release state from an older server is not proof of acknowledgement.
 
 Administrators can request recovery using:
 
@@ -35,7 +37,7 @@ Authorization: Bearer <administrator-token>
 {"operation_id":"<32 lowercase hexadecimal characters>"}
 ```
 
-The endpoint rejects unknown fields and query parameters. It verifies current local administrator authority while durably preparing the release. Work accepted before revocation may finish afterwards; the response is checked against live authority again. SQL credentials remain the SQL authority boundary: the SQL database does not independently validate the originating account session. The operation actor identifies the original configuration acceptance, not necessarily the administrator who later requests recovery. This release work does not yet retain separate recovery-actor audit provenance; central mutation auditing remains unfinished.
+The endpoint rejects unknown fields and query parameters. It verifies current local administrator authority while durably preparing the release. Work accepted before revocation may finish afterwards; the response is checked against live authority again. SQL credentials remain the SQL authority boundary: the SQL database does not independently validate the originating account session. The operation actor identifies the original configuration acceptance, not necessarily the administrator who later requests recovery. This release work does not retain separate recovery-actor audit provenance; central mutation auditing is outside this interface's coverage.
 
 A successful no-store response contains `scope: "instance"`, `operation_id`, `release_id`, and `release_state: "acknowledged"`. A 409 reports ineligible/mismatched local evidence. A 501 means the store does not implement release. A 503 means confirmation is unavailable; it does not establish that the SQL transaction failed. Refresh the local history and explicitly recover using the same operation identity. The browser does not automatically repeat the mutation.
 

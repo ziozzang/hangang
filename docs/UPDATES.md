@@ -1,5 +1,7 @@
 # Signed updates and process replacement
 
+[Documentation](README.md) · [한국어 요약](ko/UPDATES.md)
+
 Hangang has a signed release verifier, bounded downloader, atomic Unix
 activation, and a stable-PID supervisor that hands listeners to a ready child.
 Updates remain opt-in. They run only when `--supervised`, `--update-manifest`,
@@ -161,22 +163,3 @@ without downloading a release.
 and version, and the last check time. `POST /v1/update/check` queues an immediate
 check. Both require the admin bearer token. A signed manifest for the already
 running version produces `up_to_date`; a downgrade remains a hard rejection.
-
-## 한국어 요약
-
-Hangang 업데이트 라이브러리는 운영자가 지정한 Ed25519 공개키로 서명된
-매니페스트만 허용합니다. 내장 기본키나 무서명 우회 경로는 없습니다.
-매니페스트는 버전, 빌드 대상, 아티팩트 URL, SHA-256, 정확한 크기를 모두
-서명하며, 다운그레이드와 다른 빌드 대상은 거부합니다.
-
-운영 환경에서는 HTTPS만 사용하고 리다이렉트의 출처 변경을 허용하지
-않습니다. 다운로드는 128 MiB로 제한하고 임시 파일에 기록한 뒤 크기와
-해시를 확인하고 fsync 합니다. 설치 시 기존 파일의 롤백 링크를 보관한 뒤
-같은 디렉터리에서 원자적으로 교체합니다.
-
-`--supervised` 모드에서는 상위 프로세스 PID를 유지한 채 공개/Admin/TCP
-리스너를 새 자식 프로세스로 전달합니다. 새 프로세스가 설정과 리스너를
-검증하고 READY를 보낸 뒤에만 이전 프로세스의 연결을 drain 합니다. READY
-이전 실패 시 기존 실행 파일을 원자적으로 복구하고 이전 프로세스가 계속
-서비스합니다. `/v1/update/status`와 `/v1/update/check`는 Admin bearer token이
-필요합니다.

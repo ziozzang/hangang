@@ -1,5 +1,7 @@
 # Authenticated remote node observations
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 A Hangang collector can poll an explicitly configured set of peer [observer endpoints](FLEET_OBSERVER.md) over verified HTTPS. Collection is read-only: it does not distribute configuration, change peers, or decide fleet health or rollout completion.
 
 ```json

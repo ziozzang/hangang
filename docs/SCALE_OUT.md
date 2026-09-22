@@ -1,5 +1,7 @@
 # Scale-out operation
 
+[Documentation](README.md) · [한국어 요약](ko/SCALE_OUT.md)
+
 Several instances can serve the same routes behind an external load balancer when they share one
 configuration store (`--database sqlite:…` on one host, PostgreSQL, or Redis). This page states what
 the fleet guarantees, what stays local to each instance, and how to operate it. Wording below uses
@@ -58,7 +60,7 @@ poll (strict mode). After withdrawal, readiness returns on the first confirming 
 `store.epoch`, `store.grace_seconds`, plus `instance.id` (random per process) and
 `instance.config_digest` so that instances behind one address can be told apart.
 
-### Operational rules
+## Operational rules
 
 - **Provision host-local material before writing the configuration.** Certificate paths, upstream CA
   files, Lua scripts and Docker service references in the shared document are resolved on every
@@ -135,12 +137,3 @@ although configuration readiness may already be true; `acme.tls_available`, `acm
 See [Kubernetes](KUBERNETES.md): hostname ownership is decided from API-server facts (oldest Ingress
 wins), readiness expires when the API has been unreachable for `--kubernetes-stale-seconds`, status
 addresses are merged rather than replaced, and relists are spaced and jittered per replica.
-
-## 한국어 요약
-
-여러 인스턴스가 하나의 공유 스토어(SQLite/PostgreSQL/Redis)를 권한(authority)으로 두고 로드밸런서 뒤에서
-동작한다. 쓰기는 `(epoch, revision)` CAS로 중재되고, 각 인스턴스는 500ms 폴링으로 비동기 수렴한다.
-스토어 장애 시 `--store-grace-seconds`(기본 30초) 동안은 마지막 정상 스냅샷으로 계속 서비스하며 ready를
-유지하고, 그 이후 unready가 된다. 롤백/분기/epoch 변경은 즉시 unready. 인증서 파일 등 호스트 로컬 자원은
-쓰기 전에 모든 인스턴스에 먼저 배포해야 한다. 종료 시 `--lame-duck-seconds` 동안 503을 알리고 나서
-accept를 멈춘다. 캐시 purge는 공유 스토어 모드에서 `cache.generation` CAS로 전체 인스턴스에 전파된다.

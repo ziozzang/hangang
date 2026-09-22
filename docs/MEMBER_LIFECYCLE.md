@@ -1,5 +1,7 @@
 # Member lifecycle controls
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Named HTTP and TCP members under local-file configuration accept `desired_state: serving`, `draining`, or `maintenance`. Edit the state in the HTTP/TCP member editor and save the revision-checked configuration. All member changes in that document publish atomically with the normal configuration transaction. Legacy string members behave as serving. Shared ConfigStore named documents remain rejected pending fleet reader capability coordination.
 
 - `serving`: allows new backend admissions subject to health, route enablement and policy.

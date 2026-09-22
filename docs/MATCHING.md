@@ -1,5 +1,7 @@
 # Host patterns and route priority
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 HTTP Host routing and TCP ClientHello SNI routing support exact names, label-local glob patterns and explicit regular expressions. Route selection and certificate identity validation are separate: a route regex or `f??.bar.com` does not make that pattern valid in an X.509 certificate. Public certificate loading and hostname verification retain their existing rules.
 
 ## Glob patterns

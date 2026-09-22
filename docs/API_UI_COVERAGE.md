@@ -1,4 +1,6 @@
-# Admin API and console coverage
+# Management API and console coverage
+
+[Documentation](README.md) · [한국어 안내](README.ko.md)
 
 This matrix compares the published operations in `docs/openapi.json` with the embedded console. “Automatic” means the page invokes the operation as part of a visible workflow; it is not an arbitrary API request form. The API reference only displays the schema and does not count as a control for other operations. `web/tests/api_ui_coverage.spec.js` checks that every management operation remains mapped to a real UI selector and caller. The separately authenticated machine observation endpoint is explicitly inventoried as machine-only; the console manages its visible status through the administrator status endpoint and never receives its credential.
 
@@ -13,7 +15,7 @@ This matrix compares the published operations in `docs/openapi.json` with the em
 | `GET /v1/geoip/lookup` | Configuration → GeoIP database source → Look up country | Admin-only, explicit IPv4/IPv6 address query against this instance's ready database; unavailable differs from unknown country |
 | `POST /v1/cache/purge` | Cache → Purge cache, confirmation | Admin mutation |
 | `GET /v1/events` | Status → live stream indicator and chart | Automatic SSE with Bearer header |
-| `GET /v1/traffic` | Status → Recent requests | Automatic admin-only bounded metadata snapshot; accepted listener scope, EN/KO and search ([details](HTTP_TRAFFIC_LISTENERS.md)) |
+| `GET /v1/traffic` | Status → Recent requests | Automatic admin-only bounded metadata snapshot; accepted listener scope, English/Korean and search ([details](HTTP_TRAFFIC_LISTENERS.md)) |
 | `GET /v1/connections/tcp/active` | Status → Active TCP connections, refresh and next page | Admin-only best-effort active page; IDs and byte counters remain decimal strings |
 | `GET /v1/connections/tcp/recent` | Status → Recent TCP completions, refresh | Admin-only bounded completion history; separate event cursor and local TTL |
 | `GET /v1/fleet/observations` | Operations → Fleet observations, operator group/role labels, local group filter, reporting coverage and refresh | Admin-only cached HTTPS peer observations, producing collector process identity, current failures and historical samples; no browser-held peer credentials |
@@ -58,24 +60,28 @@ This matrix compares the published operations in `docs/openapi.json` with the em
 
 The unversioned `/healthz`, `/metrics`, and `/openapi.json` paths above are part of the admin listener API. `/ui` redirects to `/ui/`; `GET`/`HEAD` of `/ui/`, `/ui/index.html`, the embedded JS/CSS, and locale modules serve public console assets. The public listener has its own configurable readiness path. There are no additional `/status`, `/config`, or `/routes` aliases in the current admin router.
 
+## Listener and Docker behavior
+
 The Docker page can test whether Hangang can reach the configured Docker daemon. The route-editor dialog and Docker page also call `POST /v1/docker/resolve` and can insert the resulting endpoint into a route. Resolution does **not** prove that the target container's application accepts TCP connections or completes a TLS handshake. The daemon test and target reachability are separate checks.
 
 Creating a TCP route binds its `listen` address inside the Hangang runtime. In Docker, the default `0.0.0.0:9001` accepts connections on the container network, but host or internet clients also need that port published in Docker and allowed by the host firewall. A route API write does not change an existing container's published ports.
 
 Existing Playwright `ui.spec.js`, `auth-actual.spec.js`, `console.spec.js`, `operations.spec.js`, and `route_inventory.spec.js` exercise the major workflows. The coverage test guards the operation inventory and UI call sites; it does not replace backend authorization or network tests.
 
-HTTP route CRUD and full-configuration APIs also carry `access_mode`. The dedicated HTTP editor selector and Security classification implement this field in EN/KO; server validation rejects contradictory modes and removal of the last authenticator from a protected route. See [access policy](ACCESS_POLICY.md). This does not add an operation or establish complete Zero Trust.
+## Route, health, and member editors
+
+HTTP route CRUD and full-configuration APIs also carry `access_mode`. The dedicated HTTP editor selector and Security classification implement this field in English/Korean; server validation rejects contradictory modes and removal of the last authenticator from a protected route. See [access policy](ACCESS_POLICY.md). This does not add an operation or establish complete Zero Trust.
 
 The HTTP route editor enhances policy and request/response Lua fields with the [embedded Lua editor](../web/LUA_EDITOR.md). It uses the existing route read/write API and introduces no execution endpoint. Context-specific completions mirror the actual worker API; saving still performs server-side route validation.
 
-HTTP routes also provide native EN/KO active and passive health-policy forms,
+HTTP routes also provide native English/Korean active and passive health-policy forms,
 including initial `checking` admission, probe path/Host, timing, status sets and
 thresholds. Operations distinguishes the initial pending gate from later
 unhealthy exclusion using `initial_check_pending`. Older servers without that
 field retain generic observation labels. See [health admission](HEALTH_ADMISSION.md).
 
 TCP routes expose every optional transport-health policy field through the
-native EN/KO editor. Operations labels `active_tcp` as transport checks, with
+native English/Korean editor. Operations labels `active_tcp` as transport checks, with
 independent first-check pending and probe-observed state. See [TCP health](TCP_HEALTH.md).
 
 HTTP and TCP route editors also offer explicit conversion from legacy string
@@ -93,29 +99,33 @@ reported and keeps the configured address, effective weight, desired state,
 local admission gate, and current admission leases visible. These are
 instance-local observations, not fleet drain-completion or force-close controls.
 
-`GET /v1/config/operations` has a dedicated EN/KO configuration-operation history view with bounded paging, current-page export and a revision-consistent full retained-history export. It distinguishes durable acceptance from local candidate activation and unresolved outcomes. `POST /v1/config/operations/prune` has explicit archive/retention confirmation and revision fencing; it preserves unresolved operations and does not automatically retry or activate a fleet.
+`GET /v1/config/operations` has a dedicated English/Korean configuration-operation history view with bounded paging, current-page export and a revision-consistent full retained-history export. It distinguishes durable acceptance from local candidate activation and unresolved outcomes. `POST /v1/config/operations/prune` has explicit archive/retention confirmation and revision fencing; it preserves unresolved operations and does not automatically retry or activate a fleet.
 
-`GET /v1/config/operation-proof` has an independent EN/KO current-store proof panel in Change history with manual refresh and server observation time. It shows SQL epoch/revision/operation stamp, unsupported stores, absent current proof and unavailable reads separately. It does not infer local-history ownership, activation or fleet acknowledgement; logout/navigation scrubs late responses.
+## Configuration history and recovery
 
-`GET /v1/config/commit-receipt` has a dedicated EN/KO historical SQL commit lookup in Change history. The administrator supplies acceptance authority and operation IDs; the panel distinguishes a retained receipt, absence, unsupported stores and unavailable reads, and reports receipt capacity. It does not change local outcomes or initiate replay. Safe receipt pruning and export remain unfinished.
+`GET /v1/config/operation-proof` has an independent English/Korean current-store proof panel in Change history with manual refresh and server observation time. It shows SQL epoch/revision/operation stamp, unsupported stores, absent current proof and unavailable reads separately. It does not infer local-history ownership, activation or fleet acknowledgement; logout/navigation scrubs late responses.
 
-`GET /v1/config/commit-receipt-v2` has a distinct EN/KO sequenced mode, high-water and authority-registry capacity display. Journal receipt-version labels and raw export fields keep V1/V2 identities separate; missing versions from older servers are explicitly legacy V1. See [sequenced receipts](SEQUENCED_SQL_RECEIPTS.md).
+`GET /v1/config/commit-receipt` has a dedicated English/Korean historical SQL commit lookup in Change history. The administrator supplies acceptance authority and operation IDs; the panel distinguishes a retained receipt, absence, unsupported stores and unavailable reads, and reports receipt capacity. It does not change local outcomes or initiate replay. Safe receipt pruning and export are not exposed.
 
-`GET /v1/config/commit-receipts-v2` has a dedicated EN/KO V2 retained receipt export in Change history, with bounded snapshot-prefix paging, stale-response invalidation and a final retention-fence probe. V1 export and safe pruning remain unfinished.
+`GET /v1/config/commit-receipt-v2` has a distinct English/Korean sequenced mode, high-water and authority-registry capacity display. Journal receipt-version labels and raw export fields keep V1/V2 identities separate; missing versions from older servers are explicitly legacy V1. See [sequenced receipts](SEQUENCED_SQL_RECEIPTS.md).
 
-HTTP route CRUD includes native EN/KO `language_policy` controls (mode, allow/deny ranges, missing-header behavior and enforcement). The filter runs before cache/Lua/origin and is not country or identity authorization. HTTP and TCP inventory rows also expose confirmed deletion using the displayed revision; conflicts require a new confirmation and server-side protected-resource checks still apply.
+`GET /v1/config/commit-receipts-v2` has a dedicated English/Korean V2 retained receipt export in Change history, with bounded snapshot-prefix paging, stale-response invalidation and a final retention-fence probe. V1 export and safe pruning are not exposed.
 
-`POST /v1/config/operations/release` has a dedicated per-operation EN/KO recovery action. It displays protected/pending/acknowledged state, requires explicit confirmation, rejects stale session/view responses and does not automatically replay a failed request. Local pruning keeps V2 records without durable release acknowledgement. This action releases protection only; SQL receipt deletion, archival verification and capacity recovery remain separate. See [V2 completion acknowledgement](SQL_RECEIPT_RELEASE.md).
+HTTP route CRUD includes native English/Korean `language_policy` controls (mode, allow/deny ranges, missing-header behavior and enforcement). The filter runs before cache/Lua/origin and is not country or identity authorization. HTTP and TCP inventory rows also expose confirmed deletion using the displayed revision; conflicts require a new confirmation and server-side protected-resource checks still apply.
 
-`GET` and `PUT /v1/audit/policy` have a native EN/KO editor within Account audit. Default record/drop, ordered rules, action/actor/target conditions, revision-CAS confirmation and cumulative omission display are implemented. Policy-change snapshots remain exportable. This account policy does not filter HTTP/TCP observations or recovery journals.
+`POST /v1/config/operations/release` has a dedicated per-operation English/Korean recovery action. It displays protected/pending/acknowledged state, requires explicit confirmation, rejects stale session/view responses and does not automatically replay a failed request. Local pruning keeps V2 records without durable release acknowledgement. This action releases protection only; SQL receipt deletion, archival verification and capacity recovery remain separate. See [V2 completion acknowledgement](SQL_RECEIPT_RELEASE.md).
+
+`GET` and `PUT /v1/audit/policy` have a native English/Korean editor within Account audit. Default record/drop, ordered rules, action/actor/target conditions, revision-CAS confirmation and cumulative omission display are implemented. Policy-change snapshots remain exportable. This account policy does not filter HTTP/TCP observations or recovery journals.
+
+## Audit, diagnostics, and public listeners
 
 
 This operation mapping does not establish full response-field coverage. Operations preserves unknown balance/health modes and unreported capability/configuration authority instead of inventing round-robin, unmonitored, disabled or local-file states. Invalid paging envelopes and target rows retain an explicitly stale prior snapshot.
 
-Status also exposes nine additional existing security counters in a native EN/KO diagnostics section: JWT/HTTP mTLS/TCP mTLS/workload rejections, JWT unavailability/capacity, and HTTP mTLS/TCP mTLS/workload stream terminations. The JWT stream termination summary remains separate. Counts are cumulative for this instance, with exact safe integers and explicit unknown values; they do not establish a persistent audit trail or fleet totals. SSE updates and logout scrubbing use the existing authenticated status lifecycle.
+Status also exposes nine additional existing security counters in a native English/Korean diagnostics section: JWT/HTTP mTLS/TCP mTLS/workload rejections, JWT unavailability/capacity, and HTTP mTLS/TCP mTLS/workload stream terminations. The JWT stream termination summary remains separate. Counts are cumulative for this instance, with exact safe integers and explicit unknown values; they do not establish a persistent audit trail or fleet totals. SSE updates and logout scrubbing use the existing authenticated status lifecycle.
 
-General public HTTP/HTTPS listeners are now edited natively through Configuration → Public HTTP listeners using existing configuration APIs. HTTP route editors expose public listener IDs; default/unknown scope, per-listener trust, certificate fields, activation and failed publication behavior are covered in [the contract](PUBLIC_LISTENERS.md). This remains one-node local-file configuration; fleet authority and listener-specific certificate inventory are separate follow-ups.
+General public HTTP/HTTPS listeners are now edited natively through Configuration → Public HTTP listeners using existing configuration APIs. HTTP route editors expose public listener IDs; default/unknown scope, per-listener trust, certificate fields, activation and failed publication behavior are covered in [the contract](PUBLIC_LISTENERS.md). This remains one-node local-file configuration; fleet authority and listener-specific certificate inventory are separate scope.
 
-TCP recent-completion recording has dedicated ordered EN/KO controls under Settings, separate from HTTP/account recording. Recent records display available recording revisions, and intentional omissions have their own counter. Active inventory remains unfiltered. See [TCP completion recording](TCP_RECENT_RECORDING.md).
+TCP recent-completion recording has dedicated ordered English/Korean controls under Settings, separate from HTTP/account recording. Recent records display available recording revisions, and intentional omissions have their own counter. Active inventory remains unfiltered. See [TCP completion recording](TCP_RECENT_RECORDING.md).
 
-The HTTP route editor exposes `canonical_domain` as native EN/KO controls for active state, exact member host, scheme, status, methods and segment-boundary include/exclude paths. Saving still uses existing route CRUD with revision fencing. The redirect is an operator policy, not cookie/session sharing or proof that merging routes preserves upstream Host behavior.
+The HTTP route editor exposes `canonical_domain` as native English/Korean controls for active state, exact member host, scheme, status, methods and segment-boundary include/exclude paths. Saving still uses existing route CRUD with revision fencing. The redirect is an operator policy, not cookie/session sharing or proof that merging routes preserves upstream Host behavior.

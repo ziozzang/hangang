@@ -1,10 +1,18 @@
 # Administrator accounts
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Hangang keeps the existing `HANGANG_ADMIN_TOKEN` (or `--admin-token`) as a break-glass administrator credential. It is still required at startup and must contain at least 16 bytes. A first-run administrator account is created from the web UI using that token as the **setup token**, plus a new username and password. The setup operation succeeds only while the account database has no users; concurrent setup requests cannot create two initial accounts.
+
+## Storage and recovery
 
 Accounts are stored in a private, instance-local SQLite database. By default, Hangang creates a `0700` directory named after the config file (for example, `config.json.admin`) and stores `users.sqlite3` inside it. An existing default directory must already be private and owned by the process user; Hangang will not silently change its permissions. Use `--admin-users-db /absolute/private/path/admin-users.sqlite3` to select another local path; its parent directory must already exist and must not be writable by group or others. Hangang creates the database with mode `0600` and refuses an existing database or SQLite sidecar that is accessible to other users. Keep a protected backup of the database; losing it removes the accounts and their sessions. The break-glass token can then create a new first administrator in an empty replacement database.
 
+## Login and sessions
+
 The username is 3–64 ASCII letters, digits, `_`, `-`, or `.`. Passwords are 12–1024 UTF-8 bytes without control characters. Hangang stores Argon2id password hashes, never plaintext passwords. A successful login issues a random opaque Bearer session token valid for eight hours. The server stores only its SHA-256 digest and can revoke it on logout. Changing a password, disabling an account, or changing its role revokes that account's sessions; deleting an account removes its sessions. The browser keeps a successfully authenticated account token in tab-scoped `sessionStorage`, so a reload in the same tab restores the session after `/v1/auth/me` confirms its current role. Storage is scoped to the tab; browser session restoration may retain it, but server-side expiration and revocation still apply. Logout clears storage and revokes the server-side session. The installation/bootstrap token, static administrator token, and passwords are never stored there. If browser storage is unavailable, account login works in memory until reload. No authentication cookie is used.
+
+## Roles and authorization
 
 `admin` accounts can use the existing management API and create, update, disable, or delete accounts. At least one enabled administrator account must remain. `viewer` accounts can read `/v1/status`, `/v1/update/status`, `/healthz`, and `/metrics`, plus their own `/v1/auth/me` and `/v1/auth/logout`; they can also receive aggregate status events from `/v1/events`, without client IP history; they cannot read configuration or route documents because those may contain credential hashes. The legacy Bearer token always has administrator access and does not create a session.
 
@@ -14,13 +22,21 @@ This transaction fence covers account `POST`, `PUT` and `DELETE`. It is not a co
 
 Account list reads also revalidate the session and administrator role in the same SQLite read snapshot used to select users. Revocation committed before that snapshot is denied with 403; a read snapshot acquired first can finish with the state it observed. This is a snapshot ordering guarantee, not cancellation of bytes already sent. HTTP configuration writes use a separate [durable acceptance boundary](CONFIG_OPERATIONS.md) after preparation. Docker and lifecycle mutations are not covered by the account transaction fence.
 
+## Multiple instances
+
 The account database is **not synchronized** by the shared configuration store. Each administrator endpoint has its own users and sessions, even when gateway instances share configuration through Redis or PostgreSQL. Send account login and management requests to the intended instance's admin listener; a token from one instance is not valid on another. Do not place the instance-local SQLite database on a shared network filesystem. A centralized account authority would require a separate deployment design.
+
+## Management API
 
 For API clients, `GET /v1/auth/setup` reports whether bootstrap is needed. `POST /v1/auth/bootstrap` requires the legacy Bearer token and JSON `{ "username": "...", "password": "..." }`. `POST /v1/auth/login` accepts the same JSON without a Bearer token and returns a session token. Use `Authorization: Bearer <session token>` on subsequent requests. `GET /v1/auth/me` identifies the current account; `POST /v1/auth/logout` revokes its session. Administrators manage accounts through `GET/POST /v1/users` and `PUT/DELETE /v1/users/{id}`. Never put the setup token, password, or session token in a URL or log entry.
 
+## Troubleshooting
+
 If the UI reports that setup is needed, use the configured legacy token on the setup screen. If setup or login reports that the account store is unavailable, check that `--admin-users-db` points to a writable, private regular file in an existing directory and that its `-wal` and `-shm` files are private. An existing deployment can continue using its legacy token while accounts are being created; account setup does not change route configuration or the data plane.
 
-Successful account mutations and explicit retention changes now have a [durable local account audit](ACCOUNT_AUDIT.md), with administrator-only API and EN/KO console. Schema version2 migration preserves current users/sessions and starts a documented audit baseline. Older account writers must be stopped before migration. Audit capacity or append failure denies the account mutation atomically.
+## Schema compatibility
+
+Successful account mutations and explicit retention changes now have a [durable local account audit](ACCOUNT_AUDIT.md), with administrator-only API and English/Korean console. Schema version2 migration preserves current users/sessions and starts a documented audit baseline. Older account writers must be stopped before migration. Audit capacity or append failure denies the account mutation atomically.
 
 Schema version3 adds an instance-local [configuration operation journal](CONFIG_OPERATIONS.md) and durable account-authority namespace. It preserves the version2 account audit. Stop older account-store writers before upgrading; accepted operations and their local outcome observations are separate from account change audit records.
 

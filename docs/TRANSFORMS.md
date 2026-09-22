@@ -1,5 +1,7 @@
 # Request and response transformations
 
+[Documentation](README.md) · [한국어 요약](ko/TRANSFORMS.md)
+
 Hangang supports native body operations and isolated Lua body scripts in both directions. Add `request_transform` or `response_transform` to an HTTP route. Matching, external authorization and the existing route-level `lua` policy run before request body transformation. Native operations run in their configured order, then the optional body Lua script. Responses follow the selected route's response transform. An in-flight stream keeps its original configuration while later requests use a reloaded configuration.
 
 ```json
@@ -115,9 +117,3 @@ The example runner starts only its own loopback backend and gateway, substitutes
 The web route editor has request and response transformation JSON fields; the advanced document preserves all options. `/openapi.json` describes every field and operation.
 
 Protocol references: [SSE parsing and interpretation](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream), [HTTP transformation semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.7), and [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901).
-
-## 한국어
-
-요청·응답 각각 네이티브 또는 Lua 본문 변조를 설정할 수 있다. JSON 필드 설정/삭제, XML 요소 내용 교체/삭제, 문자열 치환과 헤더 설정/삭제를 제공한다. 일반 JSON/XML은 크기 제한 안에서 문서 전체를 버퍼링하고, 줄·NDJSON·SSE는 완성된 레코드/이벤트만 버퍼링한다. 네트워크 청크 경계와 레코드 경계는 별개로 처리한다.
-
-Lua는 기존 격리 프로세스에서 레코드별 새 VM으로 실행되며 본문 입력/출력은 각각 최대 16 KiB다. 초과·오류·시간 제한 실패 시 해당 요청/스트림을 실패시키고 서버는 계속 처리한다. 스트리밍 요청의 앞부분이 이미 백엔드에 전달되었다면 되돌릴 수 없고, 응답 헤더 전송 후 오류는 상태 코드 변경 대신 스트림 종료로 전달된다. `python3 examples/transforms/run.py`로 소유한 로컬 테스트 서버만 사용하는 예제 10개를 실행할 수 있다.

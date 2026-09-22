@@ -1,6 +1,8 @@
 # Sequenced SQL commit receipts (V2)
 
-V2 gives each accepted SQL configuration operation an identity derived from its durable local acceptance sequence. SQL retains the highest committed sequence for each acceptance authority independently of individual receipts and of the current configuration epoch. This supplies replay fencing needed for future receipt retention. It does not implement pruning, archive verification, central scoped authorization or fleet activation.
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
+V2 gives each accepted SQL configuration operation an identity derived from its durable local acceptance sequence. SQL retains the highest committed sequence for each acceptance authority independently of individual receipts and of the current configuration epoch. This supplies replay fencing for receipt retention. It does not implement pruning, archive verification, central scoped authorization or fleet activation.
 
 ## Identity and acceptance
 
@@ -28,7 +30,7 @@ Existing V1 receipts are not relabeled or backfilled into V2. Older current stam
 
 The observation contains `scope:"configuration_authority"`, `supported`, `receipt`, `high_water`, `stored_records`, `capacity`, `registered_authorities`, `authority_capacity`, `writes_available` and `server_time_unix_ms`. A supported, unregistered authority has high-water zero. Unsupported stores return null for the receipt and all fence/capacity values. A receipt contains `epoch`, `revision` and `stamp` with `authority_id`, `acceptance_seq`, `operation_id` and `candidate_sha256`.
 
-The EN/KO lookup has separate V1 and V2 modes. It shows the committed-sequence fence and both capacity limits; `writes_available` describes capacity for the queried authority, not overall write readiness. Changing mode, identifiers, role, login state or page invalidates delayed results. Reading a receipt never replays a write or changes local operation outcomes.
+The English/Korean lookup has separate V1 and V2 modes. It shows the committed-sequence fence and both capacity limits; `writes_available` describes capacity for the queried authority, not overall write readiness. Changing mode, identifiers, role, login state or page invalidates delayed results. Reading a receipt never replays a write or changes local operation outcomes.
 
 ## Bounded retained-receipt export
 
@@ -38,11 +40,11 @@ The first page reads the authority fence and rows from one SQL snapshot. Later p
 
 The response has `scope`, `supported`, `authority_id`, `receipts`, `snapshot:{high_water,retention_generation}`, `next_after`, `has_more` and `server_time_unix_ms`. An empty terminal page retains the supplied cursor. Unsupported stores return empty receipts and null snapshot/cursor/has_more. A never-registered authority has an empty prefix at high-water and generation zero; later registration does not change that empty prefix.
 
-The EN/KO console exports at most 1,000 pages / 100,000 receipts, followed by an empty terminal probe under the same fence. It rejects inconsistent pages, stale authority/query/session state and partial exports. The downloaded JSON represents retained V2 SQL commit evidence through the pinned high-water. Sequence gaps are valid and do not prove missing or uncommitted operations. The download does not verify archival storage durability, include V1 receipts or prove local/fleet activation.
+The English/Korean console exports at most 1,000 pages / 100,000 receipts, followed by an empty terminal probe under the same fence. It rejects inconsistent pages, stale authority/query/session state and partial exports. The downloaded JSON represents retained V2 SQL commit evidence through the pinned high-water. Sequence gaps are valid and do not prove missing or uncommitted operations. The download does not verify archival storage durability, include V1 receipts or prove local/fleet activation.
 
-`retention_generation` starts at zero in existing and new authority rows. No pruning is exposed yet. Any future supported deletion must atomically advance that generation, preserve high-water and supply its own authorization/audit protocol. Direct database edits and a restore recreating the same fence values can evade this token; independent rollback anchoring remains separate. A final probe is an observation at its own read boundary, not a lock held until the user stores the file.
+`retention_generation` starts at zero in existing and new authority rows. No pruning is exposed. A supported deletion must atomically advance that generation, preserve high-water and supply its own authorization/audit protocol. Direct database edits and a restore recreating the same fence values can evade this token; independent rollback anchoring remains separate. A final probe is an observation at its own read boundary, not a lock held until the user stores the file.
 
-## Remaining retention and recovery work
+## Retention and recovery boundaries
 
 There is still no receipt-pruning endpoint. Safe deletion needs an explicit archive/retention decision and audited authorization, with the durable identity fence retained after deletion. V1 random-ID receipts require an additional V1 writer retirement boundary before they can be safely removed. Authority registry entries themselves cannot be silently dropped to recover space.
 
@@ -52,4 +54,4 @@ These mechanisms do not make account acceptance and SQL commit one transaction, 
 
 Online capacity recovery is not exposed. It requires unresolved pins, durable local release acknowledgement, archive verification and SQL-coupled deletion evidence before retained receipts can be removed safely.
 
-The [V2 release workflow](SQL_RECEIPT_RELEASE.md) adds SQL-coupled default pins, account schema-6 completion acknowledgement and explicit EN/KO recovery. Receipt-schema migration is atomic; existing V2 receipts start protected. Neither pin release nor local journal pruning deletes SQL receipts.
+The [V2 release workflow](SQL_RECEIPT_RELEASE.md) adds SQL-coupled default pins, account schema-6 completion acknowledgement and explicit English/Korean recovery. Receipt-schema migration is atomic; existing V2 receipts start protected. Neither pin release nor local journal pruning deletes SQL receipts.

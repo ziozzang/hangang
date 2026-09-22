@@ -1,5 +1,7 @@
 # Authenticated TCP with inbound mutual TLS
 
+[Documentation](README.md) · [한국어 요약](ko/TCP_MTLS.md)
+
 `TcpRoute.inbound_tls` terminates client TLS at Hangang and authorizes an exact workload URI before selecting or connecting to an upstream. The upstream receives the decrypted application byte stream. Configure upstream TLS separately if that hop also needs encryption. This feature does not add bytes or HTTP identity headers to an opaque protocol.
 
 ```json
@@ -51,10 +53,6 @@ When `client_crl_file` is set, up to 16 CRLs are admitted. Preparation requires 
 `tcp_mtls_rejections_total` counts inbound handshake, workload authorization and admission-generation failures. `tcp_mtls_lease_terminations_total` counts lease-driven connection termination. Both are in status metrics and Prometheus. They do not constitute durable per-actor audit records; certificate/private-key material is not exposed by these counters.
 
 This qualifies a gateway-authenticated TCP boundary. HTTP workload principal binding, distributed trust/revocation delivery, durable audit and proof that clients cannot reach the backend by another path remain separate Zero Trust requirements.
-
-## 한국어 요약
-
-TCP 리스너에서 mTLS를 종료하고, 검증된 인증서의 SPIFFE URI를 라우트별 허용 목록과 대조한 뒤에만 업스트림에 연결한다. 기존 SNI 패스스루와 구분하며, CA가 유효해도 허용되지 않은 주체는 거부한다. 설정·인증서·신뢰 루트·CRL 변경은 새 설정 발행 시 준비하고, 기존 인증 스트림은 세대 교체 또는 유효기간 만료를 감지하면 종료한다. 파일만 바꾸는 자동 감시, HTTP 주체 바인딩, 분산 폐기 및 영구 감사까지 완료된 것은 아니다.
 
 ## TCP transport and diagnostic workload
 

@@ -1,5 +1,7 @@
 # Fleet observation examples
 
+[Documentation](../../docs/README.md)
+
 Run `make test-fleet` from the repository root after installing the browser test dependencies (`cd web && npm ci && npx playwright install chromium`). The owned examples use temporary private files, loopback listeners and short-lived child processes. OpenSSL must be available. They never contact production peers or print credentials.
 
 The sequence demonstrates a dedicated observer token, live rotation and withdrawal, verified HTTPS collection from three peers, native English/Korean UI, identity and TLS failures, historical samples, inventory relabeling, and removal. A prior successful sample is not current evidence after a failed request. Group and role values are operator-assigned labels, not authenticated execution roles or available capacity. The HTTPS example waits for the collector's real polling interval.

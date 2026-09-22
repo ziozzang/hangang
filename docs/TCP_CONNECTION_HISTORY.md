@@ -1,5 +1,7 @@
 # Live TCP connection history
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Hangang maintains bounded, process-local active and recent metadata for raw TCP connections. This is separate from the HTTP [response-head traffic ring](TRAFFIC_HISTORY.md). Workload HTTP listeners do not create duplicate raw TCP records. Accept syscall errors have no connection peer and remain aggregate errors; a raw connection whose socket setup fails records `io_error` when tracking capacity is available.
 
 ## Capacity and lifetime
@@ -28,4 +30,4 @@ Both APIs require administrator authority, recheck it after reading, and prohibi
 
 Every batch has a random per-process `process_id`. Cursors cannot be reused across process replacement. A connection's accept ID and its completion event ID are distinct: old connections may close after newer ones. Recent cursors follow completion order so polling does not miss those late completions. Active pages are best-effort observations, not one frozen inventory across requests.
 
-The EN/KO console provides separate active/recent tables, phase/outcome/country filtering, bounded paging, bytes/durations, and omission/gap/stale indicators. Pausing freezes presentation while retained recent rows still expire locally. Logout and authority loss clear the records. The HTTP and TCP history APIs expose sensitive operational metadata and are not available to viewers.
+The English/Korean console provides separate active/recent tables, phase/outcome/country filtering, bounded paging, bytes/durations, and omission/gap/stale indicators. Pausing freezes presentation while retained recent rows still expire locally. Logout and authority loss clear the records. The HTTP and TCP history APIs expose sensitive operational metadata and are not available to viewers.

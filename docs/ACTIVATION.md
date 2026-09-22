@@ -1,5 +1,7 @@
 # Activate and deactivate
 
+[Documentation](README.md) · [한국어 요약](ko/ACTIVATION.md)
+
 HTTP routes, TCP routes, file certificate entries and the global cache policy accept `enabled`. It defaults to `true`; normal serialization omits `true` for compatibility with earlier configuration files. `false` remains in the saved document and survives reloads and restarts. The console provides dedicated actions rather than requiring deletion or JSON editing.
 
 ```json
@@ -25,9 +27,3 @@ Setting `cache.enabled` to `false` retains memory/disk limits and other policy w
 All changes use existing administrator-only revision/CAS writes. Viewer accounts cannot toggle configuration. Invalid metadata remains invalid even when disabled; activation is not a way to bypass configuration validation. Kubernetes-controlled instances retain their controller-owned write restrictions, and shared configuration stores propagate these flags using their existing revision mechanism.
 
 Earlier binaries do not understand `enabled:false`. A rollback must not remove it silently, because that would reactivate traffic. The guarded release procedure refuses such a rollback until the configuration is explicitly made compatible.
-
-## 한국어
-
-HTTP/TCP 라우트, 인증서 항목, 전역 캐시 정책을 삭제하지 않고 활성/비활성으로 전환할 수 있다. 설정값은 저장되며 새 요청에 반영된다. 비활성 HTTP 라우트 대신 다른 활성 라우트가 매칭될 수 있고, 공유 TCP SNI 리스너는 나머지 활성 라우트를 계속 처리한다. 기존 스트림은 유지되며 다시 활성화할 때 포트 충돌이나 인증서 오류가 있으면 이전 설정을 유지한다.
-
-인증서 비활성화는 현재 인스턴스의 TLS 선택만 변경한다. 별도 ACME 발급기의 갱신이나 다른 HTTPS 인스턴스를 중지하지 않는다. 캐시 비활성화도 정책을 보존하며 데이터 삭제를 의미하지 않는다.

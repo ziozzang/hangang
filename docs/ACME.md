@@ -1,10 +1,17 @@
 # Native ACME certificates
 
+[Documentation](README.md) · [한국어 요약](ko/ACME.md)
+
 Hangang's acme module issues and renews certificates through ACME v2 using
 the instant-acme client. The default directory is Let's Encrypt production;
 operators should select staging while testing. A custom directory must be an
 HTTPS URL. ZeroSSL is supported through its production directory and requires
 an EAB KID and base64 or base64url encoded HMAC key.
+
+For gateway deployment, start with [gateway runtime](#gateway-runtime). The next
+section describes the Rust module integration contract.
+
+## Module integration
 
 Construct an AcmeConfig only after the operator has enabled certificate
 management. AcmeConfig::new requires at least one DNS name and an account
@@ -124,7 +131,6 @@ directories remain as local rollback material. A failed output publication
 can require another ACME order after an issuer process crash; ensure the
 output directory is writable and backed up, and monitor renewal expiry.
 
-
 Enable certificate management explicitly with a private, dynamically reloaded JSON file:
 
 ```sh
@@ -179,15 +185,9 @@ The bundle file itself is checked every 5 seconds. A bundle written by another p
 
 A per-account file lock serializes issuance on shared local state. Supervised replacement freezes the renewal task before exporting the challenge listener, and a failed candidate resumes the preceding generation. Existing TLS connections retain their negotiated certificate. Manual public TLS, Kubernetes Secret TLS and ACME TLS are mutually exclusive listener configurations in this release.
 
-## 한국어 운영 안내
-
-`--acme-config`로 명시적으로 활성화하며 일반 도메인은 HTTP-01, 와일드카드는 DNS-01을 사용한다. HTTP-01은 인터넷의 80번 포트가 `--acme-http-listen`으로 도달해야 한다. DNS 공급자는 Cloudflare 또는 인증된 HTTPS webhook을 지원한다. 공급자 토큰은 파일에서 읽으며, JSON 설정과 토큰 변경을 500ms 주기로 확인한다. ZeroSSL은 EAB KID와 HMAC 키를 함께 지정한다.
-
-계정과 인증서·개인 키 번들은 쓰기 가능한 영속 디렉터리에 보관한다. 발급 실패나 잘못된 설정 교체 중에는 마지막으로 검증한 인증서를 유지한다. 상태 API와 웹 화면에서 발급 단계·도메인·만료 시각·`tls_available`·`bundle_digest`를 확인할 수 있다. 여러 인스턴스를 운영할 때는 공유 설정 저장소(`--database`)로 HTTP-01 토큰을 공유하고, 계정·번들 경로를 공유 볼륨에 두어 잠금 보유자 한 곳만 발급하게 하며, 나머지 인스턴스는 5초마다 번들 파일 변경을 감지해 인증서를 새로 적재한다(아래 "Multiple instances" 절 참고). 공유 모드에서는 저장소가 토큰 게시를 확인(최대 3회 시도)한 뒤에야 CA에 검증 준비를 알리며, 게시가 끝내 실패하면 해당 발급 시도는 오류로 중단되고 `last_error`에 이유가 남는다. 게시된 레코드는 주문이 끝날 때까지 주기적으로 갱신되므로 검증이 늦게 도착해도 어느 인스턴스에서든 응답할 수 있다. 실제 운영 전 도메인·공급자·네트워크 경로에 맞춘 검증이 필요하며, 개발 검증은 소유한 테스트 CA와 컨테이너에서만 수행한다.
-
 Pending DNS cleanup receipts are bounded to 4096 per provider, with bounded record fields. New DNS mutations fail before contacting the provider when this bookkeeping budget is exhausted. This prevents repeated cleanup failures from growing retained memory without bound. Provider errors can still leave TXT records, and process-crash recovery of those receipts is not a distributed transaction guarantee.
 
-### Multiple instances
+## Multiple instances
 
 Running several instances behind one load balancer needs four things to hold; each is covered by a different mechanism.
 

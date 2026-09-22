@@ -1,5 +1,7 @@
 # Initial active-health admission
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 `balance.active_health.initial_state` controls whether a newly constructed HTTP
 backend may receive application traffic before active probes qualify it:
 

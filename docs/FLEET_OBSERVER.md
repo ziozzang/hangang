@@ -1,5 +1,7 @@
 # Node observation identity
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 The optional fleet observer exposes a small read-only document about one Hangang process. It does not publish configuration, register peers, or authorize management operations. Configure it with a private local JSON file:
 
 ```json

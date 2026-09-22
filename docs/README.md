@@ -1,26 +1,89 @@
 # Documentation
 
-Start with the [English](../README.md) or [Korean](../README.ko.md) README for a local run. The [example JSON configuration](../examples/hangang.json) is a small starting point; [OpenAPI](openapi.json) defines the management API and configuration objects. `hangang --help` lists command-line options.
+[한국어 보충 목차](README.ko.md)
 
-## Routing and traffic
+English is the primary documentation. Korean pages are supplementary translations and summaries; when the two differ, use the English page as the technical authority. The [repository README](../README.md) has the local quick start. The [example JSON configuration](../examples/hangang.json) is a small starting point, and [OpenAPI](openapi.json) defines the management API and configuration objects.
 
-- [Architecture](ARCHITECTURE.md), [host matching and priority](MATCHING.md), [named public HTTP/HTTPS listeners](PUBLIC_LISTENERS.md), and [canonical domain redirects](CANONICAL_DOMAINS.md)
-- [Backend connections and outbound TLS](UPSTREAM.md), [named backend members](NAMED_MEMBERS.md), [member admission](MEMBER_ADMISSION.md), [member lifecycle](MEMBER_LIFECYCLE.md), [retired members](RETIRED_MEMBERS.md), [HTTP health](HTTP_DOCKER_HEALTH.md), [initial health admission](HEALTH_ADMISSION.md), and [TCP health](TCP_HEALTH.md)
-- [Response cache](CACHE.md), [request/response body transforms](TRANSFORMS.md), [TLS/SNI routing](SNI.md), and [ACME certificates](ACME.md)
-- [TCP admission](TCP_ADMISSION.md), [TCP member activity](TCP_MEMBER_ACTIVITY.md), and [Lua worker capacity](LUA_CAPACITY.md)
+## Start here
 
-## Access and management
+- [Documentation guide](DOCUMENTATION.md) — how the documentation is organized
+- [Glossary](GLOSSARY.md) — shared terminology
+- [Architecture](ARCHITECTURE.md) — system structure and request flow
+- [Development](DEVELOPMENT.md) — development and test workflow
+- [Single-node deployment](DEPLOYMENT.md) — Docker Compose deployment
+- [OpenAPI specification](openapi.json) — management API and configuration schema
 
-- [Administrator accounts](ADMIN_USERS.md), [access modes](ACCESS_POLICY.md), [Basic/JWT/external identity and protected resources](RESOURCE_POLICY.md), [JWT](JWT_AUTH.md), and [HTTP workload mTLS](HTTP_WORKLOAD_MTLS.md)
-- [TCP workload mTLS](TCP_MTLS.md), [country admission](GEOIP.md), and [language preference](LANGUAGE_POLICY.md)
-- [Configuration publication](CONFIG_PUBLICATION.md), [configuration operation history](CONFIG_OPERATIONS.md), [SQL commit receipts](SQL_COMMIT_RECEIPTS.md), [sequenced SQL receipts](SEQUENCED_SQL_RECEIPTS.md), and [receipt release](SQL_RECEIPT_RELEASE.md)
-- [Account audit](ACCOUNT_AUDIT.md) and [audit recording filters](ACCOUNT_AUDIT_FILTERS.md)
-- [HTTP traffic history](TRAFFIC_HISTORY.md), [HTTP recording](HTTP_RECORDING.md), [HTTP listener attribution](HTTP_TRAFFIC_LISTENERS.md), [TCP connection history](TCP_CONNECTION_HISTORY.md), and [TCP completion recording](TCP_RECENT_RECORDING.md)
+## Routing and listeners
 
-## Deployment and operations
+- [Host matching and route priority](MATCHING.md) — route selection rules
+- [Named public HTTP and HTTPS listeners](PUBLIC_LISTENERS.md) — public listener configuration
+- [Canonical domain redirects](CANONICAL_DOMAINS.md) — canonical host behavior
+- [TLS termination and SNI passthrough](SNI.md) — TLS listener modes
+- [Request and response transforms](TRANSFORMS.md) — body transformation policies
+- [HTTP response caching](CACHE.md) — response cache behavior
+- [ACME certificates](ACME.md) — native certificate issuance
 
-- [Single-node Compose deployment](DEPLOYMENT.md), [Docker discovery](DOCKER.md), [Kubernetes integration](KUBERNETES.md), [shared-store operation](SCALE_OUT.md), and [Redis configuration](REDIS.md)
-- [Fleet observer identity](FLEET_OBSERVER.md) and [read-only fleet observations](FLEET_OBSERVATIONS.md). These observations do not provide fleet membership or deployment control.
-- [Route and certificate activation](ACTIVATION.md), [certificate inventory](CERTIFICATE_INVENTORY.md), [signed updates and restart](UPDATES.md), [native console/API coverage](API_UI_COVERAGE.md), [Lua editor](../web/LUA_EDITOR.md), and [development/testing](DEVELOPMENT.md)
+## Backends, members, and health
 
-The console is available at `/ui/` on the management listener. The same build serves its API specification at `/openapi.json`.
+- [Outbound connection policies](UPSTREAM.md) — backend connection and TLS settings
+- [Named HTTP and TCP members](NAMED_MEMBERS.md) — reusable backend members
+- [Member admission](MEMBER_ADMISSION.md) — HTTP member admission and activity
+- [Member lifecycle controls](MEMBER_LIFECYCLE.md) — member state transitions
+- [Retired member observations](RETIRED_MEMBERS.md) — retired member state
+- [Initial active-health admission](HEALTH_ADMISSION.md) — startup health gates
+- [HTTP Docker endpoint health](HTTP_DOCKER_HEALTH.md) — Docker health checks
+- [TCP transport health](TCP_HEALTH.md) — TCP health checks
+- [TCP member admission](TCP_ADMISSION.md) — TCP member admission and activity
+- [TCP named-member stream activity](TCP_MEMBER_ACTIVITY.md) — TCP member activity
+- [Lua capacity reporting](LUA_CAPACITY.md) — Lua worker capacity
+
+## Access control and identity
+
+- [Explicit HTTP access modes](ACCESS_POLICY.md) — access policy modes
+- [Protected HTTP resources](RESOURCE_POLICY.md) — resource protection
+- [Native access-token authentication](JWT_AUTH.md) — JWT authentication
+- [HTTP workload identity with mutual TLS](HTTP_WORKLOAD_MTLS.md) — HTTP workload certificates
+- [TCP workload identity with mutual TLS](TCP_MTLS.md) — TCP workload certificates
+- [Country admission](GEOIP.md) — country-based admission
+- [Native HTTP language preference](LANGUAGE_POLICY.md) — language selection policy
+- [Administrator accounts](ADMIN_USERS.md) — account setup and administration
+
+## Configuration and change control
+
+- [Configuration publication](CONFIG_PUBLICATION.md) — publishing configuration revisions
+- [Local configuration operation acceptance](CONFIG_OPERATIONS.md) — operation history and acceptance
+- [Activate and deactivate](ACTIVATION.md) — route and certificate activation
+- [Retained SQL configuration commit receipts](SQL_COMMIT_RECEIPTS.md) — SQL commit receipts
+- [Sequenced SQL commit receipts](SEQUENCED_SQL_RECEIPTS.md) — ordered receipt records
+- [V2 receipt protection and completion acknowledgement](SQL_RECEIPT_RELEASE.md) — receipt release
+- [Signed updates and process replacement](UPDATES.md) — update and restart flow
+- [Management API and console coverage](API_UI_COVERAGE.md) — native API and console coverage
+
+## Audit and traffic observations
+
+- [Durable local account audit](ACCOUNT_AUDIT.md) — account audit records
+- [Selective account audit recording](ACCOUNT_AUDIT_FILTERS.md) — audit filters
+- [Recent traffic metadata](TRAFFIC_HISTORY.md) — HTTP traffic history
+- [Selective HTTP response-head recording](HTTP_RECORDING.md) — HTTP recording
+- [HTTP request listener attribution](HTTP_TRAFFIC_LISTENERS.md) — listener attribution
+- [Live TCP connection history](TCP_CONNECTION_HISTORY.md) — TCP connection history
+- [Selective raw TCP completion recording](TCP_RECENT_RECORDING.md) — TCP completion recording
+- [Certificate inventory and issuer observation](CERTIFICATE_INVENTORY.md) — certificate inventory
+
+## Deployment and integrations
+
+- [Docker discovery](DOCKER.md) — Docker service discovery
+- [Kubernetes Ingress controller](KUBERNETES.md) — Kubernetes integration
+- [Scale-out operation](SCALE_OUT.md) — shared configuration and multi-node operation
+- [Redis configuration store](REDIS.md) — Redis-backed configuration
+- [Node observation identity](FLEET_OBSERVER.md) — fleet observer identity
+- [Authenticated remote node observations](FLEET_OBSERVATIONS.md) — read-only fleet observations
+
+## Related guides
+
+- [Embedded Lua editor](../web/LUA_EDITOR.md) — browser editor behavior and build
+- [Upstream transport example](../examples/upstream/README.md) — executable backend transport example
+- [Fleet observations example](../examples/fleet-observations/README.md) — fleet observation example
+- [GeoIP fixture](../tests/fixtures/geoip/README.md) — GeoIP test fixture
+
+The console is available at `/ui/` on the management listener. The same build serves its API specification at `/openapi.json`. `hangang --help` lists command-line options.

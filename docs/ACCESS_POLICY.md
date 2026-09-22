@@ -1,5 +1,7 @@
 # Explicit HTTP access modes
 
+[Documentation](README.md) · [한국어 요약](ko/ACCESS_POLICY.md)
+
 `HttpRoute.access_mode` records the operator's intended authentication boundary. The gateway validates it before publishing any route or full configuration, including disabled routes. Use resource policies and an authenticator for subject-level authorization.
 
 | Value | Meaning | Validation |
@@ -29,7 +31,7 @@ The dedicated HTTP editor provides an Access mode selector and localized explana
 
 Existing Basic/JWT/external authentication remains on the request path. Protected routes are explicitly excluded from shared response caching. On the normal forwarding path, a protected `Cache-Control: only-if-cached` request runs authentication and Lua policy before returning 504 for an unsatisfiable cache-only request; an unauthenticated request receives its authentication denial/challenge instead. No upstream request is issued for that cache-only result. Trusted external-auth terminal/forwarded SSO responses may intentionally finish earlier, retaining existing behavior. Transport errors, parsing, route admission, IP denial and TLS redirection may still reject earlier; this mode is not a promise to authenticate malformed or rejected traffic.
 
-General Lua application-header/body/supported backend-selection transformations remain available. Authenticator-owned identity fields cannot be overwritten by ordinary header mutation, including identity names whose value must remain absent. A future explicit authentication-policy capability is tracked separately. Merely configuring a Lua script does not prove a verified principal exists.
+General Lua application-header/body/supported backend-selection transformations remain available. Authenticator-owned identity fields cannot be overwritten by ordinary header mutation, including identity names whose value must remain absent. Merely configuring a Lua script does not prove a verified principal exists.
 
 `protected` does not require transport TLS automatically, validate JWT/OIDC, authenticate inbound client certificates, evaluate device posture, enforce user-specific scopes, revoke established public streams, or create durable audit. Configure current transport/authenticator controls explicitly and qualify their topology. In particular, SNI passthrough cannot establish a gateway-verified client certificate without a terminating/authenticated identity hop.
 
@@ -41,12 +43,8 @@ Older gateway binaries do not understand `access_mode` and may reject configurat
 
 [examples/access-mode.json](../examples/access-mode.json) shows public, application-owned and protected routes with an external authenticator and ordinary Lua header mutation. Replace the reserved example identity endpoint and loopback backend with owned services before using it; the file does not install an IdP. TLS termination/trusted edge configuration is separate.
 
-## Owned verification
+## Verification
 
 The Rust suites cover default/explicit serialization, invalid modes, protected authenticator removal, dual authenticators, disabled routes, authoritative API rejection with unchanged state/revision, defensive cache eligibility, and protected cache-only/auth/Lua ordering. Browser tests exercise mode round trips, editor validation and security classification.
 
 `python3 tests/access_mode_smoke.py` starts an owned loopback origin and actual gateway using `HANGANG_BIN` (defaults to `target/debug/hangang`). It checks legacy behavior, real protected Basic+Lua requests, credential hiding, cache-only authentication, and 100 operations across 12 concurrent clients (valid requests, denials and invalid policy edits), with 16 Lua worker slots. Ten rejected downgrades must preserve the active and persisted revision, and no unauthenticated request may reach the origin. This is concurrency correctness testing, **not a comparative performance benchmark**. The fixture uses temporary files and no production endpoints.
-
-## 한국어 요약
-
-HTTP 라우트에 기존 동작·공개·애플리케이션 인증·게이트웨이 보호 모드를 명시한다. 보호 모드에서는 실제 인증기를 모두 제거하는 변경을 서버가 거부하고 이전 설정을 유지한다. 일반 Lua 변조는 계속 지원한다. 이 단계는 인증 설정의 우발적 제거를 막는 기능이며, 사용자별 권한·mTLS·폐기·감사까지 포함한 Zero Trust 전체 구현은 아니다.

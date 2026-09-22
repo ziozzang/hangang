@@ -1,5 +1,7 @@
 # HTTP workload identity with dedicated mutual TLS
 
+[Documentation](README.md) · [한국어 요약](ko/HTTP_WORKLOAD_MTLS.md)
+
 `Config.workload_http` defines dedicated HTTP listeners that terminate TLS and require a client certificate. An HTTP route opts into that verified connection with `workload_auth`. The route must declare `access_mode: "protected"` and have a `resource_policy`. This listener is separate from the ordinary public HTTP/HTTPS and ACME listeners; enabling `workload_auth` does not turn a public listener into mTLS.
 
 [The example](../examples/http-workload-mtls.json) shows one listener and one route. Its addresses, hostname, and normalized absolute file paths are illustrative. It contains no certificate, private key, or credential material. The enabled listener remains unavailable until valid local material is verified at those paths. Serving a successful request also requires a reachable backend; backend reachability is not a startup prerequisite.
@@ -44,7 +46,3 @@ Supervised handoff uses a typed `WorkloadHttp` listener descriptor. A new binary
 `http_mtls_rejections_total` counts listener handshake/generation admission rejection and `http_mtls_lease_terminations_total` counts listener lease termination. `workload_auth_rejections_total` counts route workload authorization denials and `workload_route_terminations_total` counts route-stream withdrawal. These status/Prometheus counters contain no certificate material and are not durable actor audit records. Inspect both listener and route counters when diagnosing a denial; an exact resource-policy subject/method denial is a separate policy result.
 
 Implementation boundaries are in [configuration validation and snapshot preparation](../src/config.rs), [the dedicated listener](../src/workload_http.rs), [route authorization](../src/workload_auth.rs), [HTTP admission and stream fencing](../src/proxy.rs), and [the typed handoff protocol](../src/restart.rs).
-
-## 한국어 요약
-
-`workload_http`는 일반 공개 HTTP/HTTPS와 별도인 클라이언트 인증서 필수 수신기를 만든다. 보호된 HTTP 경로는 `workload_auth`로 실제 수신기 ID와 정확한 SPIFFE URI를 허용하고, 적용 중인 `resource_policy`에서 주체와 메서드를 다시 검사한다. 인증서가 유효하더라도 세 허용 목록 중 하나라도 불일치하면 통과하지 못한다. 활성 수신기의 로컬 파일은 메타데이터를 500ms마다, 전체 내용을 5초마다 재확인한다. 새 바인딩은 게시 후 검증될 때까지 대기하며 잘못된 클라이언트 CA·CRL은 해당 수신기의 인증 연결과 기존 스트림을 닫는다. 현재 인스턴스 상태는 `GET /v1/status`와 구성 화면에서 확인한다. 이 기능만으로 플릿 전체 자료 배포, 영구 감사, 백엔드 직접 접근 차단까지 완성되지는 않는다.

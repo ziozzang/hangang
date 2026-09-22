@@ -1,6 +1,8 @@
 # Selective HTTP response-head recording
 
-`settings.http_recording` controls the HTTP history ring and, when enabled by `--access-log`, the `hangang::access` tracing event. It is part of the revisioned configuration document, so existing configuration publication, persistence and conflict handling apply. The administrator Settings view provides an EN/KO editor; the same document is available through `GET`/`PUT /v1/config`. The viewer-readable status/SSE settings summary omits these rules.
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
+`settings.http_recording` controls the HTTP history ring and, when enabled by `--access-log`, the `hangang::access` tracing event. It is part of the revisioned configuration document, so existing configuration publication, persistence and conflict handling apply. The administrator Settings view provides an English/Korean editor; the same document is available through `GET`/`PUT /v1/config`. The viewer-readable status/SSE settings summary omits these rules.
 
 ```json
 {

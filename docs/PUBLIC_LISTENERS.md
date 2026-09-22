@@ -1,5 +1,7 @@
 # Named public HTTP and HTTPS listeners
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 `public_http` adds independently configured public HTTP/HTTPS sockets to the existing CLI public listener. All listeners use the same configuration revision, administrator authority, route inventory and process metrics. This is one node; it does not establish fleet membership or multi-node deployment acknowledgement.
 
 A named listener has an ASCII `id` (1–64 alphanumeric, `.`, `_`, `-` characters), nonzero socket `listen`, optional `enabled` (default true), `certificates` and `trusted_proxy_cidrs`. At most64 listeners and1,024 named certificate entries are accepted per document. The reserved ID `default` identifies the existing CLI public listener and cannot name an additional listener.
@@ -26,7 +28,7 @@ Supervisor export/import carries a separate named-public descriptor role, valida
 
 ## API and native console
 
-Use `GET`/`PUT /v1/config` and `POST /v1/config/validate`, with existing revision preconditions. Configuration → Public HTTP listeners provides native EN/KO add/edit/remove, activation, socket address, explicit proxy trust and certificate fields. Changes are staged until Apply configuration. HTTP route editors expose Public listener IDs and retain other route policies. The JSON document remains available for advanced edits.
+Use `GET`/`PUT /v1/config` and `POST /v1/config/validate`, with existing revision preconditions. Configuration → Public HTTP listeners provides native English/Korean add/edit/remove, activation, socket address, explicit proxy trust and certificate fields. Changes are staged until Apply configuration. HTTP route editors expose Public listener IDs and retain other route policies. The JSON document remains available for advanced edits.
 
 Named listener policies currently require local file authority. Shared stores and controller-owned configuration reject the new listener wire format until reader capabilities and controller ownership are coordinated. `GET /v1/certificates?listener_id=<id>` selects a named listener’s certificate inventory. Omission or `listener_id=default` retains the CLI/global set. Responses identify their scope; unknown names return404 and malformed or repeated query fields return400. Named inventories never inherit the default listener’s in-process ACME status.
 

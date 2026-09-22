@@ -1,5 +1,7 @@
 # Configuration publication
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Hangang prepares a candidate before replacing the active immutable snapshot.
 Validation, TLS material loading and listener binding must succeed first.
 A failed candidate leaves the prior configuration active. Administration writes

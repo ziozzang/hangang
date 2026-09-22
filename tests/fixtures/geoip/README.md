@@ -1,3 +1,7 @@
+# GeoIP test fixtures
+
+[Documentation](../../../docs/README.md)
+
 These are MaxMind's fake test databases, not production GeoIP databases.
 
 Sources and SHA-256 digests:

@@ -1,5 +1,7 @@
 # Country admission
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 HTTP and TCP routes can use the optional `country_policy` with an operator-provided offline country database. See [the example](../examples/country-policy.json). Country is approximate address metadata, not identity, nationality or proof of a user's location. `Accept-Language` filtering is a separate [language policy](LANGUAGE_POLICY.md).
 
 `geoip_database.file` names an absolute normalized UTF-8 path on **each node**. Provision a current GeoIP2-Country or GeoLite2-Country MMDB using its IPv6 database format, which also supports IPv4. Hangang does not download a licensed database or distribute its bytes through configuration. Publish file updates using an atomic rename. Configuration accepts a structurally valid source even when the file is unavailable; `--check` does not certify node readiness.
@@ -28,7 +30,7 @@ Country filtering acts on the selected route, without falling through to a lower
 
 Administrator APIs are `GET /v1/geoip/status` and `GET /v1/geoip/lookup?ip=...`. Status is per instance, with readiness, path-free error and generation metadata. Lookup requires exactly one IPv4/IPv6 address and returns a canonical IP and country or `null`. Unavailable lookup returns 503. Responses are not cacheable and authorization is rechecked after reading. Consult the [OpenAPI document](openapi.json) for the full wire format.
 
-The EN/KO console provides source and route-policy controls plus local status refresh and IP lookup. Changing a draft is separate from the displayed runtime observation; other nodes may differ.
+The English/Korean console provides source and route-policy controls plus local status refresh and IP lookup. Changing a draft is separate from the displayed runtime observation; other nodes may differ.
 
 ## Request observations and Lua
 
@@ -48,7 +50,7 @@ A script cannot mutate this userdata or override native admission. Country remai
 
 ## Live traffic and metrics
 
-HTTP traffic-ring records include `geoip` with the observation above; the live EN/KO console displays country/state and supports filtering. These are HTTP response-head records, not packet capture. TCP connections have a separate bounded [active/recent history](TCP_CONNECTION_HISTORY.md). Existing ring capacity and retention limits apply. Batch timestamps cover every returned record even after a wall-clock rollback.
+HTTP traffic-ring records include `geoip` with the observation above; the live English/Korean console displays country/state and supports filtering. These are HTTP response-head records, not packet capture. TCP connections have a separate bounded [active/recent history](TCP_CONNECTION_HISTORY.md). Existing ring capacity and retention limits apply. Batch timestamps cover every returned record even after a wall-clock rollback.
 
 Prometheus exports `hangang_geoip_lookups_total{protocol,result}`, `hangang_geoip_country_requests_total{protocol,country}` and `hangang_geoip_admission_total{protocol,decision}`. Protocol is `http` or `tcp`. Country labels are bounded to 676 uppercase two-letter combinations plus `unknown`; IPs, route IDs and database digests never become labels. Unavailable lookups have no country count. Admission counters describe enforced native country decisions only; passive observations count lookups but not native decisions. Earlier authorization or IP rejection does not count as a country lookup.
 

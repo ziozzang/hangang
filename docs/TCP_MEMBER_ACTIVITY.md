@@ -1,5 +1,7 @@
 # TCP named-member stream activity
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 See [member lifecycle](MEMBER_LIFECYCLE.md) for serving, draining and maintenance states.
 
 `GET /v1/operations` reports `member_active_streams` for each configured

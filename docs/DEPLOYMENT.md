@@ -1,6 +1,10 @@
 # Deploy a single Hangang gateway with Docker Compose
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 This template runs one gateway with an HTTP listener and a local management port. It starts with no routes and no named HTTPS or TCP listeners. The sample configuration does not point to any real service. It is not the configuration of any existing deployment.
+
+## Build the image
 
 The repository [Dockerfile](../Dockerfile) packages the static `hangang` binary only. Build that binary on Linux x86_64 first, then build the image from the repository root:
 
@@ -8,6 +12,8 @@ The repository [Dockerfile](../Dockerfile) packages the static `hangang` binary 
 make static
 docker build -t hangang:local .
 ```
+
+## Prepare private state
 
 Create the runtime files beside [compose.yaml](../deploy/compose.yaml). Generate a unique random administrator token, and keep it out of version control and terminal output. The gateway reads `HANGANG_ADMIN_TOKEN` from the private environment file:
 
@@ -27,6 +33,8 @@ The example image runs as UID/GID 65532. If you change `HANGANG_UID` and `HANGAN
 
 The environment file keeps the token out of the Compose template and command line, but Docker administrators can inspect container environment values. Restrict access to the Docker daemon and to `deploy/admin.env`. Once ownership changes, edit the state file through the authenticated management API or with an explicitly privileged file operation; the host user may no longer read it.
 
+## Validate and start
+
 Validate the Compose model without printing its resolved environment and check the config with the built binary:
 
 ```sh
@@ -41,7 +49,11 @@ Start the gateway:
 docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --no-build
 ```
 
+## Access the management console
+
 `http://127.0.0.1:8080/healthz` is the public readiness path configured by the sample. Management is published only at `http://127.0.0.1:49000/ui/`. The gateway binds management on the container interface using `--allow-insecure-admin` because Docker forwards the host loopback port into the container; management traffic is plaintext on that local bridge. Keep the host publish address at `127.0.0.1`, do not expose port 49000 through a firewall or reverse proxy, and use TLS or the private Unix-socket relay design for remote administration. Use the installation token to bootstrap an administrator account as described in [administrator accounts](ADMIN_USERS.md).
+
+## Configure routes and listeners
 
 Edit `deploy/state/hangang.json` or publish changes through the authenticated management API. For a route example, add an `http` item with an example-only backend such as `http://backend.example.invalid:8080`; replace it with an actual reachable service address before expecting successful proxy responses. Route and listener syntax is documented in [matching](MATCHING.md) and [public listeners](PUBLIC_LISTENERS.md).
 

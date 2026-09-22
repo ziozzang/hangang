@@ -1,5 +1,7 @@
 # TCP transport health
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 TCP routes may configure an optional `health` policy:
 
 ```json

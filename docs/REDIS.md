@@ -1,5 +1,7 @@
 # Redis configuration store
 
+[Documentation](README.md) · [한국어 요약](ko/REDIS.md)
+
 Hangang can use Redis as a shared whole-configuration store through
 `RedisConfigStore`. The store keeps one versioned string under the caller's
 key, laid out as `hangang-config-v2\n<epoch>\n<revision>\n<json>`. Bootstrap
@@ -53,7 +55,3 @@ them with `--include-ignored` and supplies `HANGANG_TEST_REDIS_*` variables.
 ## Command-line runtime
 
 Use `--database rediss://redis.example:6379/0 --redis-key hangang:config` (or `HANGANG_DATABASE`). `--database-ca /path/to/ca.pem` installs a private root. `--database-plaintext` is an explicit local-development override. The seed file is read only when bootstrapping an empty key; committed Redis revisions then become authoritative and are polled every 500 ms. API writes use the same ETag/CAS contract as other shared stores. The fixture also verifies two real gateway processes conflicting, refreshing and restarting against the owned Redis instance.
-
-## 한국어
-
-Redis는 검증된 TLS로 접속하고 하나의 키에서 전체 설정 revision을 원자적으로 비교·교체한다. 큰 u64 revision도 문자열 비교로 정밀도를 보존한다. 실제 테스트 전용 Redis의 TLS·잘못된 CA·재접속·경합과 두 게이트웨이 프로세스의 충돌·동기화·재시작을 검증했다. 장애 중에는 각 프로세스의 마지막 정상 설정을 유지한다.

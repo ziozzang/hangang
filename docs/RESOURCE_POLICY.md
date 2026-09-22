@@ -1,5 +1,7 @@
 # Protected HTTP resources
 
+[Documentation](README.md) · [한국어 요약](ko/RESOURCE_POLICY.md)
+
 An HTTP route may bind a gateway URL namespace to an authenticated principal and an exact method allowlist using `resource_policy`. This adds authorization to the existing `access_mode: protected` authentication boundary. The namespace is the route's host matcher plus `path_prefix` and `path_match`; it does not depend on route priority, header/JSON predicates, or whether the route is enabled.
 
 ```json
@@ -54,10 +56,6 @@ This is a gateway URL namespace contract, not discovery of all aliases to an ups
 
 `enforce` defaults to true and is omitted from serialized output when true. Disabling a route preserves its guard. Replacing the active configuration cannot omit, delete, move or narrow an enforced namespace. A replacement must preserve its resource ID and existing host/path scope, even if the route ID changes. Exact/glob host aliases may be added, reordered or case-normalized without releasing existing protection. Path shapes and regex expressions must remain identical; containment between different glob/regex expressions is not guessed.
 
-To deliberately release a namespace, first publish the existing policy with `enforce: false` at its existing scope. This immediately releases namespace and subject/action enforcement; the route still requires its declared authenticator. A later revision may remove the policy or route, or change ownership explicitly. All aliases using the same resource ID must be updated consistently. The dedicated EN/KO editor exposes the policy, rules and explicit release/removal steps; route CRUD and full configuration PUT share server validation and revision checks.
+To deliberately release a namespace, first publish the existing policy with `enforce: false` at its existing scope. This immediately releases namespace and subject/action enforcement; the route still requires its declared authenticator. A later revision may remove the policy or route, or change ownership explicitly. All aliases using the same resource ID must be updated consistently. The dedicated English/Korean editor exposes the policy, rules and explicit release/removal steps; route CRUD and full configuration PUT share server validation and revision checks.
 
 Transition protection compares with the active snapshot. It is not immutable central authority across a fresh process loading an independently rewritten file. For ordinary routes, a policy publication does not recall previously admitted requests or close established streams. A dedicated workload mTLS route has a separate route-generation lease: changing that route retires its existing response streams and upgraded tunnels; listener expiry or withdrawal can also close its connections. This is bounded by runtime scheduling and cannot recall bytes already delivered. [Native JWT verification](JWT_AUTH.md) and [dedicated workload mTLS](HTTP_WORKLOAD_MTLS.md) are implemented as separate, opt-in authentication slices; device posture, general revocation, durable decision audit and fleet capability enforcement remain outside this resource guard. All fleet readers must support the new field before publishing it to shared configuration; older binaries reject it rather than silently ignoring it.
-
-## 한국어 요약
-
-보호 리소스는 호스트·경로 범위와 검증된 주체·HTTP 메서드를 묶는다. 공개 라우트의 우선순위나 헤더/JSON 조건으로 보호 범위를 우회할 수 없다. 라우트를 비활성화해도 보호 범위는 유지된다. 제거하려면 먼저 기존 범위에서 `enforce=false`를 저장하고 이후 변경에서 삭제한다. JWT 검증과 전용 workload mTLS는 별도 선택 기능으로 구현되어 있으며, workload 경로 변경 시 기존 응답 스트림은 종료된다. 이 URL 범위 권한 검사가 세션 폐기·영구 감사·중앙 fleet 권한까지 제공하지는 않는다.

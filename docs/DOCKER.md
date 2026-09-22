@@ -1,5 +1,7 @@
 # Docker discovery
 
+[Documentation](README.md) · [한국어 요약](ko/DOCKER.md)
+
 Hangang can resolve HTTP and TCP backends from Docker container metadata. Enable it by passing the Docker Unix socket to the daemon:
 
 ```console
@@ -26,15 +28,6 @@ Docker inspection uses bounded requests: the resolver has a three-second request
 The admin `POST /v1/docker/resolve` endpoint remains available for explicit inspection diagnostics. Dynamic route discovery does not require calls to that endpoint.
 
 The discovery tests use a fake Unix-socket Docker API. They cover address changes, stopped and removed containers, strict reference parsing, native backend passthrough, the eight-inspection concurrency limit, and configuration-revision stability without creating real containers.
-
-## 한국어 요약
-
-`--docker-socket /var/run/docker.sock` 옵션으로 Docker 검색을 활성화하고, HTTP 또는 TCP 백엔드에 `docker://컨테이너/네트워크/포트` 형식을 사용합니다. Hangang은 시작 시 한 번, 이후 1초마다 컨테이너 정보를 갱신하며 최대 8개를 동시에 조회합니다. 설정 문자열과 설정 revision은 바뀌지 않고 런타임 주소 표만 교체됩니다.
-
-컨테이너가 중지 또는 삭제되거나, 지정한 네트워크나 IP가 없거나, 조회에 실패하면 해당 주소를 즉시 게시하지 않아 요청이 실패하도록 처리합니다. 다음 조회가 성공하면 자동으로 복구됩니다. Hangang이 실행되는 네트워크에서 컨테이너 IP에 접근할 수 있어야 합니다.
-
-Docker 소켓은 일반적으로 매우 높은 권한을 제공합니다. 소켓 파일 접근 권한을 제한하고 가능하면 최소 권한 소켓 프록시를 사용하십시오. Hangang은 컨테이너 조회 API만 호출하며 컨테이너를 시작, 중지, 변경하거나 내부 명령을 실행하지 않습니다.
-
 
 ## Connection management UI and API
 

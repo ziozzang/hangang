@@ -1,5 +1,7 @@
 # Embedded Lua editor
 
+[Documentation](../docs/README.md)
+
 `npm run build:lua-editor` bundles `lua-editor-src.js` into the same-origin
 `lua-editor.js` asset. The build appends full MIT notices for CodeMirror and
 its bundled dependencies. The server serves this file and `lua-editor.css`

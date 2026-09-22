@@ -1,5 +1,7 @@
 # Named HTTP and TCP members
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Use [the local example](../examples/named-members.json) with two origins listening on loopback ports 18081 and 18082. HTTP and TCP both select blue and green with 3:1 weights when both are eligible. Run the gateway with:
 
 ```sh

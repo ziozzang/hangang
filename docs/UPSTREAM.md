@@ -1,5 +1,7 @@
 # Outbound connection policies
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 HTTP and TCP routes accept an optional `upstream` object. A route can match a host, path, header, JSON condition or incoming TLS SNI using the existing routing rules, then select its own outbound transport. These options do not affect other routes, external authorization calls, ACME, update downloads or management traffic. Existing connections keep their transport; newly published route settings apply to new work. Failed configuration validation leaves the active configuration intact.
 
 ## Independent identities

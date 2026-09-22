@@ -1,5 +1,7 @@
 # HTTP response caching
 
+[Documentation](README.md) · [한국어 요약](ko/CACHE.md)
+
 Hangang provides an opt-in shared response cache with bounded memory storage and optional SQLite persistence. Enable storage once at the top level, then enable freshness policy on each route that may be cached. Both settings are required.
 
 ```json
@@ -99,7 +101,7 @@ A miss captures the response while forwarding it. Hangang publishes only after a
 
 Storage failures do not fail an otherwise valid proxy request. Disk reads and writes use nonblocking admission and may bypass during contention. Memory hits avoid disk work. Purge is different: it clears memory and waits for exclusive disk access, returning an error if persistent deletion fails. The runtime advances a local epoch while holding publication control, so a fill that began before purge cannot repopulate the cleared store. The local epoch is not part of the stored keys (it restarts with the process, and keying by it would strand every entry written after a purge across a restart); the configuration generation is.
 
-The authenticated admin API exposes:
+The authenticated management API exposes:
 
 - `GET /v1/cache`: active configuration, weighted memory statistics, physical main-database bytes, entry counts, cumulative store hits/misses/evictions/errors, and active fills. Disk values remain zero until the lazy database has opened.
 - `POST /v1/cache/purge`: in shared-store modes commits the configuration with the next `cache.generation`, which every instance applies as a configuration update; in file mode it clears this instance's memory and disk entries. It returns `{"purged":true}` on success, including when caching is disabled, and `503` if cache maintenance cannot complete.
@@ -115,13 +117,3 @@ python3 examples/cache/run.py
 ```
 
 The runner starts its own loopback origin and gateway, writes an instance-specific private disk directory, and first checks the generated configuration with `--check`. It then verifies a memory hit, file hot reload, ETag-protected API update, persistent disk reuse with the same public address across restart, and durable purge across another restart. It cleans up all processes and temporary files. Set `HANGANG_BINARY` to exercise another built binary.
-
-## 한국어
-
-Hangang 캐시는 전역 저장소 설정과 라우트별 TTL 설정을 모두 지정해야 동작한다. 메모리 계층은 빠른 조회를 위한 기본 선택이며, 디스크 계층은 용량과 재시작 후 지속성을 제공한다. 디스크 접근이 겹치면 요청을 대기시키지 않고 원본 서버로 우회할 수 있으므로 일반적으로 메모리와 디스크를 함께 사용한다.
-
-`memory.max_bytes`는 프로세스 RSS 제한이 아니라 키·본문·헤더와 고정 오버헤드에 대한 논리적 저장 용량이다. 각 실행 인스턴스에 절대 경로의 전용 `0700` 디렉터리를 지정해야 하며 여러 프로세스가 같은 SQLite 파일을 공유하면 안 된다. 전역 정책이 바뀌면 새 메모리 저장소를 즉시 사용하고, 이전 요청이 디스크 잠금을 놓은 뒤 데이터베이스를 다시 열어 기존 항목을 지우고 새 한도를 적용한다.
-
-`cache.generation`은 공유 설정 문서에 들어가는 무효화 세대다. 모든 캐시 키가 이 값으로 구분되며, 값이 바뀐 설정을 받은 인스턴스는 런타임을 다시 만들지 않고 메모리와 디스크 항목을 즉시 버린다. 공유 저장소 모드의 `POST /v1/cache/purge`는 이 값을 올린 문서를 CAS로 커밋하므로 문서를 공유하는 모든 인스턴스에 도달하고 `revision`으로 확인할 수 있다. 파일 모드의 purge는 요청을 받은 인스턴스만 지운다. 라우트를 수정했다가 되돌리는 것은 무효화가 아니므로 이전 표현이 돌아오면 안 될 때는 purge(세대 변경)를 사용한다.
-
-인증·쿠키·조건부 요청·범위 요청·요청 변환·Lua 정책은 공유 캐시를 우회한다. 적합한 `200` 응답의 본문을 끝까지 받은 경우에만 게시하며 오류, 취소, 크기 초과 또는 시간 초과 시 부분 본문을 저장하지 않는다. purge는 진행 중이던 게시를 차단하고 메모리와 디스크를 지운 뒤 성공을 반환한다. 위 실행 예제로 메모리 적중, 설정 갱신, 디스크 재시작 복구와 purge 지속성을 확인할 수 있다.

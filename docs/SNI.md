@@ -1,5 +1,7 @@
 # Configured TLS termination and SNI passthrough
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Hangang supports two distinct ways to use the TLS Server Name Indication (SNI).
 
 ## Terminate HTTPS with a configured certificate set

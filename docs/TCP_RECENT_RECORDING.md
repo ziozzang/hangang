@@ -1,5 +1,7 @@
 # Selective raw TCP completion recording
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 `settings.tcp_recent_recording` chooses which completed raw TCP connections enter the instance-local recent-history ring. An absent or `null` policy records every tracked completion. The active-connection inventory is independent of this policy.
 
 ```json

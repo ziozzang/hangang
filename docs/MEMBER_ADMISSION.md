@@ -1,4 +1,8 @@
-# HTTP member activity and lifecycle prerequisites
+# HTTP member activity and lifecycle
+
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
+## Activity accounting
 
 Every HTTP balancing mode now retains one backend request lease from admission
 through the final response-body or upgraded-tunnel owner. Cloning ownership does
@@ -7,11 +11,13 @@ the tunnel releases it. Compatible snapshot changes retain the shared count.
 `/v1/operations` exposes numeric `active_requests` for all HTTP modes. TCP
 keeps `active_requests: null`; named TCP members instead expose numeric
 `member_active_streams` for established streams. Legacy TCP rows have no
-per-member stream count. The EN/KO Operations table distinguishes the metrics.
+per-member stream count. The English/Korean Operations table distinguishes the metrics.
 
 Admission refusal is terminal before the first outbound send. A retry must
 acquire its newly selected member before sending; it cannot treat a refused
 lease as an untracked request. Existing no-replay and Lua-pinning rules remain.
+
+## Admission and generation lifecycle
 
 The internal `MemberAdmission` primitive combines activity with pending/retired
 flags in one atomic state. Retirement prevents new acquisition while old owners
@@ -33,6 +39,8 @@ fresh shared-authority attachment creates independent runtime/cache state but
 still retires the actual replaced snapshot's nodes at publication. Old HTTP
 leases and TCP streams keep their old ownership; pending TCP dials on a
 retired gate fail the final pre-byte check.
+
+## Named-member representation
 
 HTTP and TCP routes accept homogeneous string arrays or object arrays with
 explicit member IDs, addresses, and weights. Existing string JSON round-trips
@@ -59,6 +67,8 @@ for object members and `null` for legacy entries.
 
 Local-file per-member drain/maintenance controls now use generation retirement.
 Cross-revision HTTP connection-pool reuse is not claimed. See
-[member lifecycle](MEMBER_LIFECYCLE.md) for the remaining contract.
+[member lifecycle](MEMBER_LIFECYCLE.md) for publication and coordination details.
 
-Current retirement observation: [Retired members](RETIRED_MEMBERS.md) documents the bounded active-generation registry and dedicated API/UI. It includes pending TCP admissions and removed endpoints; operator lifecycle and fleet completion remain separate work.
+## Observation boundaries
+
+[Retired members](RETIRED_MEMBERS.md) documents the bounded active-generation registry and dedicated API/UI. It includes pending TCP admissions and removed endpoints; operator lifecycle and fleet completion are separate concerns.

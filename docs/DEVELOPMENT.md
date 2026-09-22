@@ -1,5 +1,7 @@
 # Development
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Use Rust 1.96 or newer, a C compiler for bundled native dependencies, Python 3,
 and Node.js/npm for console development. Build with the committed lockfiles.
 
@@ -23,6 +25,12 @@ package. `make static` builds the Linux static binary used by the Dockerfile.
 To change the Lua editor bundle, run `npm run build:lua-editor` inside `web/`
 and commit the generated assets with the source change. The rest of the console
 is served from checked-in assets embedded by the Rust build.
+
+## Documentation
+
+Follow the [documentation conventions](DOCUMENTATION.md) and [terminology](GLOSSARY.md).
+English is the reference language; Korean summaries live under `docs/ko/`.
+Stage changes and run `make check-docs` before publishing.
 
 ## Public repository policy
 

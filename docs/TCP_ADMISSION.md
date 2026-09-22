@@ -1,6 +1,10 @@
-# TCP member admission prerequisite
+# TCP member admission
+
+[Documentation](README.md) · [한국어 안내](README.ko.md)
 
 See [member lifecycle](MEMBER_LIFECYCLE.md) for serving, draining and maintenance states.
+
+## Admission lease
 
 Each TCP backend has an internal generation-specific admission gate in the
 prepared snapshot. The gate is separate from the named member's logical
@@ -8,7 +12,7 @@ prepared snapshot. The gate is separate from the named member's logical
 route selection and before the outbound dial, an accepted connection acquires
 one RAII admission lease; refusal ends the connection without dialing that
 member. The lease covers SOCKS/TLS negotiation and any other pending dial work,
-then remains owned through ClientHello forwarding and the established stream.
+then remains held through ClientHello forwarding and the established stream.
 Cancellation, dial failure, idle expiry and stream completion release it.
 The gate atomically combines open-state checking with count acquisition and
 rejects count overflow.
@@ -21,6 +25,8 @@ zero-gap revocation: retirement can race *after* the final check, so work
 already admitted may forward and finish. Existing established streams are not
 forcibly closed.
 
+## Snapshot compatibility
+
 Snapshots retain a gate only for a compatible backend generation. Named pools
 match exact member ID and address; route enablement, health policy, outbound
 settings and the prepared CA trust must also match. Legacy string pools require
@@ -32,6 +38,8 @@ health and enablement changes, including old-endpoint streams. Its public
 `member_active_streams` value counts only **established** streams; pending
 dials are counted by the internal admission lease but are absent from that UI
 value. TCP `active_requests` remains `null`.
+
+## Retirement and observation boundaries
 
 Snapshot preparation records which predecessor gates are absent from the
 successor by shared-pointer identity. It does not mutate the live generation:
@@ -50,6 +58,6 @@ Shared-store and Kubernetes startup keep the TCP accept gate closed until
 initial authority readiness. Hot-restart processes have separate gate memory:
 retiring a node in one process does not synchronously revoke an admission in
 its predecessor. See the [member lifecycle](MEMBER_LIFECYCLE.md) for
-remaining publication and fleet coordination requirements.
+publication and fleet coordination details.
 
-Current retirement observation: [Retired members](RETIRED_MEMBERS.md) documents the bounded active-generation registry and dedicated API/UI. It includes pending TCP admissions and removed endpoints; operator lifecycle and fleet completion remain separate work.
+[Retired members](RETIRED_MEMBERS.md) documents the bounded active-generation registry and dedicated API/UI. It includes pending TCP admissions and removed endpoints; operator lifecycle and fleet completion are separate concerns.

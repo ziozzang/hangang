@@ -1,5 +1,7 @@
 # Canonical domain redirects
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 An HTTP route with an exact `host` or a `hosts` domain group can declare one member as its canonical host. Hangang answers selected requests with the configured 301, 302, 307 or 308 redirect when the effective host differs. The scheme selects the redirect destination; requests already using the canonical host are unchanged. Use `require_tls` separately to enforce HTTPS on that host. The configured target is fixed; Hangang never copies an untrusted `Host` value into the redirect. It preserves the original path and query string.
 
 This is an operator redirect policy. It does not share cookies, login sessions, certificates, cache entries or application state between names. Provision every public name and certificate separately, and confirm the application's cookie-domain and callback policy.

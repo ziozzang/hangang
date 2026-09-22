@@ -1,5 +1,7 @@
 # Native HTTP language preference policy
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 HTTP routes can configure `language_policy` independently of console translation, gateway authentication and country lookup. It inspects the incoming `Accept-Language` preference signal. A client can change that signal; it is not an authenticated identity or geographical restriction.
 
 ```json
@@ -29,4 +31,4 @@ The policy applies to the already-selected route, before response-cache lookup, 
 
 `enforce:false` keeps and validates the configuration while bypassing language parsing and enforcement. Removing the optional policy disables this filter. Changing this preference rule does not replace or release an enforced resource namespace. Existing governed configuration writes, live publication and route cache fingerprints apply to the policy. Established streams are not reclassified midstream by a later language-policy change.
 
-The EN/KO route editor provides configure, enable/disable and remove controls, mode, missing-header behavior and allow/deny lists. Advanced JSON retains the same wire representation. Country lookup and country policy remain separate work; this feature does not implement GeoIP.
+The English/Korean route editor provides configure, enable/disable and remove controls, mode, missing-header behavior and allow/deny lists. Advanced JSON retains the same wire representation. Country lookup and country policy remain separate work; this feature does not implement GeoIP.

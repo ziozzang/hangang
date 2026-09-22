@@ -1,5 +1,7 @@
 # Architecture
 
+[Documentation](README.md) · [한국어 안내](README.ko.md)
+
 Hangang is an asynchronous HTTP/TCP reverse proxy written in Rust. A process
 serves public traffic and a separate administration interface. Optional Lua,
 TLS, discovery, shared configuration and update facilities are enabled explicitly.
@@ -54,7 +56,7 @@ the documented compatibility constraints in [Docker](DOCKER.md) and
 
 ## Management and operational boundaries
 
-The administration API and EN/KO console expose configuration, health, metrics,
+The management API and English/Korean console expose configuration, health, metrics,
 account controls and bounded traffic metadata. Request/connection history is
 process-local and is not a durable packet capture. Remote node observations do
 not provide configuration rollout, command execution or cluster consensus.
