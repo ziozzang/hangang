@@ -98,7 +98,7 @@ macOS에서는 아래 두 Hangang 명령에 `--allow-unsandboxed-lua`를 추가�
 
 ```sh
 umask 077
-export HANGANG_DEMO_DIR="$(mktemp -d)"
+export HANGANG_DEMO_DIR="$(python3 -c 'import os,tempfile; print(os.path.realpath(tempfile.mkdtemp()))')"
 cp examples/hangang.json "$HANGANG_DEMO_DIR/hangang.json"
 openssl rand -hex 32 > "$HANGANG_DEMO_DIR/admin-token"
 export HANGANG_ADMIN_TOKEN="$(cat "$HANGANG_DEMO_DIR/admin-token")"

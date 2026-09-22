@@ -31,6 +31,7 @@ Native jobs use Ubuntu 24.04 for Linux, macOS 15 Intel for x86-64, and macOS 15 
 - `hangang-dsr` is omitted from macOS archives. IPVS DSR requires a Linux kernel and suitable networking privileges; a macOS host does not provide it.
 - Docker discovery requires a reachable Docker API. Docker Desktop runs Linux containers in a VM; host networking, device access, and packet paths differ from a native Linux server.
 - Archives are not Apple Developer ID signed or notarized. An Ed25519 update manifest or checksum is not Apple notarization. macOS security policy may require approval before execution.
+- Account databases and disk caches reject symbolic links in their directory paths. macOS commonly aliases `/tmp` and `/var` into `/private`; use a physical path (for example, Python `os.path.realpath`) for writable state. The quick-start guide resolves its temporary state directory explicitly. The qualification workflow also canonicalizes `TMPDIR` without disabling the symlink checks.
 - Host-local paths, Unix permissions, external services, and privileged ports still need environment-specific configuration. A passing laptop smoke test is not a Linux production capacity qualification.
 
 ## Windows path

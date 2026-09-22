@@ -65,12 +65,16 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
           rustup target add '${{ matrix.target }}'
+      - name: Use physical temporary paths
+        shell: bash
+        run: python3 -c 'import os,tempfile; print("TMPDIR=" + os.path.realpath(tempfile.gettempdir()))' >> "$GITHUB_ENV"
+      - name: Library tests and CLI capability boundaries
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: cargo test --locked --lib --test cli_about --target '${{ matrix.target }}'
       - name: Build native release binaries
         run: cargo build --locked --release --bins --target '${{ matrix.target }}'
-      - name: Library tests
-        run: cargo test --locked --release --lib --target '${{ matrix.target }}'
-      - name: CLI capability boundaries
-        run: cargo test --locked --release --test cli_about --target '${{ matrix.target }}'
       - name: Gateway smoke tests
         run: python3 tests/smoke.py
       - name: UDP lifecycle smoke tests
