@@ -1,9 +1,13 @@
-.PHONY: build test check probes static
+.PHONY: build test check static check-docs
 build:
 	cargo build --locked
 check:
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -D warnings
+check-docs:
+	python3 tools/check_docs.py
+	python3 tools/check_publish.py
+	python3 -m unittest discover -s tests -p test_publish_policy.py
 test:
 	cargo test --locked
 	cargo build --locked
@@ -17,9 +21,6 @@ test:
 	python3 examples/upstream/run.py
 	python3 tests/restart_smoke.py
 	python3 tests/upgrade_smoke.py
-probes:
-	cargo test --manifest-path experiments/rust-lua/Cargo.toml --locked
-	cd experiments/go-lua && go test -race ./...
 static:
 	RUSTFLAGS='-C target-feature=+crt-static' cargo build --locked --release --target x86_64-unknown-linux-gnu
 

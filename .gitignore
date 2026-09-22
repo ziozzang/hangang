@@ -70,10 +70,37 @@ coverage*
 /docs/GOAL_ACCEPTANCE.md
 /docs/OPERATIONS_AND_REMOTE*.md
 /docs/research/*
-!/docs/research/DSR_SCENARIOS.md
 /docs/images/
 /docs/GOAL.md
 .DS_Store
 
 # Disposable laboratory runtime receipts
 /results/
+
+# Private development notebooks, experiments, measurements and rollout records.
+/experiments/
+/perf/
+/docs/qualification/
+/docs/research/
+/docs/*_PLAN.md
+/docs/*_RESEARCH.md
+/docs/*_DESIGN.md
+/docs/*_THREATS.md
+/docs/*DEPLOYMENT_20*.md
+/docs/DECISIONS.md
+/docs/DSR_LAB.md
+/examples/*_bench.rs
+/examples/canary/
+/tools/dsr_*.py
+/tools/test_dsr_lab.py
+/local-notes/
+
+# Public deployment templates stay tracked; operator copies and state do not.
+/deploy/.env
+/deploy/admin.env
+/deploy/state/
+/deploy/secrets/
+/deploy/overrides/
+/deploy/*.local.yaml
+/deploy/*.local.yml
+!/docs/SQL_RECEIPT_RELEASE.md
