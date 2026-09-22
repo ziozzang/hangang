@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hangang
+  labels:
+    app.kubernetes.io/name: hangang
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hangang
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hangang
+    spec:
+      serviceAccountName: hangang
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hangang
+          image: registry.example.invalid/hangang:REPLACE_ME
+          imagePullPolicy: IfNotPresent
+          args:
+            - --supervised
+            - --kubernetes-controller
+            - --kubernetes-namespace
+            - $(POD_NAMESPACE)
+            - --config
+            - /data/hangang.json
+            - --listen
+            - 0.0.0.0:8080
+            - --admin
+            - 127.0.0.1:9000
+            # Unauthenticated readiness endpoint on the public listener. It
+            # answers 503 while the controller has not published a snapshot,
+            # while the API watches are stale, or while the pod drains.
+            - --health-path
+            - /-/ready
+            # On SIGTERM: withdraw readiness first, keep accepting for the
+            # probe period × failure threshold (5 s × 2) so endpoints are
+            # removed before the listener closes, then drain. The pod's
+            # terminationGracePeriodSeconds covers lame duck + drain.
+            - --lame-duck-seconds
+            - "10"
+            - --drain-seconds
+            - "20"
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HANGANG_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hangang-admin
+                  key: token
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Readiness follows the controller's authority over the API: a
+          # replica whose watches went stale keeps serving its last snapshot
+          # but is taken out of rotation until it catches up. Liveness stays a
+          # socket check so a stale replica is never killed while it still
+          # serves valid routes.
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: state
+              mountPath: /data
+      volumes:
+        - name: state
+          emptyDir: {}

@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hangang
+spec:
+  template:
+    spec:
+      containers:
+        - name: hangang
+          args:
+            - --supervised
+            - --kubernetes-controller
+            - --kubernetes-namespace
+            - $(POD_NAMESPACE)
+            - --kubernetes-tls
+            - --config
+            - /data/hangang.json
+            - --listen
+            - 0.0.0.0:8080
+            - --admin
+            - 127.0.0.1:9000
+            - --health-path
+            - /-/ready
+            - --lame-duck-seconds
+            - "10"
+            - --drain-seconds
+            - "20"

@@ -1,0 +1,8 @@
+{
+  "revision": 0,
+  "settings": {
+    "health_path": "/healthz"
+  },
+  "http": [],
+  "tcp": []
+}

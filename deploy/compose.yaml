@@ -1,0 +1,32 @@
+# Build from the repository Dockerfile after `make static`.
+# This example binds both published ports to the host loopback interface.
+services:
+  hangang:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ${HANGANG_IMAGE:-hangang:local}
+    user: "${HANGANG_UID:-65532}:${HANGANG_GID:-65532}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ${HANGANG_ADMIN_ENV_FILE:?Set HANGANG_ADMIN_ENV_FILE to a private file containing HANGANG_ADMIN_TOKEN}
+    ports:
+      - "${HANGANG_PUBLIC_BIND_IP:-127.0.0.1}:${HANGANG_PUBLIC_PORT:-8080}:8080"
+      - "127.0.0.1:${HANGANG_ADMIN_PORT:-49000}:9000"
+    volumes:
+      - type: bind
+        source: ${HANGANG_STATE_DIR:?Set HANGANG_STATE_DIR to a private writable directory}
+        target: /data
+    command:
+      - --config
+      - /data/hangang.json
+      - --listen
+      - 0.0.0.0:8080
+      - --admin
+      - 0.0.0.0:9000
+      - --allow-insecure-admin
