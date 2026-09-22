@@ -71,6 +71,9 @@ const state = {
   certificateLoadSequence: 0,
   certificateScopeLoadSequence: 0,
   routes: { http: [], tcp: [] },
+  udpEditingIndex: null,
+  udpEditingId: null,
+  udpEditingOriginal: null,
   routeEtags: { http: null, tcp: null },
   routeInventory: { http: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 }, tcp: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 } },
   editing: null,
@@ -111,6 +114,7 @@ function refreshAppCopy() {
   refreshCacheToggle(state.config?.cache ?? null);
   if (state.certificateInventory) renderCertificateInventory(state.certificateInventory);
   if (state.config) { showCertificateScopes(state.config); if ($('#certificate-list').children.length) renderCertificates(certificatesForScope(state.config, state.certificateScope)); }
+  if ($('#udp-list') && state.config) renderUdpRelays(state.config);
   if ($('#http-recording-section')) renderHttpRecording();
   if ($('#tcp-recording-section')) renderTcpRecording();
   if (state.config) updateConfigPreview();
@@ -396,9 +400,12 @@ function scrubRenderedData() {
   resetConfigProof();
   resetConfigReceipt();
   destroyLuaEditors();
-  for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog']) { const dialog = $(`#${id}`); if (dialog.open) dialog.close(); }
+  for (const id of ['route-dialog', 'docker-dialog', 'confirm-dialog', 'udp-dialog']) { const dialog = $(`#${id}`); if (dialog?.open) dialog.close(); }
   state.editing = null;
-  for (const id of ['metric-grid', 'secondary-metric-grid', 'security-diagnostics-grid', 'cache-metric-grid', 'http-routes', 'tcp-routes', 'certificate-list', 'certificate-acme-state', 'certificate-inventory', 'certificate-inventory-pages', 'route-form-fields', 'user-list']) $(`#${id}`).replaceChildren();
+  state.udpEditingIndex = null;
+  state.udpEditingId = null;
+  state.udpEditingOriginal = null;
+  for (const id of ['metric-grid', 'secondary-metric-grid', 'security-diagnostics-grid', 'cache-metric-grid', 'http-routes', 'tcp-routes', 'udp-list', 'certificate-list', 'certificate-acme-state', 'certificate-inventory', 'certificate-inventory-pages', 'route-form-fields', 'user-list']) $(`#${id}`).replaceChildren();
   $('#certificate-inventory-count').textContent = '—';
   for (const id of ['runtime-state', 'configuration-source', 'uptime', 'last-sync', 'acme-state', 'server-version', 'process-id', 'instance-id', 'instance-digest', 'store-state', 'store-reason', 'store-confirmed', 'store-epoch', 'store-revision', 'cache-state', 'cache-memory-policy', 'cache-disk-policy', 'cache-active-fills', 'cache-generation', 'cache-purge-scope']) $(`#${id}`).textContent = '—';
   for (const id of ['acme-detail', 'update-detail', 'metrics-output', 'health-result', 'session-result', 'utility-hash-message', 'store-state-detail', 'store-reason-help', 'store-grace', 'store-detail']) $(`#${id}`).textContent = '';
@@ -415,7 +422,7 @@ function scrubRenderedData() {
   for (const key of SETTINGS_FIELDS) $(`#setting-active-${key}`).textContent = '—';
   $('#config-diff').textContent = t('Load the active configuration to compare changes.');
   $('#preview-count').textContent = t('No changes');
-  for (const id of ['config-message', 'cache-message', 'certificate-message', 'route-message', 'docker-message', 'users-message']) message($(`#${id}`));
+  for (const id of ['config-message', 'cache-message', 'certificate-message', 'route-message', 'docker-message', 'users-message', 'udp-message', 'udp-dialog-message']) message($(`#${id}`));
   for (const id of ['config-dirty', 'cache-policy-dirty', 'certificate-dirty', 'status-content', 'cache-content', 'metrics-output', 'store-panel']) $(`#${id}`).hidden = true;
   $('#status-loading').hidden = false;
   $('#cache-loading').hidden = false;
@@ -555,7 +562,7 @@ async function login(event) {
 
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
-  return ['status', 'http', 'tcp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
+  return ['status', 'http', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 
 async function switchView() {
@@ -589,6 +596,7 @@ async function loadView(name, quiet = false) {
   try {
     if (name === 'status') await loadStatus();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);
+    if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
     if (name === 'config') await loadConfig(false);
@@ -643,6 +651,7 @@ function renderUpdateStatus(update) {
 
 function renderStatus(data, record = true) {
   state.lastStatus = data;
+  if ($('#udp-list') && state.config) renderUdpRelays(state.config);
   // Locale-only rerenders may carry an older status snapshot than a recent
   // Configuration/TCP material poll; keep the newer local slot observation.
   if (record) acceptWorkloadMaterials(data);
@@ -3774,6 +3783,7 @@ function showConfigDocument(data) {
   showGeoIpSource(isObject(data) ? data.geoip_database : undefined);
   renderWorkloadListeners(data);
   renderPublicListeners(data);
+  renderUdpRelays(data);
 }
 
 function parseConfigEditor() {
@@ -4447,6 +4457,107 @@ async function rebaseConfigDraft() {
   catch (error) { message($('#config-message'), error.message, 'error'); }
   $('#config-editor').value = draft; state.configDirty = true; $('#config-dirty').hidden = false; updateConfigPreview();
   return revision;
+}
+
+const UDP_DEFAULTS = { enabled: true, protocol: 'udp', idle_timeout_ms: 30000, max_sessions: 1024, max_datagram_bytes: 65507 };
+const UDP_SOCKET = /^(?:\[(?<ipv6>[0-9A-Fa-f:.]+)\]|(?<ipv4>(?:\d{1,3}\.){3}\d{1,3})):(?<port>\d{1,5})$/;
+
+function udpSocketAddress(value) {
+  const match = UDP_SOCKET.exec(value.trim());
+  if (!match || Number(match.groups.port) < 1 || Number(match.groups.port) > 65535) return false;
+  if (match.groups.ipv4 && match.groups.ipv4.split('.').some((part) => Number(part) > 255)) return false;
+  return true;
+}
+
+function udpDefaults(value = {}) { return { ...UDP_DEFAULTS, ...value, enabled: value.enabled !== false }; }
+
+function renderUdpRelays(config) {
+  const root = $('#udp-list');
+  if (!root) return;
+  root.replaceChildren();
+  const relays = Array.isArray(config?.udp) ? config.udp : [];
+  if (!relays.length) {
+    const empty = document.createElement('div'); empty.className = 'empty-state';
+    const title = document.createElement('h2'); copy(title, 'No UDP / QUIC relays');
+    const detail = document.createElement('p'); copy(detail, 'Create a relay to forward opaque datagrams with per-flow affinity.');
+    const add = document.createElement('button'); add.type = 'button'; add.className = 'button button-primary'; copy(add, 'New UDP / QUIC relay'); add.addEventListener('click', () => openUdpRelay(-1));
+    empty.append(title, detail, add); root.append(empty); return;
+  }
+  const tableWrap = document.createElement('div'); tableWrap.className = 'route-table-wrap';
+  const table = document.createElement('table'); table.className = 'route-table'; table.setAttribute('aria-label', t('UDP / QUIC relay inventory'));
+  const head = document.createElement('thead'); const row = document.createElement('tr');
+  for (const label of ['Relay', 'Protocol', 'Listen', 'Backends', 'Limits', 'Runtime', 'Actions']) { const th = document.createElement('th'); copy(th, label); row.append(th); }
+  head.append(row); table.append(head); const body = document.createElement('tbody');
+  relays.forEach((relay, index) => {
+    const item = udpDefaults(relay); const tr = document.createElement('tr'); tr.className = 'route-row';
+    const identity = document.createElement('th'); identity.scope = 'row'; const name = document.createElement('strong'); name.textContent = item.id || t('(unnamed)'); const stateText = document.createElement('small'); stateText.className = 'route-cell-detail'; copy(stateText, item.enabled ? 'Enabled' : 'Disabled'); identity.append(name, stateText);
+    const cell = (text) => { const td = document.createElement('td'); td.textContent = text; return td; };
+    const runtime = state.lastStatus?.udp?.routes?.find((status) => status?.id === item.id);
+    const runtimeText = runtime ? t('{sessions} / {limit} sessions', { sessions: formatNumber(runtime.sessions), limit: formatNumber(runtime.max_sessions) }) : t('Listener inactive');
+    tr.append(identity, cell(String(item.protocol || 'udp').toUpperCase()), cell(item.listen || '—'), cell(Array.isArray(item.backends) ? item.backends.join(', ') : '—'), cell(t('{sessions} sessions · {bytes} bytes', { sessions: formatNumber(item.max_sessions), bytes: formatNumber(item.max_datagram_bytes) })), cell(runtimeText));
+    const actions = document.createElement('td');
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button button-secondary'; copy(edit, 'Edit'); edit.addEventListener('click', () => openUdpRelay(index)); actions.append(edit);
+    if (isAdmin()) { const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'button button-quiet'; copy(toggle, item.enabled ? 'Deactivate' : 'Activate'); toggle.addEventListener('click', () => setUdpRelayEnabled(item.id, toggle)); actions.append(toggle); }
+    if (isAdmin()) { const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-danger'; copy(remove, 'Delete'); remove.addEventListener('click', () => deleteUdpRelay(item.id, remove)); actions.append(remove); }
+    tr.append(actions); body.append(tr);
+  });
+  table.append(body); tableWrap.append(table); root.append(tableWrap);
+}
+
+function openUdpRelay(index) {
+  const relay = index >= 0 ? state.config?.udp?.[index] : null; const value = udpDefaults(relay || {});
+  state.udpEditingIndex = index; state.udpEditingId = relay?.id || null; state.udpEditingOriginal = relay ? structuredClone(relay) : null; $('#udp-id').value = value.id || ''; $('#udp-protocol').value = value.protocol || 'udp'; $('#udp-enabled').checked = value.enabled !== false;
+  $('#udp-listen').value = value.listen || ''; $('#udp-backends').value = Array.isArray(value.backends) ? value.backends.join('\n') : '';
+  $('#udp-idle-timeout').value = value.idle_timeout_ms; $('#udp-max-sessions').value = value.max_sessions; $('#udp-max-datagram').value = value.max_datagram_bytes;
+  copy($('#udp-dialog-title'), index >= 0 ? 'Edit {id}' : 'New relay', index >= 0 ? { id: value.id } : {}); copy($('#save-udp'), index >= 0 ? 'Save relay' : 'Create relay'); $('#delete-udp').hidden = index < 0; message($('#udp-dialog-message')); $('#udp-dialog').showModal(); $('#udp-id').focus();
+}
+
+function udpFromForm() {
+  const id = $('#udp-id').value.trim(); if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) throw new Error(t('Relay ID must be 1–64 ASCII letters, digits, dots, underscores or dashes'));
+  const protocol = $('#udp-protocol').value; if (!['udp', 'quic'].includes(protocol)) throw new Error(t('Protocol must be UDP or QUIC'));
+  const listen = $('#udp-listen').value.trim(); if (!udpSocketAddress(listen)) throw new Error(t('Listen address must be a literal IP:port socket address'));
+  const backends = nonemptyLines($('#udp-backends').value); if (!backends.length || backends.length > 64 || backends.some((value) => !udpSocketAddress(value)) || new Set(backends).size !== backends.length) throw new Error(t('Backends must contain 1–64 distinct literal IP:port socket addresses'));
+  const integer = (id, label, min, max) => { const value = Number($('#' + id).value); if (!Number.isInteger(value) || value < min || value > max) throw new Error(t('{field} must be {minimum}–{maximum}', { field: t(label), minimum: formatNumber(min), maximum: formatNumber(max) })); return value; };
+  const idle_timeout_ms = integer('udp-idle-timeout', 'Idle timeout', 100, 86400000); const max_sessions = integer('udp-max-sessions', 'Maximum sessions', 1, 16384); const max_datagram_bytes = integer('udp-max-datagram', 'Maximum datagram bytes', 1, 65507);
+  if (protocol === 'quic' && max_datagram_bytes < 1200) throw new Error(t('QUIC relays require a maximum datagram size of at least 1,200 bytes'));
+  return { id, protocol, listen, backends, idle_timeout_ms, max_sessions, max_datagram_bytes, ...( $('#udp-enabled').checked ? {} : { enabled: false } ) };
+}
+
+async function mutateUdp(change, button = null) {
+  if (button) setBusy(button, true, t('Applying…'));
+  try {
+    const latest = await api('/v1/config'); const draft = structuredClone(latest.data); const relays = Array.isArray(draft.udp) ? draft.udp : []; change(relays); if (relays.length > 64) throw new Error(t('At most 64 UDP / QUIC relays are allowed')); if (relays.reduce((sum, relay) => sum + Number(udpDefaults(relay).max_sessions), 0) > 16384) throw new Error(t('All UDP / QUIC relays together may use at most 16,384 sessions')); draft.udp = relays;
+    const result = await api('/v1/config', { method: 'PUT', headers: { 'If-Match': latest.etag || `"${latest.data.revision}"` }, json: draft }); adoptConfig(result); renderUdpRelays(result.data); message($('#udp-message'), t('Revision {revision} is active.', { revision: result.data.revision }), 'success'); toast(t('UDP / QUIC relay configuration applied.')); return result.data;
+  } catch (error) { if (isRevisionConflict(error)) { await loadUdpRelays(); message($('#udp-message'), t('The configuration changed on the server. Reloaded UDP / QUIC relays.'), 'error'); } else message($('#udp-message'), error.message, 'error'); throw error; }
+  finally { if (button) setBusy(button, false); }
+}
+
+async function saveUdpRelay(event) {
+  event.preventDefault(); let value; try { value = udpFromForm(); } catch (error) { message($('#udp-dialog-message'), error.message, 'error'); return; }
+  const originalId = state.udpEditingId; const original = state.udpEditingOriginal;
+  try {
+    await mutateUdp((relays) => {
+      if (originalId === null) { if (relays.some((relay) => relay.id === value.id)) throw new Error(t('Relay ID already exists')); relays.push(value); return; }
+      const index = relays.findIndex((relay) => relay.id === originalId);
+      if (index < 0 || JSON.stringify(relays[index]) !== JSON.stringify(original)) throw new Error(t('This relay changed while you were editing; reload it before saving.'));
+      if (value.id !== originalId && relays.some((relay, itemIndex) => itemIndex !== index && relay.id === value.id)) throw new Error(t('Relay ID already exists'));
+      relays[index] = value;
+    });
+    $('#udp-dialog').close();
+  } catch (_) { /* message is shown on the page */ }
+}
+
+async function setUdpRelayEnabled(id, button) {
+  try { await mutateUdp((relays) => { const item = relays.find((relay) => relay.id === id); if (!item) throw new Error(t('Relay no longer exists; reload the page.')); if (item.enabled === false) delete item.enabled; else item.enabled = false; }, button); } catch (_) { /* message is shown on the page */ }
+}
+
+async function deleteUdpRelay(id, button) {
+  if (!window.confirm(t('Delete this UDP / QUIC relay?'))) return;
+  try { await mutateUdp((relays) => { const index = relays.findIndex((relay) => relay.id === id); if (index < 0) throw new Error(t('Relay no longer exists; reload the page.')); relays.splice(index, 1); }, button); if ($('#udp-dialog').open) $('#udp-dialog').close(); } catch (_) { /* message is shown on the page */ }
+}
+
+async function loadUdpRelays() {
+  const { data, etag } = await api('/v1/config'); state.config = data; state.configEtag = etag || `"${data.revision}"`; setRevision(data.revision); renderUdpRelays(data);
 }
 
 async function loadDocs() {
@@ -5867,6 +5978,10 @@ $('#reload-docs').addEventListener('click', () => { state.openapi = null; loadDo
 $$('[data-new-route]').forEach((button) => button.addEventListener('click', () => openRoute(button.dataset.newRoute)));
 $$('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => $('#route-dialog').close()));
 $('#route-dialog').addEventListener('close', destroyLuaEditors);
+$('#new-udp').addEventListener('click', () => openUdpRelay(-1));
+$('#udp-form').addEventListener('submit', saveUdpRelay);
+$('#delete-udp').addEventListener('click', () => deleteUdpRelay(state.udpEditingIndex, $('#delete-udp')));
+$$('[data-close-udp-dialog]').forEach((button) => button.addEventListener('click', () => $('#udp-dialog').close()));
 $('[data-close-docker]').addEventListener('click', () => $('#docker-dialog').close());
 $('#route-form').addEventListener('submit', saveRoute);
 // A control the browser refuses to submit must be visible, so its section opens before the validation bubble.

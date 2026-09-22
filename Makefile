@@ -111,3 +111,17 @@ test-fleet:
 	HANGANG_FLEET_BROWSER=1 python3 tests/fleet_collector_https.py
 	python3 tests/fleet_collector_transport.py
 	python3 tests/fleet_inventory_reload.py
+
+.PHONY: test-datagram test-dsr
+test-datagram:
+	cargo test --locked --lib udp::tests
+	cargo test --locked --test udp_lifecycle
+	cargo build --locked --bin hangang
+	python3 tests/udp_smoke.py
+	$(MAKE) static
+	python3 tests/datagram_container.py
+
+test-dsr:
+	cargo test --locked --test dsr_validation
+	cargo build --locked --release --bin hangang-dsr
+	python3 tests/dsr_container.py

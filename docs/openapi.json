@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -762,7 +762,7 @@
                     "supervised": true
                   },
                   "process_id": 4217,
-                  "version": "0.1.0",
+                  "version": "0.2.0",
                   "uptime_seconds": 3600,
                   "instance": {
                     "id": "9f3a1c77d2e04b58",
@@ -835,7 +835,7 @@
                 "example": {
                   "enabled": true,
                   "phase": "idle",
-                  "current_version": "0.1.0",
+                  "current_version": "0.2.0",
                   "last_check_unix": 1788796800,
                   "detail": null
                 }
@@ -3177,6 +3177,13 @@
               "$ref": "#/components/schemas/TcpRoute"
             }
           },
+          "udp": {
+            "type": "array",
+            "maxItems": 64,
+            "items": { "$ref": "#/components/schemas/UdpRoute" },
+            "default": [],
+            "description": "Opaque UDP and QUIC datagram relays. Configuration is local-file only in this release and is not compatible with supervised or hot restart. QUIC is passed through without HTTP/3 termination, SNI inspection, or connection migration."
+          },
           "settings": {
             "$ref": "#/components/schemas/Settings"
           },
@@ -3831,6 +3838,27 @@
         },
         "description": "Requires Protected access_mode and resource_policy. Authentication from the selected dedicated HTTP mTLS listener composes conjunctively with Basic, JWT and external authorization when configured. An ordinary public HTTP/HTTPS listener cannot provide this identity."
       },
+      "UdpRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "listen", "backends"],
+        "allOf": [
+          {
+            "if": { "required": ["protocol"], "properties": { "protocol": { "const": "quic" } } },
+            "then": { "properties": { "max_datagram_bytes": { "minimum": 1200 } } }
+          }
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "description": "Stable relay ID, unique across HTTP, TCP, and UDP routes." },
+          "enabled": { "type": "boolean", "default": true, "description": "False retains the relay without binding or accepting new datagrams. Omitted means true." },
+          "protocol": { "type": "string", "enum": ["udp", "quic"], "default": "udp", "description": "Datagram mode. QUIC is opaque passthrough; Hangang does not terminate HTTP/3, inspect SNI, or support connection migration." },
+          "listen": { "type": "string", "description": "Literal IPv4:port or [IPv6]:port socket address." },
+          "backends": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "type": "string", "description": "Literal IPv4:port or [IPv6]:port socket address." } },
+          "idle_timeout_ms": { "type": "integer", "minimum": 100, "maximum": 86400000, "default": 30000, "description": "Flow idle timeout in milliseconds." },
+          "max_sessions": { "type": "integer", "minimum": 1, "maximum": 16384, "default": 1024, "description": "Per-relay flow session limit. All configured relays together may use at most 16,384 sessions." },
+          "max_datagram_bytes": { "type": "integer", "minimum": 1, "maximum": 65507, "default": 65507, "description": "Maximum datagram payload accepted by this relay." }
+        }
+      },
       "TcpRoute": {
         "type": "object",
         "additionalProperties": false,
@@ -4307,6 +4335,8 @@
           "revision",
           "http_routes",
           "tcp_routes",
+          "udp_routes",
+          "udp",
           "workload_materials",
           "metrics",
           "state",
@@ -4332,6 +4362,13 @@
             "type": "integer",
             "minimum": 0
           },
+          "udp_routes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "udp": {
+            "$ref": "#/components/schemas/UdpStatus"
+          },
           "workload_materials": {
             "type": "array",
             "description": "This instance's enabled TCP and dedicated HTTP workload mTLS bindings only. Ready means a verified local material generation is available; false closes authenticated admission. No paths, certificates, or private keys are returned. This is local runtime state, not fleet readiness.",
@@ -4353,7 +4390,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.1.0"
+            "example": "0.2.0"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"
@@ -4376,6 +4413,37 @@
             "$ref": "#/components/schemas/Settings",
             "description": "Legacy active runtime settings summary (empty object when none are set). HTTP recording rules are omitted because this response is viewer-readable; administrators read them through GET /v1/config."
           }
+        }
+      },
+      "UdpStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["routes"],
+        "properties": {
+          "routes": {
+            "type": "array",
+            "maxItems": 64,
+            "items": { "$ref": "#/components/schemas/UdpStatusRoute" }
+          }
+        }
+      },
+      "UdpStatusRoute": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "enabled", "listen", "protocol", "sessions", "max_sessions", "backend_count", "datagrams_received", "datagrams_forwarded", "responses_forwarded", "dropped_datagrams", "sessions_created"],
+        "properties": {
+          "id": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "listen": { "type": "string" },
+          "protocol": { "type": "string", "enum": ["udp", "quic"] },
+          "sessions": { "type": "integer", "minimum": 0 },
+          "max_sessions": { "type": "integer", "minimum": 1, "maximum": 16384 },
+          "backend_count": { "type": "integer", "minimum": 1, "maximum": 64 },
+          "datagrams_received": { "type": "integer", "minimum": 0, "description": "Datagrams received by this active relay." },
+          "datagrams_forwarded": { "type": "integer", "minimum": 0, "description": "Datagrams forwarded to this relay backend." },
+          "responses_forwarded": { "type": "integer", "minimum": 0, "description": "Backend response datagrams forwarded to clients through this relay." },
+          "dropped_datagrams": { "type": "integer", "minimum": 0, "description": "Datagrams dropped by admission, size, capacity, or forwarding policy on this instance." },
+          "sessions_created": { "type": "integer", "minimum": 0, "description": "UDP flow sessions created on this relay." }
         }
       },
       "Metrics": {
@@ -4542,7 +4610,7 @@
           },
           "current_version": {
             "type": "string",
-            "example": "0.1.0"
+            "example": "0.2.0"
           },
           "last_check_unix": {
             "type": "integer",

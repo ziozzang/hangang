@@ -1,0 +1,16 @@
+{
+  "revision": 0,
+  "http": [],
+  "tcp": [],
+  "udp": [
+    {
+      "id": "datagram-service",
+      "listen": "127.0.0.1:9001",
+      "backends": ["127.0.0.1:9002", "127.0.0.1:9003"],
+      "protocol": "udp",
+      "idle_timeout_ms": 30000,
+      "max_sessions": 1024,
+      "max_datagram_bytes": 65507
+    }
+  ]
+}

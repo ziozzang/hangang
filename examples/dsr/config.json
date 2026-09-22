@@ -1,0 +1,14 @@
+{
+  "services": [
+    {
+      "vip": "192.0.2.10",
+      "port": 443,
+      "protocol": "tcp",
+      "scheduler": "rr",
+      "backends": [
+        {"address": "192.0.2.21", "port": 443, "weight": 1},
+        {"address": "192.0.2.22", "port": 443, "weight": 1}
+      ]
+    }
+  ]
+}

@@ -20,6 +20,12 @@ use bounded buffers and admission limits. Record transforms support lines,
 NDJSON and SSE; WebSocket upgrades become bidirectional tunnels. See
 [transformations](TRANSFORMS.md) and [caching](CACHE.md).
 
+UDP routes are a separate datagram relay plane. Each client IP and source port
+is pinned to one literal backend for the session lifetime, subject to idle and
+resource limits. The `quic` protocol label carries encrypted QUIC datagrams as
+opaque bytes; Hangang does not terminate HTTP/3, inspect SNI, or follow QUIC
+connection migration. See [UDP and QUIC relays](UDP.md).
+
 Lua runs in replaceable child processes with memory, instruction and wall-time
 limits. Saturation fails closed instead of bypassing policy. Worker crashes do
 not run Lua inside the forwarding process. See [Lua capacity](LUA_CAPACITY.md)
@@ -66,4 +72,8 @@ See the [API reference](openapi.json), [API/UI map](API_UI_COVERAGE.md),
 Supervised process replacement and signed binary updates have separate activation
 and rollback constraints. Containers built from the scratch image use image
 replacement when the root filesystem is read-only. See [updates](UPDATES.md)
-and [deployment](DEPLOYMENT.md). UDP/QUIC routing is not implemented.
+and [deployment](DEPLOYMENT.md). UDP listeners are currently local-file only and
+cannot transfer sockets or sessions through supervised/hot restart. The
+standalone [IPv4 IPVS DSR companion](DSR.md) is separately scoped: it installs and removes
+explicitly listed Linux IPVS services and does not configure VIP ownership, ARP,
+health checks, or failover.

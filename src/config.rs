@@ -34,6 +34,8 @@ pub struct Config {
     #[serde(default)]
     pub tcp: Vec<TcpRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<crate::udp::Route>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workload_http: Vec<crate::workload_http::Listener>,
 }
 fn is_zero(value: &u64) -> bool {
@@ -524,6 +526,7 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
+        crate::udp::validate_routes(&self.udp)?;
         if let Some(source) = &self.geoip_database {
             source.validate().context("geoip_database")?;
         }
@@ -548,7 +551,7 @@ impl Config {
             "cache_generation_floor must be 0..4294967295"
         );
         ensure!(
-            self.http.len() + self.tcp.len() <= 1024,
+            self.http.len() + self.tcp.len() + self.udp.len() <= 1024,
             "at most 1024 routes are allowed"
         );
         ensure!(
@@ -697,6 +700,7 @@ impl Config {
             .iter()
             .map(|r| &r.id)
             .chain(self.tcp.iter().map(|r| &r.id))
+            .chain(self.udp.iter().map(|r| &r.id))
         {
             ensure!(
                 !id.is_empty()

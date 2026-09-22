@@ -74,6 +74,82 @@ test('authenticates in memory and renders live status accessibly', async ({ page
   expect(stored).toEqual({ local: [], session: [], cookie: '', url: `http://127.0.0.1:${process.env.HANGANG_UI_TEST_PORT || 41739}/ui/#status`, input: '' });
 });
 
+test('manages UDP and QUIC relays through the revisioned configuration page', async ({ page }) => {
+  let active = { ...config, udp: [] };
+  const calls = await fixtures(page, {
+    '/v1/status': route => route.fulfill({ json: { ...status, udp: { routes: [{ id: 'quic-edge', enabled: true, listen: '127.0.0.1:4443', protocol: 'quic', sessions: 3, max_sessions: 128, backend_count: 1 }] } } }),
+    '/v1/config': async route => {
+      if (route.request().method() === 'PUT') {
+        active = route.request().postDataJSON();
+        return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+      }
+      return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+    },
+  });
+  await login(page, 'relay-token');
+  await page.getByRole('link', { name: 'UDP / QUIC relays' }).click();
+  await expect(page.getByRole('heading', { name: 'UDP / QUIC relays', exact: true })).toBeVisible();
+  await page.locator('#new-udp').click();
+  await page.getByLabel('Relay ID').fill('quic-edge');
+  await page.getByLabel('Protocol').selectOption('quic');
+  await page.getByLabel('Listen socket address').fill('127.0.0.1:4443');
+  await page.getByLabel('Backend socket addresses').fill('127.0.0.1:5443');
+  await page.getByLabel('Idle timeout (ms)').fill('30000');
+  await page.getByLabel('Maximum sessions').fill('128');
+  await page.getByLabel('Maximum datagram bytes').fill('1200');
+  await page.getByRole('button', { name: 'Create relay' }).click();
+  await expect(page.getByRole('cell', { name: 'QUIC' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: '3 / 128 sessions' })).toBeVisible();
+  expect(active.udp).toEqual([{ id: 'quic-edge', protocol: 'quic', listen: '127.0.0.1:4443', backends: ['127.0.0.1:5443'], idle_timeout_ms: 30000, max_sessions: 128, max_datagram_bytes: 1200 }]);
+  const put = calls.find(call => call.path === '/v1/config' && call.method === 'PUT');
+  expect(JSON.parse(put.body).udp[0].protocol).toBe('quic');
+});
+
+test('keeps UDP mutations identity-safe, preserves the full document, and localizes controls', async ({ page }) => {
+  let active = { ...config, settings: { health_path: '/healthz' }, udp: [{ id: 'edge', protocol: 'udp', listen: '127.0.0.1:5353', backends: ['127.0.0.1:5354'], enabled: false, idle_timeout_ms: 30000, max_sessions: 64, max_datagram_bytes: 1200 }] };
+  let conflict = true;
+  const calls = await fixtures(page, {
+    '/v1/config': async route => {
+      if (route.request().method() === 'PUT') {
+        if (conflict) { conflict = false; return route.fulfill({ status: 409, json: { title: 'Revision Conflict', detail: 'configuration changed' }, contentType: 'application/problem+json' }); }
+        active = route.request().postDataJSON();
+        return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+      }
+      return route.fulfill({ json: active, headers: { etag: `"${active.revision}"` } });
+    },
+  });
+  active.udp[0].id = '<img src=x onerror=alert(1)>';
+  await login(page, 'relay-token');
+  await page.goto('/ui/#udp');
+  await expect(page.getByRole('heading', { name: 'UDP / QUIC relays', exact: true })).toBeVisible();
+  await expect(page.locator('#udp-list img')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Activate' })).toBeVisible();
+  await page.getByRole('button', { name: 'Activate' }).click();
+  await expect(page.getByText('The configuration changed on the server. Reloaded UDP / QUIC relays.')).toBeVisible();
+  await page.getByRole('button', { name: 'Activate' }).click();
+  await expect(page.getByRole('button', { name: 'Deactivate' })).toBeVisible();
+  expect(active.http).toEqual(config.http);
+  expect(active.tcp).toEqual(config.tcp);
+  expect(active.settings).toEqual({ health_path: '/healthz' });
+  expect(active.udp[0].enabled).toBeUndefined();
+
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.getByRole('heading', { name: 'UDP / QUIC 릴레이', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '편집' }).click();
+  await expect(page.getByLabel('릴레이 ID')).toHaveValue('<img src=x onerror=alert(1)>');
+  await page.getByLabel('릴레이 ID').fill('edge');
+  active.udp[0].max_sessions = 65;
+  await page.getByRole('button', { name: '릴레이 저장' }).click();
+  await expect(page.getByText('편집 중 릴레이가 변경되었습니다. 저장하기 전에 다시 불러오세요.')).toBeVisible();
+  await page.locator('#udp-dialog').getByRole('button', { name: '취소' }).click();
+
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '삭제' }).click();
+  await expect(page.getByText('UDP / QUIC 릴레이 없음')).toBeVisible();
+  expect(active.udp).toEqual([]);
+  expect(calls.filter(call => call.path === '/v1/config' && call.method === 'PUT').length).toBe(3);
+});
+
 test('rejects a bad token without retaining it', async ({ page }) => {
   await fixtures(page, { '/v1/status': (route) => route.fulfill({ status: 401, body: 'unauthorized' }) });
   await page.goto('/ui/'); await page.getByLabel('Administrator token').fill('bad-token'); await page.getByRole('button', { name: 'Connect' }).click();

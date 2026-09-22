@@ -7,6 +7,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -23,6 +24,9 @@ from smoke import BINARY, TOKEN, TcpEcho, ThreadingTcpServer, free_port, recv_ex
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 SIGNER = BINARY.with_name("hangang-release-sign")
+CURRENT_VERSION = re.search(r'^version = "([0-9]+\.[0-9]+\.[0-9]+)"', (WORKSPACE / "Cargo.toml").read_text(), re.M)[1]
+_major, _minor, _patch = map(int, CURRENT_VERSION.split("."))
+CANDIDATE_VERSION = f"{_major}.{_minor}.{_patch + 1}"
 TARGET = subprocess.run(
     ["rustc", "-vV"], check=True, capture_output=True, text=True
 ).stdout.split("host: ", 1)[1].splitlines()[0]
@@ -96,7 +100,7 @@ def build_candidate(root: Path) -> Path:
     package = root / "candidate-source"
     package.mkdir()
     cargo = (WORKSPACE / "Cargo.toml").read_text()
-    cargo = cargo.replace('version = "0.1.0"', 'version = "0.1.1"', 1)
+    cargo = cargo.replace(f'version = "{CURRENT_VERSION}"', f'version = "{CANDIDATE_VERSION}"', 1)
     cargo += "\n[profile.dev]"
     cargo += "\ndebug = 0"
     cargo += "\nstrip = \"debuginfo\""
@@ -130,7 +134,7 @@ def build_candidate(root: Path) -> Path:
     reported = subprocess.run(
         [candidate, "--version"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    if reported != "hangang 0.1.1":
+    if reported != f"hangang {CANDIDATE_VERSION}":
         raise AssertionError(f"unexpected candidate version: {reported}")
     return candidate
 
@@ -269,7 +273,7 @@ class SignedUpgrade(unittest.TestCase):
             # small even when the local debug server binary exceeds 128 MiB.
             release.artifact = b"already-running"
             release.manifest = signed_manifest(
-                root, seed, "0.1.0", artifact_url, release.artifact
+                root, seed, CURRENT_VERSION, artifact_url, release.artifact
             )
 
             backend = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GatewayBackend)
@@ -408,7 +412,7 @@ class SignedUpgrade(unittest.TestCase):
 
                 release.artifact = candidate.read_bytes()
                 release.manifest = signed_manifest(
-                    root, seed, "0.1.1", artifact_url, release.artifact
+                    root, seed, CANDIDATE_VERSION, artifact_url, release.artifact
                 )
                 code, _, _ = request("POST", "/v1/update/check")
                 self.assertEqual(code, 202)
@@ -421,10 +425,10 @@ class SignedUpgrade(unittest.TestCase):
                 os.kill(stable_supervisor_pid, 0)
                 update = await_json(
                     "/v1/update/status",
-                    lambda value: value["current_version"] == "0.1.1",
+                    lambda value: value["current_version"] == CANDIDATE_VERSION,
                 )
                 self.assertEqual(update["phase"], "active")
-                self.assertEqual(active["version"], "0.1.1")
+                self.assertEqual(active["version"], CANDIDATE_VERSION)
 
                 backend.release_slow.set()
                 slow_body += recv_exact(slow, len(b"http-after"))
@@ -444,7 +448,7 @@ class SignedUpgrade(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ).stdout.strip()
-                self.assertEqual(reported, "hangang 0.1.1")
+                self.assertEqual(reported, f"hangang {CANDIDATE_VERSION}")
             finally:
                 backend.release_slow.set()
                 for stream in (slow, websocket, tcp_stream):

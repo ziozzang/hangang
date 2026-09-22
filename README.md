@@ -1,8 +1,8 @@
 # Hangang
 
-[Documentation](docs/README.md) · [Quick start](#quick-start) · [한국어](README.ko.md)
+[Documentation](docs/README.md) · [Quick start](#quick-start) · [Release notes](CHANGELOG.md) · [한국어](README.ko.md)
 
-**An HTTP and TCP gateway with live configuration, isolated Lua policies, and a built-in management console.**
+**An HTTP, TCP, and UDP gateway with enterprise-class lifecycle controls, isolated Lua policies, and a built-in management console.**
 
 Hangang brings reverse proxying, load balancing, TLS certificate management, access policies, and traffic visibility into one Rust binary. Configure routes in the browser or through the API, inspect live traffic, and extend request handling with Lua—without deploying a separate console service. The console supports English and Korean; this README and the English guides are the reference documentation.
 
@@ -14,6 +14,22 @@ Hangang brings reverse proxying, load balancing, TLS certificate management, acc
 - **Change configuration while serving traffic.** File watching and revision-checked API updates prepare candidates before publication. Invalid candidates leave the working configuration in place. Under local-file configuration authority, named members support draining and maintenance; connection behavior follows the policy being changed. See [publication](docs/CONFIG_PUBLICATION.md) and [member lifecycle](docs/MEMBER_LIFECYCLE.md).
 - **See what is happening without adding a dashboard service.** Live console views combine status, metrics, recent HTTP metadata, and active/recent TCP connections. Prometheus endpoints support external monitoring. Recording filters and bounded history control what the gateway retains. See [HTTP history](docs/TRAFFIC_HISTORY.md) and [TCP history](docs/TCP_CONNECTION_HISTORY.md).
 - **Keep routing and security policy together.** Combine host glob/regex matching and priorities with JWT, workload mTLS, protected-resource rules, country/language filters, and per-route outbound DNS, SOCKS5, and TLS policy. See [routing](docs/MATCHING.md), [access control](docs/RESOURCE_POLICY.md), and [outbound connections](docs/UPSTREAM.md).
+- **Relay datagrams when the deployment boundary permits it.** UDP routes preserve datagram boundaries and pin each client flow to a literal backend. The `quic` mode is opaque passthrough: it does not terminate HTTP/3, inspect SNI, or support connection migration. UDP routes use local-file configuration only and cannot participate in supervised/hot restart; see [UDP and QUIC relays](docs/UDP.md).
+- **Use a separately scoped direct-routing companion.** `hangang-dsr` installs and removes explicitly listed IPv4 Linux IPVS services for networks that already provide VIP ownership, ARP handling, and direct return. See [IPVS DSR](docs/DSR.md) for its limits.
+
+## Enterprise-class service continuity
+
+**Change configuration, replace a serving process, and activate a signed binary while keeping the gateway's listening sockets in place.** Hangang combines live configuration with a readiness-gated supervisor handoff, so planned maintenance can preserve ongoing traffic instead of requiring a stop/start cycle.
+
+| Change | Continuity mechanism | Operating conditions |
+| --- | --- | --- |
+| Live configuration | Prepare and validate a candidate before publication; retain the working configuration on preparation failure; new traffic uses the new snapshot. | No process restart is required. Security-policy changes may deliberately close affected streams; persistence and local activation are distinct outcomes. |
+| Supervised restart | Transfer existing listener descriptors and the runtime snapshot; wait for the replacement to report `READY` before draining the old generation. | Unix `--supervised` mode; trigger with `SIGHUP` or the authenticated restart API. Existing responses and tunnels remain with the old generation during drain. |
+| Signed binary upgrade | Verify the release, run version/configuration preflight, atomically replace the executable, then use the same readiness-gated handoff. Failed pre-readiness replacement invokes binary rollback and resumes the old worker. | Explicit update source and signing key; writable install directory with hard-link/rename support. Rollback requires working local storage. |
+
+This is the concrete meaning of **enterprise-class lifecycle controls** here: live change, listener continuity, bounded draining, and a defined recovery path. The default drain budget is **30 seconds**, configurable with `--drain-seconds`; connections exceeding it can close. Policy revocation can also terminate streams intentionally. The read-only Compose template uses container replacement and does **not** inherit in-process upgrade continuity; uninterrupted image rollout needs an appropriate multi-instance deployment.
+
+See [configuration publication](docs/CONFIG_PUBLICATION.md), [upgrade and recovery semantics](docs/UPDATES.md#continuity-and-deployment-modes), and [reproducible lifecycle checks](docs/UPDATES.md#verify-lifecycle-behavior). These mechanisms support planned maintenance; they do not constitute a blanket zero-downtime SLA for host failures or every upgrade path.
 
 ## Enterprise controls, integrated
 
@@ -36,17 +52,22 @@ Hangang is especially useful when you want **interactive gateway administration,
 
 | Product | Documented approach | Why choose Hangang for this use case? |
 | --- | --- | --- |
-| **Hangang** | One binary embeds HTTP/TCP routing, an English/Korean management console, revision-checked configuration, and isolated Lua workers. | A compact, self-hosted gateway stack with browser administration and policy customization built together. |
+| **Hangang** | One binary embeds HTTP/TCP routing, local-file UDP/QUIC passthrough, an English/Korean management console, revision-checked configuration, and isolated Lua workers. | A compact, self-hosted gateway stack with browser administration, policy customization, and scoped datagram relay in one application. |
 | **Caddy** | [Automatic HTTPS](https://caddyserver.com/docs/automatic-https) and a [JSON administration API](https://caddyserver.com/docs/api); extensions use its [module system](https://caddyserver.com/docs/modules). | Choose Hangang when the embedded route-management console, TCP administration, and Lua policy editor are central to your workflow. |
 | **Kong Gateway** | [Services, Routes, Consumers, and plugins](https://developer.konghq.com/gateway/entities/) organize API policy; [Kong Manager](https://developer.konghq.com/gateway/kong-manager/) provides administration. | Choose Hangang when its native policies fit your requirements and you prefer a local-file starting point with process-isolated Lua and an embedded console. |
 | **Traefik Proxy** | [Providers](https://doc.traefik.io/traefik/getting-started/configuration-overview/) discover dynamic configuration, including [Docker label-based routing](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/). | Choose Hangang when direct route editing, custom Lua, and request/record transformations are more central than provider-driven configuration. |
 | **HAProxy** | Its [Lua API](https://www.haproxy.com/documentation/haproxy-lua-api/getting-started/introduction/) extends a non-blocking load balancer and requires scripts to respect that execution model. | Choose Hangang when you want process-isolated Lua workers and an integrated policy editor alongside gateway management. |
 
-Comparison sources reviewed on **2026-09-22**. Product editions and configuration affect availability. These are deployment tradeoffs, not a claim that Hangang is universally faster or replaces every enterprise capability. Hangang does not implement UDP/QUIC routing; administrator accounts remain instance-local, and fleet observation is read-only. Review [architecture](docs/ARCHITECTURE.md) and [scale-out semantics](docs/SCALE_OUT.md) before a migration.
+Comparison sources reviewed on **2026-09-22**. Product editions and configuration affect availability. These are deployment tradeoffs, not a claim that Hangang is universally faster or replaces every enterprise capability. UDP/QUIC relay is local-file only and has no supervised/hot restart handoff; administrator accounts remain instance-local, and fleet observation is read-only. Review [architecture](docs/ARCHITECTURE.md) and [scale-out semantics](docs/SCALE_OUT.md) before a migration.
 
 ## Quick start
 
 This local example demonstrates a working proxy, a Lua rejection rule, and the management console. You need Git, Rust 1.96 or newer, a C compiler, Python 3, OpenSSL, and curl. Node.js is only needed when developing the console; its built assets are already included.
+
+Linux amd64 binaries and `SHA256SUMS` are available in the
+[v0.2.0 release](https://github.com/ziozzang/hangang/releases/tag/v0.2.0).
+The archive contains Hangang and its companion tools; verify it with
+`sha256sum -c SHA256SUMS` before extracting. The steps below build from source.
 
 ### 1. Build
 

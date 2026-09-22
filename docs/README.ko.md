@@ -17,6 +17,8 @@
 
 - [영문: Host matching and route priority](MATCHING.md) · [한국어 요약 목차](ko/README.md)
 - [영문: Named public HTTP and HTTPS listeners](PUBLIC_LISTENERS.md) · [한국어 요약 목차](ko/README.md)
+- [영문: UDP and QUIC relays](UDP.md) · [한국어 요약 목차](ko/README.md)
+- [영문: Standalone IPv4 IPVS DSR](DSR.md) · [한국어 요약 목차](ko/README.md)
 - [영문: Canonical domain redirects](CANONICAL_DOMAINS.md) · [한국어 요약 목차](ko/README.md)
 - [영문: TLS termination and SNI passthrough](SNI.md) · [한국어 요약 목차](ko/README.md)
 - [영문: Request and response transforms](TRANSFORMS.md) · [한국어 요약 목차](ko/README.md)

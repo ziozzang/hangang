@@ -727,6 +727,14 @@ async fn run(args: Args) -> Result<()> {
     } else {
         None
     };
+    anyhow::ensure!(
+        config.udp.is_empty()
+            || (!args.supervised
+                && !args.serve_child
+                && !shared_store
+                && !args.kubernetes_controller),
+        "UDP routes require local file authority without supervised restart"
+    );
     let upstream_tls = hangang::tls::client_config(args.upstream_ca.as_deref())?;
     for route in &config.http {
         for script in route.scripts() {
@@ -835,7 +843,8 @@ async fn run(args: Args) -> Result<()> {
         args.max_connections,
         Duration::from_secs(args.tcp_idle_seconds),
     )
-    .with_discovery(discovery.clone());
+    .with_discovery(discovery.clone())
+    .with_datagrams_allowed(channel.is_none() && !shared_store && !args.kubernetes_controller);
     // A shared-store or Kubernetes generation must not accept TCP traffic
     // before its authority confirms the initial snapshot. This also covers
     // a replacement that inherited a snapshot from the previous process.

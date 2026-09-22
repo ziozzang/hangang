@@ -55,6 +55,7 @@ fn config(revision: u64, id: &str) -> Config {
         }],
         tcp: Vec::new(),
         workload_http: Vec::new(),
+        udp: Vec::new(),
         public_http: Vec::new(),
     }
 }

@@ -3978,6 +3978,11 @@ fn load_optional(path: &Path) -> StoreResult<Option<Config>> {
 }
 
 pub(crate) fn ensure_reader_compatibility(config: &Config) -> StoreResult<()> {
+    if !config.udp.is_empty() {
+        return Err(StoreError::Invalid(anyhow!(
+            "UDP routes require local file authority; shared-reader coordination is not supported"
+        )));
+    }
     if !config.public_http.is_empty()
         || config
             .http
@@ -4221,6 +4226,7 @@ mod tests {
             http: vec![],
             tcp: vec![],
             workload_http: Vec::new(),
+            udp: Vec::new(),
             public_http: Vec::new(),
             cache: Some(Default::default()),
             settings: Default::default(),

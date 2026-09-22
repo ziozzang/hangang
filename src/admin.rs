@@ -1005,6 +1005,8 @@ impl Admin {
             "revision": snapshot.config.revision,
             "http_routes": snapshot.config.http.len(),
             "tcp_routes": snapshot.config.tcp.len(),
+            "udp_routes": snapshot.config.udp.len(),
+            "udp": self.manager.tcp.udp.status(),
             "geoip_metrics": metrics.geoip.snapshot(),
             "workload_materials": snapshot.tcp_inbound_tls.iter().map(|(id, slot)|
                 serde_json::json!({"kind":"tcp", "id":id, "ready":slot.load().is_some()}))
@@ -2423,6 +2425,34 @@ impl Admin {
         }
         if path == "/metrics" && req.method() == hyper::Method::GET {
             let mut output = self.manager.metrics.render();
+            for (metric, kind) in [
+                ("sessions", "gauge"),
+                ("datagrams_received_total", "counter"),
+                ("datagrams_forwarded_total", "counter"),
+                ("responses_forwarded_total", "counter"),
+                ("dropped_datagrams_total", "counter"),
+                ("sessions_created_total", "counter"),
+            ] {
+                use std::fmt::Write;
+                let _ = writeln!(output, "# TYPE hangang_udp_{metric} {kind}");
+            }
+            for route in self.manager.tcp.udp.status().routes {
+                use std::fmt::Write;
+                for (metric, value) in [
+                    ("sessions", route.sessions as u64),
+                    ("datagrams_received_total", route.datagrams_received),
+                    ("datagrams_forwarded_total", route.datagrams_forwarded),
+                    ("responses_forwarded_total", route.responses_forwarded),
+                    ("dropped_datagrams_total", route.dropped_datagrams),
+                    ("sessions_created_total", route.sessions_created),
+                ] {
+                    let _ = writeln!(
+                        output,
+                        "hangang_udp_{metric}{{route=\"{}\"}} {value}",
+                        route.id
+                    );
+                }
+            }
             let snapshot = self.manager.active.load();
             output.push_str("# TYPE hangang_workload_material_ready gauge\n# TYPE hangang_workload_material_unavailable gauge\n");
             for (kind, slots) in [

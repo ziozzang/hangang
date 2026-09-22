@@ -12,6 +12,11 @@
 - [Redis 설정 저장소](REDIS.md) · [보호된 HTTP 리소스](RESOURCE_POLICY.md) · [다중 인스턴스 운영](SCALE_OUT.md)
 - [TCP 워크로드 mTLS](TCP_MTLS.md) · [요청과 응답 변환](TRANSFORMS.md) · [서명된 업데이트](UPDATES.md)
 
+## 영문 기준 신규 기능
+
+- [UDP·QUIC 릴레이 영문 문서](../UDP.md) — 로컬 파일 설정에서만 사용하는 데이터그램 릴레이와 불투명 QUIC 통과
+- [IPv4 IPVS DSR 영문 문서](../DSR.md) — 별도 네트워크 설계가 필요한 제한된 직접 라우팅 보조 도구
+
 ## 전체 운영 안내
 
 배포 전에는 영문 [단일 노드 Compose 배포 안내](../DEPLOYMENT.md)를 읽고, 관리자 계정과 관리 리스너는 영문 [관리자 계정 안내](../ADMIN_USERS.md)를 확인하세요. 전체 문서 탐색은 [영문 문서 목차](../README.md), 프로젝트 실행 절차는 [한국어 README](../../README.ko.md)를 참고하세요.

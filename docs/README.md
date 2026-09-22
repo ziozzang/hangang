@@ -17,6 +17,8 @@ English is the primary documentation. Korean pages are supplementary translation
 
 - [Host matching and route priority](MATCHING.md) — route selection rules
 - [Named public HTTP and HTTPS listeners](PUBLIC_LISTENERS.md) — public listener configuration
+- [UDP and QUIC relays](UDP.md) — local-file UDP datagram routing and opaque QUIC passthrough
+- [Standalone IPv4 IPVS DSR](DSR.md) — scoped direct-routing companion
 - [Canonical domain redirects](CANONICAL_DOMAINS.md) — canonical host behavior
 - [TLS termination and SNI passthrough](SNI.md) — TLS listener modes
 - [Request and response transforms](TRANSFORMS.md) — body transformation policies

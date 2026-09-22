@@ -52,6 +52,7 @@ fn config(routes: Vec<TcpRoute>) -> Config {
         http: Vec::new(),
         tcp: routes,
         workload_http: Vec::new(),
+        udp: Vec::new(),
         public_http: Vec::new(),
         settings: Default::default(),
         cache_generation_floor: 0,

@@ -15,6 +15,39 @@ container while preserving its private state volume. Do not add update flags
 to the Compose example without separately designing a writable, verified
 binary activation path.
 
+## Continuity and deployment modes
+
+Live configuration, supervised process replacement, and signed binary updates
+solve different maintenance tasks:
+
+| Mode | What stays available | Preconditions and limits |
+| --- | --- | --- |
+| Live configuration publication | The process and unaffected listeners remain active; a candidate is prepared before replacing the snapshot. | See [publication](CONFIG_PUBLICATION.md). Security policy changes can intentionally revoke existing streams, and persistence is separate from local activation. |
+| Supervised restart | Listening sockets are transferred to the replacement; the old generation retains its established responses and tunnels while draining. | Unix `--supervised` mode with a TCP management listener (not `--admin-socket`). `SIGHUP` or `POST /v1/lifecycle/restart` starts the handoff. A failed candidate leaves the old worker available. |
+| Signed in-place binary update | The same listener handoff follows verified staging and atomic executable activation. | Explicit manifest/key configuration; writable install directory with same-filesystem hard links and atomic rename. Pre-readiness failure invokes executable rollback; recovery still depends on functioning storage. |
+| Container/image replacement | Determined by the orchestrator and surrounding load balancer. | The read-only Compose template does not perform supervised in-place binary upgrades. Use readiness, draining, and a suitable multi-instance rollout design for image replacement. |
+
+[UDP/QUIC routes](UDP.md) reject supervised mode: their sockets and sessions
+are not part of this handoff. Updating a UDP route or replacing its process
+resets the affected flows. The standalone [DSR companion](DSR.md) is also
+outside the gateway supervisor lifecycle.
+
+The drain budget defaults to 30 seconds (`--drain-seconds`). Old-generation
+connections that outlive it may be closed. Admission/security checks continue
+while streams drain; preserving a connection must not bypass an identity or trust
+revocation. Existing connections stay in their original process rather than
+being migrated into the new one. Process-local observations and counters can
+restart with the new generation; the local account database remains on disk.
+
+Automatic executable rollback belongs to the signed updater's activation path.
+If an operator manually replaces the executable and requests a restart, a failed
+candidate can leave the old worker serving, but the restart path does not restore
+the manually changed file. After a successful `READY`, the updater removes its
+rollback link: it does not automatically roll back a later application failure
+or reverse database/schema changes. Check writer/schema compatibility before
+any upgrade. A host, supervisor, or storage failure is outside the planned
+handoff's continuity guarantee.
+
 ## Trust bootstrap
 
 There is no built-in signing key and no unsigned fallback. Before enabling an
@@ -163,3 +196,34 @@ without downloading a release.
 and version, and the last check time. `POST /v1/update/check` queues an immediate
 check. Both require the admin bearer token. A signed manifest for the already
 running version produces `up_to_date`; a downgrade remains a hard rejection.
+
+## Verify lifecycle behavior
+
+From the repository root, build the binary and run the relevant automated checks:
+
+```sh
+cargo build --locked --bin hangang
+cargo test --locked --test restart --test update --test publication_retirement
+python3 tests/restart_smoke.py
+python3 tests/upgrade_smoke.py
+python3 tests/smoke.py Smoke.test_file_reload_and_bad_edit_retention Smoke.test_z_graceful_shutdown_drains_websocket_and_tcp_streams
+```
+
+The Python fixtures use temporary state, loopback services, generated test
+certificates, and an owned executable copy. They require Python 3 and OpenSSL.
+The restart fixture verifies real listener handoff, established TCP and workload
+HTTP connections, retained account/audit state, failed-candidate recovery, and an
+API-triggered replacement. The smoke checks cover live file edits, invalid-edit
+retention, and WebSocket/TCP draining.
+
+The signed-upgrade fixture additionally builds a newer test version, serves a
+signed manifest and artifact over a private test HTTPS CA, and checks HTTP,
+WebSocket, and TCP continuity through actual binary replacement.
+
+Rust checks cover descriptor validation and readiness timeouts, signed artifact
+verification, staging/activation/rollback with a fake binary, update-fetch
+cancellation, and publication retirement. These tests exercise the mechanisms;
+they do not establish an end-to-end upgrade guarantee between every pair of
+released versions, continuous zero-error throughput, or an availability SLA.
+Qualify the intended source/target versions and deployment with representative
+traffic before a production upgrade.

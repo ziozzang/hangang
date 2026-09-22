@@ -30,6 +30,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 /// A transactional set of newly-bound sockets and the complete desired set.
 /// Dropping it before `commit` closes the sockets and rolls preparation back.
 pub struct Prepared {
+    udp: crate::udp::Prepared,
     desired: HashSet<SocketAddr>,
     added: Vec<(SocketAddr, TcpListener, std::net::TcpListener)>,
 }
@@ -48,6 +49,8 @@ struct State {
 }
 
 pub struct TcpManager {
+    pub udp: crate::udp::UdpManager,
+    datagrams_allowed: bool,
     active: Arc<ArcSwap<Snapshot>>,
     metrics: Arc<Metrics>,
     permits: Arc<Semaphore>,
@@ -147,6 +150,8 @@ impl TcpManager {
         idle_timeout: Duration,
     ) -> Self {
         Self {
+            udp: crate::udp::UdpManager::new(),
+            datagrams_allowed: true,
             active,
             metrics,
             permits: Arc::new(Semaphore::new(max_connections)),
@@ -161,13 +166,20 @@ impl TcpManager {
     }
 
     /// Start with the accept gate closed; see `open_gate`.
+    pub fn with_datagrams_allowed(mut self, allowed: bool) -> Self {
+        self.datagrams_allowed = allowed;
+        self
+    }
+
     pub fn with_gate_closed(self) -> Self {
+        self.udp.set_gate(false);
         self.gate.send_replace(false);
         self
     }
 
     /// Allow accept loops to take connections. Idempotent.
     pub fn open_gate(&self) {
+        self.udp.set_gate(true);
         self.gate.send_replace(true);
     }
 
@@ -223,6 +235,11 @@ impl TcpManager {
     /// already active. No accept loop starts until `commit`.
     pub async fn prepare(&self, config: &Config) -> Result<Prepared> {
         config.validate()?;
+        ensure!(
+            self.datagrams_allowed || config.udp.is_empty(),
+            "UDP routes require local file authority without supervised restart"
+        );
+        let udp = self.udp.prepare(&config.udp).await?;
         let current = {
             let state = self.state.lock().await;
             ensure!(!state.shutting_down, "TCP manager is shutting down");
@@ -304,7 +321,11 @@ impl TcpManager {
             let (listener, export) = retain_export_listener(listener)?;
             added.push((address, listener, export));
         }
-        Ok(Prepared { desired, added })
+        Ok(Prepared {
+            desired,
+            added,
+            udp,
+        })
     }
 
     /// Check that every TCP listen address in `config` can be bound on this
@@ -399,6 +420,11 @@ impl TcpManager {
         inherited: Vec<(SocketAddr, OwnedFd)>,
     ) -> Result<Prepared> {
         config.validate()?;
+        ensure!(
+            config.udp.is_empty(),
+            "UDP sessions cannot be inherited by supervised replacement"
+        );
+        let udp = self.udp.prepare(&[]).await?;
         {
             let state = self.state.lock().await;
             ensure!(!state.shutting_down, "TCP manager is shutting down");
@@ -447,7 +473,11 @@ impl TcpManager {
             seen == desired,
             "one or more configured TCP listeners are missing"
         );
-        Ok(Prepared { desired, added })
+        Ok(Prepared {
+            desired,
+            added,
+            udp,
+        })
     }
 
     /// Activate prepared sockets and stop listeners removed by the new
@@ -471,6 +501,7 @@ impl TcpManager {
                 !state.shutting_down,
                 "TCP manager is shutting down before publication"
             );
+            self.udp.commit(prepared.udp)?;
             publish();
 
             if state.health_monitor.is_none() {
@@ -526,6 +557,7 @@ impl TcpManager {
         for task in stopped {
             let _ = task.await;
         }
+        self.udp.reap().await;
         Ok(())
     }
 
@@ -536,6 +568,10 @@ impl TcpManager {
     pub async fn export_listeners(&self) -> Result<Vec<(SocketAddr, OwnedFd)>> {
         let state = self.state.lock().await;
         ensure!(!state.shutting_down, "TCP manager is shutting down");
+        ensure!(
+            self.active.load().config.udp.is_empty(),
+            "UDP sessions cannot be exported for supervised replacement"
+        );
         let mut listeners = state
             .listeners
             .iter()
@@ -560,6 +596,7 @@ impl TcpManager {
     /// draining; calling this first lets a retiring generation close its
     /// accept loops before it waits for unrelated background work.
     pub async fn stop_accepting(&self) {
+        self.udp.shutdown();
         let listeners = {
             let mut state = self.state.lock().await;
             if state.shutting_down {
@@ -580,6 +617,7 @@ impl TcpManager {
         for task in listeners {
             let _ = task.await;
         }
+        self.udp.reap().await;
     }
 
     pub async fn shutdown(&self, grace: Duration) {
