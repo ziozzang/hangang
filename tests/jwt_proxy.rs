@@ -197,6 +197,55 @@ async fn request(
 }
 
 #[tokio::test]
+async fn public_fallback_cannot_forward_other_routes_authentication_identity() {
+    let (upstream, seen, upstream_task) = origin().await;
+    let identity = json!({"X-Consumer-ID":"consumer", "X-Anonymous-Consumer":null});
+    let mut sha = sha1_smol::Sha1::new();
+    sha.update(b"secretconsumer");
+    let compatibility = format!(
+        "v1:sha1-suffix:{}:{}:{}:{}",
+        URL_SAFE_NO_PAD.encode(b"compat"),
+        URL_SAFE_NO_PAD.encode(b"consumer"),
+        sha.digest(),
+        URL_SAFE_NO_PAD.encode(identity.to_string().as_bytes())
+    );
+    let basic = json!({"id":"basic", "path_prefix":"/basic", "access_mode":"protected",
+        "backends":[format!("http://{upstream}")],
+        "basic_auth":{"realm":"restricted", "credentials":[compatibility],
+            "identity_header":"x-basic-user"}});
+    let external = json!({"id":"external", "path_prefix":"/external", "access_mode":"protected",
+        "backends":[format!("http://{upstream}")],
+        "auth":{"url":"http://127.0.0.1:9/check", "response_headers":["x-external-user"]}});
+    let public =
+        json!({"id":"public", "access_mode":"public", "backends":[format!("http://{upstream}")]});
+    let (front, policy, front_task) =
+        gateway(vec![jwt_route(upstream), basic, external, public]).await;
+    let spoofed = [
+        ("x-verified-user", "admin"),
+        ("x-basic-user", "admin"),
+        ("x-external-user", "admin"),
+        ("x-consumer-id", "admin"),
+        ("x-anonymous-consumer", "false"),
+        ("x-unrelated", "preserved"),
+    ];
+    assert_eq!(request(front, "/public", None, &spoofed).await, 200);
+    {
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        for (name, _) in &spoofed[..5] {
+            assert!(
+                !requests[0].contains_key(*name),
+                "forged {name} reached shared origin"
+            );
+        }
+        assert_eq!(requests[0]["x-unrelated"], "preserved");
+    }
+    front_task.abort();
+    upstream_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn signed_access_token_is_the_only_resource_identity_and_bearer_is_hidden() {
     let (upstream, seen, upstream_task) = origin().await;
     let (front, policy, front_task) = gateway(vec![jwt_route(upstream)]).await;

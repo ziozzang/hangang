@@ -2,17 +2,19 @@
 [hidden] { display: none !important; }
 :root {
   color-scheme: light;
-  --bg: #f7f8fa; --surface: #fff; --surface-2: #f5f7f8; --surface-3: #eef2f3;
-  --line: #e4e8eb; --line-bright: #ced6dc; --text: #1c2933; --muted: #63717d; --faint: #687985;
-  --cyan: #087f70; --cyan-soft: #e9f5f0; --green: #15805d; --amber: #a5650b; --red: #c74455;
+  --bg: #f5f7fa; --surface: #fff; --surface-2: #f0f3f7; --surface-3: #e9eef4;
+  --line: #e2e7ee; --line-bright: #c9d3df; --text: #17263b; --muted: #637288; --faint: #637288;
+  --cyan: #08777b; --cyan-soft: #e6f4f3; --green: #18724d; --amber: #946010; --red: #ba3448;
+  --on-accent: #fff;
   --shadow: 0 18px 70px #172c4020; --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #111519; --surface: #191e23; --surface-2: #20272d; --surface-3: #283139;
-  --line: #2c353c; --line-bright: #414e58; --text: #e6ecef; --muted: #a0adb7; --faint: #96a5b0;
-  --cyan: #63d4b3; --cyan-soft: #183e34; --green: #68d3ab; --amber: #e8b665; --red: #fb8490;
+  --bg: #0e1625; --surface: #151f31; --surface-2: #1c293e; --surface-3: #25344a;
+  --line: #2a364b; --line-bright: #43536b; --text: #e2eaf5; --muted: #a5b5cc; --faint: #a5b5cc;
+  --cyan: #72dcc0; --cyan-soft: #1a3635; --green: #86dec0; --amber: #f0c782; --red: #fb8490;
+  --on-accent: #10251e;
   --shadow: 0 18px 70px #0006;
 }
 
@@ -243,3 +245,44 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
 .security-diagnostics-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 5px 0; font-size: 11px; }
 .security-diagnostics-row strong { flex: none; font: 600 12px var(--mono); font-variant-numeric: tabular-nums; }
 @media(max-width:700px) { .security-diagnostics-grid { grid-template-columns: 1fr; }.security-diagnostics-group + .security-diagnostics-group { border-left: 0; border-top: 1px solid var(--line); } }
+
+/* River: shared surfaces and readable hierarchy across light and dark themes. */
+.brand-mark, .login-mark { color: var(--on-accent); background: var(--cyan); box-shadow: none; }
+.brand small { color: var(--muted); }
+.sidebar { color: var(--muted); background: var(--surface); border-right: 1px solid var(--line); }
+.workspace-card { border-color: var(--line); background: var(--surface-2); }
+.workspace-card .workspace-avatar { color: var(--cyan); background: var(--cyan-soft); }
+.workspace-card strong { color: var(--text); font-weight: 600; }
+.workspace-card small, .workspace-chevron, .nav-group-label, .sidebar-foot { color: var(--muted); }
+.sidebar-foot { border-color: var(--line); }
+.nav-link { color: var(--muted); font-weight: 500; }
+.nav-link span { color: var(--muted); }
+.nav-link:hover { color: var(--text); background: var(--surface-2); }
+.nav-link.is-active { color: var(--cyan); background: var(--cyan-soft); }
+.nav-link.is-active span { color: var(--cyan); }
+.button-primary { color: var(--on-accent); background: var(--cyan); }
+.button-primary:hover { background: var(--cyan); filter: brightness(.94); }
+.button { font-weight: 600; }
+.panel, .metric, .route-inventory, .user-card { border-radius: 10px; box-shadow: none; }
+.metric .metric-label { font-size: 12px; font-weight: 550; }
+.metric .metric-label::after { content: none; }
+.metric .metric-value { font-weight: 650; letter-spacing: -.035em; }
+.metric .metric-note, .section-heading p, .field-help-inline { font-size: 11px; line-height: 1.6; }
+.section-heading h2 { font-size: 14px; font-weight: 650; }
+.page-head h1 { font-weight: 650; letter-spacing: -.035em; }
+.route-table tr.route-card > td, .route-table tbody th { padding-block: 15px; }
+.flow-gateway { fill: var(--cyan); stroke: var(--cyan); }
+.flow-h { fill: var(--on-accent); }
+.login-story { background: #123a40; }
+.login-art > strong { background: #72dcc0; color: #10251e; }
+@media(min-width:701px) {
+  .topbar .brand { color: var(--text); background: var(--surface); border-bottom-color: var(--line); border-right: 1px solid var(--line); }
+  .metric-grid { gap: 16px; }
+  .metric { padding: 20px; }
+  .telemetry-grid { gap: 20px; }
+}
+@media(max-width:700px) {
+  .sidebar { border-right: 0; }
+  .metric .metric-label { font-size: 11px; }
+  .metric .metric-note, .section-heading p { font-size: 10px; }
+}

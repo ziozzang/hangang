@@ -113,6 +113,24 @@ fn configuration_paths_are_canonical_and_legacy_output_remains_compatible() {
 }
 
 #[test]
+fn authentication_paths_are_canonical_without_a_resource_policy() {
+    for mode in [
+        hangang::config::AccessMode::Protected,
+        hangang::config::AccessMode::Legacy,
+    ] {
+        let mut secured = config();
+        secured.http[0].resource_policy = None;
+        secured.http[0].access_mode = mode;
+        secured.validate().unwrap();
+        for path in ["/ad%6din", "/admin//a", "/admin;a", "/admin%2fa"] {
+            let mut bad = secured.clone();
+            bad.http[0].path_prefix = Some(path.into());
+            assert!(bad.validate().is_err(), "{mode:?} {path}");
+        }
+    }
+}
+
+#[test]
 fn published_resource_example_is_a_valid_protected_configuration() {
     let example: Config =
         serde_json::from_str(include_str!("../examples/resource-policy.json")).unwrap();

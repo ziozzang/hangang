@@ -3007,6 +3007,104 @@ async fn native_basic_auth_challenges_verifies_and_hides_credentials() {
 }
 
 #[tokio::test]
+async fn encoded_authentication_paths_cannot_select_public_fallbacks() {
+    use hangang::config::AccessMode;
+    let (backend, seen, backend_task) = upstream("origin").await;
+    let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_address = auth_listener.local_addr().unwrap();
+    let auth_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = auth_listener.accept().await {
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(|_: Request<Incoming>| async {
+                            Ok::<_, Infallible>(response(401, "denied"))
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    for mode in [AccessMode::Protected, AccessMode::Legacy] {
+        for kind in ["basic", "external", "jwt"] {
+            let mut secured = route(vec![format!("http://{backend}")]);
+            secured.id = "secured".into();
+            secured.host = Some("secured.test".into());
+            secured.path_prefix = Some("/admin".into());
+            secured.access_mode = mode;
+            match kind {
+                "basic" => {
+                    secured.basic_auth = Some(hangang::config::BasicAuth {
+                        realm: "restricted".into(),
+                        credentials: vec![basic_credential("alice", "secret")],
+                        hide_credentials: true,
+                        accept_proxy_authorization: false,
+                        identity_header: None,
+                    })
+                }
+                "external" => {
+                    secured.auth = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "url": format!("http://{auth_address}/check")
+                        }))
+                        .unwrap(),
+                    )
+                }
+                _ => {
+                    let example: Config =
+                        serde_json::from_str(include_str!("../examples/jwt-auth.json")).unwrap();
+                    secured.jwt_auth = example.http[0].jwt_auth.clone();
+                }
+            }
+            let mut public = route(vec![format!("http://{backend}")]);
+            public.id = "public".into();
+            public.access_mode = AccessMode::Public;
+            let (proxy, policy) = proxy(vec![secured, public]);
+            let (front, front_task, _) = frontend(proxy).await;
+            for (path, expected) in [
+                ("/admin", 401),
+                ("/%61dmin", 401),
+                ("/ad%6Din", 401),
+                ("//admin", 400),
+                ("/admin;x", 400),
+                ("/%2561dmin", 400),
+                ("/%2fadmin", 400),
+                ("/admin%5cx", 400),
+            ] {
+                let count = seen.lock().unwrap().len();
+                let (status, _) = raw_request(
+                    front,
+                    &format!(
+                        "GET {path} HTTP/1.1\r\nHost: secured.test\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await;
+                assert_eq!(status, expected, "{mode:?} {kind} {path}");
+                assert_eq!(
+                    seen.lock().unwrap().len(),
+                    count,
+                    "origin reached: {kind} {path}"
+                );
+            }
+            // Hosts without gateway authentication retain their existing URI profile.
+            for (host, path) in [("public.test", "/admin;x"), ("secured.test", "/public")] {
+                let (status, _) = raw_request(
+                    front,
+                    &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+                )
+                .await;
+                assert_eq!(status, 200, "{kind} {host} {path}");
+            }
+            front_task.abort();
+            policy.shutdown().await;
+        }
+    }
+    auth_task.abort();
+    backend_task.abort();
+}
+
+#[tokio::test]
 async fn protected_only_if_cached_checks_basic_and_lua_before_returning_no_content() {
     use base64::Engine;
     let (backend, seen, backend_task) = upstream("must-not-run").await;

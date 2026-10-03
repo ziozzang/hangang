@@ -103,27 +103,44 @@ fn same_host(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 /// A strict path profile applies to the entire host if it has any protected
-/// namespace. Ambiguous hosts are rejected even if only the alternate authority
+/// namespace or authentication-bearing route, including legacy authentication.
+/// Otherwise an encoded protected path could select a public fallback before
+/// the origin decodes it. Ambiguous hosts are rejected even if only the alternate authority
 /// matches a guard. Disabled routes retain their namespace until explicit release.
 pub(crate) fn check<'a, B>(
     guards: &'a [Arc<HttpRuntime>],
+    authentication_guards: &[Arc<HttpRuntime>],
     request: &Request<B>,
     forwarded_host: Option<&str>,
 ) -> Result<(Option<&'a str>, Option<String>), u16> {
-    if guards.is_empty() {
+    if guards.is_empty() && authentication_guards.is_empty() {
         return Ok((None, None));
     }
     let raw = request_host(request);
     let forwarded = forwarded_host.and_then(authority_host);
     let absolute = request.uri().authority().map(|authority| authority.host());
     let candidates = [raw.as_deref(), forwarded.as_deref(), absolute];
-    if !guards.iter().any(|runtime| {
+    if !guards.iter().chain(authentication_guards).any(|runtime| {
         listener_matches(&runtime.route, request)
             && candidates.iter().any(|host| scope_host(runtime, *host))
     }) {
         return Ok((None, None));
     }
-    if !same_host(raw.as_deref(), forwarded.as_deref())
+    // Host-neutral authentication may intentionally use a trusted proxy's
+    // external authority for its auth context. Preserve that contract; only
+    // host-scoped security boundaries require the two authorities to agree.
+    let host_boundary = guards
+        .iter()
+        .chain(authentication_guards.iter().filter(|runtime| {
+            runtime.route.host.is_some()
+                || !runtime.route.hosts.is_empty()
+                || runtime.host_regex.is_some()
+        }))
+        .any(|runtime| {
+            listener_matches(&runtime.route, request)
+                && candidates.iter().any(|host| scope_host(runtime, *host))
+        });
+    if (host_boundary && !same_host(raw.as_deref(), forwarded.as_deref()))
         || absolute.is_some_and(|host| !same_host(raw.as_deref(), Some(host)))
         || raw.as_deref().is_some_and(|host| host.ends_with('.'))
     {
@@ -183,6 +200,7 @@ mod tests {
                 std::hint::black_box(
                     check(
                         std::hint::black_box(&snapshot.resource_guards),
+                        &snapshot.authentication_path_guards,
                         std::hint::black_box(&request),
                         Some("app.test"),
                     )

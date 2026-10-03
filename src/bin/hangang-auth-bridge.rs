@@ -243,7 +243,29 @@ fn normalized_path(uri: &str) -> Option<String> {
         }
     }
     let path = String::from_utf8(output).ok()?;
-    path.starts_with('/').then_some(path)
+    if !path.starts_with('/') {
+        return None;
+    }
+    // Match the path after the same dot-segment resolution performed by
+    // NGINX and common HTTP backends. Otherwise /allowed/x/../deny can miss
+    // a deny rule while the backend serves /allowed/deny.
+    let mut segments = Vec::new();
+    for segment in path.split('/').skip(1) {
+        match segment {
+            "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            "" => {}
+            segment => segments.push(segment),
+        }
+    }
+    let trailing = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..");
+    let mut normalized = format!("/{}", segments.join("/"));
+    if trailing && normalized != "/" {
+        normalized.push('/');
+    }
+    Some(normalized)
 }
 
 fn reply(code: StatusCode) -> Response<Full<Bytes>> {
@@ -318,6 +340,10 @@ async fn authorize(
     let Ok(mut result) = result else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR);
     };
+    // An error or redirect body is never an authorization decision.
+    if !result.status().is_success() {
+        return reply(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let mut bytes = Vec::new();
     loop {
         match result.chunk().await {
@@ -460,6 +486,20 @@ mod tests {
             Some("/docs/admin")
         );
         assert!(normalized_path("/docs/%zz").is_none());
+        assert_eq!(
+            normalized_path("/docs/public/../admin").as_deref(),
+            Some("/docs/admin")
+        );
+        assert_eq!(
+            normalized_path("/docs/public/%2e%2e/admin").as_deref(),
+            Some("/docs/admin")
+        );
+        assert_eq!(normalized_path("/docs/.").as_deref(), Some("/docs/"));
+        assert_eq!(
+            normalized_path("/docs/public/..").as_deref(),
+            Some("/docs/")
+        );
+        assert!(normalized_path("/../docs").is_none());
         assert!(
             prepare(Settings {
                 allow_list: vec!["(?=cat)".into()],
@@ -488,15 +528,27 @@ mod tests {
                                 let bytes = request.into_body().collect().await.unwrap().to_bytes();
                                 let document: serde_json::Value =
                                     serde_json::from_slice(&bytes).unwrap();
-                                let score = match document["SSOSESSIONS"].as_str().unwrap() {
+                                let session = document["SSOSESSIONS"].as_str().unwrap();
+                                let status = match session {
+                                    "error-admin" => StatusCode::INTERNAL_SERVER_ERROR,
+                                    "redirect-admin" => StatusCode::FOUND,
+                                    _ => StatusCode::OK,
+                                };
+                                let score = match session {
                                     "banned" => "-1",
                                     "expired" => "0",
                                     "regular" => "1",
                                     "admin" => "2",
+                                    "error-admin" | "redirect-admin" => "2",
                                     _ => "invalid",
                                 };
                                 checks.lock().unwrap().push(document);
-                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(score))))
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(status)
+                                        .body(Full::new(Bytes::from(score)))
+                                        .unwrap(),
+                                )
                             }
                         });
                         let _ = http1::Builder::new()
@@ -579,6 +631,18 @@ mod tests {
         );
         let denied = call("/allowed/deny", Some("SSOSESSIONS=regular")).await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        for path in ["/allowed/public/../deny", "/allowed/public/%2e%2e/deny"] {
+            assert_eq!(
+                call(path, Some("SSOSESSIONS=regular")).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for cookie in ["SSOSESSIONS=error-admin", "SSOSESSIONS=redirect-admin"] {
+            assert_eq!(
+                call("/allowed", Some(cookie)).await.status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
         let terminal = call("/outside", Some("SSOSESSIONS=regular")).await;
         assert_eq!(terminal.status(), StatusCode::OK);
         assert_eq!(terminal.headers()["x-hangang-auth-terminal"], "1");
@@ -587,7 +651,7 @@ mod tests {
         let admin = call("/outside", Some("SSOSESSIONS=admin")).await;
         assert_eq!(admin.status(), StatusCode::NO_CONTENT);
         let checks = checks.lock().unwrap();
-        assert_eq!(checks.len(), 6);
+        assert_eq!(checks.len(), 10);
         assert!(
             checks
                 .iter()

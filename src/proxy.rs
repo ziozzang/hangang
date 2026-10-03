@@ -841,10 +841,10 @@ impl Proxy {
             }
             return Ok(response(503, "public listener configuration retired"));
         }
-        // A workload identity is only an extension created by the mandatory
-        // mTLS listener. Client-supplied lookalike fields must not participate
-        // in route predicates, external auth, Lua, or eventual forwarding.
-        for name in &snapshot.workload_identity_headers {
+        // Identity outputs are reserved across the snapshot. A public fallback
+        // can share an origin with a protected route; client lookalike fields
+        // must never reach that origin, routing, external auth, or Lua.
+        for name in &snapshot.authentication_identity_headers {
             request.headers_mut().remove(name);
         }
         let health_path = snapshot
@@ -1088,6 +1088,7 @@ impl Proxy {
 
         let (protected_resource, canonical_resource_path) = match crate::resource_guard::check(
             &snapshot.resource_guards,
+            &snapshot.authentication_path_guards,
             &request,
             edge.forwarded_host
                 .as_ref()

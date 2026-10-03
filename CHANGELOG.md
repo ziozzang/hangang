@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Require rustls 0.23.45 or later to fix TLS handshake encryption-level
+  validation (RUSTSEC-2026-0285).
+- Canonicalize authentication route paths before selection, including legacy
+  Basic/JWT/external authentication, and reject ambiguous authenticated paths.
+- Reserve authentication identity output headers across public fallbacks and
+  prevent other routes or Lua from forging those identities.
+- Fence pending administrator logins across role and enabled-state changes;
+  keep login admission available with unread HTTP/2 authentication responses.
+- Normalize SSO bridge dot segments and reject authorization scores from
+  unsuccessful session-check HTTP responses.
+- Unify administration colors, surfaces, typography and light/dark themes;
+  include three self-contained console design candidates.
 - Add native Linux x86-64/ARM64 and macOS Intel/Apple Silicon qualification jobs and platform-specific release packaging.
 - Support ordinary macOS gateway execution; explicitly reject Linux-only supervised replacement. macOS archives exclude IPVS DSR.
 - Require an explicit macOS development opt-in for Lua without Linux syscall isolation; retain Linux sandbox behavior.

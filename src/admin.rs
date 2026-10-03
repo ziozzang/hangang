@@ -890,7 +890,11 @@ impl Admin {
             response
                 .headers_mut()
                 .insert("cache-control", "no-store".parse().unwrap());
-            return Ok(crate::proxy::retain_request_permit(response, permit));
+            // Auth replies have small, bounded bodies. Retaining admission
+            // through transmission lets an unauthenticated HTTP/2 peer with
+            // a zero receive window exhaust every login/bootstrap permit.
+            drop(permit);
+            return Ok(response);
         }
         if req.uri().path() == "/v1/events" {
             let Ok(permit) = self.events.clone().try_acquire_owned() else {

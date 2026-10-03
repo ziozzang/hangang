@@ -883,10 +883,7 @@ impl Store {
             let token_hash: [u8;32] = Sha256::digest(token.as_bytes()).into();
             let now = now()?;
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let live: Option<i64> = transaction.query_row(
-                "SELECT password_epoch FROM users WHERE id=?1 AND enabled=1",
-                params![user.id], |row|row.get(0)).optional()?;
-            if live != Some(epoch) { return Ok(None); }
+            let Some(user) = login_candidate(&transaction, user.id, epoch)? else { return Ok(None); };
             transaction.execute("DELETE FROM sessions WHERE expires_at<=?1",params![now])?;
             let sessions:i64=transaction.query_row("SELECT COUNT(*) FROM sessions",[],|row|row.get(0))?;
             if sessions>=MAX_SESSIONS {
@@ -1044,7 +1041,11 @@ impl Store {
                 transaction.execute("UPDATE users SET salt=?1,password_hash=?2,password_epoch=password_epoch+1,role=?3,enabled=?4,updated_at=?5 WHERE id=?6",params![salt.as_slice(),hash.as_slice(),next_role.as_str(),i64::from(next_enabled),now()?,id])?;
                 transaction.execute("DELETE FROM sessions WHERE user_id=?1",params![id])?;
             } else {
-                transaction.execute("UPDATE users SET role=?1,enabled=?2,updated_at=?3 WHERE id=?4",params![next_role.as_str(),i64::from(next_enabled),now()?,id])?;
+                // Fence password checks already running outside this transaction.
+                // Deleting sessions alone does not stop a pending login from
+                // recreating one after a disable/re-enable or role transition.
+                let security_changed = next_enabled != user.enabled || next_role != user.role;
+                transaction.execute("UPDATE users SET role=?1,enabled=?2,updated_at=?3,password_epoch=password_epoch+?5 WHERE id=?4",params![next_role.as_str(),i64::from(next_enabled),now()?,id,i64::from(security_changed)])?;
                 if !next_enabled || next_role!=user.role {transaction.execute("DELETE FROM sessions WHERE user_id=?1",params![id])?;}
             }
             user.role=next_role;user.enabled=next_enabled;
@@ -1882,6 +1883,21 @@ fn verify_config_history(
     Ok((oldest_id, hasher))
 }
 
+/// Validate the account snapshot used by an out-of-transaction password check
+/// while holding the session-insertion write transaction.
+fn login_candidate(transaction: &Transaction<'_>, id: i64, epoch: i64) -> Result<Option<User>> {
+    Ok(transaction.query_row(
+        "SELECT id,username,role,enabled FROM users WHERE id=?1 AND enabled=1 AND password_epoch=?2",
+        params![id, epoch],
+        |row| Ok(User {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            role: Role::parse(&row.get::<_, String>(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            enabled: row.get::<_, i64>(3)? == 1,
+        }),
+    ).optional()?)
+}
+
 fn authorize_mutation(
     transaction: &Transaction<'_>,
     authority: &MutationAuthority,
@@ -2320,6 +2336,68 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn pending_login_cannot_cross_account_security_transitions() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let user = store
+            .create(
+                MutationAuthority::System,
+                "second".into(),
+                "second secure password".into(),
+                Role::Admin,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Model the exact point where Argon2 is working on an account snapshot.
+        // Changes commit before the pending login enters its insertion transaction.
+        for (role, enabled) in [
+            (Some(Role::Viewer), None),
+            (Some(Role::Admin), None),
+            (None, Some(false)),
+            (None, Some(true)),
+        ] {
+            let epoch: i64 = connection(&store.path)
+                .unwrap()
+                .query_row(
+                    "SELECT password_epoch FROM users WHERE id=?1",
+                    params![user.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .update(MutationAuthority::System, user.id, role, enabled, None)
+                    .await
+                    .unwrap()
+                    .0,
+                Change::Applied
+            );
+            let mut db = connection(&store.path).unwrap();
+            let transaction = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                login_candidate(&transaction, user.id, epoch)
+                    .unwrap()
+                    .is_none()
+            );
+            transaction.commit().unwrap();
+        }
+        // A fresh password check after the final transition still succeeds.
+        let login = store
+            .login("second".into(), "second secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(login.user.role, Role::Admin);
+        assert!(store.session(login.token).await.unwrap().is_some());
     }
 
     fn remove_v7_audit_metadata(connection: &Connection) {

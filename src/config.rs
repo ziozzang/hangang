@@ -782,6 +782,7 @@ impl Config {
             .filter_map(|route| route.workload_auth.as_ref()?.identity_header.as_ref())
             .map(|name| name.to_ascii_lowercase())
             .collect();
+        let authentication_identity_headers = authentication_identity_headers(&self.http)?;
         for route in &self.http {
             let mut other_identity = Vec::new();
             if let Some(jwt) = &route.jwt_auth {
@@ -813,11 +814,10 @@ impl Config {
                 "workload identity header conflicts with another authenticator"
             );
             ensure!(
-                !route
-                    .headers
-                    .keys()
-                    .any(|name| workload_identity_headers.contains(&name.to_ascii_lowercase())),
-                "verified workload identity cannot be a request-header predicate"
+                !route.headers.keys().any(
+                    |name| authentication_identity_headers.contains(&name.to_ascii_lowercase())
+                ),
+                "verified authentication identity cannot be a request-header predicate"
             );
         }
         let mut resources: std::collections::HashMap<&str, &HttpRoute> = Default::default();
@@ -906,6 +906,17 @@ impl Config {
             }
             if let Some(policy) = &r.language_policy {
                 policy.compile()?;
+            }
+            if (r.basic_auth.is_some()
+                || r.auth.is_some()
+                || r.jwt_auth.is_some()
+                || r.workload_auth.is_some())
+                && let Some(path) = &r.path_prefix
+            {
+                ensure!(
+                    crate::resource_policy::canonical_path(path)? == *path,
+                    "authenticated route path_prefix must be canonical"
+                );
             }
             if let Some(policy) = &r.resource_policy {
                 ensure!(
@@ -1115,7 +1126,7 @@ impl Config {
                             .iter()
                             .filter_map(|jwt| jwt.identity_header.as_deref()),
                     )
-                    .chain(workload_identity_headers.iter().map(String::as_str))
+                    .chain(authentication_identity_headers.iter().map(String::as_str))
                     .chain(
                         r.workload_auth
                             .iter()
@@ -1585,6 +1596,8 @@ pub struct Snapshot {
     /// route and an upstream cannot interpret different values.
     pub http_match_headers: std::collections::HashSet<hyper::header::HeaderName>,
     pub workload_identity_headers: Vec<hyper::header::HeaderName>,
+    /// Identity outputs reserved across every route, including public fallbacks.
+    pub authentication_identity_headers: Vec<hyper::header::HeaderName>,
     pub workload_routes:
         std::collections::HashMap<String, std::sync::Arc<crate::workload_auth::Runtime>>,
     /// Whole-route generations for admitted JWT streams; unchanged unrelated
@@ -1611,6 +1624,9 @@ pub struct Snapshot {
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
     pub resource_guards: Vec<std::sync::Arc<HttpRuntime>>,
+    /// Authentication-bearing routes impose an unambiguous path/authority
+    /// profile on their host, including requests selecting a public fallback.
+    pub authentication_path_guards: Vec<std::sync::Arc<HttpRuntime>>,
     pub tcp_health: std::collections::HashMap<String, std::sync::Arc<crate::tcp_health::TcpHealth>>,
     pub tcp_member_admissions: std::collections::HashMap<
         String,
@@ -1904,6 +1920,14 @@ impl Snapshot {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        let authentication_identity_headers: Vec<hyper::header::HeaderName> =
+            authentication_identity_headers(&config.http)?
+                .into_iter()
+                .map(|name| {
+                    name.parse()
+                        .expect("validated authentication identity header")
+                })
+                .collect();
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
@@ -1927,7 +1951,7 @@ impl Snapshot {
                             .iter()
                             .flat_map(|auth| auth.reserved_headers().iter()),
                     )
-                    .chain(workload_identity_headers.iter())
+                    .chain(authentication_identity_headers.iter())
                     .chain(
                         workload_auth
                             .iter()
@@ -2245,6 +2269,7 @@ impl Snapshot {
             settings,
             http_match_headers,
             workload_identity_headers,
+            authentication_identity_headers,
             workload_routes,
             jwt_routes,
             http_workload_tls,
@@ -2258,6 +2283,16 @@ impl Snapshot {
             cache,
             geoip,
             config,
+            authentication_path_guards: http
+                .iter()
+                .filter(|runtime| {
+                    runtime.route.basic_auth.is_some()
+                        || runtime.route.auth.is_some()
+                        || runtime.route.jwt_auth.is_some()
+                        || runtime.route.workload_auth.is_some()
+                })
+                .cloned()
+                .collect(),
             resource_guards: http
                 .iter()
                 .filter(|runtime| {
@@ -2281,6 +2316,48 @@ impl Snapshot {
         }
         Ok(next)
     }
+}
+
+fn authentication_identity_headers(
+    routes: &[HttpRoute],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    for route in routes {
+        for name in route
+            .workload_auth
+            .iter()
+            .filter_map(|auth| auth.identity_header.as_ref())
+            .chain(
+                route
+                    .jwt_auth
+                    .iter()
+                    .filter_map(|auth| auth.identity_header.as_ref()),
+            )
+            .chain(
+                route
+                    .basic_auth
+                    .iter()
+                    .filter_map(|auth| auth.identity_header.as_ref()),
+            )
+            .chain(
+                route
+                    .auth
+                    .iter()
+                    .flat_map(|auth| auth.response_headers.iter()),
+            )
+        {
+            names.insert(name.to_ascii_lowercase());
+        }
+        if let Some(basic) = &route.basic_auth {
+            names.extend(
+                crate::basic_auth::prepare(basic)?
+                    .reserved_headers()
+                    .iter()
+                    .map(|name| name.as_str().to_owned()),
+            );
+        }
+    }
+    Ok(names)
 }
 
 impl HttpRoute {
@@ -3258,6 +3335,47 @@ mod tests {
         for name in ["server", "Server", "x-powered-by", "etag"] {
             assert!(!is_protected_response_header(name), "{name}");
         }
+    }
+
+    #[test]
+    fn authentication_outputs_are_reserved_on_other_routes() {
+        let mut config = route();
+        config.http[0].basic_auth = Some(BasicAuth {
+            realm: "restricted".into(),
+            credentials: vec![format!("alice:{}:{}", "00".repeat(16), "00".repeat(32))],
+            hide_credentials: true,
+            accept_proxy_authorization: false,
+            identity_header: Some("X-Verified-User".into()),
+        });
+        let mut public = config.http[0].clone();
+        public.id = "public".into();
+        public.basic_auth = None;
+        public.access_mode = AccessMode::Public;
+        config.http.push(public);
+        assert!(config.validate().is_ok());
+        config.http[1]
+            .headers
+            .insert("x-verified-user".into(), "admin".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("request-header predicate")
+        );
+        config.http[1].headers.clear();
+        let mut transform = crate::transform::BodyTransform::default();
+        transform
+            .set_headers
+            .insert("x-VERIFIED-user".into(), "admin".into());
+        config.http[1].request_transform = Some(transform);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("authentication identity header")
+        );
     }
 
     #[test]

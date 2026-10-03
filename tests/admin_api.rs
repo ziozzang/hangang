@@ -4018,6 +4018,45 @@ async fn unread_public_assets_cannot_exhaust_authenticated_admission() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn unread_public_auth_replies_cannot_exhaust_login_admission() {
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    let (address, _manager, _dir) = server().await;
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(0)
+        .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut held = Vec::new();
+    // Keep more unread responses than the entire authentication budget.
+    for _ in 0..=Admin::AUTH_REQUEST_LIMIT {
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/v1/auth/setup")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        held.push(response);
+    }
+    // Public auth still processes new requests while the hostile stream bodies
+    // remain flow-control blocked. A malformed login reaches validation (415)
+    // rather than being denied admission (503).
+    let (status, _, _) =
+        request_with_token(address, "POST", "/v1/auth/login", None, None, None).await;
+    assert_eq!(status, 415);
+    drop(held);
+    connection.abort();
+}
+
 /// A compact document under the request limit whose persisted (pretty) form
 /// would exceed the file read limit is a validation failure, not a commit.
 #[tokio::test]
