@@ -75,7 +75,8 @@ def main():
                     failures.append((name, 'skipped heading level: ' + title))
                 previous = level
             if name not in ('docs/README.md', 'docs/README.ko.md'):
-                index = '../README.ko.md' if name.startswith('docs/ko/') else 'README.md'
+                target = 'docs/README.ko.md' if name.startswith('docs/ko/') else 'docs/README.md'
+                index = posixpath.relpath(target, posixpath.dirname(name))
                 if '](' + index + ')' not in content:
                     failures.append((name, 'missing documentation index navigation'))
             if name.startswith('docs/ko/') and name != 'docs/ko/README.md':
