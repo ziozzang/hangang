@@ -401,3 +401,60 @@ async fn dynamic_sni_serves_multiple_secrets_and_removes_deleted_names() {
     );
     server.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_line_tls_rejects_material_replaced_by_a_fifo() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = directory.path().join("config.json");
+    std::fs::write(&config, r#"{"revision":0,"http":[],"tcp":[]}"#).unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = directory.path().join("server.key");
+    let cert = directory.path().join("server.pem");
+    std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+    for (cert_option, key_option) in [
+        ("--tls-cert", "--tls-key"),
+        ("--admin-tls-cert", "--admin-tls-key"),
+    ] {
+        std::fs::write(&cert, pair.cert.pem()).unwrap();
+        let command = || {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hangang"));
+            command
+                .arg("--config")
+                .arg(&config)
+                .arg("--check")
+                .arg(cert_option)
+                .arg(&cert)
+                .arg(key_option)
+                .arg(&key)
+                .args(["--threads", "1", "--lua-workers", "1"])
+                .env("HANGANG_ADMIN_TOKEN", "local-fifo-test-token")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        };
+        assert!(
+            command().status().unwrap().success(),
+            "valid material failed baseline check"
+        );
+        std::fs::remove_file(&cert).unwrap();
+        let path = std::ffi::CString::new(cert.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a valid NUL-terminated fixture pathname.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut child = Child(command().spawn().unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(result) = child.0.try_wait().unwrap() {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("opening replaced TLS material waited for a FIFO writer");
+        assert!(!result.success(), "nonregular TLS material was accepted");
+        std::fs::remove_file(&cert).unwrap();
+    }
+}

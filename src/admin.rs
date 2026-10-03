@@ -1574,25 +1574,40 @@ impl Admin {
                         Ok(config) => config,
                         Err(response) => return Ok(response),
                     };
-                return Ok(match docker.test_candidate(config).await {
-                    Ok(()) => json_value(200, &serde_json::json!({"ok":true}), None),
-                    Err(error) if error.is::<crate::docker_connections::Busy>() => problem(
-                        503,
-                        "Docker Busy",
-                        "Docker connection work capacity exhausted",
-                    ),
-                    Err(error) => {
-                        tracing::warn!(%error, "Docker candidate connection test failed");
-                        problem(
-                            422,
-                            "Docker Connection Failed",
-                            "the Docker connection could not be verified; check the server log for the validation stage",
+                return Ok(
+                    match docker
+                        .test_candidate_authorized(
+                            config,
+                            self.users.clone(),
+                            actor.mutation_authority(),
                         )
-                    }
-                });
+                        .await
+                    {
+                        Err(error) if error.is::<crate::admin_users::AuthorizationRevoked>() => {
+                            account_problem(error)
+                        }
+                        Ok(()) => json_value(200, &serde_json::json!({"ok":true}), None),
+                        Err(error) if error.is::<crate::docker_connections::Busy>() => problem(
+                            503,
+                            "Docker Busy",
+                            "Docker connection work capacity exhausted",
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "Docker candidate connection test failed");
+                            problem(
+                                422,
+                                "Docker Connection Failed",
+                                "the Docker connection could not be verified; check the server log for the validation stage",
+                            )
+                        }
+                    },
+                );
             }
             if req.method() == hyper::Method::GET {
                 let view = docker.view().await;
+                if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                    return Ok(account_problem(error));
+                }
                 return Ok(json_value(200, &view, Some(view.revision)));
             }
             if req.method() != hyper::Method::PUT && req.method() != hyper::Method::DELETE {
@@ -1620,11 +1635,23 @@ impl Admin {
                         Ok(config) => config,
                         Err(response) => return Ok(response),
                     };
-                docker.put(expected, config).await
+                docker
+                    .put_authorized(
+                        expected,
+                        config,
+                        self.users.clone(),
+                        actor.mutation_authority(),
+                    )
+                    .await
             } else {
-                docker.delete(expected).await
+                docker
+                    .delete_authorized(expected, self.users.clone(), actor.mutation_authority())
+                    .await
             };
             return Ok(match result {
+                Err(error) if error.is::<crate::admin_users::AuthorizationRevoked>() => {
+                    account_problem(error)
+                }
                 Ok(Some(view)) => json_value(200, &view, Some(view.revision)),
                 Ok(None) => problem(
                     409,

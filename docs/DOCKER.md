@@ -38,7 +38,7 @@ The **Docker** console page manages a single active Docker daemon connection per
 - `DELETE /v1/docker/connection`: remove the managed override and restore the process default, or disable when no default exists.
 - `POST /v1/docker/connection/test`: test a candidate without saving.
 
-All four operations require administrator access. A saved `{"transport":"disabled"}` explicitly disables Docker even when a CLI default is present. Connection file paths refer to the gateway filesystem and must be accessible there. Certificates and keys are never returned by the API; only file references are returned. The client private key must be a private regular file owned by the gateway process. Remote endpoints must be HTTPS origins without URL credentials, paths or queries. Redirects and environment proxy inheritance are disabled, and daemon certificate verification cannot be skipped.
+All four operations require administrator access. Writes recheck account authority after queueing and serialize the local file commit with session revocation and role changes. A revoked request cannot commit a delayed connection change. A saved `{"transport":"disabled"}` explicitly disables Docker even when a CLI default is present. Connection file paths refer to the gateway filesystem and must be accessible there. Certificates and keys are never returned by the API; only file references are returned. The client private key must be a private regular file owned by the gateway process. Remote endpoints must be HTTPS origins without URL credentials, paths or queries. Redirects and environment proxy inheritance are disabled, and daemon certificate verification cannot be skipped.
 
 A remote connection request looks like:
 

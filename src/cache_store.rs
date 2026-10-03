@@ -347,9 +347,9 @@ impl CacheStore {
         self.get_if(key, || true).await
     }
 
-    /// Looks up `key`; a disk hit is promoted into memory only if `promote`
-    /// still holds after the blocking read (callers use it to re-check the
-    /// cache epoch so a purge that raced the read cannot be undone).
+    /// Looks up `key`; hits are returned only while `promote` still holds
+    /// and the entry remains fresh. Callers use the predicate to re-check
+    /// their epoch after a blocking read so invalidation cannot be undone.
     pub async fn get_if(
         &self,
         key: &str,
@@ -368,6 +368,11 @@ impl CacheStore {
                 .map_err(|_| anyhow::anyhow!("memory cache lock poisoned"))?;
             match memory.get(key, now, self.config.memory.eviction) {
                 MemoryLookup::Hit(entry) => {
+                    drop(memory);
+                    if is_expired(&entry, unix_time_ms()) || !promote() {
+                        self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                        return Ok(None);
+                    }
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(entry));
                 }
@@ -415,9 +420,10 @@ impl CacheStore {
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
-        if !promote() {
+        if is_expired(&entry, unix_time_ms()) || !promote() {
             // The entry belongs to a generation that was purged while the read
-            // was in flight: serve nothing rather than resurrect it.
+            // was in flight, or expired while disk I/O was pending: serve
+            // nothing rather than promote or return a stale representation.
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
@@ -1556,6 +1562,69 @@ mod tests {
         assert!(store.get("small").await.unwrap().is_some());
         store.purge().await.unwrap();
         assert!(store.get("small").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disk_lookup_cannot_return_an_entry_that_expires_while_read_is_blocked() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(CacheStore::new(CacheConfig {
+            memory: MemoryConfig {
+                max_bytes: 0,
+                max_entries: 0,
+                ..Default::default()
+            },
+            disk: Some(DiskConfig {
+                directory: directory.path().join("cache"),
+                max_bytes: 1024 * 1024,
+                max_entries: 8,
+                eviction: Eviction::Lru,
+            }),
+            ..Default::default()
+        }));
+        let mut sample = entry(b"expires during read");
+        // Allow setup/scheduling headroom on loaded CI. The gate is released
+        // only after observing the actual wall-clock expiry below.
+        sample.ttl_ms = 2_000;
+        let expires = expires_at_ms(&sample);
+        store.put("key".into(), sample).await.unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let started = Mutex::new(Some(started));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        *store.disk_read_hook.lock().unwrap() = Some(Arc::new(move || {
+            started.lock().unwrap().take().unwrap().send(()).unwrap();
+            gate.lock().unwrap().recv().unwrap();
+        }));
+        let lookup = {
+            let store = store.clone();
+            tokio::spawn(async move { store.get("key").await.unwrap() })
+        };
+        observed.await.unwrap();
+        assert!(
+            unix_time_ms() < expires,
+            "the lookup must begin before expiry"
+        );
+        while unix_time_ms() < expires {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                expires.saturating_sub(unix_time_ms()).max(1),
+            ))
+            .await;
+        }
+        release.send(()).unwrap();
+        assert!(
+            lookup.await.unwrap().is_none(),
+            "disk lookup served an expired cached representation"
+        );
+        assert_eq!(store.stats().await.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_hit_also_obeys_the_callers_invalidation_fence() {
+        let store = CacheStore::new(CacheConfig::default());
+        store.put("key".into(), entry(b"withdrawn")).await.unwrap();
+        assert!(store.get_if("key", || false).await.unwrap().is_none());
+        assert_eq!(store.stats().await.hits, 0);
+        assert!(store.get_if("key", || true).await.unwrap().is_some());
     }
 
     #[tokio::test]

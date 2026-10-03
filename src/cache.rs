@@ -141,7 +141,15 @@ impl CacheRuntime {
         if epoch != self.epoch() {
             return None;
         }
-        self.store.get_if(key, || epoch == self.epoch()).await.ok()
+        let result = self.store.get_if(key, || epoch == self.epoch()).await.ok();
+        // The publication lock excludes local purge, but synchronous config
+        // generation adoption deliberately does not wait for it. Recheck all
+        // outcomes, including memory hits and disk misses: an obsolete miss
+        // must not become a new fill under the withdrawn generation.
+        if epoch != self.epoch() {
+            return None;
+        }
+        result
     }
     pub async fn lookup(self: &Arc<Self>, key: String, epoch: u64) -> Lookup {
         match self.guarded_get(&key, epoch).await {
@@ -151,6 +159,9 @@ impl CacheRuntime {
         }
         let wait = {
             let mut filling = self.filling.lock().expect("cache fill lock");
+            if epoch != self.epoch() {
+                return Lookup::Bypass;
+            }
             if let Some(registration) = filling.get(&key) {
                 Some(registration.done.subscribe())
             } else {
@@ -266,9 +277,13 @@ impl Fill {
 }
 
 pub fn cached_response(entry: CacheEntry) -> Option<Response<Body>> {
-    let age = entry
-        .initial_age_seconds
-        .saturating_add(now_ms().checked_sub(entry.stored_unix_ms)? / 1000);
+    let elapsed_ms = now_ms().checked_sub(entry.stored_unix_ms)?;
+    // A valid store hit may expire before the caller builds its reply.
+    // Recheck at this final representation boundary as well.
+    if elapsed_ms >= entry.ttl_ms {
+        return None;
+    }
+    let age = entry.initial_age_seconds.saturating_add(elapsed_ms / 1000);
     let mut response = Response::builder()
         .status(entry.status)
         .body(
@@ -523,6 +538,15 @@ mod tests {
             ttl_ms: 60000,
             initial_age_seconds: 0,
         }
+    }
+
+    #[test]
+    fn cached_reply_cannot_serve_an_entry_expired_after_lookup() {
+        let mut cached = entry();
+        cached.stored_unix_ms = now_ms().saturating_sub(1_000);
+        cached.ttl_ms = 1_000;
+        assert!(cached_response(cached).is_none());
+        assert!(cached_response(entry()).is_some());
     }
     #[tokio::test]
     async fn purge_prevents_inflight_fill_repopulation() {
@@ -821,6 +845,42 @@ mod tests {
         assert!(cache.store.get("key").await.unwrap().is_none());
         assert!(matches!(
             cache.lookup("key".into(), cache.epoch()).await,
+            Lookup::Fill(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn generation_change_during_disk_lookup_cannot_start_an_old_fill() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheRuntime::new(CacheConfig {
+            disk: Some(DiskConfig {
+                directory: directory.path().join("cache"),
+                max_bytes: 1024 * 1024,
+                max_entries: 8,
+                eviction: Eviction::Lru,
+            }),
+            ..Default::default()
+        });
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let started = Mutex::new(Some(started));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        *cache.store.disk_read_hook.lock().unwrap() = Some(Arc::new(move || {
+            started.lock().unwrap().take().unwrap().send(()).unwrap();
+            gate.lock().unwrap().recv().unwrap();
+        }));
+        let lookup = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.lookup("old-generation".into(), 0).await })
+        };
+        observed.await.unwrap();
+        assert!(cache.adopt_generation(1));
+        release.send(()).unwrap();
+        assert!(matches!(lookup.await.unwrap(), Lookup::Bypass));
+        assert_eq!(cache.active_fills(), 0);
+        *cache.store.disk_read_hook.lock().unwrap() = None;
+        assert!(matches!(
+            cache.lookup("current".into(), cache.epoch()).await,
             Lookup::Fill(_)
         ));
     }

@@ -949,6 +949,21 @@ impl Store {
         .await?
     }
 
+    /// Serialize a bounded local side effect with account/session revocation.
+    /// Call on a blocking worker; the action must not wait on async work.
+    pub(crate) fn authorized_action<T>(
+        &self,
+        authority: &MutationAuthority,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut connection = connection(&self.path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize_mutation(&transaction, authority)?;
+        let result = action()?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub async fn list(&self, authority: MutationAuthority) -> Result<Vec<User>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -2345,6 +2360,51 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn local_side_effect_keeps_revocation_serialized_until_commit() {
+        let (_directory, store) = store();
+        let store = Arc::new(store);
+        store
+            .bootstrap("root".into(), "strong root password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "strong root password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (finish, gate) = std::sync::mpsc::channel();
+        let action = {
+            let store = store.clone();
+            let actor = MutationAuthority::Session(login.token.clone());
+            tokio::task::spawn_blocking(move || {
+                store.authorized_action(&actor, || {
+                    started.send(()).unwrap();
+                    gate.recv()?;
+                    Ok(())
+                })
+            })
+        };
+        observed.await.unwrap();
+        let db = connection(&store.path).unwrap();
+        db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let deletion = db.execute("DELETE FROM sessions", []);
+        finish.send(()).unwrap();
+        action.await.unwrap().unwrap();
+        assert!(
+            matches!(deletion, Err(rusqlite::Error::SqliteFailure(ref error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy),
+            "revocation was allowed to commit while an authorized side effect was pending"
+        );
+        store.logout(login.token.clone()).await.unwrap();
+        assert!(
+            store
+                .authorized_action(&MutationAuthority::Session(login.token), || Ok(()))
+                .unwrap_err()
+                .is::<AuthorizationRevoked>()
+        );
     }
 
     #[tokio::test]

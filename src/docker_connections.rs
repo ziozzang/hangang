@@ -18,6 +18,18 @@ const MAX_STATE: usize = 4096;
 const MAX_PEM: usize = 65536;
 const MAX_WORK: usize = 8;
 
+type Authority = (
+    Arc<crate::admin_users::Store>,
+    crate::admin_users::MutationAuthority,
+);
+
+fn save_authorized(path: &Path, stored: &Stored, authority: Option<&Authority>) -> Result<()> {
+    match authority {
+        Some((users, actor)) => users.authorized_action(actor, || save_state(path, stored)),
+        None => save_state(path, stored),
+    }
+}
+
 #[derive(Debug)]
 pub struct Busy;
 
@@ -188,12 +200,39 @@ impl DockerConnections {
     }
 
     pub async fn test_candidate(&self, config: ConnectionConfig) -> Result<()> {
+        self.test_candidate_inner(config, None).await
+    }
+
+    pub async fn test_candidate_authorized(
+        &self,
+        config: ConnectionConfig,
+        users: Arc<crate::admin_users::Store>,
+        actor: crate::admin_users::MutationAuthority,
+    ) -> Result<()> {
+        self.test_candidate_inner(config, Some((users, actor)))
+            .await
+    }
+
+    async fn test_candidate_inner(
+        &self,
+        config: ConnectionConfig,
+        authority: Option<Authority>,
+    ) -> Result<()> {
         let permit = self.work.clone().try_acquire_owned().map_err(|_| Busy)?;
         tokio::spawn(async move {
             let _permit = permit;
-            let resolver = tokio::task::spawn_blocking(move || build(&config))
-                .await??
-                .context("Docker connection is disabled")?;
+            let (resolver, authority) = tokio::task::spawn_blocking(move || {
+                let resolver = match &authority {
+                    Some((users, actor)) => users.authorized_action(actor, || build(&config)),
+                    None => build(&config),
+                }?;
+                Ok::<_, anyhow::Error>((resolver, authority))
+            })
+            .await??;
+            let resolver = resolver.context("Docker connection is disabled")?;
+            if let Some((users, actor)) = authority {
+                users.authorize_admin(actor).await?;
+            }
             resolver.ping().await
         })
         .await?
@@ -205,6 +244,25 @@ impl DockerConnections {
         &self,
         expected: u64,
         config: ConnectionConfig,
+    ) -> Result<Option<ConnectionView>> {
+        self.put_inner(expected, config, None).await
+    }
+
+    pub async fn put_authorized(
+        &self,
+        expected: u64,
+        config: ConnectionConfig,
+        users: Arc<crate::admin_users::Store>,
+        actor: crate::admin_users::MutationAuthority,
+    ) -> Result<Option<ConnectionView>> {
+        self.put_inner(expected, config, Some((users, actor))).await
+    }
+
+    async fn put_inner(
+        &self,
+        expected: u64,
+        config: ConnectionConfig,
+        authority: Option<Authority>,
     ) -> Result<Option<ConnectionView>> {
         let permit = self.work.clone().try_acquire_owned().map_err(|_| Busy)?;
         let writer_lock = self.writer_lock.clone();
@@ -243,7 +301,7 @@ impl DockerConnections {
                 // A blocking write can outlive async task cancellation during
                 // runtime shutdown. Keep ownership until disk work finishes.
                 let _commit_lock = commit_lock;
-                save_state(&path, &stored)
+                save_authorized(&path, &stored, authority.as_ref())
             })
             .await??;
             state.revision = revision;
@@ -260,6 +318,23 @@ impl DockerConnections {
 
     /// Remove the managed override; the initial CLI socket becomes effective.
     pub async fn delete(&self, expected: u64) -> Result<Option<ConnectionView>> {
+        self.delete_inner(expected, None).await
+    }
+
+    pub async fn delete_authorized(
+        &self,
+        expected: u64,
+        users: Arc<crate::admin_users::Store>,
+        actor: crate::admin_users::MutationAuthority,
+    ) -> Result<Option<ConnectionView>> {
+        self.delete_inner(expected, Some((users, actor))).await
+    }
+
+    async fn delete_inner(
+        &self,
+        expected: u64,
+        authority: Option<Authority>,
+    ) -> Result<Option<ConnectionView>> {
         let permit = self.work.clone().try_acquire_owned().map_err(|_| Busy)?;
         let writer_lock = self.writer_lock.clone();
         let fallback = self
@@ -292,12 +367,13 @@ impl DockerConnections {
             let commit_lock = _writer_lock.clone();
             tokio::task::spawn_blocking(move || {
                 let _commit_lock = commit_lock;
-                save_state(
+                save_authorized(
                     &path,
                     &Stored {
                         revision,
                         config: None,
                     },
+                    authority.as_ref(),
                 )
             })
             .await??;
@@ -641,6 +717,62 @@ mod tests {
                 .revision,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn revoked_queued_mutations_cannot_commit_local_docker_state() {
+        use crate::admin_users::{AuthorizationRevoked, MutationAuthority, Store};
+        use std::os::unix::fs::PermissionsExt;
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.path().join("connection.json");
+            let connections = Arc::new(DockerConnections::open(path.clone(), None).unwrap());
+            let users = Arc::new(Store::open(dir.path().join("users.sqlite3")).unwrap());
+            users
+                .bootstrap("root".into(), "strong root password".into())
+                .await
+                .unwrap();
+            let login = users
+                .login("root".into(), "strong root password".into())
+                .await
+                .unwrap()
+                .unwrap();
+            let guard = connections.state.lock().await;
+            let pending = {
+                let connections = connections.clone();
+                let users = users.clone();
+                let actor = MutationAuthority::Session(login.token.clone());
+                tokio::spawn(async move {
+                    if delete {
+                        connections.delete_authorized(0, users, actor).await
+                    } else {
+                        connections
+                            .put_authorized(0, ConnectionConfig::Disabled, users, actor)
+                            .await
+                    }
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while connections.work.available_permits() == MAX_WORK {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            users.logout(login.token).await.unwrap();
+            drop(guard);
+            assert!(
+                pending
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is::<AuthorizationRevoked>()
+            );
+            assert_eq!(connections.view().await.revision, 0);
+            assert_eq!(connections.generation(), 0);
+            assert!(!path.exists(), "revoked queued mutation persisted state");
+        }
     }
 
     #[tokio::test]

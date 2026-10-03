@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwap;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::{
-    io::{Cursor, Read},
+    io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -123,13 +123,9 @@ impl ReloadingTls {
     }
 }
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .context("open TLS material")?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 1024 * 1024, "TLS material exceeds 1 MiB");
-    Ok(bytes)
+    // Inspect the opened descriptor, rather than checking a path and then
+    // opening it: replacement by a FIFO must not pin startup or the watcher.
+    crate::certificates::read_bounded(path, "command-line", "material")
 }
 pub fn server_config(cert: &[u8], key: &[u8]) -> Result<ServerConfig> {
     let certificates =

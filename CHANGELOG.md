@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Fence Docker connection writes against account/session revocation after body
+  admission and writer-queue waits; recheck candidate-test authorization.
+- Recheck cache freshness and invalidation after disk reads, and reject
+  nonregular command-line TLS material without blocking on FIFO replacement.
+
 - Separate viewer response and login password-work budgets from administrator
   recovery; limit account sessions without evicting another account's sessions.
 - Retain cache-fill capacity through publication and yield while consuming

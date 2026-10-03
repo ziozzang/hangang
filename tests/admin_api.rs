@@ -2149,6 +2149,29 @@ async fn last_admin_and_password_change_are_enforced_through_api() {
 }
 
 #[tokio::test]
+async fn revoked_account_cannot_change_or_test_docker_after_body_admission() {
+    for (method, path) in [
+        ("PUT", "/v1/docker/connection"),
+        ("POST", "/v1/docker/connection/test"),
+    ] {
+        let (address, _manager, _directory) = server().await;
+        let token = account_admin_token(address).await;
+        let body = r#"{"transport":"disabled"}"#;
+        let mut pending =
+            admitted_config_mutation_waiting_for_body(address, method, path, &token, body).await;
+        revoke_account_session(address, &token).await;
+        assert_eq!(
+            finish_user_mutation(&mut pending, body).await,
+            403,
+            "{path}"
+        );
+        let (status, _, bytes) = request(address, "GET", "/v1/docker/connection", None, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(json(&bytes)["revision"], 0);
+    }
+}
+
+#[tokio::test]
 async fn revoked_account_cannot_finish_user_creation_after_body_admission() {
     let (address, _manager, _directory) = server().await;
     let credentials = r#"{"username":"operator","password":"correct horse battery"}"#;
