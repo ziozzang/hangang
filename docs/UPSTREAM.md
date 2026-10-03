@@ -6,6 +6,8 @@ HTTP and TCP routes accept an optional `upstream` object. A route can match a ho
 
 ## Independent identities
 
+Request trailers are unsupported and discarded before policy processing and upstream forwarding, for both HTTP/1 and HTTP/2 clients. Only initial request headers participate in authentication and identity sanitation. Applications that require trailer metadata must send it in initial headers or the body instead. Response trailers retain their existing forwarding behavior, subject to response transforms and cache eligibility.
+
 - `backends`: the logical destination and load-balancing candidates. For HTTP, the URL also supplies the default Host and TLS verification name.
 - `upstream.connect_address`: the socket destination, `host:port` or `[IPv6]:port`. This overrides the chosen backend address without changing its logical identity. If set on a route with several backends, all candidates dial this same address.
 - `upstream.unix_socket`: an absolute, normalized path (at most 107 encoded bytes) to a Unix stream socket mounted inside the gateway. All candidates dial this socket; their logical backend still supplies HTTP Host and the default TLS verification name. It cannot be combined with `connect_address`, `socks5`, or `dns_servers`. A failed socket connection has no direct-TCP fallback.

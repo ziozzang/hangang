@@ -1092,7 +1092,7 @@ impl Proxy {
             .cloned();
         // Replacing the body preserves request extensions, including OnUpgrade.
         let (parts, body) = request.into_parts();
-        let mut request = Request::from_parts(parts, boxed_incoming(body));
+        let mut request = Request::from_parts(parts, RequestDataBody { body }.boxed_unsync());
 
         let (protected_resource, canonical_resource_path) = match crate::resource_guard::check(
             &snapshot.resource_guards,
@@ -3274,6 +3274,47 @@ fn upstream_uri(backend: &str, original: &Uri) -> Result<Uri, ()> {
     format!("{scheme}://{authority}{path}")
         .parse()
         .map_err(|_| ())
+}
+
+/// Only initial request headers participate in routing, policy, authentication,
+/// and forwarding sanitation. Do not let uninspected late fields restore a
+/// stripped identity or present a different application-header view to an h2
+/// origin. Trailer declarations are already removed before upstream dispatch;
+/// response trailers retain their existing behavior.
+struct RequestDataBody {
+    body: Incoming,
+}
+
+impl hyper::body::Body for RequestDataBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BodyError>>> {
+        loop {
+            match std::pin::Pin::new(&mut self.body).poll_frame(cx) {
+                std::task::Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    return std::task::Poll::Ready(Some(Err(BodyError(Box::new(error)))));
+                }
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    return std::task::Poll::Ready(Some(Ok(frame)));
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 fn boxed_incoming(body: Incoming) -> Body {

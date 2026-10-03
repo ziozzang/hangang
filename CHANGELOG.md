@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Drop request trailers before policy and upstream forwarding so late HTTP/2
+  fields cannot restore stripped authentication or forwarding headers.
+- Fence retired Docker discovery completions and timeout cleanup against newer
+  daemon generations; reject symlink replacement on SQLite cache reopening.
+
 - Fence Docker connection writes against account/session revocation after body
   admission and writer-queue waits; recheck candidate-test authorization.
 - Recheck cache freshness and invalidation after disk reads, and reject

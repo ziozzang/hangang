@@ -327,6 +327,8 @@ impl CacheStore {
                 state: Mutex::new(DiskState::default()),
                 gate: Arc::new(Semaphore::new(1)),
                 counters: counters.clone(),
+                #[cfg(test)]
+                before_sqlite_open: Mutex::new(None),
             })
         });
         Self {
@@ -699,6 +701,8 @@ struct DiskStore {
     state: Mutex<DiskState>,
     gate: Arc<Semaphore>,
     counters: Arc<Counters>,
+    #[cfg(test)]
+    before_sqlite_open: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub(crate) enum PutOutcome {
@@ -1104,7 +1108,15 @@ impl DiskStore {
         }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            // SQLite reopens the pathname independently of the no-follow
+            // ownership descriptor above. Enforce the same symlink boundary
+            // on this second open, including replacements between the opens.
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        #[cfg(test)]
+        if let Some(hook) = self.before_sqlite_open.lock().unwrap().take() {
+            hook();
+        }
         let mut connection =
             Connection::open_with_flags(&self.path, flags).context("open disk cache database")?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
@@ -1988,6 +2000,42 @@ mod tests {
         // ... while the configuration the store was built with does not.
         let stale = CacheStore::new(config);
         assert!(stale.get("key").await.unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_open_rejects_symlink_replacement_after_ownership_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = disk_config(directory.path().join("cache"), 8);
+        let database = config.disk.as_ref().unwrap().directory.join("cache-v1.db");
+        {
+            let seed = CacheStore::new(config.clone());
+            seed.put("key".into(), entry(b"substituted")).await.unwrap();
+        }
+        let replacement = directory.path().join("replacement.db");
+        fs::rename(&database, &replacement).unwrap();
+        let store = CacheStore::new(config);
+        let replaced_database = database.clone();
+        *store
+            .disk
+            .as_ref()
+            .unwrap()
+            .before_sqlite_open
+            .lock()
+            .unwrap() = Some(Arc::new(move || {
+            // The legitimate ownership descriptor stays open while the
+            // pathname is replaced with another valid cache database.
+            fs::remove_file(&replaced_database).unwrap();
+            std::os::unix::fs::symlink(&replacement, &replaced_database).unwrap();
+        }));
+        assert!(store.get("key").await.unwrap().is_none());
+        assert_eq!(store.stats().await.errors, 1);
+        assert!(
+            fs::symlink_metadata(database)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[tokio::test]

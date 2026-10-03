@@ -187,6 +187,129 @@ async fn outbound_preserve_host_uses_one_authority_on_h2_and_host_on_h1() {
     policy.shutdown().await;
 }
 
+/// Initial-header sanitation also applies to late HTTP/2 trailer fields.
+#[tokio::test]
+async fn http1_request_trailers_cannot_restore_stripped_forwarding_identity_on_h2_origin() {
+    request_trailer_boundary(false).await;
+}
+
+#[tokio::test]
+async fn http2_request_trailers_cannot_restore_stripped_forwarding_identity_on_h2_origin() {
+    request_trailer_boundary(true).await;
+}
+
+async fn request_trailer_boundary(h2_ingress: bool) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let origin = tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(socket).await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let seen = seen.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let collected = body.collect().await.unwrap();
+                    let trailers = collected.trailers().cloned();
+                    let bytes = collected.to_bytes();
+                    *seen.lock().unwrap() = Some((parts.version, parts.headers, trailers, bytes));
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        }
+    });
+    let mut r = route(vec![format!("https://{address}")]);
+    r.upstream.tls = Some(hangang::upstream::UpstreamTls {
+        insecure_skip_verify: true,
+        ..Default::default()
+    });
+    let (proxy, policy) = proxy(vec![r]);
+    let (front, front_task) = if h2_ingress {
+        frontend_h2(proxy).await
+    } else {
+        let (front, task, _) = frontend(proxy).await;
+        (front, task)
+    };
+    if h2_ingress {
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert(
+            "x-forwarded-for",
+            hyper::header::HeaderValue::from_static("198.51.100.77"),
+        );
+        trailers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_static("Bearer forged"),
+        );
+        trailers.insert(
+            "x-app",
+            hyper::header::HeaderValue::from_static("late-value"),
+        );
+        let frames = vec![
+            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"data"))),
+            Ok(hyper::body::Frame::trailers(trailers)),
+        ];
+        let body = http_body_util::StreamBody::new(futures_util::stream::iter(frames));
+        let stream = TcpStream::connect(front).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let reply = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{front}/"))
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 200);
+        reply.into_body().collect().await.unwrap();
+        driver.abort();
+    } else {
+        let (status, text) = raw_request(front,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTrailer: x-forwarded-for, authorization, x-app\r\nConnection: close\r\n\r\n4\r\ndata\r\n0\r\nx-forwarded-for: 198.51.100.77\r\nauthorization: Bearer forged\r\nx-app: late-value\r\n\r\n").await;
+        assert_eq!(status, 200, "{text}");
+    }
+    {
+        let seen = seen.lock().unwrap();
+        let (version, headers, trailers, bytes) = seen.as_ref().unwrap();
+        assert_eq!(*version, hyper::Version::HTTP_2);
+        assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
+        assert_eq!(bytes.as_ref(), b"data");
+        assert!(
+            trailers.as_ref().is_none_or(hyper::HeaderMap::is_empty),
+            "unaudited request trailers reached the origin: {trailers:?}"
+        );
+    }
+    front_task.abort();
+    origin.abort();
+    policy.shutdown().await;
+}
+
 async fn upstream(label: &'static str) -> (SocketAddr, Arc<Mutex<Vec<Seen>>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -145,6 +145,11 @@ impl Discovery {
     fn publish(&self, generation: u64, next: HashMap<String, Resolved>) {
         static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.resolved.rcu(|previous| {
+            // A retired daemon's completion, including an error cleanup,
+            // must not erase a replacement that has already published.
+            if previous.generation > generation {
+                return previous.clone();
+            }
             let epochs = next
                 .iter()
                 .map(|(name, value)| {
@@ -171,17 +176,22 @@ impl Discovery {
     /// Failed references are deliberately absent from the new map so a stopped
     /// or removed container cannot keep receiving traffic through stale data.
     pub async fn refresh(&self, config: &Config) -> Result<()> {
-        match tokio::time::timeout(REFRESH_DEADLINE, self.refresh_inner(config)).await {
+        let (generation, resolver) = self.managed.as_ref().map_or_else(
+            || (0, self.resolver.clone()),
+            |manager| manager.generation_resolver(),
+        );
+        match tokio::time::timeout(
+            REFRESH_DEADLINE,
+            self.refresh_inner(config, generation, resolver),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 // The full batch has one deadline. Clearing here is essential:
                 // otherwise a large or stalled batch could preserve an address
                 // after its container has disappeared.
-                self.resolved.store(Arc::new(ResolvedSnapshot::empty(
-                    self.managed
-                        .as_ref()
-                        .map_or(0, |manager| manager.generation()),
-                )));
+                self.publish(generation, HashMap::new());
                 anyhow::bail!(
                     "Docker discovery refresh exceeded {} seconds",
                     REFRESH_DEADLINE.as_secs()
@@ -190,11 +200,12 @@ impl Discovery {
         }
     }
 
-    async fn refresh_inner(&self, config: &Config) -> Result<()> {
-        let (generation, resolver) = self.managed.as_ref().map_or_else(
-            || (0, self.resolver.clone()),
-            |manager| manager.generation_resolver(),
-        );
+    async fn refresh_inner(
+        &self,
+        config: &Config,
+        generation: u64,
+        resolver: Option<Arc<DockerResolver>>,
+    ) -> Result<()> {
         let mut references = HashMap::<String, DockerReference>::new();
         for backend in config
             .http
@@ -215,13 +226,11 @@ impl Discovery {
             }
         }
         if references.is_empty() {
-            self.resolved
-                .store(Arc::new(ResolvedSnapshot::empty(generation)));
+            self.publish(generation, HashMap::new());
             return Ok(());
         }
         let Some(resolver) = resolver else {
-            self.resolved
-                .store(Arc::new(ResolvedSnapshot::empty(generation)));
+            self.publish(generation, HashMap::new());
             anyhow::bail!(
                 "Docker discovery is disabled but the configuration contains Docker references"
             );
@@ -252,8 +261,7 @@ impl Discovery {
             .as_ref()
             .is_some_and(|manager| manager.generation() != generation)
         {
-            self.resolved
-                .store(Arc::new(ResolvedSnapshot::empty(generation)));
+            self.publish(generation, HashMap::new());
             anyhow::bail!("Docker connection changed during discovery refresh");
         }
         self.publish(generation, next);

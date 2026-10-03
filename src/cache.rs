@@ -850,6 +850,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_purge_caller_cannot_abandon_admitted_invalidation() {
+        let cache = CacheRuntime::new(CacheConfig::default());
+        cache.store.put("key".into(), entry()).await.unwrap();
+        let epoch = cache.epoch();
+        let publication = cache.publication.clone().read_owned().await;
+        let caller = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.purge().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.maintenance.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(cache.epoch(), epoch, "publication still blocks the purge");
+        assert_eq!(cache.maintenance.available_permits(), 0);
+        drop(publication);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.maintenance.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(cache.epoch(), epoch);
+        assert!(cache.store.get("key").await.unwrap().is_none());
+        assert_eq!(cache.active_fills(), 0);
+    }
+
+    #[tokio::test]
     async fn generation_change_during_disk_lookup_cannot_start_an_old_fill() {
         let directory = tempfile::tempdir().unwrap();
         let cache = CacheRuntime::new(CacheConfig {

@@ -288,6 +288,117 @@ async fn in_flight_old_daemon_refresh_cannot_publish_after_swap() {
 }
 
 #[tokio::test]
+async fn retired_refresh_failure_does_not_remove_a_published_replacement() {
+    let first = FakeDocker::start(Duration::from_millis(300)).await;
+    first.set("api", true, "172.20.0.2");
+    let second = FakeDocker::start(Duration::ZERO).await;
+    second.set("api", true, "172.20.0.9");
+    let directory = tempfile::tempdir().unwrap();
+    let connections = Arc::new(
+        DockerConnections::open(
+            directory.path().join("connection.json"),
+            Some(first.socket.clone()),
+        )
+        .unwrap(),
+    );
+    let discovery = Discovery::managed(connections.clone());
+    let reference = "docker://api/edge/8080";
+    let configured = config(vec![reference.into()], Vec::new());
+    let retired = {
+        let discovery = discovery.clone();
+        let configured = configured.clone();
+        tokio::spawn(async move { discovery.refresh(&configured).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while first.active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    connections
+        .put(
+            0,
+            ConnectionConfig::Unix {
+                socket_path: second.socket.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    discovery.refresh(&configured).await.unwrap();
+    let replacement = discovery
+        .resolve_with_epoch(reference, Protocol::Http)
+        .unwrap();
+    assert_eq!(replacement.endpoint, "http://172.20.0.9:8080");
+    assert!(retired.await.unwrap().is_err());
+    assert_eq!(
+        discovery.resolve_with_epoch(reference, Protocol::Http),
+        Some(replacement)
+    );
+}
+
+#[tokio::test]
+async fn retired_batch_deadline_does_not_clear_replacement_daemon_endpoints() {
+    // Nine references require two batches. Individual inspections have a
+    // three-second limit, so this stalled daemon reaches the five-second
+    // aggregate deadline after a new daemon has already published its map.
+    let first = FakeDocker::start(Duration::from_secs(4)).await;
+    let second = FakeDocker::start(Duration::ZERO).await;
+    second.set("api", true, "172.20.0.9");
+    let directory = tempfile::tempdir().unwrap();
+    let connections = Arc::new(
+        DockerConnections::open(
+            directory.path().join("connection.json"),
+            Some(first.socket.clone()),
+        )
+        .unwrap(),
+    );
+    let discovery = Discovery::managed(connections.clone());
+    let stalled = config(
+        (0..9)
+            .map(|index| format!("docker://old-{index}/edge/80"))
+            .collect(),
+        Vec::new(),
+    );
+    let retired = {
+        let discovery = discovery.clone();
+        tokio::spawn(async move { discovery.refresh(&stalled).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while first.active.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    connections
+        .put(
+            0,
+            ConnectionConfig::Unix {
+                socket_path: second.socket.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let reference = "docker://api/edge/8080";
+    discovery
+        .refresh(&config(vec![reference.into()], Vec::new()))
+        .await
+        .unwrap();
+    let replacement = discovery
+        .resolve_with_epoch(reference, Protocol::Http)
+        .unwrap();
+    let error = retired.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("exceeded"));
+    assert_eq!(
+        discovery.resolve_with_epoch(reference, Protocol::Http),
+        Some(replacement)
+    );
+}
+
+#[tokio::test]
 async fn refresh_tracks_ip_changes_and_removes_stopped_or_unconfigured_containers() {
     let docker = FakeDocker::start(Duration::ZERO).await;
     docker.set("api", true, "172.20.0.2");
