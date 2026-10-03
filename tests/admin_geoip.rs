@@ -81,6 +81,7 @@ async fn serve(
         lifecycle: None,
         update_status_path: None,
         requests: Arc::new(tokio::sync::Semaphore::new(8)),
+        viewer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::VIEWER_REQUEST_LIMIT)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(Admin::PUBLIC_REQUEST_LIMIT)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
         observer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),

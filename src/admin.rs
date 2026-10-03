@@ -808,6 +808,9 @@ impl Manager {
         outcome
     }
 }
+#[derive(Clone, Copy)]
+struct ViewerResponse;
+
 #[derive(Clone)]
 pub struct Admin {
     pub fleet_observer: Option<Arc<crate::fleet_observer::Runtime>>,
@@ -823,6 +826,8 @@ pub struct Admin {
     pub update_status_path: Option<PathBuf>,
     /// Admission for authenticated administration.
     pub requests: Arc<tokio::sync::Semaphore>,
+    /// Bounded viewer replies and event streams cannot pin administrator writes.
+    pub viewer_requests: Arc<tokio::sync::Semaphore>,
     /// Separate, smaller admission for the assets served before
     /// authentication (`/ui/*`, `/openapi.json`). An unauthenticated peer can
     /// pin at most this many responses by refusing to read them; it can never
@@ -839,6 +844,7 @@ pub struct Admin {
 impl Admin {
     /// Bounded admission for the embedded assets that need no token.
     pub const PUBLIC_REQUEST_LIMIT: usize = 16;
+    pub const VIEWER_REQUEST_LIMIT: usize = 16;
     pub const AUTH_REQUEST_LIMIT: usize = 8;
     pub const EVENT_STREAM_LIMIT: usize = 32;
     pub const OBSERVER_REQUEST_LIMIT: usize = 8;
@@ -934,6 +940,7 @@ impl Admin {
         // still retain the permit through completion.
         if response.status() == hyper::StatusCode::UNAUTHORIZED
             || response.status() == hyper::StatusCode::FORBIDDEN
+            || response.extensions().get::<ViewerResponse>().is_some()
         {
             drop(permit);
             return Ok(response);
@@ -1100,6 +1107,20 @@ impl Admin {
                 );
             }
         };
+        let viewer_permit = if actor.role() == crate::admin_users::Role::Viewer {
+            match self.viewer_requests.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return problem(
+                        503,
+                        "Service Unavailable",
+                        "viewer response capacity exhausted",
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let privileged_seen = actor.role() == crate::admin_users::Role::Admin;
         let account_token = match actor {
             AdminActor::System => None,
@@ -1193,13 +1214,17 @@ impl Admin {
         let body = StreamBody::new(stream)
             .map_err(|never| match never {})
             .boxed_unsync();
-        Response::builder()
+        let response = Response::builder()
             .status(200)
             .header("content-type", "text/event-stream; charset=utf-8")
             .header("cache-control", "no-store")
             .header("x-accel-buffering", "no")
             .body(body)
-            .expect("static event response")
+            .expect("static event response");
+        match viewer_permit {
+            Some(permit) => crate::proxy::retain_request_permit(response, permit),
+            None => response,
+        }
     }
     async fn handle_inner(&self, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
         let path = req.uri().path().to_owned();
@@ -1242,6 +1267,41 @@ impl Admin {
                 .insert("www-authenticate", "Bearer".parse().unwrap());
             return Ok(r);
         };
+        let viewer = actor.role() == crate::admin_users::Role::Viewer;
+        let viewer_permit = if viewer {
+            match self.viewer_requests.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let mut response = problem(
+                        503,
+                        "Service Unavailable",
+                        "viewer response capacity exhausted",
+                    );
+                    response.extensions_mut().insert(ViewerResponse);
+                    return Ok(response);
+                }
+            }
+        } else {
+            None
+        };
+        let mut response = self.handle_authenticated(req, actor).await?;
+        if viewer {
+            // Retain the separate viewer budget through transmission; an
+            // unread observation must not reserve administrator write admission.
+            response.extensions_mut().insert(ViewerResponse);
+        }
+        if let Some(permit) = viewer_permit {
+            return Ok(crate::proxy::retain_request_permit(response, permit));
+        }
+        Ok(response)
+    }
+
+    async fn handle_authenticated(
+        &self,
+        req: Request<Incoming>,
+        actor: AdminActor,
+    ) -> Result<Response<Body>, Infallible> {
+        let path = req.uri().path().to_owned();
         if path == "/v1/auth/me" {
             return Ok(if req.method() == hyper::Method::GET {
                 json_value(200, &serde_json::json!({"user":actor.user()}), None)

@@ -1092,6 +1092,7 @@ async fn run(args: Args) -> Result<()> {
         acme_status: acme.as_ref().map(|runtime| runtime.status.clone()),
         file_tls_enabled: args.config_tls,
         requests: Arc::new(tokio::sync::Semaphore::new(64)),
+        viewer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::VIEWER_REQUEST_LIMIT)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(Admin::PUBLIC_REQUEST_LIMIT)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
         observer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::OBSERVER_REQUEST_LIMIT)),
@@ -1474,8 +1475,14 @@ async fn serve(
                     let connection_lease=lease.clone();
                     let transport_tls=tls_config.is_some();
                     let io:Box<dyn TransportIo>=if let Some(config)=tls_config {
+                        // Public handshake exhaustion must not deny the
+                        // separately admitted administration listener.
+                        let handshake_permit=if matches!(&handler,Handler::Proxy(_)) {
+                            match hangang::public_http::public_handshake_admission().try_acquire_owned() {Ok(permit)=>Some(permit),Err(_)=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return;}}
+                        } else {None};
                         let acceptor=tokio_rustls::TlsAcceptor::from(config);
                         let accepted=tokio::select!{_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(5),acceptor.accept(stream))=>result};
+                        drop(handshake_permit);
                         match accepted {Ok(Ok(stream))=>Box::new(stream),_=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return}}
                     } else {Box::new(stream)};
                     let (io, idle_watch)=hangang::idle::IdleIo::new(io,idle_timeout);

@@ -243,7 +243,16 @@ impl WorkerSlot {
     }
 
     async fn call(&mut self, executable: &Path, request: WorkerRequest) -> Result<WorkerResponse> {
-        let mut worker = self.take_running(executable)?;
+        let mut worker = match self.take_running(executable) {
+            Ok(worker) => worker,
+            Err(error) => {
+                // Process/resource failures need the same restart backoff as
+                // a crashed worker. Otherwise every hostile request retries
+                // spawn immediately while the host is already exhausted.
+                self.retry_after = Some(TokioInstant::now() + RESTART_COOLDOWN);
+                return Err(error);
+            }
+        };
         // From this point until a complete response is validated, the worker
         // belongs to this future. Cancellation drops and kills it, so its late
         // response can never be consumed by another request.
@@ -1069,6 +1078,23 @@ mod tests {
             headers: BTreeMap::from([("X-Tenant".to_owned(), "green".to_owned())]),
             geoip: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_worker_spawn_enters_restart_cooldown() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("missing-worker");
+        let mut slot = WorkerSlot::default();
+        assert!(
+            slot.call(&executable, WorkerRequest::Shutdown)
+                .await
+                .is_err()
+        );
+        assert!(
+            slot.retry_after.is_some(),
+            "spawn failure must retain a restart fence"
+        );
+        assert!(slot.worker.is_none());
     }
 
     #[test]

@@ -181,6 +181,7 @@ async fn server_on_with_observer(
         lifecycle: None,
         update_status_path: None,
         requests: Arc::new(tokio::sync::Semaphore::new(request_limit)),
+        viewer_requests: Arc::new(tokio::sync::Semaphore::new(Admin::VIEWER_REQUEST_LIMIT)),
         public_requests: Arc::new(tokio::sync::Semaphore::new(public_limit)),
         auth_requests: Arc::new(tokio::sync::Semaphore::new(Admin::AUTH_REQUEST_LIMIT)),
         observer_requests,
@@ -4016,6 +4017,126 @@ async fn unread_public_assets_cannot_exhaust_authenticated_admission() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn unread_viewer_observations_and_events_cannot_pin_administrator_admission() {
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    for path in ["/v1/status", "/v1/events"] {
+        let (address, _manager, _dir) = server_with_limits(false, 4, 4).await;
+        let administrator = account_admin_token(address).await;
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                "/v1/users",
+                Some(r#"{"username":"viewer","password":"viewer password 123","role":"viewer"}"#),
+                None
+            )
+            .await
+            .0,
+            201
+        );
+        let (status, _, body) = request_with_token(
+            address,
+            "POST",
+            "/v1/auth/login",
+            Some(r#"{"username":"viewer","password":"viewer password 123"}"#),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let viewer = json(&body)["token"].as_str().unwrap().to_owned();
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .initial_stream_window_size(0)
+                .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut held = Vec::new();
+        for _ in 0..Admin::VIEWER_REQUEST_LIMIT {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", format!("Bearer {viewer}"))
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            held.push(response);
+        }
+        let exhausted = sender
+            .send_request(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {viewer}"))
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exhausted.status(),
+            503,
+            "viewer response memory must stay bounded"
+        );
+        held.push(exhausted);
+        assert_eq!(
+            request_with_token(
+                address,
+                "GET",
+                "/v1/status",
+                None,
+                None,
+                Some(&administrator)
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(
+            request_with_token(
+                address,
+                "PUT",
+                "/v1/config",
+                Some("{}"),
+                Some(0),
+                Some(&administrator)
+            )
+            .await
+            .0,
+            200
+        );
+        if path == "/v1/events" {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", format!("Bearer {administrator}"))
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                200,
+                "viewer streams must leave administrator event capacity"
+            );
+            held.push(response);
+        }
+        drop(held);
+        connection.abort();
+    }
 }
 
 #[tokio::test]

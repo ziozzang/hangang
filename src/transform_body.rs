@@ -165,18 +165,8 @@ async fn transform_inner(
         }
         let deadline = Duration::from_millis(config.timeout_ms);
         let operation = async {
-            let bytes = Limited::new(body, config.max_buffer_bytes)
-                .collect()
-                .await
-                .map_err(|error| {
-                    if error.is::<http_body_util::LengthLimitError>() {
-                        TransformError::TooLarge
-                    } else {
-                        TransformError::Invalid
-                    }
-                })?
-                .to_bytes();
-            let bytes = apply(bytes.to_vec(), config, policy, phase, geoip, budget.clone()).await?;
+            let bytes = collect_buffered(body, config.max_buffer_bytes).await?;
+            let bytes = apply(bytes, config, policy, phase, geoip, budget.clone()).await?;
             Ok(hold(
                 Full::new(Bytes::from(bytes))
                     .map_err(|never| match never {})
@@ -216,6 +206,33 @@ async fn transform_inner(
     Ok(StreamBody::new(stream)
         .map_err(|error: TransformError| BodyError::from_error(error))
         .boxed_unsync())
+}
+
+async fn collect_buffered(body: Body, limit: usize) -> Result<Vec<u8>, TransformError> {
+    let mut body = Limited::new(body, limit);
+    let mut output = Vec::new();
+    loop {
+        // Byte limits do not count empty frames or trailers. Cooperate even
+        // when every frame is immediately ready, so the caller's deadline
+        // and cancellation remain effective.
+        tokio::task::consume_budget().await;
+        let Some(frame) = body.frame().await else {
+            return Ok(output);
+        };
+        let frame = frame.map_err(|error| {
+            if error.is::<http_body_util::LengthLimitError>() {
+                TransformError::TooLarge
+            } else {
+                TransformError::Invalid
+            }
+        })?;
+        if let Ok(bytes) = frame.into_data() {
+            // Flatten incrementally: retaining each individual one-byte
+            // frame until EOF would amplify per-frame metadata far beyond
+            // the configured body-byte limit. Transformed trailers drop.
+            append_bounded(&mut output, &bytes, limit)?;
+        }
+    }
 }
 
 async fn apply(
@@ -460,6 +477,10 @@ impl Reader {
         let mut record = Vec::new();
         let append_limit = limit.saturating_add(usize::from(!sse));
         loop {
+            // A body may keep yielding immediately-ready empty data frames or
+            // trailers. Those consume no byte quota, but must still yield to
+            // cancellation and the enclosing record deadline.
+            tokio::task::consume_budget().await;
             if !self.chunk.is_empty() {
                 if self.skip_lf {
                     self.skip_lf = false;
@@ -534,5 +555,61 @@ impl hyper::body::Body for HeldBody {
     }
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_ready_frames_cannot_starve_the_record_deadline() {
+        let frames = (0..4096)
+            .map(|_| Ok::<_, BodyError>(Frame::data(Bytes::new())))
+            .chain(std::iter::once(Ok(Frame::data(Bytes::from_static(b"x\n")))));
+        let mut reader = Reader {
+            body: StreamBody::new(futures_util::stream::iter(frames)).boxed_unsync(),
+            chunk: Bytes::new(),
+            eof: false,
+            skip_lf: false,
+        };
+        // All frames are ready and have no byte weight. Without cooperative
+        // admission the line future completes before timeout is ever polled.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, reader.line(32, false))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_empty_ready_frames_cannot_starve_the_deadline() {
+        let frames = (0..4096)
+            .map(|_| Ok::<_, BodyError>(Frame::data(Bytes::new())))
+            .chain(std::iter::once(Ok(Frame::data(Bytes::from_static(b"x")))));
+        let body = StreamBody::new(futures_util::stream::iter(frames)).boxed_unsync();
+        assert!(
+            tokio::time::timeout(Duration::ZERO, collect_buffered(body, 32))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_fragmentation_preserves_bytes_and_enforces_limit() {
+        let make_body = || {
+            StreamBody::new(futures_util::stream::iter(
+                (0..4096).map(|_| Ok::<_, BodyError>(Frame::data(Bytes::from_static(b"x")))),
+            ))
+            .boxed_unsync()
+        };
+        assert_eq!(
+            collect_buffered(make_body(), 4096).await.unwrap(),
+            vec![b'x'; 4096]
+        );
+        assert!(matches!(
+            collect_buffered(make_body(), 4095).await,
+            Err(TransformError::TooLarge)
+        ));
     }
 }

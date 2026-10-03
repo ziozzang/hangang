@@ -272,6 +272,7 @@ fn reply(code: StatusCode) -> Response<Full<Bytes>> {
     Response::builder()
         .status(code)
         .header(header::CACHE_CONTROL, "no-store")
+        .header("referrer-policy", "no-referrer")
         .body(Full::new(Bytes::new()))
         .expect("static auth bridge response")
 }
@@ -315,14 +316,20 @@ async fn authorize(
             Ok(parsed) => parsed,
             Err(_) => return reply(StatusCode::SERVICE_UNAVAILABLE),
         };
-        if let Some((_, supplied)) = parsed
+        let mut sessions = parsed
             .query_pairs()
-            .find(|(key, _)| key.as_ref() == prepared.settings.cookie_name)
-            && supplied.len() <= 4096
-        {
+            .filter(|(key, _)| key.as_ref() == prepared.settings.cookie_name);
+        let supplied = sessions.next();
+        if sessions.next().is_some() {
+            return reply(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if let Some((_, supplied)) = supplied {
+            if supplied.is_empty() || supplied.len() > 4096 {
+                return reply(StatusCode::SERVICE_UNAVAILABLE);
+            }
             let encoded = base64::engine::general_purpose::STANDARD.encode(supplied.as_bytes());
             let set_cookie = format!(
-                "{}={encoded}; Path=/; secure",
+                "{}={encoded}; Path=/; Secure; HttpOnly; SameSite=Lax",
                 prepared.settings.cookie_name
             );
             return redirect(&prepared.settings.login_done_url, Some(&set_cookie));
@@ -620,8 +627,17 @@ mod tests {
         );
         assert_eq!(
             setup.headers()[header::SET_COOKIE],
-            "SSOSESSIONS=cGxhaW4=; Path=/; secure"
+            "SSOSESSIONS=cGxhaW4=; Path=/; Secure; HttpOnly; SameSite=Lax"
         );
+        assert_eq!(setup.headers()["referrer-policy"], "no-referrer");
+        for path in [
+            "/set-cookie?SSOSESSIONS=",
+            "/set-cookie?SSOSESSIONS=first&SSOSESSIONS=second",
+        ] {
+            let invalid = call(path, None).await;
+            assert_eq!(invalid.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!invalid.headers().contains_key(header::SET_COOKIE));
+        }
         let ban = call("/allowed", Some("SSOSESSIONS=banned")).await;
         assert_eq!(ban.headers()[header::LOCATION], "http://login.example/ban");
         let expired = call("/allowed", Some("SSOSESSIONS=expired")).await;

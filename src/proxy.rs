@@ -689,6 +689,11 @@ impl Proxy {
                             .append(HeaderName::from_static(name), value.clone());
                     }
                 }
+                // Login callbacks may carry a session credential in their URI.
+                // Do not expose that URI as Referer on an auth-driven redirect.
+                forwarded
+                    .headers_mut()
+                    .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
                 return Ok(AuthOutcome::Forward(Box::new(forwarded)));
             }
             if status.is_success() {
@@ -738,6 +743,9 @@ impl Proxy {
                             .append(HeaderName::from_static(name), value.clone());
                     }
                 }
+                forwarded
+                    .headers_mut()
+                    .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
                 return Ok(AuthOutcome::Forward(Box::new(forwarded)));
             }
             match status {

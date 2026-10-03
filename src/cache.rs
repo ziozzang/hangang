@@ -210,28 +210,23 @@ pub struct Fill {
     // at its deadline can never deregister a newer fill for the same key.
     id: u64,
     epoch: u64,
-    // For a streaming capture the permit is moved into a detached deadline guard
-    // (see FillPermitGuard) so it is released at fill_timeout even when the
-    // client stops reading and never polls the capture body. For non-streaming
-    // paths the Fill drops the permit directly.
+    // The Fill owns capacity through capture and publication. The deadline
+    // guard abandons a stalled capture's shared Fill, releasing this permit
+    // even when the response body is never polled again.
     _permit: Option<OwnedSemaphorePermit>,
 }
 
 // Enforces the fill deadline independently of whether the capture body is
 // being polled: at the deadline it discards the captured bytes, deregisters
 // the fill (which also wakes coalesced followers) and only then releases the
-// admission permit. Dropping the guard (on normal completion or when the
-// response body is dropped) releases the permit promptly instead.
+// admission permit. Normal completion transfers the Fill and its permit into
+// publication before cancelling this guard; dropping a response abandons it.
 struct FillPermitGuard {
     _cancel: tokio::sync::oneshot::Sender<()>,
 }
 
 impl FillPermitGuard {
-    fn spawn(
-        permit: OwnedSemaphorePermit,
-        deadline: Instant,
-        state: Arc<Mutex<CaptureState>>,
-    ) -> Self {
+    fn spawn(deadline: Instant, state: Arc<Mutex<CaptureState>>) -> Self {
         let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             tokio::select! {
@@ -242,7 +237,6 @@ impl FillPermitGuard {
                 }
                 _ = cancelled => {}
             }
-            drop(permit);
         });
         Self { _cancel: cancel }
     }
@@ -362,18 +356,17 @@ fn prepare_capture(
     // might not be polled until after a busy executor has already spent the
     // entire budget, so its first poll must never start a fresh interval.
     let deadline = Instant::now() + timeout;
-    // Move the permit into a deadline guard so a client that stops reading (and
-    // therefore never polls this body) cannot pin a fill slot, the capture
-    // buffer or the per-key registration for longer than fill_timeout.
-    let mut fill = fill;
-    let permit = fill._permit.take();
+    // The deadline guard can discard the shared Fill even if this body is
+    // never polled again. Keep its permit attached to the Fill: normal body
+    // completion must transfer capacity into publication rather than release
+    // it while a detached task still owns the captured bytes.
     let state = Arc::new(Mutex::new(CaptureState {
         fill: Some(fill),
         entry: Some(entry),
         buffer: Vec::new(),
         deadline,
     }));
-    let permit_guard = permit.map(|permit| FillPermitGuard::spawn(permit, deadline, state.clone()));
+    let permit_guard = Some(FillPermitGuard::spawn(deadline, state.clone()));
     Ok((
         parts,
         Capture {
@@ -563,6 +556,53 @@ mod tests {
         assert!(matches!(cache.lookup("b".into(), 0).await, Lookup::Bypass));
         drop(fill);
         assert!(matches!(cache.lookup("b".into(), 0).await, Lookup::Fill(_)));
+    }
+
+    #[tokio::test]
+    async fn completed_capture_keeps_capacity_until_publication_finishes() {
+        let cache = CacheRuntime::new(CacheConfig {
+            max_fills: 1,
+            fill_timeout_ms: 20,
+            ..Default::default()
+        });
+        let Lookup::Fill(fill) = cache.lookup("a".into(), 0).await else {
+            panic!("fill")
+        };
+        let source = Full::new(Bytes::from_static(b"captured"))
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let Ok((_parts, mut capture)) =
+            prepare_capture(Response::new(source), fill, 60000, 0, now_ms())
+        else {
+            panic!("streaming body is captured")
+        };
+        // Model a purge or slow publication keeping completed responses queued.
+        let publication = cache.publication.write().await;
+        assert!(matches!(
+            std::future::poll_fn(|cx| Pin::new(&mut capture).poll_frame(cx)).await,
+            Some(Ok(_))
+        ));
+        assert!(capture.ended);
+        // Let the old capture deadline and the publication task both run.
+        // The completed entry is now owned by publication, so cancellation or
+        // expiry of its capture guard must not allow another buffered fill.
+        drop(capture);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cache.fills.available_permits(), 0);
+        assert_eq!(cache.active_fills(), 1);
+        drop(publication);
+        for _ in 0..100 {
+            if cache.fills.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.fills.available_permits(), 1);
+        assert_eq!(cache.active_fills(), 0);
+        assert_eq!(
+            cache.store.get("a").await.unwrap().unwrap().body,
+            b"captured"[..]
+        );
     }
     #[tokio::test]
     async fn unpolled_capture_releases_the_fill_permit_after_timeout() {

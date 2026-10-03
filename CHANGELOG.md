@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Separate viewer response and login password-work budgets from administrator
+  recovery; limit account sessions without evicting another account's sessions.
+- Retain cache-fill capacity through publication and yield while consuming
+  empty or fragmented body frames so transform deadlines remain effective.
+- Bound command-line TLS handshakes with the shared public-listener budget and
+  back off after policy worker creation failures.
+- Harden SSO cookies with HttpOnly and SameSite=Lax, reject ambiguous callbacks,
+  and suppress credential-bearing callback referrers.
 - Require rustls 0.23.45 or later to fix TLS handshake encryption-level
   validation (RUSTSEC-2026-0285).
 - Canonicalize authentication route paths before selection, including legacy

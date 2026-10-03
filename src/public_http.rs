@@ -238,7 +238,8 @@ pub async fn serve(
     }
 }
 
-fn public_handshake_admission() -> Arc<tokio::sync::Semaphore> {
+/// Shared TLS handshake capacity for named and command-line public listeners.
+pub fn public_handshake_admission() -> Arc<tokio::sync::Semaphore> {
     static ADMISSION: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
     ADMISSION.clone()

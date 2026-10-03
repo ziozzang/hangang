@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 
 const MAX_USERS: i64 = 256;
 const MAX_SESSIONS: i64 = 4096;
+const MAX_SESSIONS_PER_USER: i64 = 16;
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_SAFE_ID: i64 = 9_007_199_254_740_991;
 pub const AUDIT_CAPACITY: i64 = 100_000;
@@ -518,6 +519,7 @@ impl std::error::Error for ConfigOperationConflict {}
 pub struct Store {
     path: PathBuf,
     password_workers: Arc<Semaphore>,
+    login_workers: Arc<Semaphore>,
 }
 
 impl Store {
@@ -808,6 +810,7 @@ impl Store {
         Ok(Self {
             path,
             password_workers: Arc::new(Semaphore::new(2)),
+            login_workers: Arc::new(Semaphore::new(2)),
         })
     }
 
@@ -854,10 +857,11 @@ impl Store {
     }
 
     pub async fn login(&self, username: String, password: String) -> Result<Option<Login>> {
-        // Identical Argon2 work for an unknown username. A full login attempt
-        // owns one of two password permits before any database work starts.
+        // Identical Argon2 work for an unknown username. Keep unauthenticated
+        // password checks separate from the bounded management pool so a
+        // login flood cannot prevent an administrator resetting a password.
         let permit = self
-            .password_workers
+            .login_workers
             .clone()
             .try_acquire_owned()
             .context("password capacity exhausted")?;
@@ -885,9 +889,14 @@ impl Store {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let Some(user) = login_candidate(&transaction, user.id, epoch)? else { return Ok(None); };
             transaction.execute("DELETE FROM sessions WHERE expires_at<=?1",params![now])?;
+            // One authenticated account must never log other accounts out by
+            // filling the global session budget. Retain its newest sessions,
+            // leaving one slot for this login, including pre-upgrade surplus.
+            transaction.execute("DELETE FROM sessions WHERE user_id=?1 AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=?1 ORDER BY created_at DESC,token_hash DESC LIMIT ?2)",params![user.id,MAX_SESSIONS_PER_USER-1])?;
             let sessions:i64=transaction.query_row("SELECT COUNT(*) FROM sessions",[],|row|row.get(0))?;
             if sessions>=MAX_SESSIONS {
-                transaction.execute("DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM sessions ORDER BY created_at,token_hash LIMIT 1)",[])?;
+                let removed = transaction.execute("DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM sessions WHERE user_id=?1 ORDER BY created_at,token_hash LIMIT 1)",params![user.id])?;
+                if removed == 0 { return Ok(None); }
             }
             transaction.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![token_hash.as_slice(),user.id,now+SESSION_SECONDS,now])?;
             transaction.commit()?;
@@ -2336,6 +2345,97 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn anonymous_login_capacity_cannot_block_administrator_password_recovery() {
+        let (_directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let _first = store.login_workers.clone().try_acquire_owned().unwrap();
+        let _second = store.login_workers.clone().try_acquire_owned().unwrap();
+        assert!(
+            store
+                .login("unknown".into(), "invalid password".into())
+                .await
+                .is_err()
+        );
+        let result = store
+            .update(
+                MutationAuthority::Session(login.token),
+                root.id,
+                None,
+                None,
+                Some("replacement secure password".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.0, Change::Applied);
+    }
+
+    #[tokio::test]
+    async fn viewer_login_surplus_cannot_evict_another_accounts_session() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "first secure password".into())
+            .await
+            .unwrap();
+        let root = store
+            .login("root".into(), "first secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let viewer = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "second secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut db = connection(&store.path).unwrap();
+        let transaction = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE sessions SET created_at=?1 WHERE user_id=?2",
+                params![now().unwrap() - 100, root.user.id],
+            )
+            .unwrap();
+        for index in 0..MAX_SESSIONS - 1 {
+            let hash: [u8; 32] = Sha256::digest(index.to_le_bytes()).into();
+            transaction.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![hash.as_slice(),viewer.id,now().unwrap()+SESSION_SECONDS,now().unwrap()]).unwrap();
+        }
+        transaction.commit().unwrap();
+        let login = store
+            .login("viewer".into(), "second secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store.session(root.token).await.unwrap().is_some(),
+            "viewer login evicted administrator session"
+        );
+        assert!(store.session(login.token).await.unwrap().is_some());
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE user_id=?1",
+                params![viewer.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_SESSIONS_PER_USER);
     }
 
     #[tokio::test]

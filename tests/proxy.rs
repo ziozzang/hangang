@@ -3617,6 +3617,7 @@ async fn external_auth_forward_response_drives_sso_redirect_and_cookie() {
         response.headers()["set-cookie"],
         "flow=abc; Path=/; HttpOnly"
     );
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
     response.into_body().collect().await.unwrap();
 
     // Connection-nominated auth response fields are hop-by-hop and must not
