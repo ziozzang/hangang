@@ -5704,3 +5704,477 @@ async fn lua_member_selection_is_route_scoped_and_survives_reorder() {
     second_task.abort();
     policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn response_security_finalizes_redirects_auth_cache_and_early_denials() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move {
+                        if request.uri().path() == "/trailers" {
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+                            trailers
+                                .insert("location", "http://app.example/bypass".parse().unwrap());
+                            trailers.insert("x-ordinary", "retained".parse().unwrap());
+                            let body =
+                                http_body_util::StreamBody::new(futures_util::stream::iter([
+                                    Ok::<_, hangang::proxy::BodyError>(hyper::body::Frame::data(
+                                        Bytes::from_static(b"payload"),
+                                    )),
+                                    Ok(hyper::body::Frame::trailers(trailers)),
+                                ]))
+                                .boxed_unsync();
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("trailer", "x-frame-options, location, x-ordinary")
+                                    .body(body)
+                                    .unwrap(),
+                            );
+                        }
+                        let mut reply = response(
+                            if request.uri().path() == "/cache" {
+                                200
+                            } else {
+                                302
+                            },
+                            "origin",
+                        );
+                        reply
+                            .headers_mut()
+                            .insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+                        match request.uri().path() {
+                            "/cache" => {
+                                reply
+                                    .headers_mut()
+                                    .insert("cache-control", "public, max-age=30".parse().unwrap());
+                            }
+                            "/external" => {
+                                reply
+                                    .headers_mut()
+                                    .insert("location", "http://external.test/x".parse().unwrap());
+                            }
+                            "/port" => {
+                                reply.headers_mut().insert(
+                                    "location",
+                                    "http://app.example:8080/x".parse().unwrap(),
+                                );
+                            }
+                            "/duplicate" => {
+                                reply
+                                    .headers_mut()
+                                    .append("location", "http://app.example/a".parse().unwrap());
+                                reply
+                                    .headers_mut()
+                                    .append("location", "http://app.example/b".parse().unwrap());
+                            }
+                            _ => {
+                                reply.headers_mut().insert(
+                                    "location",
+                                    "http://app.example/a/../b?q=%2F#frag".parse().unwrap(),
+                                );
+                            }
+                        }
+                        Ok::<_, Infallible>(reply)
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let r = route(vec![format!("http://{origin}")]);
+
+    let settings=hangang::config::Settings {response_security:Some(vec![serde_json::from_value(serde_json::json!({"hosts":["*.example"],"upgrade_same_host_redirect":true,"headers":{"x-frame-options":"DENY","strict-transport-security":"max-age=600","x-content-type-options":"nosniff"}})).unwrap()]),trusted_proxy_cidrs:Some(vec!["127.0.0.1/32".parse().unwrap()]),..Default::default()};
+    let ((proxy, policy), active) = proxy_with_settings(vec![r], settings);
+    let mut config = active.load().config.clone();
+    config.cache = Some(Default::default());
+    config.http[0].cache = Some(Default::default());
+    config.revision += 1;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let history = Arc::new(TrafficHistory::default());
+    let (front, front_task, _) =
+        frontend(proxy.clone().with_traffic_history(history.clone())).await;
+    let send = |path: &str| {
+        let req = Request::builder()
+            .uri(format!("http://{front}{path}"))
+            .header("host", "app.example")
+            .header("x-forwarded-proto", "https")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        async move {
+            let reply = client().request(req).await.unwrap();
+            let status = reply.status();
+            let headers = reply.headers().clone();
+            reply.into_body().collect().await.unwrap();
+            (status, headers)
+        }
+    };
+    let (status, headers) = send("/redirect").await;
+    assert_eq!(status, 302);
+    assert_eq!(headers["location"], "https://app.example/a/../b?q=%2F#frag");
+    assert_eq!(headers["x-frame-options"], "DENY");
+    assert_eq!(headers["strict-transport-security"], "max-age=600");
+    for (path, location) in [
+        ("/external", "http://external.test/x"),
+        ("/port", "http://app.example:8080/x"),
+    ] {
+        let (_, headers) = send(path).await;
+        assert_eq!(headers["location"], location);
+    }
+    let (status, headers) = send("/duplicate").await;
+    assert_eq!(status, 502);
+    assert_eq!(headers["x-frame-options"], "DENY");
+    assert_eq!(headers["cache-control"], "no-store");
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_failure_bans=Some(vec![serde_json::from_value(serde_json::json!({"path":"/duplicate","failures":1,"window_seconds":60,"ban_seconds":60,"statuses":[502]})).unwrap()]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(send("/duplicate").await.0, 502);
+    let (status, headers) = send("/duplicate").await;
+    assert_eq!(
+        status, 429,
+        "security-policy502 was not counted by failure ban"
+    );
+    assert_eq!(headers["x-frame-options"], "DENY");
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_failure_bans = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let (status, headers) = send("/cache").await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-frame-options"], "DENY");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let before = calls.load(std::sync::atomic::Ordering::Relaxed);
+    let (status, headers) = send("/cache").await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["x-frame-options"], "DENY");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "cache hit contacted origin"
+    );
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/redirect"))
+                .header("host", "app.example:8443")
+                .header("x-forwarded-proto", "https")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.headers()["location"],
+        "https://app.example:8443/a/../b?q=%2F#frag"
+    );
+    reply.into_body().collect().await.unwrap();
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/trailers"))
+                .header("host", "app.example")
+                .header("te", "trailers")
+                .header("x-forwarded-proto", "https")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.headers()["x-frame-options"], "DENY");
+    let collected = reply.into_body().collect().await.unwrap();
+    if let Some(trailers) = collected.trailers() {
+        assert!(!trailers.contains_key("location"));
+        assert!(!trailers.contains_key("x-frame-options"));
+    }
+    assert_eq!(collected.to_bytes(), "payload");
+    assert!(
+        history
+            .snapshot_since(None, 100)
+            .records
+            .iter()
+            .any(|r| r.path == "/duplicate" && r.status == 502),
+        "policy replacement status missing from traffic history"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_blocks = Some(vec![hangang::path_blocks::Rule {
+        path: "/blocked".into(),
+        hosts: vec![],
+    }]);
+    config.http[0].basic_auth = Some(hangang::config::BasicAuth {
+        realm: "restricted".into(),
+        credentials: vec![basic_credential("alice", "password")],
+        hide_credentials: true,
+        accept_proxy_authorization: false,
+        identity_header: None,
+    });
+    config.http[0].cache = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    for (path, status) in [("/blocked", 404), ("/auth", 401)] {
+        let (actual, headers) = send(path).await;
+        assert_eq!(actual, status);
+        assert_eq!(headers["x-frame-options"], "DENY");
+    }
+    let (mapped_front, mapped_task) = frontend_with_peer_transport(
+        proxy.clone(),
+        "[::ffff:127.0.0.1]:12345".parse().unwrap(),
+        false,
+    )
+    .await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{mapped_front}/auth"))
+                .header("host", "app.example")
+                .header("x-forwarded-proto", "https")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 401);
+    assert_eq!(reply.headers()["strict-transport-security"], "max-age=600");
+    reply.into_body().collect().await.unwrap();
+    mapped_task.abort();
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.trusted_proxy_cidrs = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let (_, headers) = send("/auth").await;
+    assert!(
+        !headers.contains_key("strict-transport-security"),
+        "untrusted XFP enabled HSTS"
+    );
+    assert_eq!(headers["x-frame-options"], "DENY");
+    let (capacity_front, capacity_task, _) = frontend(proxy.with_request_limit(0)).await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{capacity_front}/capacity"))
+                .header("host", "app.example")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 503);
+    assert_eq!(reply.headers()["x-frame-options"], "DENY");
+    assert!(!reply.headers().contains_key("strict-transport-security"));
+    reply.into_body().collect().await.unwrap();
+    capacity_task.abort();
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn conditional_response_transform_preserves_unmatched_streams_and_fences_bypasses() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|request: Request<Incoming>| async move {
+                    let path = request.uri().path();
+                    let payload = if path == "/matched" || path.contains("ntry") {
+                        Bytes::from_static(b"PREFIX:private-value")
+                    } else if path == "/large" {
+                        Bytes::from(vec![0xa5; 128 * 1024])
+                    } else {
+                        Bytes::from_static(b"unmatched")
+                    };
+                    let mut reply = Response::builder()
+                        .status(if path == "/partial" {
+                            206
+                        } else if path == "/bodyless" {
+                            304
+                        } else {
+                            200
+                        })
+                        .header("etag", "\"origin-validator\"")
+                        .body(Full::new(payload).map_err(|e| match e {}).boxed_unsync())
+                        .unwrap();
+                    if path == "/large" {
+                        reply
+                            .headers_mut()
+                            .insert("cache-control", "no-transform".parse().unwrap());
+                    }
+                    if path == "/encoded" || path == "/nominated-encoded" {
+                        reply
+                            .headers_mut()
+                            .insert("content-encoding", "gzip".parse().unwrap());
+                    }
+                    if path == "/partial" || path == "/nominated-partial" {
+                        reply
+                            .headers_mut()
+                            .insert("content-range", "bytes 100-108/200".parse().unwrap());
+                    }
+                    if path == "/nominated-encoded" {
+                        reply
+                            .headers_mut()
+                            .insert("connection", "content-encoding".parse().unwrap());
+                    }
+                    if path == "/nominated-partial" {
+                        reply
+                            .headers_mut()
+                            .insert("connection", "content-range".parse().unwrap());
+                    }
+                    if path == "/slow" {
+                        let body =
+                            http_body_util::StreamBody::new(futures_util::stream::once(async {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                Ok::<_, hangang::proxy::BodyError>(hyper::body::Frame::data(
+                                    Bytes::from_static(b"PREFIX:private-value"),
+                                ))
+                            }))
+                            .boxed_unsync();
+                        reply = Response::new(body);
+                    }
+                    Ok::<_, Infallible>(reply)
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let mut r = route(vec![format!("http://{origin}")]);
+    r.response_transform = Some(hangang::transform::BodyTransform {
+        when_prefix: Some("PREFIX:".into()),
+        operations: vec![hangang::transform::Operation::Replace {
+            from: "private-value".into(),
+            to: "redacted".into(),
+        }],
+        max_buffer_bytes: 64,
+        max_output_bytes: 64,
+        timeout_ms: 50,
+        ..Default::default()
+    });
+    let ((proxy, policy), active) = proxy_with_settings(vec![r.clone()], Default::default());
+    let (front, front_task, _) = frontend(proxy).await;
+    let send = |path: &str, condition: bool, range: bool| {
+        let mut request = Request::builder().uri(format!("http://{front}{path}"));
+        if condition {
+            request = request
+                .header("if-none-match", "\"origin-validator\"")
+                .header("cache-control", "no-transform");
+        }
+        if range {
+            request = request.header("range", "bytes=100-");
+        }
+        let request = request.body(Full::new(Bytes::new())).unwrap();
+        async move {
+            let reply = client().request(request).await.unwrap();
+            let status = reply.status();
+            let headers = reply.headers().clone();
+            let body = reply.into_body().collect().await.unwrap().to_bytes();
+            (status, headers, body)
+        }
+    };
+    let (status, headers, body) = send("/matched", false, false).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "PREFIX:redacted");
+    assert!(!headers.contains_key("etag"));
+    let (status, headers, body) = send("/large", true, false).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, Bytes::from(vec![0xa5; 128 * 1024]));
+    assert_eq!(headers["etag"], "\"origin-validator\"");
+    assert_eq!(headers["cache-control"], "no-transform");
+    assert_eq!(send("/matched", true, false).await.0, 400);
+    assert_eq!(send("/large", false, true).await.0, 416);
+    assert_eq!(send("/partial", false, false).await.0, 502);
+    assert_eq!(send("/encoded", false, false).await.0, 502);
+    assert_eq!(send("/nominated-encoded", false, false).await.0, 502);
+    assert_eq!(send("/nominated-partial", false, false).await.0, 502);
+    assert_eq!(send("/slow", false, false).await.0, 504);
+    let (status, headers, _) = send("/bodyless", false, false).await;
+    assert_eq!(status, 304);
+    assert_eq!(headers["etag"], "\"origin-validator\"");
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].host = Some("app.example".into());
+    config.http[0].path_prefix = Some("/api/entry".into());
+    config.http[0].path_match = hangang::config::PathMatch::Exact;
+    let mut fallback = r;
+    fallback.id = "public-fallback".into();
+    fallback.priority = -1;
+    fallback.response_transform = None;
+    config.http.push(fallback);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let alias = |path: &str, host: &str| {
+        let request = Request::builder()
+            .uri(format!("http://{front}{path}"))
+            .header("host", host)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        async move {
+            let reply = client().request(request).await.unwrap();
+            let status = reply.status();
+            let body = reply.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+    for path in ["/api/entry", "/api/%65ntry"] {
+        let (status, body) = alias(path, "app.example").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body, "PREFIX:redacted",
+            "encoded route escaped response transform"
+        );
+    }
+    for path in [
+        "/api%2fentry",
+        "/api/%2565ntry",
+        "/api//entry",
+        "/api/entry;ignored",
+    ] {
+        assert_eq!(alias(path, "app.example").await.0, 400);
+    }
+    assert_eq!(
+        alias("/api/%65ntry", "other.example").await.1,
+        "PREFIX:private-value",
+        "wrong-host fallback changed"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].enabled = false;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        alias("/api/%65ntry", "app.example").await.0,
+        404,
+        "disabled transform namespace leaked through fallback"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].enabled = true;
+    config.http[0].request_transform = Some(hangang::transform::BodyTransform {
+        operations: vec![hangang::transform::Operation::Replace {
+            from: "unused".into(),
+            to: "unused".into(),
+        }],
+        set_headers: BTreeMap::from([("cache-control".into(), "no-transform".into())]),
+        ..Default::default()
+    });
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        alias("/api/entry", "app.example").await.0,
+        400,
+        "requesttransform header mutation bypassed representation guards"
+    );
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}

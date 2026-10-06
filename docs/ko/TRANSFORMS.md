@@ -117,3 +117,15 @@ runner는 자체 loopback backend와 gateway만 시작하고 [10-route 설정](.
 웹 route editor는 request/response transformation JSON field를 제공하며 advanced document는 모든 옵션을 보존합니다. `/openapi.json`은 모든 field와 operation을 설명합니다.
 
 프로토콜 참고: [SSE parsing](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream), [HTTP transformation semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.7), [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901).
+
+## Conditional response prefixes
+
+`response_transform.when_prefix`는 최대 1,024바이트의 선택적 리터럴 UTF-8 접두사이며 `buffered` 응답 변환에서만 지원합니다. 요청 변환에서는 거부합니다. 공백과 줄바꿈을 정확히 비교하며 정규식이 아닙니다. 라우트 편집 화면에서 리터럴 접두사를 입력하고, 빈 값으로 조건을 제거합니다.
+
+게이트웨이는 접두사 일치 여부를 판단하는 데 필요한 입력만 읽습니다. 불일치하면 변환 버퍼 제한보다 큰 본문도 원래 헤더와 바이트를 유지하며 스트리밍합니다. 일치하면 기존 전체 본문 버퍼·출력·Lua 제한을 적용합니다. 조건부 변환은 Lua 제한을 완화하거나 다른 표현 형식을 변경하지 않습니다.
+
+선택적인 [Synology 세션 예시](../../examples/lua/synology-session-redact.lua)는 애플리케이션 Lua이며 게이트웨이의 제품 모드가 아닙니다. 확인한 정확한 래퍼 접두사와 함께 실제 익명 `getjs.cgi` 부트스트랩 응답에만 적용하세요. 예시는 설명용 메타데이터를 제거하면서 `isLogined`와 `enable_syno_token` 같은 로그인·토큰 제어 필드를 유지합니다. 인증을 대체하거나 필요한 로그인 제어를 차단하지 않습니다. 활성화하기 전에 배포한 애플리케이션의 응답 계약을 기준으로 검토하세요.
+
+선택한 변환 라우트는 조건 불일치 여부와 관계없이 `Range`·`If-Range` 요청을 416으로 거부하고, 업스트림의 206·`Content-Range` 응답을 502로 거부합니다. 부분 응답은 접두사를 생략하여 제거 정책을 우회할 수 있기 때문입니다. 큰 불일치 본문 통과는 정상적인 전체 200 응답에 해당하며, 임의의 바이너리 이어받기 호환성을 의미하지 않습니다.
+
+경로별 응답 변환은 일치하는 호스트에서 엄격하게 정규화한 이름 공간을 예약합니다. `%65` 같은 일반 문자의 퍼센트 인코딩은 같은 변환 라우트로 정규화합니다. 인코딩된 구분자, 이중 이스케이프, 세미콜론, 반복 슬래시는 해당 호스트 범위에서 거부하며 다른 호스트에는 영향을 주지 않습니다. 변환 라우트를 비활성화해도 이름 공간을 유지하고 404를 반환합니다. 제거되지 않은 본문을 노출할 수 있는 공개 라우트로 대체하지 않습니다. 라우트를 삭제하여 이름 공간을 해제하거나, 응답 변환을 명시적으로 제거하여 해당 변환 보호를 제거해야 합니다.

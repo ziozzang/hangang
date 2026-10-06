@@ -30,6 +30,7 @@ pub mod proxy;
 pub mod public_http;
 pub mod public_listener_config;
 pub mod redis_store;
+pub mod response_security;
 pub mod restart;
 mod security_events;
 pub mod security_redis;

@@ -211,3 +211,32 @@ test('URL CSRF origin policy validates and round-trips alongside existing settin
   await page.locator('#locale-select').selectOption('en');
   await expect(page.locator('#view-certificates')).toContainText('A base domain, its www alias, and its matching wildcard share one management group');
 });
+
+test('response security native rules preserve CSP, scope preset, validate and round-trip', async ({ page }) => {
+  const writes = await open(page, { health_path: '/ready', response_security: [{ hosts: ['example.test'], headers: { 'content-security-policy': "default-src 'self'" } }] });
+  await expect(page.getByLabel('Response security hosts')).toHaveValue('example.test');
+  await page.getByRole('button', { name: 'Use conservative security headers' }).click();
+  await page.getByLabel('Prevent same-host HTTPS downgrade').check();
+  const staged = JSON.parse(await page.locator('#config-editor').inputValue());
+  expect(staged.settings.response_security[0]).toMatchObject({ hosts: ['example.test'], upgrade_same_host_redirect: true, headers: { 'content-security-policy': "default-src 'self'", 'strict-transport-security': 'max-age=300', 'x-content-type-options': 'nosniff' } });
+  expect(staged.settings.response_security[0].headers['strict-transport-security']).not.toContain('includeSubDomains');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.getByLabel('응답 보안 호스트')).toHaveValue('example.test');
+  await page.locator('#apply-config').click(); await expect.poll(() => writes.length).toBe(1);
+  expect(writes[0].settings.health_path).toBe('/ready');
+  await expect(page.locator('#config-message')).toContainText('8');
+  await expect(page.locator('#apply-config')).toBeEnabled();
+  const headerControl = page.locator('[name="response_security_headers_0"]');
+  const validHeaders = await headerControl.inputValue();
+  await headerControl.fill('invalid header without colon');
+  await headerControl.blur(); await page.locator('#apply-config').click();
+  expect(writes).toHaveLength(1);
+  await headerControl.fill(validHeaders);
+  const advanced = page.locator('#setting-response_security').locator('xpath=ancestor::details[1]'); await advanced.locator(':scope > summary').click();
+  await page.locator('#setting-response_security').fill('[{"hosts":[],"headers":{"server":"hidden"}}]');
+  await page.locator('#apply-config').click(); await expect(page.locator('#settings-message')).toContainText('128'); expect(writes).toHaveLength(1);
+  await page.locator('#setting-response_security').fill('[{"hosts":["example.test"],"headers":{"X-Frame-Options":"DENY","x-frame-options":"SAMEORIGIN"}}]');
+  await page.locator('#apply-config').click(); expect(writes).toHaveLength(1);
+  await page.locator('#setting-response_security').fill('');
+  expect(JSON.parse(await page.locator('#config-editor').inputValue()).settings).not.toHaveProperty('response_security');
+});

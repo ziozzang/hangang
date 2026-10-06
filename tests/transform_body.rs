@@ -341,10 +341,14 @@ async fn buffered_deadline_includes_worker_execution_and_cancels_it() {
     let policy = Arc::new(PolicyPool::new(executable, 1));
     let limit = Arc::new(Semaphore::new(1));
     let outcome=transform(chunks(vec![b"x".to_vec()]),config(json!({"lua":"return 'ok'","max_buffer_bytes":16384,"max_output_bytes":16384,"timeout_ms":20})),policy.clone(),"request",Arc::new(limit.clone().acquire_owned().await.unwrap()),Arc::new(Metrics::default())).await;
-    assert!(matches!(
-        outcome,
-        Err(hangang::transform_body::TransformError::Timeout)
-    ));
+    assert!(
+        matches!(
+            outcome,
+            Err(hangang::transform_body::TransformError::Timeout)
+        ),
+        "expected transform deadline expiry, got {:?}",
+        outcome.as_ref().err()
+    );
     assert_eq!(limit.available_permits(), 1);
     policy.shutdown().await;
 }

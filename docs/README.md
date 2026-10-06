@@ -48,6 +48,8 @@ The HTTP route inventory and backend editor use `last_observation` from the exis
 
 No observation, or an observation older than 60 seconds, displays **Unknown**. The console shows the observation age and adds monotonic client elapsed time, updating visible badges every five seconds without fetching or probing. Refreshing the route inventory fetches a new instance-local snapshot. Evidence comes only from real traffic (`passive`) or explicitly configured active probes (`active_probe`); opening the console neither enables unsolicited probes nor introduces a new API.
 
+- [Domain response security](RESPONSE_SECURITY.md)
+
 ## Access control and identity
 
 - [Explicit HTTP access modes](ACCESS_POLICY.md) — access policy modes

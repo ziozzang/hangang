@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.2.3",
+    "version": "0.2.4",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -4584,7 +4584,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.2.3"
+            "example": "0.2.4"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"
@@ -5133,6 +5133,7 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "when_prefix": { "type": ["string", "null"], "minLength": 1, "maxLength": 1024, "description": "Response-only literal UTF-8 prefix, at most 1024 bytes; requires buffered mode. Mismatch streams byte-exact input with original headers and without the transform buffer limit. Match runs the configured bounded full-body transform. No regex or product-specific selector. Selected transform routes retain Range/If-Range 416 and upstream 206/Content-Range 502 rejection even for prefix mismatch." },
           "mode": {
             "type": "string",
             "enum": [
@@ -5882,6 +5883,7 @@
             },
             "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
           },
+          "response_security": { "type": ["array", "null"], "maxItems": 128, "items": { "$ref": "#/components/schemas/ResponseSecurityRule" }, "description": "Explicit domain-scoped final response profiles, including redirects and denials. Maximum 32 KiB aggregate host/header text; matching rules apply in order with later headers overriding earlier values; redirect upgrading is enabled if any matching rule enables it. Empty means no changes. HSTS applies only to verified HTTPS." },
           "path_csrf": {
             "type": ["array", "null"],
             "maxItems": 128,
@@ -6955,6 +6957,7 @@
         },
         "description": "Bounded CSRF origin policy for selected URLs. At least same-origin access or a nonempty allowed-origin list is required. Ordinary image/safe GET requests are unaffected by default; global HTTP security and administrator recovery boundaries remain independent."
       },
+      "ResponseSecurityRule": { "type": "object", "additionalProperties": false, "required": ["hosts"], "properties": { "hosts": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 253 }, "description": "Required explicit host/IP patterns; existing label-local * and ? matching. Empty all-host scope is forbidden." }, "upgrade_same_host_redirect": { "type": "boolean", "default": false, "description": "For verified HTTPS only, upgrades absolute http:// same-host default-port redirects to HTTPS. Relative, external-host and nondefault-port redirects are preserved." }, "headers": { "type": "object", "default": {}, "additionalProperties": { "type": "string", "maxLength": 4096 }, "description": "Case-insensitive allowlist: strict-transport-security, x-content-type-options, referrer-policy, x-frame-options, content-security-policy, content-security-policy-report-only, permissions-policy. Values at most 4096 bytes, no controls. Duplicate canonical names rejected. Explicit CSP replaces existing CSP; no automatic policy is supplied." } } },
       "RuntimeSettingsSummary": {
         "type": "object",
         "additionalProperties": false,
@@ -7014,6 +7017,7 @@
             "type": "integer",
             "minimum": 0
           },
+          "response_security_count": { "type": "integer", "minimum": 0, "maximum": 128, "description": "Rule count only; viewer summary does not expose host selectors or header policies." },
           "path_csrf_count": {
             "type": "integer", "minimum": 0, "maximum": 128,
             "description": "Configured URL CSRF rule count. No origin or URL policy details are exposed in the viewer summary."

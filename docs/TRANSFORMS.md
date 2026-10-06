@@ -117,3 +117,15 @@ The example runner starts only its own loopback backend and gateway, substitutes
 The web route editor has request and response transformation JSON fields; the advanced document preserves all options. `/openapi.json` describes every field and operation.
 
 Protocol references: [SSE parsing and interpretation](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream), [HTTP transformation semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.7), and [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901).
+
+## Conditional response prefixes
+
+`response_transform.when_prefix` is an optional literal UTF-8 prefix of at most 1,024 bytes, supported only in `buffered` response transforms. Request transforms reject it. Whitespace and newlines are compared exactly; this is not a regular expression. The route editor provides a literal-prefix textarea; blank removes the condition.
+
+The gateway reads only enough input to decide the prefix. On mismatch, it streams the original bytes with their original headers, including bodies larger than the transform buffer limit. On match, the existing full-body buffer, output and Lua limits apply. Conditional transforms do not relax Lua limits or alter unrelated representations.
+
+The optional [Synology session example](../examples/lua/synology-session-redact.lua) is application Lua, not a gateway product mode. Apply it only to the actual anonymous `getjs.cgi` bootstrap response with its exact verified wrapper prefix. The example redacts descriptive metadata while preserving login and token control fields such as `isLogined` and `enable_syno_token`; it does not replace authentication or block required login controls. Review it against the deployed application's response contract before enabling it.
+
+Selected transform routes retain the existing 416 rejection of `Range`/`If-Range` requests and 502 rejection of upstream 206/`Content-Range` responses, even when the prefix would mismatch. Partial bodies can omit the prefix and bypass redaction. Large unmatched passthrough applies to ordinary whole 200 responses; it does not promise arbitrary binary resume/download compatibility.
+
+Path-scoped response transforms reserve a strictly canonical namespace on their matching hosts. Ordinary percent-encoded letters, such as `%65`, canonicalize into the same transform route. Encoded separators, double escapes, semicolons and repeated slashes are rejected within that host scope; other hosts are unaffected. Disabling the transform route keeps its namespace reserved and returns 404 instead of falling through to a public route that might expose the unredacted body. Delete the route to release the namespace, or explicitly remove its response transform to remove that transform guard.

@@ -52,6 +52,9 @@ impl From<http_body_util::LengthLimitError> for BodyError {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ResponseSecurityFinalized;
+
 pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, BodyError>;
 
 /// Result of an external authorization call.
@@ -862,8 +865,103 @@ impl Proxy {
 
     pub async fn handle(
         &self,
+        request: Request<Incoming>,
+        peer: SocketAddr,
+    ) -> Result<Response<Body>, Infallible> {
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        let snapshot = self.active.load_full();
+        let retired = request
+            .extensions()
+            .get::<crate::public_http::Evidence>()
+            .is_some_and(|e| !e.current(&snapshot));
+        let trusted: &[ipnet::IpNet] = if request
+            .extensions()
+            .get::<crate::workload_http::Evidence>()
+            .is_some()
+        {
+            &[]
+        } else if let Some(e) = request.extensions().get::<crate::public_http::Evidence>() {
+            e.trusted_proxy_cidrs()
+        } else {
+            snapshot
+                .settings
+                .trusted_proxy_cidrs
+                .as_deref()
+                .map(Vec::as_slice)
+                .unwrap_or(&self.trusted_proxies)
+        };
+        let mut context = if retired
+            || connection_tokens(request.headers())
+                .iter()
+                .any(is_forwarding_identity_header)
+        {
+            None
+        } else {
+            self.resolve_edge(&request, peer, trusted)
+                .ok()
+                .and_then(|edge| {
+                    let authority = edge
+                        .forwarded_host
+                        .as_ref()
+                        .and_then(|h| h.to_str().ok())
+                        .or_else(|| {
+                            request
+                                .headers()
+                                .get(header::HOST)
+                                .and_then(|h| h.to_str().ok())
+                        })
+                        .and_then(|h| h.parse().ok())
+                        .or_else(|| request.uri().authority().cloned())?;
+                    Some(crate::response_security::Context {
+                        authority,
+                        https: edge.proto == "https",
+                        explicit_port: edge.explicit_forwarded_port,
+                    })
+                })
+        };
+        if context.is_none()
+            && !retired
+            && request.headers().get_all(header::HOST).iter().count() == 1
+        {
+            context = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
+                .filter(|a| {
+                    !a.as_str().contains('@')
+                        && (a.port().is_none() || a.port_u16().is_some_and(|p| p > 0))
+                })
+                .map(|authority| crate::response_security::Context {
+                    authority,
+                    https: false,
+                    explicit_port: None,
+                });
+        }
+        let mut response = self
+            .handle_unfinalized(request, peer, snapshot.clone(), context.clone())
+            .await?;
+        if response
+            .extensions_mut()
+            .remove::<ResponseSecurityFinalized>()
+            .is_some()
+        {
+            Ok(response)
+        } else {
+            Ok(crate::response_security::apply(
+                response,
+                &snapshot.settings.response_security,
+                context,
+            ))
+        }
+    }
+
+    async fn handle_unfinalized(
+        &self,
         mut request: Request<Incoming>,
         peer: SocketAddr,
+        snapshot: Arc<Snapshot>,
+        response_context: Option<crate::response_security::Context>,
     ) -> Result<Response<Body>, Infallible> {
         // Canonicalize the peer address so an IPv4-mapped IPv6 address
         // (`::ffff:a.b.c.d`, produced by a dual-stack `[::]` listener for an
@@ -882,7 +980,6 @@ impl Proxy {
         // One snapshot per request, captured before the health check so the
         // probe decision, routing and the document's settings all come from
         // the same activation.
-        let snapshot = self.active.load_full();
         if request
             .extensions()
             .get::<crate::public_http::Evidence>()
@@ -1042,8 +1139,13 @@ impl Proxy {
             request.extensions_mut().insert(capture.clone());
         }
         let mut response = self
-            .handle_inner(request, peer, snapshot, traffic.as_mut())
+            .handle_inner(request, peer, snapshot.clone(), traffic.as_mut())
             .await?;
+        response = crate::response_security::apply(
+            response,
+            &snapshot.settings.response_security,
+            response_context.clone(),
+        );
         let observation = capture.and_then(|capture| {
             capture
                 .0
@@ -1080,7 +1182,11 @@ impl Proxy {
                 }
                 Err(_) => {
                     crate::security_events::record("security_backend_unavailable", ip, 503, None);
-                    response = security_denied(503);
+                    response = crate::response_security::apply(
+                        security_denied(503),
+                        &snapshot.settings.response_security,
+                        response_context.clone(),
+                    );
                 }
             }
         }
@@ -1101,6 +1207,7 @@ impl Proxy {
                 .boxed_unsync(),
             );
         }
+        response.extensions_mut().insert(ResponseSecurityFinalized);
         if let Some(context) = &traffic {
             self.record_response_head(context, response.status().as_u16());
         }
@@ -1801,7 +1908,24 @@ impl Proxy {
 
         let transforms =
             runtime.route.request_transform.is_some() || runtime.route.response_transform.is_some();
+        let conditional_response = runtime
+            .response_transform
+            .as_ref()
+            .is_some_and(|config| config.when_prefix.is_some());
+        let mut transform_request_no_transform =
+            crate::transform_body::no_transform(request.headers());
+        let mut transform_request_preconditions = [
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::IF_UNMODIFIED_SINCE,
+        ]
+        .iter()
+        .any(|name| request.headers().contains_key(name));
 
+        let mut transform_request_range = request.headers().contains_key(header::RANGE)
+            || request.headers().contains_key(header::IF_RANGE);
+        let mut transform_request_partial = request.headers().contains_key(header::CONTENT_RANGE);
         // Identity headers established by authentication on this request. They
         // are re-asserted after the request transform so a later header rewrite
         // cannot replace the authenticated identity the upstream relies on.
@@ -2246,6 +2370,18 @@ impl Proxy {
             return Ok(response(504, "only-if-cached cannot be satisfied"));
         }
 
+        transform_request_no_transform |= crate::transform_body::no_transform(request.headers());
+        transform_request_preconditions |= [
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::IF_UNMODIFIED_SINCE,
+        ]
+        .iter()
+        .any(|name| request.headers().contains_key(name));
+        transform_request_range |= request.headers().contains_key(header::RANGE)
+            || request.headers().contains_key(header::IF_RANGE);
+        transform_request_partial |= request.headers().contains_key(header::CONTENT_RANGE);
         if transforms {
             if request.method() == Method::CONNECT
                 || request.headers().contains_key(header::UPGRADE)
@@ -2255,37 +2391,27 @@ impl Proxy {
                     "body transforms do not support tunnels or upgrades",
                 ));
             }
-            if crate::transform_body::no_transform(request.headers()) {
+            if transform_request_no_transform
+                && (runtime.request_transform.is_some() || !conditional_response)
+            {
                 return Ok(response(400, "body transform conflicts with no-transform"));
             }
             if runtime.route.response_transform.is_some() {
-                if request.headers().contains_key(header::RANGE)
-                    || request.headers().contains_key(header::IF_RANGE)
-                {
+                if transform_request_range {
                     return Ok(response(
                         416,
                         "ranges are unsupported for transformed representations",
                     ));
                 }
-                // Preconditions refer to the original representation, not the configured output.
-                if [
-                    header::IF_MATCH,
-                    header::IF_NONE_MATCH,
-                    header::IF_MODIFIED_SINCE,
-                    header::IF_UNMODIFIED_SINCE,
-                ]
-                .iter()
-                .any(|name| request.headers().contains_key(name))
-                {
+                // Preconditions refer to the original representation.
+                if !conditional_response && transform_request_preconditions {
                     return Ok(response(
                         412,
                         "preconditions are unsupported for transformed representations",
                     ));
                 }
             }
-            if runtime.request_transform.is_some()
-                && request.headers().contains_key(header::CONTENT_RANGE)
-            {
+            if runtime.request_transform.is_some() && transform_request_partial {
                 return Ok(response(
                     400,
                     "partial request bodies cannot be transformed",
@@ -2345,6 +2471,46 @@ impl Proxy {
                         "request body transformation failed",
                     ));
                 }
+            }
+        }
+        transform_request_no_transform |= crate::transform_body::no_transform(request.headers());
+        transform_request_preconditions |= [
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::IF_UNMODIFIED_SINCE,
+        ]
+        .iter()
+        .any(|name| request.headers().contains_key(name));
+        transform_request_range |= request.headers().contains_key(header::RANGE)
+            || request.headers().contains_key(header::IF_RANGE);
+        transform_request_partial |= request.headers().contains_key(header::CONTENT_RANGE);
+        if transforms {
+            if transform_request_no_transform
+                && (runtime.request_transform.is_some() || !conditional_response)
+            {
+                return Ok(response(400, "body transform conflicts with no-transform"));
+            }
+            if runtime.request_transform.is_some() && transform_request_partial {
+                return Ok(response(
+                    400,
+                    "partial request bodies cannot be transformed",
+                ));
+            }
+            if runtime.response_transform.is_some() && transform_request_range {
+                return Ok(response(
+                    416,
+                    "ranges are unsupported for transformed representations",
+                ));
+            }
+            if runtime.response_transform.is_some()
+                && !conditional_response
+                && transform_request_preconditions
+            {
+                return Ok(response(
+                    412,
+                    "preconditions are unsupported for transformed representations",
+                ));
             }
         }
         if runtime.route.response_transform.is_some() {
@@ -2694,6 +2860,13 @@ impl Proxy {
             ));
         }
         let upstream_upgrade = response_is_websocket.then(|| hyper::upgrade::on(&mut upstream));
+        // Transformation eligibility belongs to the original representation;
+        // hop-by-hop nominations and configured removals cannot erase it.
+        let origin_transform_identity =
+            crate::transform_body::identity_encoding(upstream.headers());
+        let origin_transform_no_transform = crate::transform_body::no_transform(upstream.headers());
+        let origin_transform_partial = upstream.status() == StatusCode::PARTIAL_CONTENT
+            || upstream.headers().contains_key(header::CONTENT_RANGE);
         strip_hop_by_hop(upstream.headers_mut());
         // Streaming-safe response header rules (global removals + per-route
         // set/remove), applied to the head before the body is streamed.
@@ -2775,14 +2948,74 @@ impl Proxy {
         let (parts, body) = upstream.into_parts();
         let mut response = Response::from_parts(parts, boxed_incoming(body));
         if let Some(config) = &runtime.response_transform {
-            if response_has_body
+            if config.when_prefix.is_some()
+                && (origin_transform_partial
+                    || response.status() == StatusCode::PARTIAL_CONTENT
+                    || response.headers().contains_key(header::CONTENT_RANGE))
+            {
+                return Ok(self.failure(
+                    StatusCode::BAD_GATEWAY,
+                    "partial representation cannot be inspected",
+                ));
+            }
+            let mut selected = config.when_prefix.is_none();
+            let inspection_started = std::time::Instant::now();
+            if config.when_prefix.is_some()
+                && response_has_body
+                && !response.status().is_informational()
+                && !matches!(response.status().as_u16(), 204 | 205 | 304)
+            {
+                if !origin_transform_identity
+                    || !crate::transform_body::identity_encoding(response.headers())
+                {
+                    return Ok(self.failure(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream representation cannot be inspected",
+                    ));
+                }
+                let (parts, body) = response.into_parts();
+                let probe = tokio::select! {
+                    biased;
+                    retired=auth_retired(auth_route_lease.as_ref())=>{retired.record(&self.metrics);return Ok(crate::proxy::response(503,"route authorization retired"));}
+                    result=crate::transform_body::probe_prefix(body,config,transform_budget.clone().expect("transform budget"))=>result,
+                };
+                match probe {
+                    Ok((body, matched)) => {
+                        response = Response::from_parts(parts, body);
+                        selected = matched;
+                    }
+                    Err(error) => {
+                        return Ok(self.failure(
+                            StatusCode::from_u16(error.status(false)).expect("static status"),
+                            "response body inspection failed",
+                        ));
+                    }
+                }
+                if selected && transform_request_no_transform {
+                    return Ok(crate::proxy::response(
+                        400,
+                        "body transform conflicts with no-transform",
+                    ));
+                }
+                if selected && transform_request_preconditions {
+                    return Ok(crate::proxy::response(
+                        412,
+                        "preconditions are unsupported for transformed representations",
+                    ));
+                }
+            }
+            if selected
+                && response_has_body
                 && !response.status().is_informational()
                 && response.status() != StatusCode::NO_CONTENT
                 && response.status() != StatusCode::NOT_MODIFIED
                 && response.status() != StatusCode::RESET_CONTENT
             {
-                if !crate::transform_body::identity_encoding(response.headers())
+                if !origin_transform_identity
+                    || !crate::transform_body::identity_encoding(response.headers())
+                    || origin_transform_no_transform
                     || crate::transform_body::no_transform(response.headers())
+                    || origin_transform_partial
                     || response.status() == StatusCode::PARTIAL_CONTENT
                     || response.headers().contains_key(header::CONTENT_RANGE)
                 {
@@ -2793,6 +3026,23 @@ impl Proxy {
                 }
                 let (mut parts, body) = response.into_parts();
                 crate::transform_body::rewrite_headers(&mut parts.headers, config);
+                let transform_config = if config.when_prefix.is_some() {
+                    let mut remaining = (**config).clone();
+                    let elapsed = inspection_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
+                    if elapsed >= remaining.timeout_ms {
+                        return Ok(self.failure(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "response body inspection timed out",
+                        ));
+                    }
+                    remaining.timeout_ms -= elapsed;
+                    Arc::new(remaining)
+                } else {
+                    config.clone()
+                };
                 let transformed = tokio::select! {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
@@ -2801,7 +3051,7 @@ impl Proxy {
                     }
                     result = crate::transform_body::transform_with_geoip(
                     body,
-                    config.clone(),
+                    transform_config,
                     self.policy.clone(),
                     "response",
                     geoip.clone(),
@@ -2823,7 +3073,7 @@ impl Proxy {
                         ));
                     }
                 }
-            } else {
+            } else if selected {
                 crate::transform_body::rewrite_headers(response.headers_mut(), config);
             }
         }

@@ -103,7 +103,7 @@ fn same_host(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 /// A strict path profile applies to the entire host if it has any protected
-/// namespace or authentication-bearing route, including legacy authentication.
+/// namespace, authentication-bearing route, or path-scoped response transform.
 /// Otherwise an encoded protected path could select a public fallback before
 /// the origin decodes it. Ambiguous hosts are rejected even if only the alternate authority
 /// matches a guard. Disabled routes retain their namespace until explicit release.
@@ -147,6 +147,15 @@ pub(crate) fn check<'a, B>(
         return Err(400);
     }
     let path = crate::resource_policy::canonical_path(request.uri().path()).map_err(|_| 400u16)?;
+    if authentication_guards.iter().any(|runtime| {
+        !runtime.route.enabled
+            && runtime.route.response_transform.is_some()
+            && listener_matches(&runtime.route, request)
+            && scope_host(runtime, raw.as_deref())
+            && path_matches(&runtime.route, &path)
+    }) {
+        return Err(404);
+    }
     let mut resource = None;
     for runtime in guards {
         if listener_matches(&runtime.route, request)
@@ -174,6 +183,71 @@ mod tests {
     use super::*;
     use crate::config::{Config, Snapshot};
     use serde_json::json;
+
+    #[test]
+    fn path_scoped_transforms_normalize_aliases_and_retain_disabled_namespaces() {
+        let mut config: crate::config::Config=serde_json::from_value(serde_json::json!({"http":[{"id":"transform","host":"app.test","path_prefix":"/api/entry","path_match":"exact","backends":["http://127.0.0.1:9"],"response_transform":{"operations":[{"op":"replace","from":"secret","to":"redacted"}]}}]})).unwrap();
+        let mut invalid = config.clone();
+        invalid.http[0].path_prefix = Some("/api/%65ntry".into());
+        assert!(crate::config::Snapshot::new(invalid).is_err());
+        for enabled in [true, false] {
+            config.http[0].enabled = enabled;
+            let snapshot = crate::config::Snapshot::new(config.clone()).unwrap();
+            let request = Request::builder()
+                .uri("/api/%65ntry")
+                .header("host", "app.test")
+                .body(())
+                .unwrap();
+            let result = check(
+                &snapshot.resource_guards,
+                &snapshot.authentication_path_guards,
+                &request,
+                Some("app.test"),
+            );
+            if enabled {
+                assert_eq!(result.unwrap().1.as_deref(), Some("/api/entry"));
+            } else {
+                assert_eq!(result, Err(404));
+            }
+            for path in [
+                "/api%2fentry",
+                "/api/%2565ntry",
+                "/api//entry",
+                "/api/entry;ignored",
+            ] {
+                let request = Request::builder()
+                    .uri(path)
+                    .header("host", "app.test")
+                    .body(())
+                    .unwrap();
+                assert_eq!(
+                    check(
+                        &snapshot.resource_guards,
+                        &snapshot.authentication_path_guards,
+                        &request,
+                        Some("app.test")
+                    ),
+                    Err(400)
+                );
+            }
+            let request = Request::builder()
+                .uri("/api/%65ntry")
+                .header("host", "other.test")
+                .body(())
+                .unwrap();
+            assert_eq!(
+                check(
+                    &snapshot.resource_guards,
+                    &snapshot.authentication_path_guards,
+                    &request,
+                    Some("other.test")
+                )
+                .unwrap()
+                .1,
+                None
+            );
+        }
+    }
 
     #[test]
     #[ignore = "owned release-mode microbenchmark, not a network throughput test"]

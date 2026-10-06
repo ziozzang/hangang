@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.2.4 — 2026-10-06
+
+- Add opt-in domain response security at final response delivery, covering
+  redirects, cached responses and gateway errors; emit HSTS on verified HTTPS.
+- Upgrade selected same-host HTTP redirects from HTTPS without changing
+  external destinations or leaking internal listener ports.
+
 ## 0.2.3 — 2026-10-06
 
 - Keep HTTP-01 issuer registration when ACME permission is disabled; allow

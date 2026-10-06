@@ -48,6 +48,8 @@ fn is_zero(value: &u64) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_security: Option<Vec<crate::response_security::Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_csrf: Option<Vec<crate::path_csrf::Rule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_allowlists: Option<Vec<crate::path_allowlists::Rule>>,
@@ -96,6 +98,9 @@ impl Settings {
         *self == Self::default()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(rules) = &self.response_security {
+            crate::response_security::validate(rules)?;
+        }
         if let Some(rules) = &self.path_csrf {
             crate::path_csrf::validate(rules)?;
         }
@@ -171,6 +176,7 @@ impl Settings {
 /// `Settings` with names and durations parsed once per snapshot.
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
+    pub response_security: Vec<crate::response_security::Compiled>,
     pub path_csrf: Vec<std::sync::Arc<crate::path_csrf::Compiled>>,
     pub path_allowlists: Vec<std::sync::Arc<crate::path_allowlists::Compiled>>,
     pub(crate) security_redis: Option<std::sync::Arc<crate::security_redis::Backend>>,
@@ -191,6 +197,9 @@ impl PreparedSettings {
         use anyhow::Context;
         settings.validate()?;
         Ok(Self {
+            response_security: crate::response_security::prepare(
+                settings.response_security.as_deref().unwrap_or(&[]),
+            )?,
             path_csrf: crate::path_csrf::prepare(settings.path_csrf.as_deref().unwrap_or(&[]))?,
             path_allowlists: crate::path_allowlists::prepare(
                 settings.path_allowlists.as_deref().unwrap_or(&[]),
@@ -974,12 +983,13 @@ impl Config {
             if (r.basic_auth.is_some()
                 || r.auth.is_some()
                 || r.jwt_auth.is_some()
-                || r.workload_auth.is_some())
+                || r.workload_auth.is_some()
+                || r.response_transform.is_some())
                 && let Some(path) = &r.path_prefix
             {
                 ensure!(
                     crate::resource_policy::canonical_path(path)? == *path,
-                    "authenticated route path_prefix must be canonical"
+                    "security-sensitive route path_prefix must be canonical"
                 );
             }
             if let Some(policy) = &r.resource_policy {
@@ -1175,6 +1185,10 @@ impl Config {
             // remove them, or the upstream would trust a configured value in
             // place of the authenticated one.
             if let Some(transform) = &r.request_transform {
+                ensure!(
+                    transform.when_prefix.is_none(),
+                    "request transforms cannot use when_prefix"
+                );
                 let identity_headers = r
                     .basic_auth
                     .as_ref()
@@ -2376,6 +2390,8 @@ impl Snapshot {
                         || runtime.route.auth.is_some()
                         || runtime.route.jwt_auth.is_some()
                         || runtime.route.workload_auth.is_some()
+                        || (runtime.route.path_prefix.is_some()
+                            && runtime.route.response_transform.is_some())
                 })
                 .cloned()
                 .collect(),

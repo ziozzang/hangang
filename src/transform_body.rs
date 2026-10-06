@@ -97,6 +97,110 @@ pub fn rewrite_headers(headers: &mut HeaderMap, config: &BodyTransform) {
     }
 }
 
+/// Probe only the configured literal prefix. Reassemble consumed data/trailers
+/// without buffering the rest of an unmatched representation. Callers must
+/// reject nonidentity encodings before probing and delay header changes until
+/// a match. The shared transform permit follows the returned body.
+pub async fn probe_prefix(
+    mut body: Body,
+    config: &BodyTransform,
+    budget: Budget,
+) -> Result<(Body, bool), TransformError> {
+    let Some(prefix) = config.when_prefix.as_deref() else {
+        return Ok((body, true));
+    };
+    if prefix.is_empty() || prefix.len() > 1024 {
+        return Err(TransformError::Invalid);
+    }
+    let mut retained = Vec::with_capacity(prefix.len());
+    let operation = async {
+        loop {
+            tokio::task::consume_budget().await;
+            let Some(frame) = body.frame().await else {
+                return Ok((prepend(body, retained, None, budget), false));
+            };
+            let frame = frame.map_err(|_| TransformError::Invalid)?;
+            match frame.into_data() {
+                Ok(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let remaining = &prefix.as_bytes()[retained.len()..];
+                    let compared = bytes.len().min(remaining.len());
+                    if bytes[..compared] != remaining[..compared] {
+                        return Ok((
+                            prepend(body, retained, Some(Frame::data(bytes)), budget),
+                            false,
+                        ));
+                    }
+                    if bytes.len() >= remaining.len() {
+                        return Ok((
+                            prepend(body, retained, Some(Frame::data(bytes)), budget),
+                            true,
+                        ));
+                    }
+                    retained.extend_from_slice(&bytes);
+                }
+                Err(frame) => return Ok((prepend(body, retained, Some(frame), budget), false)),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_millis(config.timeout_ms), operation)
+        .await
+        .map_err(|_| TransformError::Timeout)?
+}
+struct PrefixedBody {
+    body: Body,
+    frames: std::collections::VecDeque<Frame<Bytes>>,
+    _budget: Budget,
+}
+fn prepend(body: Body, retained: Vec<u8>, last: Option<Frame<Bytes>>, budget: Budget) -> Body {
+    let mut frames = std::collections::VecDeque::with_capacity(2);
+    if !retained.is_empty() {
+        frames.push_back(Frame::data(Bytes::from(retained)));
+    }
+    if let Some(frame) = last {
+        frames.push_back(frame);
+    }
+    PrefixedBody {
+        body,
+        frames,
+        _budget: budget,
+    }
+    .boxed_unsync()
+}
+impl hyper::body::Body for PrefixedBody {
+    type Data = Bytes;
+    type Error = BodyError;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if let Some(frame) = self.frames.pop_front() {
+            return std::task::Poll::Ready(Some(Ok(frame)));
+        }
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty() && self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let prefix = self
+            .frames
+            .iter()
+            .filter_map(|frame| frame.data_ref())
+            .map(|bytes| bytes.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let original = self.body.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(original.lower().saturating_add(prefix));
+        if let Some(upper) = original.upper().and_then(|value| value.checked_add(prefix)) {
+            hint.set_upper(upper);
+        }
+        hint
+    }
+}
+
 pub async fn transform(
     body: Body,
     config: Arc<BodyTransform>,

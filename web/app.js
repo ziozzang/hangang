@@ -2031,6 +2031,7 @@ function transformSection(direction, route) {
     fields: [
       span2(field(`Enable ${direction} body transform`, `${key}_enabled`, Boolean(transform), { checkbox: true, toggles: key, help: 'Unchecked removes the transform from the route.' })),
       field(`${label} transform mode`, `${key}_mode`, value.mode || 'buffered', { group: key, select: [['buffered', 'buffered – whole body'], ['lines', 'lines – newline records'], ['ndjson', 'ndjson – JSON per line'], ['sse', 'sse – server-sent events']] }),
+      ...(direction === 'response' ? [span2(field('Response transform literal prefix', `${key}_when_prefix`, value.when_prefix ?? '', { group: key, textarea: true, help: 'Optional exact UTF-8 prefix, at most 1,024 bytes, buffered response transforms only. Blank disables the condition. Whitespace is literal. Nonmatching responses stream unchanged without the transform buffer limit or header edits; matching responses use the configured bounded transform. Range requests and partial responses remain rejected on this route.' }))] : []),
       field(`${label} transform timeout (ms)`, `${key}_timeout_ms`, value.timeout_ms ?? '', { group: key, type: 'number', min: 1, max: 30000, placeholder: '5000', help: '1–30,000 ms per body or record.' }),
       field(`${label} transform buffer limit (bytes)`, `${key}_max_buffer_bytes`, value.max_buffer_bytes ?? '', { group: key, type: 'number', min: 1, max: 1048576, placeholder: '65536', help: '1–1,048,576 bytes of input held at once.' }),
       field(`${label} transform output limit (bytes)`, `${key}_max_output_bytes`, value.max_output_bytes ?? '', { group: key, type: 'number', min: 1, max: 1048576, placeholder: '65536', help: '1–1,048,576 bytes produced per body or record.' }),
@@ -2942,6 +2943,12 @@ function routeFromForm() {
       if (!checked(`${key}_enabled`)) { route[key] = null; continue; }
       const transform = isObject(route[key]) ? route[key] : {};
       transform.mode = raw(`${key}_mode`);
+      if (direction === 'request' && transform.when_prefix !== undefined && transform.when_prefix !== null) throw new Error(t('Literal prefix conditions are allowed only for buffered response transforms.'));
+      if (direction === 'response') {
+        const prefix = raw(`${key}_when_prefix`);
+        if (prefix) { if (transform.mode !== 'buffered' || new TextEncoder().encode(prefix).length > 1024) throw new Error(t('Literal prefix conditions are allowed only for buffered response transforms, at most 1,024 UTF-8 bytes.')); transform.when_prefix = prefix; }
+        else delete transform.when_prefix;
+      }
       const operations = text(`${key}_operations`);
       transform.operations = operations ? parseJsonField(operations, `${label} operations`) : [];
       if (!Array.isArray(transform.operations)) throw new Error(t('{field} operations must be a JSON array', { field: t(label) }));
@@ -3184,6 +3191,7 @@ function syncRouteControlsFromJson() {
     const transform = enabled ? raw : DEFAULT_TRANSFORM;
     const set = (suffix, value) => { form.elements[`${key}_${suffix}`].value = value === null || value === undefined ? '' : String(value); };
     set('mode', transform.mode ?? 'buffered');
+    if (direction === 'response') set('when_prefix', transform.when_prefix);
     set('timeout_ms', transform.timeout_ms ?? 5000);
     set('max_buffer_bytes', transform.max_buffer_bytes ?? 65536);
     set('max_output_bytes', transform.max_output_bytes ?? 65536);
@@ -4422,7 +4430,7 @@ function syncTcpRecordingToDocument() {
   } catch (error) { state.tcpRecordingError = error.message; message($('#tcp-recording-message'), error.message, 'error'); }
 }
 
-const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists', 'path_csrf'];
+const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists', 'path_csrf', 'response_security'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
 
@@ -4445,6 +4453,8 @@ function showSettings(settings) {
   $('#settings-state').hidden = !SETTINGS_FIELDS.some(present);
   state.settingsError = null;
   message($('#settings-message'));
+  $('#setting-response_security').value = present('response_security') ? JSON.stringify(value.response_security, null, 2) : '';
+  renderResponseSecurityRules();
   showHttpRecording(value.http_recording);
   showTcpRecording(value.tcp_recent_recording);
 }
@@ -4513,7 +4523,43 @@ function settingsFromForm() {
       settings.security_redis = value;
     } catch { throw invalid('security_redis', t('Redis settings require an environment reference HANGANG_SECURITY_REDIS_* and a safe ASCII namespace, each at most 128 characters. Never paste a URL or password.')); }
   }
+  const responseSecurity = $('#setting-response_security').value.trim();
+  if (responseSecurity) { try { settings.response_security = responseSecurityRules(responseSecurity); } catch (error) { throw invalid('response_security', error.message); } }
   return settings;
+}
+
+const RESPONSE_SECURITY_HEADERS = new Set(['strict-transport-security', 'x-content-type-options', 'referrer-policy', 'x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'permissions-policy']);
+function responseSecurityRules(raw) {
+  let rules; try { rules = JSON.parse(raw); } catch { throw new Error(t('Response security must be a valid JSON array.')); }
+  const fail = () => { throw new Error(t('Response security requires at most 128 rules, 1–16 host patterns per rule, seven allowed security headers with values at most 4,096 bytes, and 32 KiB total text.')); };
+  if (!Array.isArray(rules) || rules.length > 128) fail();
+  const bytes = value => new TextEncoder().encode(value).length; let size = 0;
+  for (const rule of rules) {
+    if (!isObject(rule) || Object.keys(rule).some(key => !['hosts', 'headers', 'upgrade_same_host_redirect'].includes(key)) || !Array.isArray(rule.hosts) || !rule.hosts.length || rule.hosts.length > 16 || rule.hosts.some(host => !urlDefenseHost(host)) || (rule.upgrade_same_host_redirect !== undefined && typeof rule.upgrade_same_host_redirect !== 'boolean')) fail();
+    size += rule.hosts.reduce((sum, host) => sum + bytes(host), 0);
+    const headers = rule.headers ?? {}; if (!isObject(headers)) fail(); const names = new Set();
+    for (const [name, value] of Object.entries(headers)) { const canonical = name.toLowerCase(); if (!RESPONSE_SECURITY_HEADERS.has(canonical) || names.has(canonical) || typeof value !== 'string' || bytes(value) > 4096 || /[\p{Cc}]/u.test(value)) fail(); names.add(canonical); size += bytes(name) + bytes(value); }
+    if (size > 32768) fail();
+  }
+  return rules;
+}
+function renderResponseSecurityRules() {
+  const root = $('#response-security-rules'); root.replaceChildren();
+  let rules; try { rules = JSON.parse($('#setting-response_security').value || '[]'); } catch { return; }
+  if (!Array.isArray(rules) || rules.length > 128) return;
+  rules.forEach((rule, index) => {
+    if (!isObject(rule)) return;
+    const card = document.createElement('div'); card.className = 'panel response-security-rule';
+    const hosts = field('Response security hosts', `response_security_hosts_${index}`, Array.isArray(rule.hosts) ? rule.hosts.join('\n') : '', { textarea: true, help: 'Required explicit host patterns, one per line. No empty all-host scope.' });
+    const upgrade = field('Prevent same-host HTTPS downgrade', `response_security_upgrade_${index}`, rule.upgrade_same_host_redirect === true, { checkbox: true, help: 'On verified HTTPS, upgrade only absolute http:// redirects to the same hostname and default port. External, relative and nondefault-port redirects remain unchanged.' });
+    const headers = field('Security header lines', `response_security_headers_${index}`, pairsToLines(rule.headers), { textarea: true, help: 'Allowed: HSTS, nosniff, X-Frame-Options, Referrer-Policy, Permissions-Policy and reviewed CSP or CSP Report-Only. One name: value per line.' });
+    const write = () => { try { rules[index] = { ...rule, hosts: nonemptyLines(hosts.querySelector('textarea').value), upgrade_same_host_redirect: upgrade.querySelector('input').checked, headers: parseHeaderLines(headers.querySelector('textarea').value, 'Response header') }; $('#setting-response_security').value = JSON.stringify(rules, null, 2); syncSettingsToDocument(); } catch (error) { $('#setting-response_security').value = '{invalid header draft'; state.settingsError = error.message; message($('#settings-message'), error.message, 'error'); } };
+    for (const field of [hosts, upgrade, headers]) { const control = field.querySelector('input, textarea'); control.removeEventListener('input', syncRouteJsonFromForm); control.removeEventListener('change', syncRouteJsonFromForm); for (const eventName of ['input', 'change']) control.addEventListener(eventName, event => { event.stopPropagation(); write(); }); }
+    const preset = document.createElement('button'); preset.type = 'button'; preset.className = 'button button-secondary'; copy(preset, 'Use conservative security headers');
+    preset.addEventListener('click', () => { headers.querySelector('textarea').value = pairsToLines({ ...Object.fromEntries(Object.entries(parseHeaderLines(headers.querySelector('textarea').value, 'Response header')).map(([name, value]) => [name.toLowerCase(), value])), 'strict-transport-security': 'max-age=300', 'x-content-type-options': 'nosniff', 'x-frame-options': 'SAMEORIGIN', 'referrer-policy': 'no-referrer', 'permissions-policy': 'camera=(), microphone=(), geolocation=()' }); write(); });
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button button-danger'; copy(remove, 'Remove rule'); remove.addEventListener('click', () => { rules.splice(index, 1); $('#setting-response_security').value = JSON.stringify(rules, null, 2); renderResponseSecurityRules(); syncSettingsToDocument(); });
+    card.append(hosts, upgrade, headers, preset, remove); root.append(card);
+  });
 }
 
 /** Validate local JSON drafts; authoritative validation still runs on the server. */
@@ -4655,7 +4701,7 @@ function renderSettings(settings) {
     health_path: typeof value.health_path === 'string' ? value.health_path : null,
     security_redis: ['redis', 'local'].includes(value.security_state_backend) ? t(value.security_state_backend === 'redis' ? 'Shared Redis' : 'Local state') : null,
     failure_ban_scope: ({ url: t('Configured URLs only'), host: t('Host: all paths, including images'), global: t('Global: all public HTTP hosts and paths') })[value.failure_ban_scope] ?? null,
-    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf'].map(key => [key,
+    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf', 'response_security'].map(key => [key,
       Number.isSafeInteger(value[`${key}_count`]) && value[`${key}_count`] >= 0 ? t('{count} configured rules', { count: value[`${key}_count`] }) : null])),
   };
   for (const key of SETTINGS_FIELDS) {
@@ -6311,6 +6357,8 @@ $('#format-certificates').addEventListener('click', formatCertificates);
 $('#apply-certificates').addEventListener('click', applyCertificates);
 $('#reload-config').addEventListener('click', () => { if (state.configDirty && !confirm('Discard the unsaved document and reload the active configuration?')) return; state.configDirty = false; loadConfig(true).catch((error) => showGlobalError(error.message)); });
 $('#config-editor').addEventListener('input', configEditorInput);
+$('#response-security-add').addEventListener('click', () => { let rules; try { rules = JSON.parse($('#setting-response_security').value || '[]'); } catch { return; } if (!Array.isArray(rules) || rules.length >= 128) return; rules.push({ hosts: [], headers: {} }); $('#setting-response_security').value = JSON.stringify(rules, null, 2); renderResponseSecurityRules(); syncSettingsToDocument(); });
+$('#setting-response_security').addEventListener('input', renderResponseSecurityRules);
 $('#settings-form').addEventListener('input', syncSettingsToDocument);
 $('#settings-form').addEventListener('change', syncSettingsToDocument);
 $('#cache-generation-input').addEventListener('input', cacheGenerationInput);

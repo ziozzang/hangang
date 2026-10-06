@@ -56,6 +56,9 @@ pub enum Operation {
 pub struct BodyTransform {
     #[serde(default)]
     pub mode: TransformMode,
+    /// Response-only literal prefix gate; unmatched bodies remain unchanged streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_prefix: Option<String>,
     #[serde(default)]
     pub operations: Vec<Operation>,
     #[serde(default)]
@@ -76,6 +79,7 @@ impl Default for BodyTransform {
     fn default() -> Self {
         Self {
             mode: TransformMode::Buffered,
+            when_prefix: None,
             operations: Vec::new(),
             lua: None,
             max_buffer_bytes: default_body_limit(),
@@ -99,6 +103,16 @@ impl BodyTransform {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(prefix) = &self.when_prefix {
+            ensure!(
+                !prefix.is_empty() && prefix.len() <= 1024,
+                "transform when_prefix must contain 1..1024 UTF-8 bytes"
+            );
+            ensure!(
+                self.mode == TransformMode::Buffered,
+                "transform when_prefix requires buffered mode"
+            );
+        }
         ensure!(
             self.operations.len() <= 32,
             "at most 32 transform operations are allowed"

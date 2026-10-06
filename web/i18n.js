@@ -6,6 +6,26 @@ import koOperations from './locales/ko-operations.js';
 
 const STORAGE_KEY = 'hangang-locale';
 const urlDefenseKorean = {
+"Response transform literal prefix":"응답 변환 리터럴 접두사",
+"Optional exact UTF-8 prefix, at most 1,024 bytes, buffered response transforms only. Blank disables the condition. Whitespace is literal. Nonmatching responses stream unchanged without the transform buffer limit or header edits; matching responses use the configured bounded transform. Range requests and partial responses remain rejected on this route.":"선택적인 정확한 UTF-8 접두사입니다. 최대 1,024바이트이며 버퍼링 응답 변환에서만 사용합니다. 빈 값은 조건을 제거하고 공백은 그대로 비교합니다. 불일치 응답은 변환 버퍼 제한이나 헤더 변경 없이 그대로 스트리밍하며, 일치한 응답은 설정한 제한 안에서 변환합니다. 이 라우트의 Range 요청과 부분 응답은 계속 거부합니다.",
+"Literal prefix conditions are allowed only for buffered response transforms.":"리터럴 접두사 조건은 버퍼링 응답 변환에서만 허용합니다.",
+"Literal prefix conditions are allowed only for buffered response transforms, at most 1,024 UTF-8 bytes.":"리터럴 접두사 조건은 버퍼링 응답 변환에서만 허용하며 최대 1,024 UTF-8바이트입니다.",
+
+  "Response security": "응답 보안",
+  "Response security JSON": "응답 보안 JSON",
+  "Add response security rule": "응답 보안 규칙 추가",
+  "Response security hosts": "응답 보안 호스트",
+  "Required explicit host patterns, one per line. No empty all-host scope.": "호스트 패턴을 한 줄에 하나씩 명시해야 합니다. 빈 목록으로 모든 호스트를 선택할 수 없습니다.",
+  "Prevent same-host HTTPS downgrade": "같은 호스트의 HTTPS 다운그레이드 방지",
+  "On verified HTTPS, upgrade only absolute http:// redirects to the same hostname and default port. External, relative and nondefault-port redirects remain unchanged.": "검증된 HTTPS 요청에서 같은 호스트·기본 포트의 절대 http:// 리다이렉트만 HTTPS로 바꿉니다. 외부 호스트·상대 경로·비기본 포트는 유지합니다.",
+  "Security header lines": "보안 헤더 목록",
+  "Allowed: HSTS, nosniff, X-Frame-Options, Referrer-Policy, Permissions-Policy and reviewed CSP or CSP Report-Only. One name: value per line.": "HSTS, nosniff, X-Frame-Options, Referrer-Policy, Permissions-Policy 및 검토한 CSP·CSP Report-Only만 허용합니다. 한 줄에 이름: 값을 입력합니다.",
+  "Use conservative security headers": "보수적인 보안 헤더 적용",
+  "Remove rule": "규칙 제거",
+  "Explicit domain rules cover every response status. HSTS is sent only over verified HTTPS. CSP is never added automatically; configured CSP explicitly replaces the existing policy. The preset applies only to the selected rule.": "명시한 도메인의 모든 응답 상태에 적용합니다. HSTS는 검증된 HTTPS에서만 전송합니다. CSP는 자동 추가하지 않으며, 직접 설정하면 기존 정책을 대체합니다. 예시는 선택한 규칙에만 적용합니다.",
+  "Response security must be a valid JSON array.": "응답 보안은 유효한 JSON 배열이어야 합니다.",
+  "Response security requires at most 128 rules, 1–16 host patterns per rule, seven allowed security headers with values at most 4,096 bytes, and 32 KiB total text.": "응답 보안은 최대 128개 규칙, 규칙당 1–16개 호스트 패턴, 7종의 허용 헤더와 값당 최대 4,096바이트, 전체 텍스트 32 KiB로 제한됩니다.",
+
   '{seconds}s ago': '{seconds}초 전',
   'Connection error': '연결 오류',
   'Timed out': '시간 초과',
