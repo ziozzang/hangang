@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.2.3 — 2026-10-06
+
+- Keep HTTP-01 issuer registration when ACME permission is disabled; allow
+  registered challenges by default and keep registration details in advanced UI.
+- Show observed backend reachability, HTTP response status, age and routing
+  eligibility independently; never label an unobserved backend healthy.
+- Fence backend observation updates against retired Docker endpoint generations.
+
 ## 0.2.2 — 2026-10-06
 
 - Add opt-in per-URL browser Origin/Referer checks with verified same-origin

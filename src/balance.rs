@@ -164,6 +164,7 @@ fn validate_statuses(healthy: &[u16], unhealthy: &[u16]) -> anyhow::Result<()> {
 #[derive(Default)]
 struct Node {
     active: crate::member_admission::MemberAdmission,
+    observation: Mutex<Option<ObservationEvidence>>,
     endpoint_epoch: AtomicU64,
     // Serializes endpoint resets with probe and dynamic-response feedback.
     // Selection still reads the published atomics without taking this lock.
@@ -181,6 +182,60 @@ struct Node {
     passive_http_failures: AtomicUsize,
     passive_tcp_failures: AtomicUsize,
     passive_timeouts: AtomicUsize,
+}
+struct ObservationEvidence {
+    source: &'static str,
+    kind: &'static str,
+    status: Option<u16>,
+    observed_at_unix_ms: u64,
+    observed: std::time::Instant,
+}
+impl Node {
+    fn record_observation(&self, source: &'static str, kind: &'static str, status: Option<u16>) {
+        let mut current = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = std::time::Instant::now();
+        let observed_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        *current = Some(ObservationEvidence {
+            source,
+            kind,
+            status,
+            observed_at_unix_ms,
+            observed,
+        });
+    }
+    fn last_observation(&self) -> Option<BackendObservation> {
+        self.observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|evidence| BackendObservation {
+                source: evidence.source,
+                kind: evidence.kind,
+                status: evidence.status,
+                observed_at_unix_ms: evidence.observed_at_unix_ms,
+                age_ms: evidence
+                    .observed
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            })
+    }
+}
+/// Last actual response or connection error; admission alone is not evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendObservation {
+    pub source: &'static str,
+    pub kind: &'static str,
+    pub status: Option<u16>,
+    pub observed_at_unix_ms: u64,
+    pub age_ms: u64,
 }
 pub struct Balancer {
     config: BalanceConfig,
@@ -208,6 +263,7 @@ impl BackendRetirement {
 #[derive(Debug, Clone, Serialize)]
 pub struct BackendState {
     pub available: bool,
+    pub last_observation: Option<BackendObservation>,
     pub health_mode: &'static str,
     pub probe_observed: Option<bool>,
     /// Whether a checking initial state has yet to pass its healthy probe
@@ -265,6 +321,9 @@ impl BackendLease {
         });
     }
     pub fn record_http_status(&self, status: u16) {
+        self.with_current_epoch(|node| {
+            node.record_observation("passive", "http_response", Some(status))
+        });
         if let Some(passive) = &self.0.passive {
             // Kong's configured passive healthy.successes=0 makes healthy
             // status reports no-ops; they do not reset a failure streak.
@@ -281,6 +340,9 @@ impl BackendLease {
         }
     }
     pub fn record_transport_failure(&self) {
+        self.with_current_epoch(|node| {
+            node.record_observation("passive", "transport_failure", None)
+        });
         if let Some(passive) = &self.0.passive {
             self.with_current_epoch(|node| {
                 if node.passive_tcp_failures.fetch_add(1, Ordering::Relaxed) + 1
@@ -294,6 +356,7 @@ impl BackendLease {
         }
     }
     pub fn record_timeout(&self) {
+        self.with_current_epoch(|node| node.record_observation("passive", "timeout", None));
         if let Some(passive) = &self.0.passive {
             self.with_current_epoch(|node| {
                 if node.passive_timeouts.fetch_add(1, Ordering::Relaxed) + 1
@@ -480,6 +543,10 @@ impl Balancer {
         node.initial_check_pending
             .store(checking, Ordering::Release);
         node.active_probe_seen.store(false, Ordering::Release);
+        *node
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         node.passive_unhealthy.store(false, Ordering::Release);
         node.active_successes.store(0, Ordering::Relaxed);
         node.active_http_failures.store(0, Ordering::Relaxed);
@@ -511,6 +578,7 @@ impl Balancer {
         };
         Some(BackendState {
             available: self.available(index),
+            last_observation: node.last_observation(),
             health_mode,
             probe_observed: self
                 .config
@@ -624,6 +692,7 @@ impl Balancer {
         if !self.ensure_epoch_locked(node, epoch) {
             return;
         }
+        node.record_observation("active_probe", "http_response", Some(status));
         node.active_probe_seen.store(true, Ordering::Release);
         if policy.healthy_statuses.contains(&status) {
             node.active_http_failures.store(0, Ordering::Relaxed);
@@ -672,6 +741,7 @@ impl Balancer {
         if !self.ensure_epoch_locked(node, epoch) {
             return;
         }
+        node.record_observation("active_probe", "transport_failure", None);
         node.active_probe_seen.store(true, Ordering::Release);
         node.active_successes.store(0, Ordering::Relaxed);
         if node.active_tcp_failures.fetch_add(1, Ordering::Relaxed) + 1
@@ -697,6 +767,7 @@ impl Balancer {
         if !self.ensure_epoch_locked(node, epoch) {
             return;
         }
+        node.record_observation("active_probe", "timeout", None);
         node.active_probe_seen.store(true, Ordering::Release);
         node.active_successes.store(0, Ordering::Relaxed);
         if node.active_timeouts.fetch_add(1, Ordering::Relaxed) + 1
@@ -709,6 +780,113 @@ impl Balancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actual_http_feedback_is_observed_without_enabling_health_checks() {
+        let balancer = Balancer::new(BalanceConfig::default(), 1);
+        assert!(
+            balancer
+                .backend_state(0)
+                .unwrap()
+                .last_observation
+                .is_none()
+        );
+        let lease = balancer.acquire(0).unwrap();
+        lease.record_http_status(503);
+        let state = balancer.backend_state(0).unwrap();
+        assert!(state.available);
+        assert_eq!(state.health_mode, "unmonitored");
+        let observed = state.last_observation.unwrap();
+        assert_eq!(observed.source, "passive");
+        assert_eq!(observed.kind, "http_response");
+        assert_eq!(observed.status, Some(503));
+        assert!(observed.observed_at_unix_ms > 0);
+        lease.record_transport_failure();
+        assert_eq!(
+            balancer
+                .backend_state(0)
+                .unwrap()
+                .last_observation
+                .unwrap()
+                .kind,
+            "transport_failure"
+        );
+        lease.record_timeout();
+        assert_eq!(
+            balancer
+                .backend_state(0)
+                .unwrap()
+                .last_observation
+                .unwrap()
+                .kind,
+            "timeout"
+        );
+        assert!(
+            balancer.available(0),
+            "observations alone must not change routing"
+        );
+    }
+    #[test]
+    fn endpoint_generation_resets_observations_and_fences_stale_feedback() {
+        let balancer = Balancer::new(
+            BalanceConfig {
+                active_health: Some(active_policy()),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(balancer.observe_epoch(0, 41));
+        let old = balancer.acquire_for(0, 41).unwrap();
+        old.record_http_status(200);
+        assert!(
+            balancer
+                .backend_state_for(0, 41)
+                .unwrap()
+                .last_observation
+                .is_some()
+        );
+        assert!(balancer.observe_epoch(0, 42));
+        assert!(
+            balancer
+                .backend_state_for(0, 42)
+                .unwrap()
+                .last_observation
+                .is_none()
+        );
+        old.record_transport_failure();
+        assert!(
+            balancer
+                .backend_state_for(0, 42)
+                .unwrap()
+                .last_observation
+                .is_none()
+        );
+        balancer.record_active_status_for(0, 41, 200);
+        assert!(
+            balancer
+                .backend_state_for(0, 42)
+                .unwrap()
+                .last_observation
+                .is_none()
+        );
+        balancer.record_active_status_for(0, 42, 500);
+        let seen = balancer
+            .backend_state_for(0, 42)
+            .unwrap()
+            .last_observation
+            .unwrap();
+        assert_eq!(seen.source, "active_probe");
+        assert_eq!(seen.status, Some(500));
+        balancer.record_active_timeout_for(0, 42);
+        assert_eq!(
+            balancer
+                .backend_state_for(0, 42)
+                .unwrap()
+                .last_observation
+                .unwrap()
+                .kind,
+            "timeout"
+        );
+    }
     fn active_policy() -> ActiveHealthPolicy {
         ActiveHealthPolicy {
             path: "/health/readiness".into(),

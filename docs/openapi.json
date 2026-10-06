@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.2.2",
+    "version": "0.2.3",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -2148,9 +2148,14 @@
               "pattern": "^[A-Za-z0-9._-]+$"
             },
             "description": "Optional existing public listener IDs, a subset of the owning route listener coverage. Empty uses that route coverage; an unscoped route covers only default."
+          },
+          "allow": {
+            "type": "boolean",
+            "default": true,
+            "description": "Registered HTTP-01 forwarding is allowed by default. False retains backend/listener/domain metadata but returns opaque404 for the owned challenge namespace without contacting the issuer. True is omitted on normal serialization. This does not invent an issuer endpoint for unregistered routes."
           }
         },
-        "description": "Exact host or exact domain-alias public-listener routes only; no host regex or globs. Owning routes cannot configure deny_cidrs, country_policy, resource_policy or workload_auth; ordinary auth/basic/JWT and TLS/canonical redirects remain allowed with this explicit narrow challenge exception. Global URL security still applies. Selects raw GET /.well-known/acme-challenge/{token}, with a 1–256 byte base64url token and no query, request body, upgrade or trailers. Runs after global URL security and before ordinary route path/JSON/auth/TLS redirects. Shared admission is 64 concurrent requests and 100 TPS with burst 100; complete issuer responses are bounded to 2 seconds and 4 KiB. Only a valid 200 key authorization (token + dot + 43-character base64url thumbprint) or 404 is returned; other failures are opaque 503. Issuer response headers and error bodies are not forwarded. Certificate issuance remains external."
+        "description": "Exact host or exact domain-alias public-listener routes only; no host regex or globs. Owning routes cannot configure deny_cidrs, country_policy, resource_policy or workload_auth; ordinary auth/basic/JWT and TLS/canonical redirects remain allowed with this explicit narrow challenge exception. Global URL security still applies. Selects raw GET /.well-known/acme-challenge/{token}, with a 1\u2013256 byte base64url token and no query, request body, upgrade or trailers. Runs after global URL security and before ordinary route path/JSON/auth/TLS redirects. Shared admission is 64 concurrent requests and 100 TPS with burst 100; complete issuer responses are bounded to 2 seconds and 4 KiB. Only a valid 200 key authorization (token + dot + 43-character base64url thumbprint) or 404 is returned; other failures are opaque 503. Issuer response headers and error bodies are not forwarded. Certificate issuance remains external."
       },
       "CanonicalDomainRedirect": {
         "type": "object",
@@ -4225,6 +4230,7 @@
           "admission_open": { "type": "boolean", "description": "Current member admission gate only; route activation and health eligibility are separate. This is not a reachability test or fleet-wide state." },
           "active_admissions": { "type": "integer", "minimum": 0, "description": "Instance-local leases on this current member generation. TCP includes pending dials and established streams; HTTP includes in-flight work. Displaced retired generations are reported separately by /v1/retired-members. Zero does not prove fleet drain completion." },
           "health_mode": { "type": "string", "enum": ["unmonitored", "cooldown", "active", "active_passive", "active_tcp"] },
+          "last_observation": { "type": ["object", "null"], "additionalProperties": false, "required": ["source", "kind", "status", "observed_at_unix_ms", "age_ms"], "description": "Latest instance-local HTTP response, connection failure or timeout observation for the current backend generation, from real traffic or configured probes. Null before observation or for TCP. A response including HTTP 500 proves a response was received, not service health; routing availability is independent. The console treats observations older than 60 seconds as unknown and displays age. Reading does not trigger probes.", "properties": { "source": { "type": "string", "enum": ["passive", "active_probe"] }, "kind": { "type": "string", "enum": ["http_response", "transport_failure", "timeout"] }, "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 }, "observed_at_unix_ms": { "type": "integer", "minimum": 0 }, "age_ms": { "type": "integer", "minimum": 0 } } },
           "probe_observed": { "type": ["boolean", "null"], "description": "Whether an HTTP active probe or TCP connection probe result has been recorded; null without active probing." },
           "initial_check_pending": { "type": ["boolean", "null"], "description": "True while a checking-startup backend has not met its healthy HTTP or TCP connection probe threshold; false after release or with healthy-default startup; null without active health checks." },
           "active_requests": { "type": ["integer", "null"], "minimum": 0, "description": "HTTP per-backend live request ownership count in every balancing mode. Always null for TCP." },
@@ -4578,7 +4584,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.2.2"
+            "example": "0.2.3"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"

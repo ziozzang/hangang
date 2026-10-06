@@ -488,6 +488,7 @@ async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
         methods: vec!["GET".into(), "HEAD".into()],
     });
     r.acme_http01 = Some(hangang::acme_http01::Config {
+        allow: true,
         backend: format!("http://{issuer}"),
         listener_ids: vec![],
     });
@@ -584,6 +585,52 @@ async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
         received.lock().unwrap().len(),
         1,
         "invalid requests contacted issuer"
+    );
+    let original_binding = active.load().config.http[0].acme_http01.clone().unwrap();
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].acme_http01.as_mut().unwrap().allow = false;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let reply = send(
+        "GET",
+        "/.well-known/acme-challenge/owned_01",
+        "example.test",
+        "",
+    )
+    .await;
+    assert_eq!(reply.status(), 404);
+    assert_eq!(reply.headers()["cache-control"], "no-store");
+    assert_eq!(
+        reply.into_body().collect().await.unwrap().to_bytes(),
+        "not found"
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "disabled binding contacted issuer"
+    );
+    let disabled = active.load().config.http[0].acme_http01.clone().unwrap();
+    assert_eq!(disabled.backend, original_binding.backend);
+    assert_eq!(disabled.listener_ids, original_binding.listener_ids);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].acme_http01.as_mut().unwrap().allow = true;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        2,
+        "reenabled binding failed to reach issuer"
     );
     for (token, status) in [
         ("unknown", 404),

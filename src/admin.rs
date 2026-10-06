@@ -2148,6 +2148,7 @@ impl Admin {
                                 state = current;
                             } else {
                                 state.available = false;
+                                state.last_observation = None;
                                 state.probe_observed = state.probe_observed.map(|_| false);
                                 state.initial_check_pending =
                                     runtime.route.balance.active_health.as_ref().map(|policy| {
@@ -2172,6 +2173,7 @@ impl Admin {
                             "enabled": runtime.route.enabled,
                             "available": runtime.route.enabled && state.available,
                             "health_mode": state.health_mode,
+                            "last_observation": state.last_observation,
                             "probe_observed": state.probe_observed,
                             "initial_check_pending": state.initial_check_pending,
                             "active_requests": state.active_requests,
@@ -2220,6 +2222,7 @@ impl Admin {
                             "enabled": route.enabled,
                             "available": route.enabled && snapshot.tcp_member_admissions[&route.id][backend_index].is_open() && health.as_ref().is_none_or(|state| state.available),
                             "health_mode": if health.is_some() { "active_tcp" } else { "unmonitored" },
+                            "last_observation": null,
                             "probe_observed": health.as_ref().map(|state| state.probe_observed),
                             "initial_check_pending": health.as_ref().map(|state| state.initial_check_pending),
                             "active_requests": null,

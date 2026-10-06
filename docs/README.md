@@ -42,6 +42,12 @@ English is the reference language. Available Korean pages are full translations 
 - [TCP named-member stream activity](TCP_MEMBER_ACTIVITY.md) — TCP member activity
 - [Lua capacity reporting](LUA_CAPACITY.md) — Lua worker capacity
 
+### Observed backend reachability
+
+The HTTP route inventory and backend editor use `last_observation` from the existing administrator-only `GET /v1/operations` API. A recent HTTP response, including HTTP 500, means the backend was reachable; it does not prove service health or eligibility for routing (`available`). Connection failures and timeouts have separate labels. Disabled, draining and initial-checking states remain distinct.
+
+No observation, or an observation older than 60 seconds, displays **Unknown**. The console shows the observation age and adds monotonic client elapsed time, updating visible badges every five seconds without fetching or probing. Refreshing the route inventory fetches a new instance-local snapshot. Evidence comes only from real traffic (`passive`) or explicitly configured active probes (`active_probe`); opening the console neither enables unsolicited probes nor introduces a new API.
+
 ## Access control and identity
 
 - [Explicit HTTP access modes](ACCESS_POLICY.md) — access policy modes

@@ -6,6 +6,18 @@ import koOperations from './locales/ko-operations.js';
 
 const STORAGE_KEY = 'hangang-locale';
 const urlDefenseKorean = {
+  '{seconds}s ago': '{seconds}초 전',
+  'Connection error': '연결 오류',
+  'Timed out': '시간 초과',
+  'Unavailable for routing': '라우팅 제외',
+  'Runtime observation snapshot. Unknown means no observation within 60 seconds; availability for routing is separate from network reachability.': '런타임 관측 상태입니다. 알 수 없음은 최근 60초 내 관측이 없다는 의미이며, 라우팅 허용 여부와 네트워크 연결 여부는 별개입니다.',
+  'Reachable': '연결 가능',
+  'Unreachable': '연결 불가',
+  'Unknown': '알 수 없음',
+  'Checking': '확인 중',
+  'Draining': '종료 대기',
+  'Runtime probe snapshot. Unknown means no verified active probe evidence; availability alone does not prove reachability.': '런타임 검사 상태입니다. 알 수 없음은 검증된 활성 검사 결과가 없다는 의미이며, 요청 허용 여부만으로 연결 가능을 판단하지 않습니다.',
+
   "Security URL controls": "URL 보안 설정",
   "Blocked URL namespaces": "차단할 URL 경로",
   "URL request rate limits": "URL 요청 속도 제한",
@@ -92,7 +104,12 @@ const urlDefenseKorean = {
   "Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.": "자격 증명·쿼리·fragment·glob이 없는 서로 다른 정확한 HTTP·HTTPS 루트 출처를 최대 128개 사용하세요.",
   "Enable same-origin access or configure at least one allowed origin.": "같은 출처 접근을 허용하거나 허용 출처를 하나 이상 설정하세요.",
   "CSRF methods require 1–8 distinct uppercase standard methods; CONNECT is not supported.": "CSRF 메서드는 중복 없는 대문자 표준 메서드 1~8개여야 합니다. CONNECT는 지원하지 않습니다.",
-  "Keep unrelated services in separate certificate groups. A base domain, its www alias, and its matching wildcard share one management group; wildcard authorization requires DNS-01. A wildcard for an internal namespace can avoid listing individual service names, but publicly trusted certificates, including wildcards, are still published in Certificate Transparency logs.": "관련 없는 서비스는 별도 인증서 그룹으로 나누세요. 기본 도메인, www 별칭, 일치하는 와일드카드는 같은 관리 그룹입니다. 와일드카드 인증에는 DNS-01이 필요합니다. 내부 네임스페이스의 와일드카드는 개별 서비스 이름의 나열을 줄일 수 있지만, 와일드카드를 포함한 공개 신뢰 인증서는 여전히 Certificate Transparency 로그에 게시됩니다."
+  "Keep unrelated services in separate certificate groups. A base domain, its www alias, and its matching wildcard share one management group; wildcard authorization requires DNS-01. A wildcard for an internal namespace can avoid listing individual service names, but publicly trusted certificates, including wildcards, are still published in Certificate Transparency logs.": "관련 없는 서비스는 별도 인증서 그룹으로 나누세요. 기본 도메인, www 별칭, 일치하는 와일드카드는 같은 관리 그룹입니다. 와일드카드 인증에는 DNS-01이 필요합니다. 내부 네임스페이스의 와일드카드는 개별 서비스 이름의 나열을 줄일 수 있지만, 와일드카드를 포함한 공개 신뢰 인증서는 여전히 Certificate Transparency 로그에 게시됩니다.",
+  "ACME allow": "ACME 허용",
+  "HTTP-01 issuer registration (advanced)": "HTTP-01 발급 서버 등록 (고급)",
+  "A registered HTTP-01 issuer is allowed by default. Turn ACME allow off to return 404 without contacting it while keeping registration. Unregistered domains need issuer registration in advanced settings; no endpoint is invented. Wildcards require separate DNS-01 authorization.": "등록한 HTTP-01 발급 서버는 기본 허용합니다. ACME 허용을 끄면 등록 정보를 유지하면서 발급 서버에 접근하지 않고 404를 반환합니다. 미등록 도메인은 고급 설정에서 발급 서버를 등록해야 하며 엔드포인트를 임의로 만들지 않습니다. 와일드카드에는 별도의 DNS-01 인증이 필요합니다.",
+  "Controls only this domain route’s registered HTTP-01 challenge namespace. Application traffic and certificate files are unchanged.": "이 도메인 라우트에 등록한 HTTP-01 챌린지 경로의 허용 여부만 설정합니다. 애플리케이션 요청과 인증서 파일은 변경하지 않습니다.",
+  "ACME allow must be true or false.": "ACME 허용은 true 또는 false여야 합니다."
 };
 const korean = { ...koStatic, ...koApp, ...koConsole, ...koOperations, ...koDocker, ...urlDefenseKorean };
 

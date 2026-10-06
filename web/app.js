@@ -32,6 +32,9 @@ function mountLuaEditors() {
 const state = {
   token: '',
   authGeneration: 0,
+  backendFreshnessTimer: null,
+  backendRuntime: [],
+  backendRuntimeRevision: null,
   user: null,
   authMode: 'token',
   accountAuthAvailable: false,
@@ -432,6 +435,7 @@ function scrubRenderedData() {
 }
 
 function logout(reason = '') {
+  stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
   const token = state.token;
@@ -440,6 +444,8 @@ function logout(reason = '') {
   state.token = '';
   state.authGeneration += 1;
   state.user = null;
+  state.backendRuntime = [];
+  state.backendRuntimeRevision = null;
   state.config = null;
   state.configEtag = null;
   state.configDirty = false;
@@ -590,6 +596,7 @@ async function switchView() {
   if (name === 'status' && state.token) startStatusPolling(); else stopStatusPolling();
   if (name !== 'config' && name !== 'tcp') stopWorkloadMaterialPolling();
   if (name === 'certificates' && state.token && !document.hidden) startCertificatePolling(); else stopCertificatePolling();
+  startBackendFreshness();
   if (state.token) await loadView(name);
   $('#main').focus({ preventScroll: true });
 }
@@ -1273,10 +1280,71 @@ async function loadRoutes(type) {
     if (type === 'tcp') state.tcpRoutesRevision = data?.revision ?? null;
     if (data?.revision !== undefined) setRevision(data.revision);
     renderRoutes(type);
+    await loadBackendReachability(type, data?.revision);
   } catch (error) {
     if (error instanceof StaleSessionError || !state.token) return;
     root.replaceChildren(errorNode(error.message, () => loadRoutes(type)));
     throw error;
+  }
+}
+
+// Runtime availability alone is not evidence that an upstream is reachable.
+function observationAge(row) { return row?.last_observation?.age_ms + Math.max(0, performance.now() - (row.receivedAt ?? performance.now())); }
+function stopBackendFreshness() { if (state.backendFreshnessTimer) clearInterval(state.backendFreshnessTimer); state.backendFreshnessTimer = null; }
+function updateBackendFreshness() {
+  for (const badge of $$('.backend-reachability')) {
+    const type = badge.dataset.protocol; const route = state.routes[type]?.find(route => route.id === badge.dataset.routeId); const index = Number(badge.dataset.backendIndex);
+    if (route && backendAddress(route.backends?.[index]) === badge.dataset.address) badge.replaceWith(backendRuntimeBadge(type, route, index));
+  }
+}
+function startBackendFreshness() {
+  stopBackendFreshness();
+  if (!state.token || document.hidden || !['http', 'tcp'].includes(state.view)) return;
+  updateBackendFreshness(); state.backendFreshnessTimer = setInterval(updateBackendFreshness, 5000);
+}
+function backendReachability(row) {
+  if (!row) return 'Unknown';
+  const observation = row.last_observation;
+  if (observation && Number.isFinite(observationAge(row)) && observationAge(row) >= 0 && observationAge(row) <= 60000) {
+    if (observation.kind === 'http_response') return 'Reachable';
+    if (observation.kind === 'transport_failure') return 'Connection error';
+    if (observation.kind === 'timeout') return 'Timed out';
+  }
+  if (row.initial_check_pending === true) return 'Checking';
+  return 'Unknown';
+}
+function appendRuntimeLabel(node, label, values = {}) { const part = document.createElement('span'); copy(part, label, values); node.append(' · ', part); }
+function backendRuntimeBadge(type, route, index) {
+  const address = backendAddress(route.backends?.[index]);
+  const observed = state.backendRuntimeRevision === state.revision
+    ? state.backendRuntime.find(row => row.protocol === type && row.route_id === route.id && row.backend_index === index && row.address === address) : null;
+  const label = backendReachability(observed);
+  const badge = document.createElement('span'); badge.className = 'tag backend-reachability'; badge.dataset.reachability = label.toLowerCase(); badge.dataset.protocol = type; badge.dataset.routeId = route.id; badge.dataset.backendIndex = String(index); badge.dataset.address = address;
+  const labelNode = document.createElement('span'); copy(labelNode, label); badge.append(labelNode);
+  if (observed?.enabled === false || observed?.desired_state === 'maintenance') appendRuntimeLabel(badge, 'Disabled');
+  else if (observed?.desired_state === 'draining') appendRuntimeLabel(badge, 'Draining');
+  else if (observed?.available === false && label === 'Reachable') appendRuntimeLabel(badge, 'Unavailable for routing'); badge.title = t('Runtime observation snapshot. Unknown means no observation within 60 seconds; availability for routing is separate from network reachability.');
+  const observation = observed?.last_observation;
+  if (observation && Number.isFinite(observation.age_ms) && observation.age_ms >= 0) { appendRuntimeLabel(badge, '{seconds}s ago', { seconds: Math.floor(observationAge(observed) / 1000) }); if (Number.isInteger(observation.status)) badge.append(` · HTTP ${observation.status}`); }
+  return badge;
+}
+async function loadBackendReachability(type, revision) {
+  const generation = state.authGeneration; const token = state.token;
+  const rows = [];
+  try {
+    // Bound the console snapshot to 4,096 members. Omitted members remain Unknown.
+    for (let offset = 0; offset < 4096; offset += 128) {
+      const { data } = await api(`/v1/operations?offset=${offset}&limit=128`);
+      if (generation !== state.authGeneration || token !== state.token || !token || data?.revision !== revision) return;
+      if (!Array.isArray(data.rows)) return;
+      const receivedAt = performance.now(); rows.push(...data.rows.slice(0, 128).map(row => ({ ...row, receivedAt })));
+      if (data.rows.length < 128 || offset + 128 >= data.total) break;
+    }
+    if (generation !== state.authGeneration || token !== state.token || revision !== state.revision) return;
+    state.backendRuntime = rows; state.backendRuntimeRevision = revision;
+    if (state.view === type) renderRoutes(type);
+  } catch (_) { // Missing permissions or runtime data must never become a healthy badge.
+    if (generation === state.authGeneration && token === state.token) { state.backendRuntime = []; state.backendRuntimeRevision = null; if (state.view === type) renderRoutes(type); }
   }
 }
 
@@ -1469,6 +1537,7 @@ function routeRow(type, route) {
   const matchDetail = type === 'http' ? `${route.path_match === 'exact' ? t('Exact ') : ''}${route.path_prefix || '/'}` : (route.sni ? t('Listen {address}', { address: route.listen || '—' }) : t('Any TCP connection'));
   const backends = route.backends || [];
   const upstream = cell(backendAddress(backends[0]) || '—', backends.length > 1 ? t(backends.length === 2 ? '+{count} more backend' : '+{count} more backends', { count: backends.length - 1 }) : ''); upstream.className = 'route-upstream-cell';
+  backends.forEach((backend, index) => { const detail = document.createElement('small'); detail.className = 'route-cell-detail'; detail.append(backendRuntimeBadge(type, route, index), ` ${backendAddress(backend)}`); upstream.append(detail); });
   const policy = document.createElement('td'); policy.className = 'route-policy-cell'; const tags = routeSummaryTags(type, route); if (type === 'tcp' && route.sni) tags.unshift('SNI');
   policy.append(...tags.slice(0, 3).map(tagNode)); if (tags.length > 3) policy.append(tagNode(`+${tags.length - 3}`)); if (!tags.length) policy.textContent = '—';
   const action = document.createElement('td'); const edit = document.createElement('button'); edit.className = 'button button-secondary'; edit.type = 'button'; edit.textContent = t('Edit'); edit.addEventListener('click', () => openRoute(type, route)); action.append(edit);
@@ -1551,7 +1620,7 @@ async function openRoute(type, route = null) {
   applyGroupToggles($('#route-form'));
   updateBackendModeUi();
   $('#route-json').value = JSON.stringify(value, null, 2);
-  $('.advanced-editor', $('#route-dialog')).open = false;
+  $('#route-json').closest('details').open = false;
   $('#route-dialog').showModal();
   mountLuaEditors();
   $('#route-form').scrollTop = 0;
@@ -1706,7 +1775,9 @@ function backendFields(type, route) {
       message($('#route-message'));
     } catch (error) { message($('#route-message'), error.message, 'error'); }
   });
-  editor.append(legacy, namedWrap, convert, help);
+  const runtime = document.createElement('div'); runtime.className = 'backend-runtime-status';
+  (route.backends || []).forEach((backend, index) => { const row = document.createElement('p'); row.className = 'field-help-inline'; row.append(backendRuntimeBadge(type, route, index), ` ${backendAddress(backend)}`); runtime.append(row); });
+  editor.append(legacy, namedWrap, convert, help, runtime);
   return editor;
 }
 
@@ -2020,12 +2091,19 @@ function canonicalDomainSection(route) {
 function acmeHttp01Section(route) {
   const configured = isObject(route.acme_http01);
   const value = configured ? route.acme_http01 : {};
+  const advanced = document.createElement('details'); advanced.className = 'advanced-editor';
+  const summary = document.createElement('summary'); copy(summary, 'HTTP-01 issuer registration (advanced)'); advanced.append(summary);
+  const grid = document.createElement('div'); grid.className = 'form-grid';
+  grid.append(
+    span2(field('HTTP-01 issuer backend', 'acme_http01_backend', value.backend || '', { placeholder: 'docker://acme-issuer/edge/8080', maxlength: 2048, help: 'http://host[:port] with only a root path, or docker://container/network/port. No credentials, query or fragment. Ordinary application traffic keeps its existing backends.' })),
+    span2(field('HTTP-01 listener IDs', 'acme_http01_listener_ids', (value.listener_ids || []).join('\n'), { textarea: true, help: 'Optional: one public listener ID per line, at most 64. Must be a subset of this route’s listener coverage. Blank follows the domain route; no standalone ACME rows are created.' })),
+  );
+  advanced.append(grid);
   return section({ title: 'ACME HTTP-01 forwarding', configured,
-    note: 'Use this domain route for HTTP-01 tokens without a separate challenge route. The external issuer still manages certificates; only the narrow GET challenge path is forwarded.',
+    note: 'A registered HTTP-01 issuer is allowed by default. Turn ACME allow off to return 404 without contacting it while keeping registration. Unregistered domains need issuer registration in advanced settings; no endpoint is invented. Wildcards require separate DNS-01 authorization.',
     fields: [
-      span2(field('Forward HTTP-01 challenges', 'acme_http01_enabled', configured, { checkbox: true, toggles: 'acme_http01', help: 'Unchecked removes forwarding. Requires exact domain hosts; wildcard and regular-expression host routes are not supported.' })),
-      span2(field('HTTP-01 issuer backend', 'acme_http01_backend', value.backend || '', { group: 'acme_http01', placeholder: 'docker://acme-issuer/edge/8080', maxlength: 2048, help: 'http://host[:port] with only a root path, or docker://container/network/port. No credentials, query or fragment. Ordinary application traffic keeps its existing backends.' })),
-      span2(field('HTTP-01 listener IDs', 'acme_http01_listener_ids', (value.listener_ids || []).join('\n'), { group: 'acme_http01', textarea: true, help: 'Optional: one public listener ID per line, at most 64. Must be a subset of this route’s listener coverage. Blank follows the domain route; no standalone ACME rows are created.' })),
+      span2(field('ACME allow', 'acme_http01_enabled', value.allow !== false, { checkbox: true, help: 'Controls only this domain route’s registered HTTP-01 challenge namespace. Application traffic and certificate files are unchanged.' })),
+      span2(advanced),
     ] });
 }
 
@@ -2565,11 +2643,15 @@ function routeFromForm() {
     if (hostMode === 'regex' && !route.host_regex?.trim()) throw new Error(t('Enter a host regular expression'));
     if (route.acme_http01 !== null && route.acme_http01 !== undefined && !isObject(route.acme_http01))
       throw new Error(t('HTTP-01 settings must be an object.'));
-    if (checked('acme_http01_enabled')) {
+    if (isObject(route.acme_http01) && route.acme_http01.allow !== undefined && typeof route.acme_http01.allow !== 'boolean')
+      throw new Error(t('ACME allow must be true or false.'));
+    const challengeBackend = text('acme_http01_backend');
+    const challengeListeners = lines('acme_http01_listener_ids');
+    if (challengeBackend || challengeListeners.length) {
       const hosts = route.hosts?.length ? route.hosts : route.host ? [route.host] : [];
       if (route.host_regex || !hosts.length || hosts.some(host => /[?*]/.test(host)))
         throw new Error(t('HTTP-01 forwarding requires exact domain hosts without globs or regular expressions.'));
-      const backend = text('acme_http01_backend');
+      const backend = challengeBackend;
       let valid = false;
       if (backend.startsWith('docker://')) {
         const parts = backend.slice(9).split('/');
@@ -2580,11 +2662,12 @@ function routeFromForm() {
       }
       if (!valid || new TextEncoder().encode(backend).length > 2048)
         throw new Error(t('Use an HTTP root origin or canonical Docker reference for the HTTP-01 issuer, without credentials, query or fragment.'));
-      const listenerIds = lines('acme_http01_listener_ids');
+      const listenerIds = challengeListeners;
       const coverage = route.listener_ids?.length ? route.listener_ids : ['default'];
       if (listenerIds.length > 64 || new Set(listenerIds).size !== listenerIds.length || listenerIds.some(id => !/^[A-Za-z0-9._-]{1,64}$(?![\s\S])/.test(id) || !coverage.includes(id)))
         throw new Error(t('HTTP-01 listener IDs must be distinct members of this route’s public listener coverage, at most 64.'));
       route.acme_http01 = { ...(isObject(route.acme_http01) ? route.acme_http01 : {}), backend };
+      if (checked('acme_http01_enabled')) delete route.acme_http01.allow; else route.acme_http01.allow = false;
       if (listenerIds.length) route.acme_http01.listener_ids = listenerIds;
       else delete route.acme_http01.listener_ids;
     } else delete route.acme_http01;
@@ -2949,7 +3032,7 @@ function syncRouteControlsFromJson() {
     form.elements['access_mode'].value = draft.access_mode || 'legacy';
   if (form.elements.acme_http01_enabled && (draft.acme_http01 === null || draft.acme_http01 === undefined || isObject(draft.acme_http01))) {
     const challenge = isObject(draft.acme_http01) ? draft.acme_http01 : null;
-    form.elements.acme_http01_enabled.checked = Boolean(challenge);
+    form.elements.acme_http01_enabled.checked = challenge?.allow !== false;
     form.elements.acme_http01_backend.value = challenge?.backend ?? '';
     form.elements.acme_http01_listener_ids.value = Array.isArray(challenge?.listener_ids) ? challenge.listener_ids.join('\n') : '';
   }
@@ -6255,12 +6338,13 @@ $('#docker-form').addEventListener('submit', resolveDocker);
 window.addEventListener('hashchange', switchView);
 window.addEventListener('hangang:localechange', refreshAppCopy);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { stopStatusPolling(); stopCertificatePolling(); stopWorkloadMaterialPolling(); }
+  if (!document.hidden) startBackendFreshness();
+  if (document.hidden) { stopBackendFreshness(); stopStatusPolling(); stopCertificatePolling(); stopWorkloadMaterialPolling(); }
   else if (state.token && state.view === 'status') { loadStatus().catch(() => {}); startStatusPolling(); }
   else if (state.token && state.view === 'certificates') { loadCertificateInventory(state.certificateInventoryOffset, true).catch(() => {}); startCertificatePolling(); }
   else if (state.token && ['config', 'tcp'].includes(state.view)) { refreshWorkloadMaterialStatus(); startWorkloadMaterialPolling(); }
 });
-window.addEventListener('beforeunload', () => { state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
+window.addEventListener('beforeunload', () => { stopBackendFreshness(); state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
 ensureGeoIpPanel();

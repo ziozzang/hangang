@@ -16,9 +16,18 @@ const PREFIX: &str = "/.well-known/acme-challenge/";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
+    pub allow: bool,
     pub backend: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listener_ids: Vec<String>,
+}
+
+fn enabled() -> bool {
+    true
+}
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 pub fn validate(config: &crate::config::Config) -> Result<()> {
@@ -248,6 +257,14 @@ pub(crate) async fn serve<B: hyper::body::Body>(
                 .chain(route.hosts.iter())
                 .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(host))
     })?;
+    let service = owner
+        .route
+        .acme_http01
+        .as_ref()
+        .expect("selected ACME service");
+    if !service.allow {
+        return Some(response(404, Bytes::from_static(b"not found")));
+    }
     let token = request.uri().path().strip_prefix(PREFIX).unwrap_or("");
     if request.method() != Method::GET {
         return Some(response(404, Bytes::from_static(b"not found")));
@@ -264,11 +281,6 @@ pub(crate) async fn serve<B: hyper::body::Body>(
     let Some(_permit) = admission.admit() else {
         return Some(response(503, Bytes::from_static(b"unavailable")));
     };
-    let service = owner
-        .route
-        .acme_http01
-        .as_ref()
-        .expect("selected ACME service");
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         let target = if service.backend.starts_with("docker://") {
             discovery
@@ -391,6 +403,25 @@ pub(crate) async fn serve<B: hyper::body::Body>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_defaults_on_and_explicit_disable_preserves_binding() {
+        let mut binding: Config = serde_json::from_value(serde_json::json!({
+            "backend":"http://127.0.0.1:8081","listener_ids":["default"]
+        }))
+        .unwrap();
+        assert!(binding.allow);
+        assert!(
+            serde_json::to_value(&binding)
+                .unwrap()
+                .get("allow")
+                .is_none()
+        );
+        binding.allow = false;
+        let encoded = serde_json::to_value(&binding).unwrap();
+        assert_eq!(encoded["allow"], false);
+        assert_eq!(serde_json::from_value::<Config>(encoded).unwrap(), binding);
+    }
 
     fn config(host: &str) -> crate::config::Config {
         serde_json::from_value(serde_json::json!({"revision":0,"http":[{

@@ -291,3 +291,9 @@ previously published certificate names remain part of that public history.
 The issuer rejects a single configuration containing unrelated certificate groups
 before contacting the CA or DNS provider. Split legacy bundles with the offline
 planner and provision separate issuer outputs before changing gateway bindings.
+
+HTTP-01 registrations allow challenges by default. Set `acme_http01.allow: false`
+to answer the reserved path with opaque404 while retaining the issuer backend and
+listener binding. Re-enabling the permission uses that same registration. The
+console shows ACME allow and keeps backend/listener registration in a collapsed
+advanced section; an unregistered domain does not acquire an invented issuer.

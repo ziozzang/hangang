@@ -188,3 +188,9 @@ SAN과 인증서 키를 분리하면 한 TLS 인증서가 드러내는 서비스
 발급기는 관련 없는 인증서 그룹을 섞은 단일 설정을 CA·DNS provider에 접속하기
 전에 거부합니다. 예전 묶음은 오프라인 planner로 분리하고 별도 발급기 출력을
 준비한 뒤 gateway 연결을 바꾸십시오.
+
+HTTP-01 등록은 기본적으로 challenge를 허용합니다. `acme_http01.allow: false`면
+발급기 backend·listener 연결을 보존하면서 예약 경로에 일반404를 반환합니다.
+다시 허용하면 같은 등록을 사용합니다. console은 ACME allow를 표시하고
+backend·listener 등록은 접힌 고급 영역에 둡니다. 미등록 도메인에 발급기를
+임의로 만들지 않습니다.
