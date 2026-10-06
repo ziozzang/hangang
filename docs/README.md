@@ -50,6 +50,7 @@ English is the reference language. Available Korean pages are full translations 
 - [HTTP workload identity with mutual TLS](HTTP_WORKLOAD_MTLS.md) — HTTP workload certificates
 - [TCP workload identity with mutual TLS](TCP_MTLS.md) — TCP workload certificates
 - [Country admission](GEOIP.md) — country-based admission
+- [URL security controls](PATH_BLOCKS.md) — path blocks, country/IP allowlists, simultaneous quotas, IP bans and shared Redis
 - [Native HTTP language preference](LANGUAGE_POLICY.md) — language selection policy
 - [Administrator accounts](ADMIN_USERS.md) — account setup and administration
 

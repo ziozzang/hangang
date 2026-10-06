@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -1813,6 +1813,156 @@
           },
           "409": {
             "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    }
+  ,
+    "/v1/security/bans": {
+      "get": {
+        "summary": "Administrator-only active client-IP bans",
+        "description": "Maximum200 records with truncated flag; optional singleIP filter. Shared Redis when configured, otherwise this node's active state. Reauthorizes after state read; no-store.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "ip",
+            "schema": {
+              "type": "string",
+              "maxLength": 45
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active bans",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "scope",
+                    "distributed",
+                    "bans",
+                    "truncated"
+                  ],
+                  "properties": {
+                    "scope": {
+                      "type": "string",
+                      "enum": [
+                        "url",
+                        "host",
+                        "global"
+                      ]
+                    },
+                    "distributed": {
+                      "type": "boolean"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "bans": {
+                      "type": "array",
+                      "maxItems": 200,
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "ip",
+                          "path",
+                          "remaining_seconds"
+                        ],
+                        "properties": {
+                          "ip": {
+                            "type": "string"
+                          },
+                          "path": {
+                            "type": "string"
+                          },
+                          "remaining_seconds": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or duplicateIP filter"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "503": {
+            "description": "State unavailable"
+          }
+        }
+      }
+    }
+  ,
+    "/v1/security/bans/release": {
+      "post": {
+        "summary": "Administrator-only release of one client-IP ban",
+        "description": "Clears active configured failure/ban records for canonicalIP. Live authority fences queue admission; accepted work completes even after caller cancellation/logout. Old in-flight responses cannot reban the cleared generation. Bounded4 admissions per process.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "ip"
+                ],
+                "properties": {
+                  "ip": {
+                    "type": "string",
+                    "maxLength": 45
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Release result, no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ip": {
+                      "type": "string"
+                    },
+                    "released": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "distributed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body/query"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Revoked or insufficient authority"
+          },
+          "503": {
+            "description": "Capacity/state unavailable; accepted remote result may be ambiguous"
           }
         }
       }
@@ -4349,7 +4499,9 @@
           "settings"
         ],
         "properties": {
-          "geoip_metrics": {"$ref":"#/components/schemas/CountryMetrics"},
+          "geoip_metrics": {
+            "$ref": "#/components/schemas/CountryMetrics"
+          },
           "revision": {
             "type": "integer",
             "minimum": 0
@@ -4372,7 +4524,9 @@
           "workload_materials": {
             "type": "array",
             "description": "This instance's enabled TCP and dedicated HTTP workload mTLS bindings only. Ready means a verified local material generation is available; false closes authenticated admission. No paths, certificates, or private keys are returned. This is local runtime state, not fleet readiness.",
-            "items": { "$ref": "#/components/schemas/WorkloadMaterialStatus" }
+            "items": {
+              "$ref": "#/components/schemas/WorkloadMaterialStatus"
+            }
           },
           "metrics": {
             "$ref": "#/components/schemas/Metrics"
@@ -4390,7 +4544,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.2.1"
+            "example": "0.2.2"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"
@@ -4410,8 +4564,8 @@
             "description": "Shared configuration store diagnostics; null in file and controller modes."
           },
           "settings": {
-            "$ref": "#/components/schemas/Settings",
-            "description": "Legacy active runtime settings summary (empty object when none are set). HTTP recording rules are omitted because this response is viewer-readable; administrators read them through GET /v1/config."
+            "$ref": "#/components/schemas/RuntimeSettingsSummary",
+            "description": "Viewer-readable runtime settings summary. Security rules and Redis connection configuration are available only through administrator GET /v1/config."
           }
         }
       },
@@ -5489,12 +5643,333 @@
         "additionalProperties": false,
         "description": "Process-wide runtime settings carried in the document so every instance of a fleet converges on them. A present field overrides the command-line value of the same name; an absent field keeps the process default. Applied on the next request after activation.",
         "properties": {
+          "security_redis": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "url_env",
+              "namespace"
+            ],
+            "properties": {
+              "url_env": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^HANGANG_SECURITY_REDIS_[A-Z0-9_]*$"
+              },
+              "namespace": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_:.\\-]+$"
+              },
+              "allow_insecure_remote": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "description": "Optional shared Redis/Valkey counters and bans. URL/credentials remain in an environment variable, never in this document. Verified TLS or loopback plaintext by default; approved remote plaintext requires explicit opt-in. Standalone endpoint or compatible proxy, no native Redis Cluster discovery. Require protected namespace, no-eviction and appropriate persistence. Outage fails selected security admission closed with503; no local fallback."
+          },
+          "failure_ban_scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "url",
+              "host",
+              "global",
+              null
+            ],
+            "description": "Default url. Host/global expands an established client-IP ban across paths, including images and public health. Separate administrator recovery is exempt."
+          },
+          "path_failure_bans": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "failures",
+                "window_seconds",
+                "ban_seconds"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 2048
+                },
+                "hosts": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "include_subpaths": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "failures": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                },
+                "window_seconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 86400
+                },
+                "ban_seconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 86400
+                },
+                "statuses": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "default": [
+                    401,
+                    403
+                  ],
+                  "items": {
+                    "type": "integer",
+                    "minimum": 400,
+                    "maximum": 599
+                  }
+                }
+              }
+            },
+            "description": "Explicit URL failure windows start at first selected response failure. Verified client-IP state is bounded1024 per rule; capacity exhaustion fails closed. Exact path by default, images unaffected unless wider ban scope is explicitly enabled. Active ban expiry never extends due to already-admitted responses. Admin clear/ban transitions fence old observations."
+          },
+          "path_rate_limits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "anyOf": [
+                {
+                  "required": [
+                    "tps"
+                  ],
+                  "properties": {
+                    "tps": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "limits"
+                  ],
+                  "properties": {
+                    "limits": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 2048
+                },
+                "hosts": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "tps": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "include_subpaths": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "burst": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000,
+                  "default": 1
+                },
+                "limits": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "requests",
+                      "window_seconds"
+                    ],
+                    "properties": {
+                      "requests": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000000
+                      },
+                      "window_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
+          },
+          "path_allowlists": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "anyOf": [
+                {
+                  "required": [
+                    "allow_cidrs"
+                  ],
+                  "properties": {
+                    "allow_cidrs": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "allow_countries"
+                  ],
+                  "properties": {
+                    "allow_countries": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 2048
+                },
+                "hosts": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "include_subpaths": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "allow_cidrs": {
+                  "type": "array",
+                  "maxItems": 1024,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "allow_countries": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Z]{2}$"
+                  }
+                }
+              }
+            },
+            "description": "Pre-route URL whitelist, exact by default. CIDR and country lists both apply when supplied, all overlapping rules intersect. Verified clientIP only, unknown country403/unavailable503. Countries require configured GeoIP source.32KiB aggregate selector/policy text. Images outside selected exactURL unaffected."
+          },
+          "path_blocks": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 2048,
+                  "description": "Canonical absolute path; matches itself and slash-delimited descendants, case-sensitive."
+                },
+                "hosts": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Optional hostname glob scopes; empty or absent means every host."
+                }
+              }
+            },
+            "description": "Explicit deny namespaces before routing/auth/cache/origin work. Matched paths return opaque404; ambiguous paths on scoped hosts return400. Max32KiB combined path/host text. Empty or absent disables. Dedicated health probe and administration are separate."
+          },
           "debug_gateway_header": {
-            "type": ["boolean", "null"],
+            "type": [
+              "boolean",
+              "null"
+            ],
             "description": "Permit configured or origin x-hangang-gateway response headers and trailers for temporary debugging. Default false, including when absent or null. Does not generate a header."
           },
-          "http_recording": {"anyOf":[{"$ref":"#/components/schemas/HttpRecordingPolicy"},{"type":"null"}]},
-          "tcp_recent_recording": {"anyOf":[{"$ref":"#/components/schemas/TcpRecentRecordingPolicy"},{"type":"null"}]},
+          "http_recording": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HttpRecordingPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tcp_recent_recording": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TcpRecentRecordingPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "trusted_proxy_cidrs": {
             "type": "array",
             "maxItems": 1024,
@@ -6332,6 +6807,95 @@
             "minLength": 12,
             "maxLength": 1024,
             "writeOnly": true
+          }
+        }
+      }
+    ,
+      "RuntimeSettingsSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "trusted_proxy_cidrs": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "string",
+              "example": "10.0.0.0/8"
+            },
+            "description": "Peers whose X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host / X-Forwarded-Port are trusted (overrides --trusted-proxy-cidrs)."
+          },
+          "remove_response_headers": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string"
+            },
+            "description": "Response headers removed from every upstream response (overrides --remove-response-headers). Protected framing headers are rejected."
+          },
+          "debug_gateway_header": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Permit configured or origin x-hangang-gateway response headers and trailers for temporary debugging. Default false, including when absent or null. Does not generate a header."
+          },
+          "https_redirect_code": {
+            "type": "integer",
+            "enum": [
+              301,
+              302,
+              307,
+              308,
+              426
+            ],
+            "description": "Status used for require_tls redirects (overrides --https-redirect-code)."
+          },
+          "upstream_timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400000,
+            "description": "Default upstream response-header timeout for routes without upstream_timeout_ms (overrides --upstream-timeout-seconds)."
+          },
+          "allow_dot_segments": {
+            "type": "boolean",
+            "description": "Accept request paths containing dot segments (overrides --allow-dot-segments)."
+          },
+          "health_path": {
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^/",
+            "description": "Unauthenticated readiness probe path on the public listener (overrides --health-path)."
+          },
+          "path_blocks_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "path_allowlists_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "path_rate_limits_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "path_failure_bans_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failure_ban_scope": {
+            "type": "string",
+            "enum": [
+              "url",
+              "host",
+              "global"
+            ]
+          },
+          "security_state_backend": {
+            "type": "string",
+            "enum": [
+              "local",
+              "redis"
+            ]
           }
         }
       }

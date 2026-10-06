@@ -35,6 +35,197 @@ struct Seen {
 }
 
 #[tokio::test]
+async fn global_failure_ban_crosses_hosts_and_health_without_trusting_client_ip_spoofs() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(|request: Request<Incoming>| async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(if request.uri().path() == "/login" {
+                                        401
+                                    } else {
+                                        200
+                                    })
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    let settings = hangang::config::Settings {
+        path_failure_bans: Some(vec![hangang::path_failure_bans::Rule {
+            path: "/login".into(),
+            hosts: vec!["app.example".into()],
+            include_subpaths: false,
+            failures: 2,
+            window_seconds: 60,
+            ban_seconds: 60,
+            statuses: vec![401, 403],
+        }]),
+        failure_ban_scope: Some(hangang::path_failure_bans::Scope::Global),
+        trusted_proxy_cidrs: Some(vec!["127.0.0.0/8".parse().unwrap()]),
+        health_path: Some("/health".into()),
+        ..Default::default()
+    };
+    let ((proxy, policy), _) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy.clone()).await;
+    let send = |path: &'static str, host: &'static str, ip: &'static str| async move {
+        let reply = client()
+            .request(
+                Request::builder()
+                    .uri(format!("http://{front}{path}"))
+                    .header("host", host)
+                    .header("x-forwarded-for", ip)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = reply.status();
+        reply.into_body().collect().await.unwrap();
+        status
+    };
+    assert_eq!(send("/login", "app.example", "192.0.2.1").await, 401);
+    assert_eq!(send("/login", "app.example", "192.0.2.1").await, 401);
+    assert_eq!(send("/image.png", "images.example", "192.0.2.1").await, 429);
+    assert_eq!(send("/health", "images.example", "192.0.2.1").await, 429);
+    assert_eq!(send("/image.png", "images.example", "192.0.2.2").await, 200);
+    let (direct, direct_task) = frontend_with_peer(proxy, "192.0.2.1:5000".parse().unwrap()).await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{direct}/image.png"))
+                .header("host", "images.example")
+                .header("x-forwarded-for", "192.0.2.2")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 429);
+    reply.into_body().collect().await.unwrap();
+    front_task.abort();
+    direct_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn path_blocks_and_url_budget_precede_origins_and_survive_unrelated_reload() {
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let settings = hangang::config::Settings {
+        path_blocks: Some(vec![hangang::path_blocks::Rule {
+            path: "/private".into(),
+            hosts: vec![],
+        }]),
+        path_allowlists: Some(vec![
+            hangang::path_allowlists::Rule {
+                path: "/staff".into(),
+                hosts: vec![],
+                include_subpaths: false,
+                allow_cidrs: vec!["192.0.2.0/24".parse().unwrap()],
+                allow_countries: vec![],
+            },
+            hangang::path_allowlists::Rule {
+                path: "/office".into(),
+                hosts: vec![],
+                include_subpaths: false,
+                allow_cidrs: vec!["127.0.0.1/32".parse().unwrap()],
+                allow_countries: vec![],
+            },
+        ]),
+        path_rate_limits: Some(vec![hangang::path_rate_limits::Rule {
+            path: "/login".into(),
+            include_subpaths: false,
+            hosts: vec![],
+            tps: Some(1),
+            burst: 1,
+            limits: vec![],
+        }]),
+        ..Default::default()
+    };
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy).await;
+    let send = |path: &'static str| async move {
+        client()
+            .request(
+                Request::builder()
+                    .uri(format!("http://{front}{path}"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    for (path, status) in [
+        ("/private", 404),
+        ("/pr%69vate/file", 404),
+        ("/private%2ffile", 400),
+    ] {
+        let reply = send(path).await;
+        assert_eq!(reply.status(), status);
+        assert_eq!(reply.headers()["cache-control"], "no-store");
+        reply.into_body().collect().await.unwrap();
+    }
+    assert!(seen.lock().unwrap().is_empty());
+    let admitted = send("/login").await;
+    assert_eq!(admitted.status(), 200);
+    admitted.into_body().collect().await.unwrap();
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.debug_gateway_header = Some(false);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let denied = send("/log%69n").await;
+    assert_eq!(denied.status(), 429);
+    assert_eq!(denied.headers()["retry-after"], "1");
+    assert_eq!(denied.headers()["cache-control"], "no-store");
+    denied.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let trailing = send("/login/").await;
+    assert_eq!(trailing.status(), 429);
+    trailing.into_body().collect().await.unwrap();
+    let image = send("/login/image.png").await;
+    assert_eq!(image.status(), 200);
+    image.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_blocks = None;
+    config.settings.path_rate_limits = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let released = send("/private").await;
+    assert_eq!(released.status(), 200);
+    released.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    let denied = send("/staff").await;
+    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.headers()["cache-control"], "no-store");
+    denied.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    for path in ["/office", "/staff/image.png"] {
+        let allowed = send(path).await;
+        assert_eq!(allowed.status(), 200);
+        allowed.into_body().collect().await.unwrap();
+    }
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn gateway_fingerprint_is_default_denied_and_debug_opt_in_reloads() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = listener.local_addr().unwrap();

@@ -6,6 +6,8 @@ This template runs one gateway with an HTTP listener and a local management port
 
 ## Build the image
 
+For explicit sensitive-directory denial, see [path blocks](PATH_BLOCKS.md).
+
 Hangang removes the deployment fingerprint header `x-hangang-gateway` from public responses and trailers by default, even when a route or origin sets it. For temporary debugging only, `settings.debug_gateway_header: true` permits existing values; it does not generate a header. Omit this setting or set it to `false` in production. Changes apply through the revision-checked configuration API without restarting.
 
 The repository [Dockerfile](../Dockerfile) packages the static `hangang` binary only. Build that binary on Linux x86_64 first, then build the image from the repository root:
@@ -60,3 +62,20 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --no-build
 Edit `deploy/state/hangang.json` or publish changes through the authenticated management API. For a route example, add an `http` item with an example-only backend such as `http://backend.example.invalid:8080`; replace it with an actual reachable service address before expecting successful proxy responses. Route and listener syntax is documented in [matching](MATCHING.md) and [public listeners](PUBLIC_LISTENERS.md).
 
 Named listeners are configured in `public_http` and need matching Docker `ports` entries. A named HTTPS listener also needs readable certificate/key files mounted into the container at the configured paths. If changing listener ports or adding TCP listeners, publish those ports explicitly and restart Compose after editing the port mappings. Avoid binding the public port to a non-loopback host address until route, TLS, and firewall policy are set. The default CLI listener remains the single `--listen` port above. This single-node template does not configure a shared store, fleet collection, ACME, or a Kubernetes controller.
+
+## Consolidating legacy listener routes
+
+One HTTP route can list several `listener_ids`; an entry per listener is unnecessary
+when its selectors and policies are the same. Generate an offline candidate with
+`python3 tools/consolidate_listener_routes.py current.json candidate.json --report report.json`.
+The default preserves different Host forwarding policies. After reviewing the
+backend's Host requirements, `--prefer-preserve-host` explicitly merges recognized
+legacy Host alternatives using `preserve_host: true`. This preserves the incoming
+host and port instead of forcing one configured alias for every listener.
+
+The tool preserves unrelated settings and distinct path/authentication policies.
+It can also retain one HTTPS requirement when the relaxed copy applies exclusively
+to certificate-backed listeners without trusted forwarding evidence. Review the
+report, validate the candidate with the gateway, and submit it through the
+administrator configuration API with the latest revision in `If-Match`. A revision
+conflict requires a fresh candidate; do not overwrite newer administrator changes.

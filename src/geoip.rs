@@ -1,4 +1,4 @@
-//! Bounded, offline country lookup from an operator-provided MaxMind MMDB.
+//! Bounded, offline country lookup from an operator-provided country MMDB.
 //!
 //! Loading and MMDB structural verification are synchronous and must be called
 //! from a blocking worker. Country-code schema is checked per lookup, with
@@ -153,7 +153,7 @@ impl Database {
         if metadata.ip_version != 6
             || !matches!(
                 metadata.database_type.as_str(),
-                "GeoIP2-Country" | "GeoLite2-Country"
+                "GeoIP2-Country" | "GeoLite2-Country" | "DBIP-Country-Lite"
             )
         {
             return Err(GeoIpError::UnsupportedDatabase);
@@ -430,6 +430,37 @@ mod tests {
         let database = Database::load_at(&path, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_AGE, now)
             .expect("fake Country test database should verify");
         (dir, database, now)
+    }
+
+    #[test]
+    #[ignore = "operator-provided current licensed DB-IP MMDB qualification"]
+    fn real_db_ip_country_database_qualification() {
+        let file =
+            std::env::var("HANGANG_GEOIP_DBIP_TEST_FILE").expect("set the licensed MMDB path");
+        let database = Database::load(
+            Path::new(&file),
+            DEFAULT_MAX_FILE_BYTES,
+            Duration::from_secs(45 * 86400),
+        )
+        .unwrap();
+        assert_eq!(database.status().database_type, "DBIP-Country-Lite");
+        for (ip, expected) in [
+            ("8.8.8.8", "US"),
+            ("168.126.63.1", "KR"),
+            ("223.130.195.95", "KR"),
+        ] {
+            assert_eq!(
+                database
+                    .lookup(ip.parse().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+        }
+        for ip in ["127.0.0.1", "192.168.1.1"] {
+            assert!(database.lookup(ip.parse().unwrap()).unwrap().is_none());
+        }
     }
 
     #[test]

@@ -47,6 +47,19 @@ fn is_zero(value: &u64) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_allowlists: Option<Vec<crate::path_allowlists::Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_redis: Option<crate::security_redis::Settings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_failure_bans: Option<Vec<crate::path_failure_bans::Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_ban_scope: Option<crate::path_failure_bans::Scope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_rate_limits: Option<Vec<crate::path_rate_limits::Rule>>,
+    /// Explicit pre-routing path deny namespaces. No implicit blocked paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_blocks: Option<Vec<crate::path_blocks::Rule>>,
     /// Permit the deployment fingerprint header only for explicit debugging.
     /// This does not generate a header; it allows configured/origin values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +94,21 @@ impl Settings {
         *self == Self::default()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(rules) = &self.path_allowlists {
+            crate::path_allowlists::validate(rules)?;
+        }
+        if let Some(settings) = &self.security_redis {
+            settings.validate()?;
+        }
+        if let Some(rules) = &self.path_failure_bans {
+            crate::path_failure_bans::validate(rules)?;
+        }
+        if let Some(rules) = &self.path_rate_limits {
+            crate::path_rate_limits::validate(rules)?;
+        }
+        if let Some(rules) = &self.path_blocks {
+            crate::path_blocks::validate(rules)?;
+        }
         if let Some(policy) = &self.http_recording {
             policy.validate()?;
         }
@@ -138,6 +166,10 @@ impl Settings {
 /// `Settings` with names and durations parsed once per snapshot.
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
+    pub path_allowlists: Vec<std::sync::Arc<crate::path_allowlists::Compiled>>,
+    pub(crate) security_redis: Option<std::sync::Arc<crate::security_redis::Backend>>,
+    pub path_failure_bans: Vec<std::sync::Arc<crate::path_failure_bans::Bucket>>,
+    pub path_rate_limits: Vec<std::sync::Arc<crate::path_rate_limits::Bucket>>,
     pub debug_gateway_header: Option<bool>,
     pub http_recording: Option<std::sync::Arc<crate::http_recording::CompiledPolicy>>,
     pub tcp_recent_recording: Option<std::sync::Arc<crate::tcp_recording::CompiledPolicy>>,
@@ -153,6 +185,12 @@ impl PreparedSettings {
         use anyhow::Context;
         settings.validate()?;
         Ok(Self {
+            path_allowlists: crate::path_allowlists::prepare(
+                settings.path_allowlists.as_deref().unwrap_or(&[]),
+            )?,
+            security_redis: None,
+            path_failure_bans: Vec::new(),
+            path_rate_limits: Vec::new(),
             debug_gateway_header: settings.debug_gateway_header,
             http_recording: settings
                 .http_recording
@@ -532,6 +570,16 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
+        ensure!(
+            self.settings
+                .path_allowlists
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .all(|rule| rule.allow_countries.is_empty())
+                || self.geoip_database.is_some(),
+            "URL country whitelist requires geoip_database"
+        );
         crate::udp::validate_routes(&self.udp)?;
         if let Some(source) = &self.geoip_database {
             source.validate().context("geoip_database")?;
@@ -1826,7 +1874,29 @@ impl Snapshot {
         if let Some(previous) = previous {
             config.validate_transition_from(&previous.config)?;
         }
-        let settings = std::sync::Arc::new(PreparedSettings::prepare(&config.settings)?);
+        let mut settings = PreparedSettings::prepare(&config.settings)?;
+        settings.path_rate_limits = crate::path_rate_limits::prepare(
+            config.settings.path_rate_limits.as_deref().unwrap_or(&[]),
+            previous
+                .map(|old| old.settings.path_rate_limits.as_slice())
+                .unwrap_or(&[]),
+        );
+        settings.path_failure_bans = crate::path_failure_bans::prepare(
+            config.settings.path_failure_bans.as_deref().unwrap_or(&[]),
+            previous
+                .map(|old| old.settings.path_failure_bans.as_slice())
+                .unwrap_or(&[]),
+        );
+        settings.security_redis = match &config.settings.security_redis {
+            Some(redis) => previous
+                .filter(|old| old.config.settings.security_redis.as_ref() == Some(redis))
+                .and_then(|old| old.settings.security_redis.clone())
+                .map(Ok)
+                .unwrap_or_else(|| crate::security_redis::Backend::new(redis.clone()))
+                .map(Some)?,
+            None => None,
+        };
+        let settings = std::sync::Arc::new(settings);
         let geoip = config
             .geoip_database
             .as_ref()

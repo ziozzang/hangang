@@ -50,6 +50,7 @@
 - [상호 TLS를 사용하는 HTTP 워크로드 신원](ko/HTTP_WORKLOAD_MTLS.md) — HTTP 워크로드 인증서
 - [상호 TLS를 사용하는 TCP 워크로드 신원](ko/TCP_MTLS.md) — TCP 워크로드 인증서
 - [국가별 접근 허용 · 영문](GEOIP.md) — 국가 기반 접근 허용
+- [URL 보안 제어](ko/PATH_BLOCKS.md) — 경로 차단, 국가/IP 허용 목록, 다중 한도, IP 임시 차단과 공유 Redis
 - [네이티브 HTTP 언어 선호 · 영문](LANGUAGE_POLICY.md) — 언어 선택 정책
 - [관리자 계정 · 영문](ADMIN_USERS.md) — 계정 설정과 관리
 

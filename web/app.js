@@ -418,6 +418,7 @@ function scrubRenderedData() {
   $('#cache-generation-input').value = '';
   $('#cache-generation-input').setAttribute('aria-invalid', 'false');
   showSettings(undefined);
+  resetSecurityBans();
   showGeoIpSource(undefined);
   for (const key of SETTINGS_FIELDS) $(`#setting-active-${key}`).textContent = '—';
   $('#config-diff').textContent = t('Load the active configuration to compare changes.');
@@ -573,6 +574,7 @@ async function switchView() {
   }
   state.view = name;
   if (name !== 'operations') pauseObserver();
+  if (name !== 'security') resetSecurityBans();
   if (name !== 'config') resetGeoIpRuntime(true);
   if (name !== 'audit') state.audit.sequence += 1;
   if (name !== 'audit') state.auditPolicy.sequence += 1;
@@ -610,7 +612,7 @@ async function loadView(name, quiet = false) {
     if (name === 'config-operations' && isAdmin()) await Promise.all([loadConfigOperations(0, []), loadConfigProof()]);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
-    if (name === 'security' && isAdmin()) { const latest = await api('/v1/config'); renderSecurity(latest.data); }
+    if (name === 'security' && isAdmin()) { const latest = await api('/v1/config'); renderSecurity(latest.data); await loadSecurityBans(); }
     if (name === 'docs') await loadDocs();
     $('#global-alert').hidden = true;
   } catch (error) {
@@ -4291,7 +4293,7 @@ function syncTcpRecordingToDocument() {
   } catch (error) { state.tcpRecordingError = error.message; message($('#tcp-recording-message'), error.message, 'error'); }
 }
 
-const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path'];
+const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
 
@@ -4305,6 +4307,11 @@ function showSettings(settings) {
   $('#setting-upstream_timeout_ms').value = present('upstream_timeout_ms') ? String(value.upstream_timeout_ms) : '';
   $('#setting-allow_dot_segments').value = typeof value.allow_dot_segments === 'boolean' ? String(value.allow_dot_segments) : '';
   $('#setting-health_path').value = typeof value.health_path === 'string' ? value.health_path : '';
+  $('#setting-security_redis').value = present('security_redis') ? JSON.stringify(value.security_redis, null, 2) : '';
+  $('#setting-failure_ban_scope').value = ['url', 'host', 'global'].includes(value.failure_ban_scope) ? value.failure_ban_scope : '';
+  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists']) {
+    $(`#setting-${key}`).value = present(key) ? JSON.stringify(value[key], null, 2) : '';
+  }
   for (const control of $$('#settings-form [name]')) control.setAttribute('aria-invalid', 'false');
   $('#settings-state').hidden = !SETTINGS_FIELDS.some(present);
   state.settingsError = null;
@@ -4350,7 +4357,116 @@ function settingsFromForm() {
     if (!health.startsWith('/') || health.length > 256 || !/^[\x21-\x7e]+$/.test(health) || /[?#]/.test(health)) throw invalid('health_path', t('Health path must be an absolute path of printable ASCII without query, fragment or whitespace (at most 256 characters)'));
     settings.health_path = health;
   }
+  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists']) {
+    const raw = $(`#setting-${key}`).value.trim();
+    if (!raw) continue;
+    try { settings[key] = urlDefenseRulesFromJson(raw, key); }
+    catch (error) { throw invalid(key, error.message); }
+  }
+  if (settings.path_allowlists?.some(rule => rule.allow_countries?.length)) {
+    let document; try { document = parseConfigEditor(); } catch { document = null; }
+    if (!isObject(document?.geoip_database)) throw invalid('path_allowlists', t('Country URL allowlists require a configured GeoIP source. Configure it below before staging country rules.'));
+  }
+  const scope = $('#setting-failure_ban_scope').value;
+  if (scope) {
+    if (!['url', 'host', 'global'].includes(scope)) throw invalid('failure_ban_scope', t('Choose URL, host or global failure ban scope.'));
+    settings.failure_ban_scope = scope;
+  }
+  const redis = $('#setting-security_redis').value.trim();
+  if (redis) {
+    try {
+      const value = JSON.parse(redis);
+      if (!isObject(value) || Object.keys(value).some(key => !['url_env', 'namespace', 'allow_insecure_remote'].includes(key)) ||
+          (value.allow_insecure_remote !== undefined && typeof value.allow_insecure_remote !== 'boolean') ||
+          typeof value.url_env !== 'string' || value.url_env.length > 128 || !/^HANGANG_SECURITY_REDIS_[A-Z0-9_]*$(?![\s\S])/.test(value.url_env) ||
+          typeof value.namespace !== 'string' || !value.namespace.length || value.namespace.length > 128 || !/^[A-Za-z0-9_:.-]+$(?![\s\S])/.test(value.namespace))
+        throw new Error();
+      settings.security_redis = value;
+    } catch { throw invalid('security_redis', t('Redis settings require an environment reference HANGANG_SECURITY_REDIS_* and a safe ASCII namespace, each at most 128 characters. Never paste a URL or password.')); }
+  }
   return settings;
+}
+
+/** Validate local JSON drafts; authoritative validation still runs on the server. */
+function urlDefenseRulesFromJson(raw, kind) {
+  let rules;
+  try { rules = JSON.parse(raw); }
+  catch { throw new Error(t('URL defenses must be valid JSON arrays.')); }
+  if (!Array.isArray(rules) || rules.length > 128) throw new Error(t('URL defenses allow at most 128 rules per list.'));
+  const bytes = value => new TextEncoder().encode(value).length;
+  const fail = (index, detail) => { throw new Error(t('URL defense rule {index}: {detail}', { index: index + 1, detail: t(detail) })); };
+  const known = kind === 'path_blocks' ? ['path', 'hosts'] : kind === 'path_rate_limits'
+    ? ['path', 'hosts', 'include_subpaths', 'tps', 'burst', 'limits']
+    : kind === 'path_allowlists' ? ['path', 'hosts', 'include_subpaths', 'allow_cidrs', 'allow_countries']
+    : ['path', 'hosts', 'include_subpaths', 'failures', 'window_seconds', 'ban_seconds', 'statuses'];
+  const seen = new Set();
+  let textBytes = 0;
+  rules.forEach((rule, index) => {
+    if (!isObject(rule) || Object.keys(rule).some(key => !known.includes(key))) fail(index, 'Use a rule object with supported fields only.');
+    if (typeof rule.path !== 'string' || !rule.path.startsWith('/') || bytes(rule.path) > 2048 ||
+        /[%\\;?#\p{Cc}]/u.test(rule.path) || rule.path.includes('//') ||
+        (rule.path !== '/' && rule.path.endsWith('/')) || rule.path.split('/').some(part => part === '.' || part === '..'))
+      fail(index, 'Use a canonical absolute path of at most 2,048 UTF-8 bytes, without escapes, dot segments, repeated slashes or a trailing slash.');
+    const hosts = rule.hosts === undefined ? [] : rule.hosts;
+    if (!Array.isArray(hosts) || hosts.length > 16 || hosts.some(host => !urlDefenseHost(host)))
+      fail(index, 'Use at most 16 ASCII hostname or IP patterns, each at most 253 characters. Wildcards * and ? match within one label.');
+    textBytes += bytes(rule.path) + hosts.reduce((sum, host) => sum + bytes(host), 0);
+    if (rule.include_subpaths !== undefined && typeof rule.include_subpaths !== 'boolean') fail(index, 'include_subpaths must be true or false.');
+    const integer = (key, max, fallback) => {
+      const value = rule[key] === undefined ? fallback : rule[key];
+      if (!Number.isSafeInteger(value) || value < 1 || value > max)
+        fail(index, t('{field} must be an integer from 1 to {max}.', { field: key, max: max.toLocaleString(getLocale()) }));
+      return value;
+    };
+    const signature = { path: rule.path, hosts };
+    if (kind !== 'path_blocks') signature.include_subpaths = rule.include_subpaths ?? false;
+    if (kind === 'path_rate_limits') {
+      if (rule.tps !== undefined && rule.tps !== null) signature.tps = integer('tps', 1000000);
+      signature.burst = integer('burst', 1000000, 1);
+      const limits = rule.limits === undefined ? [] : rule.limits;
+      if (!Array.isArray(limits) || limits.length > 8 || limits.some(limit => !isObject(limit) ||
+          Object.keys(limit).some(key => !['requests', 'window_seconds'].includes(key)) ||
+          !Number.isSafeInteger(limit.requests) || limit.requests < 1 || limit.requests > 1000000 ||
+          !Number.isSafeInteger(limit.window_seconds) || limit.window_seconds < 1 || limit.window_seconds > 86400))
+        fail(index, 'limits allows at most 8 windows with requests 1–1,000,000 and window_seconds 1–86,400.');
+      if ((rule.tps === undefined || rule.tps === null) && limits.length === 0) fail(index, 'Configure TPS or at least one request window.');
+      signature.limits = limits.map(limit => ({ requests: limit.requests, window_seconds: limit.window_seconds }));
+    }
+    if (kind === 'path_allowlists') {
+      const cidrs = rule.allow_cidrs === undefined ? [] : rule.allow_cidrs;
+      const countries = rule.allow_countries === undefined ? [] : rule.allow_countries;
+      if (!Array.isArray(cidrs) || cidrs.length > 1024 || new Set(cidrs).size !== cidrs.length || cidrs.some(cidr => typeof cidr !== 'string' || /\p{Cc}/u.test(cidr) || !recordingCidr(cidr)))
+        fail(index, 'allow_cidrs must contain at most 1,024 unique valid IPv4 or IPv6 CIDRs.');
+      if (!Array.isArray(countries) || countries.length > 256 || new Set(countries).size !== countries.length || countries.some(code => typeof code !== 'string' || code.length !== 2 || !COUNTRY_CODE.test(code)))
+        fail(index, 'allow_countries must contain at most 256 unique uppercase two-letter country codes.');
+      if (!cidrs.length && !countries.length) fail(index, 'Configure at least one allowed CIDR or country.');
+      textBytes += cidrs.reduce((sum, cidr) => sum + bytes(cidr), 0) + countries.reduce((sum, code) => sum + bytes(code), 0);
+      signature.allow_cidrs = cidrs; signature.allow_countries = countries;
+    }
+    if (kind === 'path_failure_bans') {
+      signature.failures = integer('failures', 1000);
+      signature.window_seconds = integer('window_seconds', 86400);
+      signature.ban_seconds = integer('ban_seconds', 86400);
+      const statuses = rule.statuses === undefined ? [401, 403] : rule.statuses;
+      if (!Array.isArray(statuses) || statuses.length < 1 || statuses.length > 16 || new Set(statuses).size !== statuses.length || statuses.some(code => !Number.isSafeInteger(code) || code < 400 || code > 599))
+        fail(index, 'statuses must contain 1–16 distinct HTTP status codes from 400 to 599.');
+      signature.statuses = statuses;
+    }
+    const encoded = JSON.stringify(signature);
+    if (seen.has(encoded)) fail(index, 'Duplicate URL defense rules are not allowed.');
+    seen.add(encoded);
+  });
+  if (textBytes > 32768) throw new Error(t('URL defense paths, hosts and allowlist entries allow at most 32 KiB of UTF-8 text per list.'));
+  return rules;
+}
+function urlDefenseHost(host) {
+  if (typeof host !== 'string' || !host.length || host.length > 253 || /[^\x21-\x7e]/.test(host)) return false;
+  if (host.includes(':')) {
+    const address = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+    if (!/^[0-9a-fA-F:.]+$/.test(address)) return false;
+    try { new URL(`http://[${address}]/`); return true; } catch { return false; }
+  }
+  return host.split('.').every(label => label.length >= 1 && label.length <= 63 && !label.startsWith('-') && !label.endsWith('-') && /^[A-Za-z0-9*?-]+$/.test(label));
 }
 
 /** Mirror the fleet-settings controls into the JSON document (a fully blank form removes the `settings` block). */
@@ -4385,6 +4501,10 @@ function renderSettings(settings) {
     upstream_timeout_ms: value.upstream_timeout_ms !== undefined && value.upstream_timeout_ms !== null ? `${Number(value.upstream_timeout_ms).toLocaleString(getLocale())} ms` : null,
     allow_dot_segments: typeof value.allow_dot_segments === 'boolean' ? (value.allow_dot_segments ? t('Allowed') : t('Rejected')) : null,
     health_path: typeof value.health_path === 'string' ? value.health_path : null,
+    security_redis: ['redis', 'local'].includes(value.security_state_backend) ? t(value.security_state_backend === 'redis' ? 'Shared Redis' : 'Local state') : null,
+    failure_ban_scope: ({ url: t('Configured URLs only'), host: t('Host: all paths, including images'), global: t('Global: all public HTTP hosts and paths') })[value.failure_ban_scope] ?? null,
+    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists'].map(key => [key,
+      Number.isSafeInteger(value[`${key}_count`]) && value[`${key}_count`] >= 0 ? t('{count} configured rules', { count: value[`${key}_count`] }) : null])),
   };
   for (const key of SETTINGS_FIELDS) {
     const el = $(`#setting-active-${key}`);
@@ -5941,6 +6061,79 @@ $('#config-operations-export-all').addEventListener('click', exportAllConfigOper
 $('#config-operations-prune').addEventListener('click', pruneConfigOperationsPage);
 $('#toggle-token').addEventListener('click', () => { const input = $('#token-input'); input.type = input.type === 'password' ? 'text' : 'password'; refreshTokenToggle(); });
 $('#logout-button').addEventListener('click', () => logout());
+let securityBanSequence = 0;
+function clearSecurityBanMeta() {
+  const meta = $('#security-ban-meta'); meta.textContent = '';
+  delete meta.dataset.appI18n; delete meta.appI18nParams;
+}
+function resetSecurityBans() {
+  securityBanSequence++;
+  $('#security-ban-rows').replaceChildren();
+  clearSecurityBanMeta();
+  $('#security-ban-search').value = '';
+  $('#security-ban-release-ip').value = '';
+  message($('#security-ban-message'));
+}
+function securityBanIp(value) {
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return value.split('.').every(part => Number(part) <= 255 && String(Number(part)) === part);
+  if (!value.includes(':') || !/^[0-9a-fA-F:.]+$(?![\s\S])/.test(value)) return false;
+  try { new URL(`http://[${value}]/`); return true; } catch { return false; }
+}
+async function loadSecurityBans() {
+  if (!state.token || !isAdmin() || state.view !== 'security') return;
+  const sequence = ++securityBanSequence;
+  const ip = $('#security-ban-search').value.trim();
+  const generation = state.authGeneration; const token = state.token;
+  const current = () => sequence === securityBanSequence && generation === state.authGeneration && token === state.token && isAdmin() && state.view === 'security' && $('#security-ban-search').value.trim() === ip;
+  $('#security-ban-rows').replaceChildren(); clearSecurityBanMeta();
+  if (ip && !securityBanIp(ip)) return message($('#security-ban-message'), t('Enter a literal IPv4 or IPv6 address.'), 'error');
+  message($('#security-ban-message'), t('Loading current IP bans…'));
+  try {
+    const { data } = await api(`/v1/security/bans${ip ? `?ip=${encodeURIComponent(ip)}` : ''}`);
+    if (!current()) return;
+    if (!isObject(data) || !['url', 'host', 'global'].includes(data.scope) || typeof data.distributed !== 'boolean' || !Array.isArray(data.bans) || typeof data.truncated !== 'boolean') throw new Error(t('Current IP ban data is unavailable.'));
+    const visible = data.bans.slice(0, 128);
+    if (visible.some(ban => !isObject(ban) || !securityBanIp(ban.ip) || typeof ban.path !== 'string' || ban.path.length > 2048 || !Number.isSafeInteger(ban.remaining_seconds) || ban.remaining_seconds < 0 || ban.remaining_seconds > 86400)) throw new Error(t('Current IP ban data is unavailable.'));
+    for (const ban of visible) {
+      const row = document.createElement('tr');
+      for (const value of [ban.ip, ban.path]) { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); }
+      const remaining = document.createElement('td'); copy(remaining, '{seconds} seconds remaining', { seconds: ban.remaining_seconds }); row.append(remaining);
+      $('#security-ban-rows').append(row);
+    }
+    copy($('#security-ban-meta'), data.distributed ? 'Shared Redis · {scope} scope · {count} bans shown' : 'This instance · {scope} scope · {count} bans shown', { scope: data.scope, count: visible.length });
+    message($('#security-ban-message'), data.truncated || data.bans.length > 128 ? t('List truncated. Search a specific IP to inspect its bans.') : visible.length ? '' : t('No current IP bans in this result.'));
+  } catch (error) {
+    if (!current()) return;
+    if ([401, 403].includes(error.status)) return logout(t('Your session is no longer authorized.'));
+    message($('#security-ban-message'), error.message, 'error');
+  }
+}
+async function releaseSecurityBan(event) {
+  event.preventDefault();
+  if (!state.token || !isAdmin() || state.view !== 'security') return;
+  const ip = $('#security-ban-release-ip').value.trim();
+  if (!securityBanIp(ip)) return message($('#security-ban-message'), t('Enter a literal IPv4 or IPv6 address.'), 'error');
+  const token = state.token; const generation = state.authGeneration;
+  const current = () => token === state.token && generation === state.authGeneration && isAdmin() && state.view === 'security';
+  const accepted = await confirmDialog({ title: t('Release this IP ban?'), body: t('Release current bans for {ip} on this instance. Other clients are unaffected; future matching failures can ban this IP again.', { ip }), accept: t('Release IP'), danger: false });
+  if (!accepted || !current() || $('#security-ban-release-ip').value.trim() !== ip) return;
+  const button = $('#security-ban-release'); setBusy(button, true, t('Releasing…'));
+  try {
+    await api('/v1/security/bans/release', { method: 'POST', json: { ip } });
+    if (!current()) return;
+    await loadSecurityBans();
+    if (current()) message($('#security-ban-message'), t('Release completed for {ip}.', { ip }), 'success');
+  } catch (error) {
+    if (!current()) return;
+    if ([401, 403].includes(error.status)) return logout(t('Your session is no longer authorized.'));
+    message($('#security-ban-message'), error.message, 'error');
+  } finally { setBusy(button, false); }
+}
+$('#security-ban-refresh').addEventListener('click', loadSecurityBans);
+$('#security-ban-search-form').addEventListener('submit', event => { event.preventDefault(); loadSecurityBans(); });
+$('#security-ban-search').addEventListener('input', () => { securityBanSequence++; $('#security-ban-rows').replaceChildren(); clearSecurityBanMeta(); message($('#security-ban-message')); });
+$('#security-ban-release-form').addEventListener('submit', releaseSecurityBan);
+
 $('#refresh-security').addEventListener('click', () => loadView('security'));
 $('#refresh-status').addEventListener('click', () => loadView('status'));
 $('#check-health').addEventListener('click', checkHealth);

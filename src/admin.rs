@@ -1004,6 +1004,12 @@ impl Admin {
             "trusted_proxy_cidrs": settings.trusted_proxy_cidrs,
             "remove_response_headers": settings.remove_response_headers,
             "debug_gateway_header": settings.debug_gateway_header.unwrap_or(false),
+            "path_blocks_count": settings.path_blocks.as_ref().map_or(0, Vec::len),
+            "path_allowlists_count": settings.path_allowlists.as_ref().map_or(0, Vec::len),
+            "path_rate_limits_count": settings.path_rate_limits.as_ref().map_or(0, Vec::len),
+            "path_failure_bans_count": settings.path_failure_bans.as_ref().map_or(0, Vec::len),
+            "failure_ban_scope": settings.failure_ban_scope.unwrap_or_default(),
+            "security_state_backend": if settings.security_redis.is_some() { "redis" } else { "local" },
             "https_redirect_code": settings.https_redirect_code,
             "upstream_timeout_ms": settings.upstream_timeout_ms,
             "allow_dot_segments": settings.allow_dot_segments,
@@ -1328,6 +1334,173 @@ impl Admin {
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
+        }
+        if path == "/v1/security/bans" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let ip = match req.uri().query() {
+                None => None,
+                Some(query) => match geoip_lookup_query(Some(query)) {
+                    Some(ip) => Some(ip),
+                    None => {
+                        return Ok(problem(
+                            400,
+                            "Invalid Query",
+                            "only one valid IP filter is allowed",
+                        ));
+                    }
+                },
+            };
+            let snapshot = self.manager.active.load_full();
+            let observed = if let Some(redis) = &snapshot.settings.security_redis {
+                match redis
+                    .list(
+                        snapshot
+                            .config
+                            .settings
+                            .path_failure_bans
+                            .as_deref()
+                            .unwrap_or(&[]),
+                        ip,
+                        200,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Ok(problem(
+                            503,
+                            "Security State Unavailable",
+                            "security backend unavailable",
+                        ));
+                    }
+                }
+            } else {
+                crate::path_failure_bans::list(&snapshot.settings.path_failure_bans, ip, 200)
+            };
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            return Ok(auth_json(
+                200,
+                &serde_json::json!({"scope":snapshot.config.settings.failure_ban_scope.unwrap_or_default(),
+                "distributed":snapshot.settings.security_redis.is_some(),"bans":observed.0,"truncated":observed.1}),
+            ));
+        }
+        if path == "/v1/security/bans/release" {
+            if req.method() != hyper::Method::POST {
+                return Ok(problem(405, "Method Not Allowed", "POST required"));
+            }
+            if req.uri().query().is_some() {
+                return Ok(problem(
+                    400,
+                    "Invalid Query",
+                    "release does not accept query parameters",
+                ));
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Release {
+                ip: std::net::IpAddr,
+            }
+            let release: Release = match read_json(req, 4096).await {
+                Ok(body) => body,
+                Err(response) => return Ok(response),
+            };
+            let ip = release.ip.to_canonical();
+            // Admitted releases may finish after caller cancellation/logout.
+            // Queue admission itself is fenced by the live account transaction;
+            // no async work is awaited while holding that transaction.
+            static RELEASES: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            let permit = match RELEASES
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Ok(problem(
+                        503,
+                        "Security State Busy",
+                        "release capacity exhausted",
+                    ));
+                }
+            };
+            let snapshot = self.manager.active.load_full();
+            let distributed = snapshot.settings.security_redis.is_some();
+            let users = self.users.clone();
+            let authority = actor.mutation_authority();
+            let handle = tokio::runtime::Handle::current();
+            let admitted = tokio::task::spawn_blocking(move || {
+                users.authorized_action(&authority, || {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    handle.spawn(async move {
+                        let _permit = permit;
+                        let outcome = if let Some(redis) = &snapshot.settings.security_redis {
+                            redis
+                                .clear_ip(
+                                    snapshot
+                                        .config
+                                        .settings
+                                        .path_failure_bans
+                                        .as_deref()
+                                        .unwrap_or(&[]),
+                                    ip,
+                                )
+                                .await
+                                .map_err(|_| ())
+                        } else {
+                            Ok(crate::path_failure_bans::clear(
+                                &snapshot.settings.path_failure_bans,
+                                ip,
+                            ))
+                        };
+                        crate::security_events::record(
+                            if outcome.is_ok() {
+                                "ip_ban_released"
+                            } else {
+                                "security_release_unconfirmed"
+                            },
+                            ip,
+                            if outcome.is_ok() { 200 } else { 503 },
+                            None,
+                        );
+                        let _ = sender.send(outcome);
+                    });
+                    Ok(receiver)
+                })
+            })
+            .await;
+            let receiver = match admitted {
+                Ok(Ok(receiver)) => receiver,
+                Ok(Err(error)) => return Ok(account_problem(error)),
+                Err(_) => {
+                    return Ok(problem(
+                        503,
+                        "Security State Unavailable",
+                        "release unavailable",
+                    ));
+                }
+            };
+            let cleared = match receiver.await {
+                Ok(Ok(count)) => count,
+                _ => {
+                    return Ok(problem(
+                        503,
+                        "Security State Unavailable",
+                        "security backend unavailable",
+                    ));
+                }
+            };
+            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
+                return Ok(account_problem(error));
+            }
+            return Ok(auth_json(
+                200,
+                &serde_json::json!({"ip":ip,"released":cleared,"distributed":distributed}),
+            ));
         }
         if path == "/v1/geoip/status" {
             if req.method() != hyper::Method::GET {

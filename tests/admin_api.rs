@@ -14,6 +14,307 @@ use std::{convert::Infallible, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex};
 
 const TOKEN: &str = "0123456789abcdef";
+
+struct SecurityBanApiFixture {
+    admin: std::net::SocketAddr,
+    front: std::net::SocketAddr,
+    manager: Arc<Manager>,
+    _directory: tempfile::TempDir,
+    _tasks: Vec<tokio_util::task::AbortOnDropHandle<()>>,
+}
+
+async fn security_ban_api_fixture() -> SecurityBanApiFixture {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = origin_listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_: Request<Incoming>| async {
+                    Ok::<_, Infallible>(
+                        hyper::Response::builder()
+                            .status(401)
+                            .body(Full::new(Bytes::from_static(b"invalid login")))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let mut config = Config {
+        http: serde_json::from_value(serde_json::json!([{
+            "id":"login-origin","backends":[format!("http://{origin}")]
+        }]))
+        .unwrap(),
+        ..Default::default()
+    };
+    config.settings.trusted_proxy_cidrs = Some(vec!["127.0.0.1/32".parse().unwrap()]);
+    config.settings.path_failure_bans = Some(vec![hangang::path_failure_bans::Rule {
+        path: "/login".into(),
+        hosts: vec![],
+        include_subpaths: false,
+        failures: 1,
+        window_seconds: 60,
+        ban_seconds: 300,
+        statuses: vec![401],
+    }]);
+    hangang::store::save(state_path.clone(), config.clone())
+        .await
+        .unwrap();
+    let (admin, manager) = server_on(
+        state_path,
+        config,
+        None,
+        false,
+        64,
+        Admin::PUBLIC_REQUEST_LIMIT,
+    )
+    .await;
+    let proxy = hangang::proxy::Proxy::new(
+        manager.active.clone(),
+        manager.policy.clone(),
+        manager.metrics.clone(),
+    );
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = front_listener.local_addr().unwrap();
+    let front_task = tokio::spawn(async move {
+        loop {
+            let (stream, peer) = front_listener.accept().await.unwrap();
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    async move { proxy.handle(request, peer).await }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    SecurityBanApiFixture {
+        admin,
+        front,
+        manager,
+        _directory: directory,
+        _tasks: vec![
+            tokio_util::task::AbortOnDropHandle::new(origin_task),
+            tokio_util::task::AbortOnDropHandle::new(front_task),
+        ],
+    }
+}
+
+async fn security_login_status(fixture: &SecurityBanApiFixture, ip: &str) -> u16 {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .get(format!("http://{}/login", fixture.front))
+        .header("x-forwarded-for", ip)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    response.bytes().await.unwrap();
+    status
+}
+
+#[tokio::test]
+async fn security_ban_api_lists_filters_and_releases_only_the_selected_client() {
+    let fixture = security_ban_api_fixture().await;
+    for ip in ["192.0.2.1", "192.0.2.2"] {
+        assert_eq!(security_login_status(&fixture, ip).await, 401);
+        assert_eq!(security_login_status(&fixture, ip).await, 429);
+    }
+    let (status, headers, body) =
+        request(fixture.admin, "GET", "/v1/security/bans", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["cache-control"], "no-store");
+    let listed = json(&body);
+    assert_eq!(listed["scope"], "url");
+    assert_eq!(listed["distributed"], false);
+    assert_eq!(listed["bans"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["truncated"], false);
+    let (status, _, body) = request(
+        fixture.admin,
+        "GET",
+        "/v1/security/bans?ip=192.0.2.1",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let filtered = json(&body);
+    assert_eq!(filtered["bans"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["bans"][0]["ip"], "192.0.2.1");
+    assert_eq!(filtered["bans"][0]["path"], "/login");
+    assert!((1..=300).contains(&filtered["bans"][0]["remaining_seconds"].as_u64().unwrap()));
+    let (status, _, body) = request(
+        fixture.admin,
+        "POST",
+        "/v1/security/bans/release",
+        Some(r#"{"ip":"::ffff:192.0.2.1"}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["released"], 1);
+    assert_eq!(json(&body)["ip"], "192.0.2.1");
+    let (_, _, body) = request(
+        fixture.admin,
+        "GET",
+        "/v1/security/bans?ip=192.0.2.1",
+        None,
+        None,
+    )
+    .await;
+    assert!(json(&body)["bans"].as_array().unwrap().is_empty());
+    assert_eq!(security_login_status(&fixture, "192.0.2.2").await, 429);
+    assert_eq!(
+        security_login_status(&fixture, "192.0.2.1").await,
+        401,
+        "released request must reach the real origin"
+    );
+    fixture.manager.policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn security_ban_api_requires_admin_and_rejects_ambiguous_input() {
+    let fixture = security_ban_api_fixture().await;
+    let _operator = account_admin_token(fixture.admin).await;
+    assert_eq!(
+        request(
+            fixture.admin,
+            "POST",
+            "/v1/users",
+            Some(r#"{"username":"viewer","password":"viewer password 123","role":"viewer"}"#),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (_, _, login) = request_with_token(
+        fixture.admin,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"viewer","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    let viewer = json(&login)["token"].as_str().unwrap().to_owned();
+    for (method, path, body) in [
+        ("GET", "/v1/security/bans", None),
+        (
+            "POST",
+            "/v1/security/bans/release",
+            Some(r#"{"ip":"192.0.2.1"}"#),
+        ),
+    ] {
+        assert_eq!(
+            request_with_token(fixture.admin, method, path, body, None, None)
+                .await
+                .0,
+            401
+        );
+        assert_eq!(
+            request_with_token(fixture.admin, method, path, body, None, Some(&viewer))
+                .await
+                .0,
+            403
+        );
+    }
+    for query in [
+        "ip=invalid",
+        "ip=192.0.2.1&ip=192.0.2.2",
+        "unknown=192.0.2.1",
+        "ip=192.0.2.1&unknown=x",
+        "",
+    ] {
+        assert_eq!(
+            request(
+                fixture.admin,
+                "GET",
+                &format!("/v1/security/bans?{query}"),
+                None,
+                None
+            )
+            .await
+            .0,
+            400,
+            "{query}"
+        );
+    }
+    for body in [
+        r#"{"ip":"invalid"}"#,
+        r#"{"ip":"192.0.2.1","extra":true}"#,
+        "{}",
+        r#"{"ip":"192.0.2.1","ip":"192.0.2.2"}"#,
+    ] {
+        assert_eq!(
+            request(
+                fixture.admin,
+                "POST",
+                "/v1/security/bans/release",
+                Some(body),
+                None
+            )
+            .await
+            .0,
+            400,
+            "{body}"
+        );
+    }
+    assert_eq!(
+        request(
+            fixture.admin,
+            "POST",
+            "/v1/security/bans/release?ip=192.0.2.1",
+            Some(r#"{"ip":"192.0.2.1"}"#),
+            None
+        )
+        .await
+        .0,
+        400
+    );
+    fixture.manager.policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn security_ban_api_revoked_release_waiting_for_body_cannot_clear_state() {
+    let fixture = security_ban_api_fixture().await;
+    let token = account_admin_token(fixture.admin).await;
+    assert_eq!(security_login_status(&fixture, "192.0.2.1").await, 401);
+    let body = r#"{"ip":"192.0.2.1"}"#;
+    let mut pending = admitted_user_mutation_waiting_for_body(
+        fixture.admin,
+        "POST",
+        "/v1/security/bans/release",
+        &token,
+        body,
+    )
+    .await;
+    revoke_account_session(fixture.admin, &token).await;
+    assert_eq!(finish_user_mutation(&mut pending, body).await, 403);
+    let (status, _, body) = request(
+        fixture.admin,
+        "GET",
+        "/v1/security/bans?ip=192.0.2.1",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["bans"].as_array().unwrap().len(), 1);
+    assert_eq!(security_login_status(&fixture, "192.0.2.1").await, 429);
+    fixture.manager.policy.shutdown().await;
+}
 static NEXT_DOCKER_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct EventFixture {

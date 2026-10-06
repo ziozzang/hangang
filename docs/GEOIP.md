@@ -4,6 +4,8 @@
 
 HTTP and TCP routes can use the optional `country_policy` with an operator-provided offline country database. See [the example](../examples/country-policy.json). Country is approximate address metadata, not identity, nationality or proof of a user's location. `Accept-Language` filtering is a separate [language policy](LANGUAGE_POLICY.md).
 
+Independent exact-URL country/IP whitelists are also available through [URL security controls](PATH_BLOCKS.md), before ordinary route selection. Supported country MMDB types include GeoIP2-Country, GeoLite2-Country and DBIP-Country-Lite; city/ASN databases remain rejected. [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) uses the compatible country ISO-code schema and requires CC-BY4 attribution for displayed/used results. Keep the offline file current; source freshness limits are measured from its build timestamp, not its download timestamp.
+
 `geoip_database.file` names an absolute normalized UTF-8 path on **each node**. Provision a current GeoIP2-Country or GeoLite2-Country MMDB using its IPv6 database format, which also supports IPv4. Hangang does not download a licensed database or distribute its bytes through configuration. Publish file updates using an atomic rename. Configuration accepts a structurally valid source even when the file is unavailable; `--check` does not certify node readiness.
 
 | Source setting | Default | Allowed range |

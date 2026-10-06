@@ -83,6 +83,47 @@ fn connect_timeout() -> Duration {
     *CONNECT_TIMEOUT.get().unwrap_or(&Duration::from_secs(3))
 }
 
+enum FailureObservation {
+    Local(IpAddr, crate::path_failure_bans::Observation),
+    Redis(IpAddr, crate::security_redis::Observation),
+}
+#[derive(Clone)]
+struct FailureCapture(Arc<std::sync::Mutex<Option<FailureObservation>>>);
+#[derive(Clone)]
+struct SecurityCountry(crate::country_observation::Observation);
+
+fn security_view<B>(request: &Request<B>) -> Request<()> {
+    let mut view = Request::new(());
+    *view.uri_mut() = request.uri().clone();
+    *view.method_mut() = request.method().clone();
+    if let Some(host) = request.headers().get(header::HOST) {
+        view.headers_mut().insert(header::HOST, host.clone());
+    }
+    view
+}
+
+fn security_denied(status: u16) -> Response<Body> {
+    let mut denied = response(
+        status,
+        match status {
+            429 => "too many requests",
+            404 => "not found",
+            403 => "forbidden",
+            400 => "bad request",
+            _ => "service unavailable",
+        },
+    );
+    denied
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static("no-store"));
+    if status == 429 {
+        denied
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+    }
+    denied
+}
+
 #[derive(Clone)]
 pub struct Proxy {
     active: Arc<ArcSwap<Snapshot>>,
@@ -860,6 +901,76 @@ impl Proxy {
             .health_path
             .clone()
             .or_else(|| self.health_path.clone());
+        let ban_scope = snapshot
+            .config
+            .settings
+            .failure_ban_scope
+            .unwrap_or_default();
+        if ban_scope != crate::path_failure_bans::Scope::Url
+            && !snapshot.settings.path_failure_bans.is_empty()
+        {
+            if connection_tokens(request.headers())
+                .iter()
+                .any(is_forwarding_identity_header)
+            {
+                return Ok(security_denied(400));
+            }
+            let trusted: &[ipnet::IpNet] = if request
+                .extensions()
+                .get::<crate::workload_http::Evidence>()
+                .is_some()
+            {
+                &[]
+            } else if let Some(evidence) =
+                request.extensions().get::<crate::public_http::Evidence>()
+            {
+                evidence.trusted_proxy_cidrs()
+            } else {
+                snapshot
+                    .settings
+                    .trusted_proxy_cidrs
+                    .as_deref()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&self.trusted_proxies)
+            };
+            let edge = match self.resolve_edge(&request, peer, trusted) {
+                Ok(edge) => edge,
+                Err(_) => return Ok(security_denied(400)),
+            };
+            let forwarded = edge
+                .forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok());
+            let result = if let Some(redis) = &snapshot.settings.security_redis {
+                redis
+                    .check_bans(
+                        snapshot
+                            .config
+                            .settings
+                            .path_failure_bans
+                            .as_deref()
+                            .unwrap_or(&[]),
+                        &security_view(&request),
+                        forwarded,
+                        edge.client_ip,
+                        ban_scope,
+                    )
+                    .await
+                    .map_err(|error| error.status())
+            } else {
+                crate::path_failure_bans::precheck(
+                    &snapshot.settings.path_failure_bans,
+                    &request,
+                    forwarded,
+                    edge.client_ip,
+                    ban_scope,
+                )
+            };
+            if let Err(status) = result {
+                crate::security_events::record("ip_ban_rejected", edge.client_ip, status, None);
+                return Ok(security_denied(status));
+            }
+        }
         if let Some(path) = &health_path
             && request.uri().path() == path.as_ref()
         {
@@ -919,9 +1030,54 @@ impl Proxy {
             }
         };
         let debug_gateway_header = snapshot.settings.debug_gateway_header == Some(true);
+        let capture = (!snapshot.settings.path_failure_bans.is_empty())
+            .then(|| FailureCapture(Arc::new(std::sync::Mutex::new(None))));
+        if let Some(capture) = &capture {
+            request.extensions_mut().insert(capture.clone());
+        }
         let mut response = self
             .handle_inner(request, peer, snapshot, traffic.as_mut())
             .await?;
+        let observation = capture.and_then(|capture| {
+            capture
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        });
+        if let Some(observation) = observation {
+            let status = response.status().as_u16();
+            let (ip, events) = match observation {
+                FailureObservation::Local(ip, observation) => {
+                    if observation.is_failure(status) {
+                        crate::security_events::record("url_failure", ip, status, None);
+                    }
+                    (ip, Ok(observation.record(status)))
+                }
+                FailureObservation::Redis(ip, observation) => {
+                    if observation.is_failure(status) {
+                        crate::security_events::record("url_failure", ip, status, None);
+                    }
+                    (ip, observation.record(status).await)
+                }
+            };
+            match events {
+                Ok(events) => {
+                    for event in events {
+                        crate::security_events::record(
+                            "ip_ban_created",
+                            ip,
+                            429,
+                            Some(&event.path),
+                        );
+                    }
+                }
+                Err(_) => {
+                    crate::security_events::record("security_backend_unavailable", ip, 503, None);
+                    response = security_denied(503);
+                }
+            }
+        }
         // Apply after every route/auth/cache/Lua/transform path so legacy
         // configuration and origins cannot expose the deployment fingerprint.
         if !debug_gateway_header {
@@ -1104,6 +1260,172 @@ impl Proxy {
             context.client_ip = edge.client_ip;
         }
         let peer = SocketAddr::new(edge.client_ip, peer.port());
+        if let Some(capture) = request.extensions().get::<FailureCapture>().cloned() {
+            let scope = snapshot
+                .config
+                .settings
+                .failure_ban_scope
+                .unwrap_or_default();
+            let forwarded = edge
+                .forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok());
+            let observed = if let Some(redis) = &snapshot.settings.security_redis {
+                let rules = snapshot
+                    .config
+                    .settings
+                    .path_failure_bans
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let view = security_view(&request);
+                match redis
+                    .check_bans(rules, &view, forwarded, edge.client_ip, scope)
+                    .await
+                {
+                    Ok(()) => redis
+                        .observe(rules, &view, forwarded, edge.client_ip)
+                        .await
+                        .map(|observation| FailureObservation::Redis(edge.client_ip, observation)),
+                    Err(error) => Err(error),
+                }
+                .map_err(|error| error.status())
+            } else {
+                crate::path_failure_bans::check(
+                    &snapshot.settings.path_failure_bans,
+                    &request,
+                    forwarded,
+                    edge.client_ip,
+                    scope,
+                )
+                .map(|observation| FailureObservation::Local(edge.client_ip, observation))
+            };
+            match observed {
+                Ok(observation) => {
+                    *capture
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observation);
+                }
+                Err(status) => {
+                    crate::security_events::record(
+                        if status == 429 {
+                            "ip_ban_rejected"
+                        } else {
+                            "security_backend_unavailable"
+                        },
+                        edge.client_ip,
+                        status,
+                        None,
+                    );
+                    return Ok(security_denied(status));
+                }
+            }
+        }
+        if let Err(status) = crate::path_blocks::check(
+            snapshot
+                .config
+                .settings
+                .path_blocks
+                .as_deref()
+                .unwrap_or(&[]),
+            &request,
+            edge.forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok()),
+        ) {
+            crate::security_events::record("path_blocked", edge.client_ip, status, None);
+            let mut denied = response(
+                status,
+                if status == 404 {
+                    "not found"
+                } else {
+                    "bad request"
+                },
+            );
+            denied.headers_mut().insert(
+                "cache-control",
+                hyper::header::HeaderValue::from_static("no-store"),
+            );
+            return Ok(denied);
+        }
+        match crate::path_allowlists::check(
+            &snapshot.settings.path_allowlists,
+            &request,
+            edge.forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok()),
+            edge.client_ip,
+            snapshot.geoip.as_ref(),
+        ) {
+            Ok(Some(country)) => {
+                request.extensions_mut().insert(SecurityCountry(country));
+            }
+            Ok(None) => {}
+            Err(status) => {
+                crate::security_events::record(
+                    "url_allowlist_rejected",
+                    edge.client_ip,
+                    status,
+                    None,
+                );
+                return Ok(security_denied(status));
+            }
+        }
+        let rate_result = if let Some(redis) = &snapshot.settings.security_redis {
+            redis
+                .check_rates(
+                    snapshot
+                        .config
+                        .settings
+                        .path_rate_limits
+                        .as_deref()
+                        .unwrap_or(&[]),
+                    &security_view(&request),
+                    edge.forwarded_host
+                        .as_ref()
+                        .and_then(|host| host.to_str().ok()),
+                )
+                .await
+                .map_err(|error| error.status())
+        } else {
+            crate::path_rate_limits::check(
+                &snapshot.settings.path_rate_limits,
+                &request,
+                edge.forwarded_host
+                    .as_ref()
+                    .and_then(|host| host.to_str().ok()),
+            )
+        };
+        if let Err(status) = rate_result {
+            crate::security_events::record(
+                if status == 429 {
+                    "url_rate_limited"
+                } else {
+                    "security_backend_unavailable"
+                },
+                edge.client_ip,
+                status,
+                None,
+            );
+            let mut denied = response(
+                status,
+                if status == 429 {
+                    "too many requests"
+                } else {
+                    "bad request"
+                },
+            );
+            if status == 429 {
+                denied
+                    .headers_mut()
+                    .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+            }
+            denied.headers_mut().insert(
+                "cache-control",
+                hyper::header::HeaderValue::from_static("no-store"),
+            );
+            return Ok(denied);
+        }
         let connection_lease = request
             .extensions()
             .get::<Arc<crate::metrics::ConnectionLease>>()
@@ -1319,7 +1641,13 @@ impl Proxy {
 
         // One copied observation supplies admission, telemetry and every Lua
         // phase. It never retains the database or performs per-record lookups.
-        let geoip = crate::country_observation::capture(snapshot.geoip.as_ref(), peer.ip());
+        let geoip = request
+            .extensions()
+            .get::<SecurityCountry>()
+            .map(|captured| captured.0.clone())
+            .unwrap_or_else(|| {
+                crate::country_observation::capture(snapshot.geoip.as_ref(), peer.ip())
+            });
         if let Some(context) = traffic {
             context.geoip = geoip.clone();
         }

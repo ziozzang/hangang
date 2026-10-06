@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+## 0.2.2 — 2026-10-06
+
+- Add an offline, policy-aware migration tool for consolidating legacy listener
+  copies into one route; keep distinct URL policies and conflicting routes separate.
+
+- Add exact-URL country/IP allowlists, simultaneous minute/day quotas,
+  failure-triggered IP bans and administrator lookup/release controls.
+- Support shared Redis/Valkey admission and ban state with atomic server-time
+  counters, bounded operations, and generation fences for delayed responses.
+- Add opt-in host/global IP-ban scope, bounded private security logs, and
+  English/Korean security controls and documentation.
+- Accept verified DBIP-Country-Lite MMDBs alongside existing country formats.
+- Add bounded `settings.path_rate_limits` token buckets for URL namespaces,
+  shared across clients/connections and retained on unrelated configuration
+  updates; return429 with Retry-After and no-store before origin work.
+- Add `settings.path_blocks` for bounded host-scoped path/directory denial
+  before routing, authentication, cache, transforms and origin requests;
+  reject encoded separators, double decoding and traversal aliases.
 - Suppress `x-hangang-gateway` response headers and trailers by default,
   including legacy route and origin values; permit them only with explicit
   `settings.debug_gateway_header: true` for debugging.

@@ -19,6 +19,8 @@ const coverage = new Map([
   ['GET /v1/certificates', ['#certificate-inventory', 'app', '/v1/certificates?offset=']],
   ['GET /v1/geoip/status', ['#geoip-refresh-status', 'app', "api('/v1/geoip/status'"]],
   ['GET /v1/geoip/lookup', ['#geoip-lookup-form', 'app', '/v1/geoip/lookup?ip=']],
+  ['GET /v1/security/bans', ['#security-ban-search-form', 'app', '/v1/security/bans${ip']],
+  ['POST /v1/security/bans/release', ['#security-ban-release-form', 'app', "api('/v1/security/bans/release', { method: 'POST'"]],
   ['POST /v1/cache/purge', ['#purge-cache', 'app', "api('/v1/cache/purge'"]],
   ['GET /v1/events', ['#stream-state', 'console', "fetch('/v1/events'"]],
   ['GET /v1/traffic', ['#activity-panel', 'console', "fetch('/v1/traffic?limit=128'"]],
