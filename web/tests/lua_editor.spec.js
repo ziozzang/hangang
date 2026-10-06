@@ -85,9 +85,9 @@ test('Lua draft survives locale and JSON views, transform disable follows the ch
   expect(await page.evaluate(() => window.pwned)).toBeUndefined();
   await page.locator('#locale-select-route').selectOption('ko');
   await expect(page.getByRole('textbox', { name: 'Lua 정책' })).toContainText(source);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   await expect(page.locator('#route-json')).toHaveValue(new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const requestSection = page.locator('#route-field-request_transform_enabled').locator('xpath=ancestor::details[1]');
   if (!(await requestSection.evaluate((element) => element.open))) await requestSection.locator('summary').click();
   await page.locator('[name="request_transform_enabled"]').check();
@@ -183,7 +183,7 @@ test('named member completion is policy-only, localized, and saves an exact ID s
 test('advanced JSON Lua edits survive a later native field change and save', async ({ page }) => {
   const writes = await fixture(page);
   await openEditor(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.lua = 'return nil -- JSON policy';
@@ -207,7 +207,7 @@ test('advanced JSON Lua edits survive a later native field change and save', asy
 test('advanced JSON can add and remove whole transforms before a native edit without losing unknown fields', async ({ page }) => {
   const writes = await fixture(page, { ...original, request_transform: null });
   await openEditor(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.request_transform = {

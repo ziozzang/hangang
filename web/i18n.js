@@ -6,6 +6,17 @@ import koOperations from './locales/ko-operations.js';
 
 const STORAGE_KEY = 'hangang-locale';
 const urlDefenseKorean = {
+"Lua policies":"Lua 정책",
+"HTTP route scripts":"HTTP 라우트 스크립트",
+"Find route policies and body scripts, then edit the exact phase in the existing route editor. Script contents stay out of this inventory.":"라우트 정책과 본문 스크립트를 찾고 기존 라우트 편집기에서 해당 단계를 편집합니다. 목록에는 스크립트 본문을 표시하지 않습니다.",
+"HTTP route":"HTTP 라우트",
+"Script phase":"스크립트 단계",
+"Script size":"스크립트 크기",
+"Configure Lua":"Lua 설정",
+"No configured Lua scripts":"설정된 Lua 스크립트 없음",
+"Choose an existing HTTP route and script phase above to configure Lua.":"위에서 기존 HTTP 라우트와 스크립트 단계를 선택하여 Lua를 설정하세요.",
+"{count} bytes":"{count}바이트",
+
 "Response transform literal prefix":"응답 변환 리터럴 접두사",
 "Optional exact UTF-8 prefix, at most 1,024 bytes, buffered response transforms only. Blank disables the condition. Whitespace is literal. Nonmatching responses stream unchanged without the transform buffer limit or header edits; matching responses use the configured bounded transform. Range requests and partial responses remain rejected on this route.":"선택적인 정확한 UTF-8 접두사입니다. 최대 1,024바이트이며 버퍼링 응답 변환에서만 사용합니다. 빈 값은 조건을 제거하고 공백은 그대로 비교합니다. 불일치 응답은 변환 버퍼 제한이나 헤더 변경 없이 그대로 스트리밍하며, 일치한 응답은 설정한 제한 안에서 변환합니다. 이 라우트의 Range 요청과 부분 응답은 계속 거부합니다.",
 "Literal prefix conditions are allowed only for buffered response transforms.":"리터럴 접두사 조건은 버퍼링 응답 변환에서만 허용합니다.",

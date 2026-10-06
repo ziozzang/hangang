@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.2.5 — 2026-10-06
+
+- Add a dedicated Lua policies menu to find route/request/response scripts and
+  open the existing scoped editor directly while preserving other route fields.
+
 ## 0.2.4 — 2026-10-06
 
 - Add opt-in domain response security at final response delivery, covering

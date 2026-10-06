@@ -33,6 +33,8 @@ const state = {
   token: '',
   authGeneration: 0,
   backendFreshnessTimer: null,
+  luaPolicyRoutes: [],
+  luaPolicySequence: 0,
   backendRuntime: [],
   backendRuntimeRevision: null,
   user: null,
@@ -127,6 +129,7 @@ function refreshAppCopy() {
   if (state.openapi) renderDocs(state.openapi);
   refreshOperationsCopy();
   refreshDockerCopy();
+  if (state.token && isAdmin() && state.view === 'lua') renderLuaPolicies();
   if (state.audit.page || state.audit.error) renderAudit();
   if (state.auditPolicy.observation || state.auditPolicy.error || state.auditPolicy.draft) renderAuditPolicy();
   if (state.configOperations.page || state.configOperations.error) renderConfigOperations();
@@ -449,6 +452,7 @@ function logout(reason = '') {
   state.config = null;
   state.configEtag = null;
   state.configDirty = false;
+  state.luaPolicySequence++; state.luaPolicyRoutes = []; $('#lua-policy-list').replaceChildren(); $('#lua-route-picker').replaceChildren();
   state.routes = { http: [], tcp: [] };
   state.routeEtags = { http: null, tcp: null };
   state.routeInventory = { http: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 }, tcp: { query: '', policy: 'all', sort: 'priority-desc', page: 1, pageSize: 25 } };
@@ -569,7 +573,7 @@ async function login(event) {
 
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
-  return ['status', 'http', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
+  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 
 async function switchView() {
@@ -579,6 +583,7 @@ async function switchView() {
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
   state.view = name;
+  if (name !== 'lua') state.luaPolicySequence++;
   if (name !== 'operations') pauseObserver();
   if (name !== 'security') resetSecurityBans();
   if (name !== 'config') resetGeoIpRuntime(true);
@@ -604,6 +609,7 @@ async function switchView() {
 async function loadView(name, quiet = false) {
   try {
     if (name === 'status') await loadStatus();
+    if (name === 'lua' && isAdmin()) await loadLuaPolicies();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);
     if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
@@ -1348,6 +1354,48 @@ async function loadBackendReachability(type, revision) {
   }
 }
 
+const LUA_PHASES = [['lua', 'Lua policy'], ['request_transform_lua', 'Request transform Lua'], ['response_transform_lua', 'Response transform Lua']];
+function scriptForPhase(route, phase) { return phase === 'lua' ? route.lua : route[phase.replace('_lua', '')]?.lua; }
+async function loadLuaPolicies() {
+  if (!state.token || !isAdmin() || state.view !== 'lua') return;
+  const sequence = ++state.luaPolicySequence; const generation = state.authGeneration; const token = state.token;
+  const current = () => sequence === state.luaPolicySequence && generation === state.authGeneration && token === state.token && isAdmin() && state.view === 'lua';
+  $('#lua-policy-list').replaceChildren(loadingNode('Loading routes…'));
+  try {
+    const { data, etag } = await api('/v1/routes/http'); if (!current()) return;
+    state.luaPolicyRoutes = Array.isArray(data?.routes) ? data.routes : []; state.routeEtags.http = etag || (data?.revision !== undefined ? `"${data.revision}"` : null);
+    if (data?.revision !== undefined) setRevision(data.revision); renderLuaPolicies();
+  } catch (error) { if (!current()) return; state.luaPolicyRoutes = []; $('#lua-route-picker').replaceChildren(); $('#configure-lua-policy').disabled = true; $('#lua-policy-list').replaceChildren(errorNode(error.message, loadLuaPolicies)); }
+}
+function renderLuaPolicies() {
+  const root = $('#lua-policy-list'); const picker = $('#lua-route-picker'); const selected = picker.value; picker.replaceChildren();
+  for (const route of state.luaPolicyRoutes) picker.add(new Option(`${route.id} · ${routeMatch('http', route)} · ${route.path_prefix || '/'}`, route.id));
+  if (state.luaPolicyRoutes.some(route => route.id === selected)) picker.value = selected;
+  $('#configure-lua-policy').disabled = !state.luaPolicyRoutes.length;
+  root.replaceChildren();
+  const rows = [];
+  for (const route of state.luaPolicyRoutes) for (const [phase, label] of LUA_PHASES) { const script = scriptForPhase(route, phase); if (typeof script !== 'string' || !script.length) continue; rows.push({ route, phase, label, bytes: new TextEncoder().encode(script).length }); }
+  if (!rows.length) { root.append(emptyNode('No configured Lua scripts', 'Choose an existing HTTP route and script phase above to configure Lua.')); return; }
+  const wrap = document.createElement('div'); wrap.className = 'route-table-wrap'; const table = document.createElement('table'); table.className = 'route-table'; const head = document.createElement('thead'); const headings = document.createElement('tr');
+  for (const label of ['Route', 'Match', 'Script phase', 'Script size', 'Action']) { const th = document.createElement('th'); copy(th, label); headings.append(th); } head.append(headings);
+  const body = document.createElement('tbody');
+  for (const { route, phase, label, bytes } of rows) { const row = document.createElement('tr'); row.dataset.luaRoute = route.id; row.dataset.luaPhase = phase;
+    for (const text of [route.id, `${routeMatch('http', route)} · ${route.path_prefix || '/'} · ${route.enabled === false ? t('Disabled') : t('Enabled')}`, t(label), t('{count} bytes', { count: bytes })]) { const td = document.createElement('td'); td.textContent = text; row.append(td); }
+    const action = document.createElement('td'); const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button button-secondary'; copy(edit, 'Edit'); edit.addEventListener('click', () => openLuaPolicy(route, phase)); action.append(edit); row.append(action); body.append(row);
+  }
+  table.append(head, body); wrap.append(table); root.append(wrap);
+}
+async function openLuaPolicy(route, phase) {
+  if (!state.token || !isAdmin() || state.view !== 'lua' || !LUA_PHASES.some(([key]) => key === phase)) return;
+  const generation = state.authGeneration; const token = state.token; const sequence = state.luaPolicySequence;
+  await openRoute('http', route, () => sequence === state.luaPolicySequence && state.view === 'lua' && isAdmin());
+  if (generation !== state.authGeneration || token !== state.token || sequence !== state.luaPolicySequence || state.view !== 'lua' || !isAdmin()) { return; }
+  const textarea = $('#route-form').elements[phase]; if (!textarea) return;
+  const panel = textarea.closest('details'); if (panel) panel.open = true;
+  if (phase !== 'lua') { const key = phase.replace('_lua', ''); const enabled = $('#route-form').elements[`${key}_enabled`]; if (!enabled.checked) { enabled.click(); for (const suffix of ['max_buffer_bytes', 'max_output_bytes']) { const control = $('#route-form').elements[`${key}_${suffix}`]; control.value = '16384'; control.dispatchEvent(new Event('input', { bubbles: true })); } } }
+  const content = textarea.closest('.field')?.querySelector('.cm-content'); if (content) { content.scrollIntoView({ block: 'center' }); content.focus(); }
+}
+
 function loadingNode(text) {
   const el = document.createElement('div'); el.className = 'loading-panel';
   const spinner = document.createElement('span'); spinner.className = 'spinner'; el.append(spinner, t(text)); return el;
@@ -1594,20 +1642,25 @@ async function setRouteEnabled(type, id, enabled, button) {
   } finally { setBusy(button, false); }
 }
 
-async function openRoute(type, route = null) {
+async function openRoute(type, route = null, isCurrent = () => true) {
+  const generation = state.authGeneration; const token = state.token;
+  const current = () => generation === state.authGeneration && token === state.token && Boolean(token) && isCurrent();
   let value = structuredClone(route || routeDefaults(type));
   let note = '';
   if (route?.id) {
     // The single-route endpoint returns the freshest document and revision ETag.
     try {
       const { data, etag } = await api(`/v1/routes/${type}/${encodeURIComponent(route.id)}`);
+      if (!current()) return;
       if (isObject(data)) value = data;
       if (etag) state.routeEtags[type] = etag;
     } catch (error) {
+      if (!current()) return;
       if (error.status === 401) return logout('Your session is no longer authorized.');
       note = `Showing the cached copy of this route; the server could not be asked for the latest version (${error.message}).`;
     }
   }
+  if (!current()) return;
   state.editing = { type, originalId: route?.id || null, value };
   delete $('#route-form').dataset.invalidNative;
   copy($('#route-dialog-eyebrow'), '{type} route', { type: type.toUpperCase() });
@@ -1624,7 +1677,7 @@ async function openRoute(type, route = null) {
   $('#route-dialog').showModal();
   mountLuaEditors();
   $('#route-form').scrollTop = 0;
-  setTimeout(() => $('[name="id"]', $('#route-form')).focus(), 0);
+  if (state.view !== 'lua') setTimeout(() => $('[name="id"]', $('#route-form')).focus(), 0);
 }
 
 function section({ title, note, open, configured, fields }) {
@@ -3231,7 +3284,7 @@ async function saveRoute(event) {
     const result = await api(path, { method: editing ? 'PUT' : 'POST', headers, json: route });
     if (result.etag) state.routeEtags[type] = result.etag;
     if (result.data?.revision !== undefined) setRevision(result.data.revision);
-    $('#route-dialog').close(); toast(t(editing ? '{id} updated.' : '{id} created.', { id: route.id || t('Route') })); await loadRoutes(type);
+    $('#route-dialog').close(); toast(t(editing ? '{id} updated.' : '{id} created.', { id: route.id || t('Route') })); await loadRoutes(type); if (state.view === 'lua' && isAdmin()) await loadLuaPolicies();
   } catch (error) {
     if (isRevisionConflict(error)) { message($('#route-message'), `${error.message === 'route id already exists' ? t('A route with this ID already exists.') : t('The configuration changed on the server. The latest routes were loaded; your edits remain here.')} ${t('Review and save again.')}`, 'error'); await refreshRoutesKeepingDialog(type); }
     else if (isIndeterminate(error)) message($('#route-message'), error.message, 'error', { label: t('Reload routes'), run: () => reloadRoutesAfterIndeterminate(type, route.id, editing) });
@@ -6346,6 +6399,8 @@ $('#cache-policy-template').addEventListener('click', cachePolicyTemplate);
 $('#apply-cache-policy').addEventListener('click', applyCachePolicy);
 $('#toggle-cache-policy').addEventListener('click', toggleCachePolicy);
 $('#purge-cache').addEventListener('click', purgeCache);
+$('#reload-lua-policies').addEventListener('click', loadLuaPolicies);
+$('#configure-lua-policy').addEventListener('click', () => { const route = state.luaPolicyRoutes.find(route => route.id === $('#lua-route-picker').value); if (route) openLuaPolicy(route, $('#lua-phase-picker').value); });
 $('#reload-certificates').addEventListener('click', () => {
   if (state.certificateDirty && !confirm('Discard the unsaved certificate paths and reload the active set?')) return;
   loadCertificates(true).catch((error) => showGlobalError(error.message));

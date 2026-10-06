@@ -50,6 +50,8 @@ No observation, or an observation older than 60 seconds, displays **Unknown**. T
 
 - [Domain response security](RESPONSE_SECURITY.md)
 
+The administrator console **Lua policies** menu lists HTTP route policy and request/response body Lua by phase, showing scope and script size without code contents. Select an existing route to configure a new script; edits use the existing code editor and revision-checked route save.
+
 ## Access control and identity
 
 - [Explicit HTTP access modes](ACCESS_POLICY.md) — access policy modes
