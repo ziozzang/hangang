@@ -2123,6 +2123,35 @@
       "GeoIpStatus": {"type":"object","additionalProperties":false,"required":["scope","revision","configured","ready","error_code","checked_at_unix_ms","database"],"properties":{"scope":{"const":"instance"},"revision":{"type":"integer","minimum":0},"configured":{"type":"boolean"},"ready":{"type":"boolean"},"error_code":{"anyOf":[{"type":"string"},{"type":"null"}]},"checked_at_unix_ms":{"anyOf":[{"type":"integer","minimum":0},{"type":"null"}]},"database":{"anyOf":[{"$ref":"#/components/schemas/GeoIpDatabaseMetadata"},{"type":"null"}]}},"description":"A concurrent node-local observation. Pending configured slots can have ready false with null error/timestamp. Metadata can describe an expired loaded database with ready false; metadata presence alone is not readiness."},
       "GeoIpLookup": {"type":"object","additionalProperties":false,"required":["ip","country","revision"],"properties":{"ip":{"type":"string","maxLength":45},"country":{"anyOf":[{"type":"string","pattern":"^[A-Z]{2}$"},{"type":"null"}]},"revision":{"type":"integer","minimum":0}}},
       "GeoIpSource": {"type":"object","additionalProperties":false,"required":["file"],"properties":{"file":{"type":"string","pattern":"^/","description":"Normalized absolute UTF-8 node-local path; no NUL, dot or parent components. Provision the MMDB independently on each node."},"max_file_bytes":{"type":"integer","minimum":1,"maximum":67108864,"default":33554432},"max_age_days":{"type":"integer","minimum":1,"maximum":90,"default":14},"reload_interval_seconds":{"type":"integer","minimum":1,"maximum":3600,"default":30}},"description":"Dynamic node-local GeoIP2-Country or GeoLite2-Country MMDB with IPv6 format (also supports IPv4). Configuration validation is structural; new runtime slots remain pending until post-publication file verification succeeds. Invalid reload removes availability. File size does not bound total verifier memory."},
+      "AcmeHttp01": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "backend"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "description": "Canonical docker://container/network/port or http://host[:port] root origin (empty or / path). Credentials, queries, fragments and HTTPS are rejected."
+          },
+          "listener_ids": {
+            "type": "array",
+            "maxItems": 64,
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "description": "Optional existing public listener IDs, a subset of the owning route listener coverage. Empty uses that route coverage; an unscoped route covers only default."
+          }
+        },
+        "description": "Exact host or exact domain-alias public-listener routes only; no host regex or globs. Owning routes cannot configure deny_cidrs, country_policy, resource_policy or workload_auth; ordinary auth/basic/JWT and TLS/canonical redirects remain allowed with this explicit narrow challenge exception. Global URL security still applies. Selects raw GET /.well-known/acme-challenge/{token}, with a 1–256 byte base64url token and no query, request body, upgrade or trailers. Runs after global URL security and before ordinary route path/JSON/auth/TLS redirects. Shared admission is 64 concurrent requests and 100 TPS with burst 100; complete issuer responses are bounded to 2 seconds and 4 KiB. Only a valid 200 key authorization (token + dot + 43-character base64url thumbprint) or 404 is returned; other failures are opaque 503. Issuer response headers and error bodies are not forwarded. Certificate issuance remains external."
+      },
       "CanonicalDomainRedirect": {
         "type": "object",
         "additionalProperties": false,
@@ -3489,6 +3518,11 @@
               "maxLength": 255
             },
             "description": "Alternative case-insensitive Host patterns for a single route sharing its upstreams, policy, balancing and metrics. Matches when any alias matches. Supports the same label-local glob syntax as host; conflicts with host and host_regex. Duplicates are rejected case-insensitively. Omitted from serialized routes when empty. HTTP route priority and configuration order still decide between different routes."
+          },
+          "acme_http01": {
+            "anyOf": [{"$ref": "#/components/schemas/AcmeHttp01"}, {"type": "null"}],
+            "default": null,
+            "description": "Optional HTTP-01 forwarding attached to this exact-domain route, without standalone ACME routes. Only narrow bodyless GET token requests reach the external issuer; ordinary application traffic keeps its route policy and backends."
           },
           "canonical_domain": {
             "anyOf": [

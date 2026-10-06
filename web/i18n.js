@@ -72,7 +72,20 @@ const urlDefenseKorean = {
   "allow_countries must contain at most 256 unique uppercase two-letter country codes.": "allow_countries에는 서로 다른 대문자 두 글자 국가 코드를 최대 256개 입력하세요.",
   "Configure at least one allowed CIDR or country.": "허용할 CIDR 또는 국가를 하나 이상 설정하세요.",
   "Attribution": "출처",
-  "IP Geolocation by DB-IP": "GeoIP 데이터: DB-IP"
+  "IP Geolocation by DB-IP": "GeoIP 데이터: DB-IP",
+  "ACME HTTP-01 forwarding": "ACME HTTP-01 전달",
+  "Use this domain route for HTTP-01 tokens without a separate challenge route. The external issuer still manages certificates; only the narrow GET challenge path is forwarded.": "별도 챌린지 라우트 없이 이 도메인 라우트로 HTTP-01 토큰을 전달합니다. 인증서는 외부 발급 서버가 계속 관리하며 제한된 GET 챌린지 경로만 전달합니다.",
+  "Forward HTTP-01 challenges": "HTTP-01 챌린지 전달",
+  "Unchecked removes forwarding. Requires exact domain hosts; wildcard and regular-expression host routes are not supported.": "선택을 해제하면 전달 설정을 제거합니다. 정확한 도메인 호스트가 필요하며 와일드카드·정규식 호스트 라우트는 지원하지 않습니다.",
+  "HTTP-01 issuer backend": "HTTP-01 발급 서버 백엔드",
+  "http://host[:port] with only a root path, or docker://container/network/port. No credentials, query or fragment. Ordinary application traffic keeps its existing backends.": "루트 경로만 있는 http://host[:port] 또는 docker://container/network/port를 사용합니다. 자격 증명·쿼리·fragment는 허용하지 않습니다. 일반 애플리케이션 요청은 기존 백엔드를 사용합니다.",
+  "HTTP-01 listener IDs": "HTTP-01 리스너 ID",
+  "Optional: one public listener ID per line, at most 64. Must be a subset of this route’s listener coverage. Blank follows the domain route; no standalone ACME rows are created.": "선택 사항이며 공개 리스너 ID를 한 줄에 하나씩 최대 64개 입력합니다. 이 라우트에 포함된 리스너만 사용할 수 있습니다. 비우면 도메인 라우트의 리스너를 따르며 별도 ACME 행을 만들지 않습니다.",
+  "HTTP-01 settings must be an object.": "HTTP-01 설정은 객체여야 합니다.",
+  "HTTP-01 forwarding requires exact domain hosts without globs or regular expressions.": "HTTP-01 전달에는 glob·정규식이 없는 정확한 도메인 호스트가 필요합니다.",
+  "Use an HTTP root origin or canonical Docker reference for the HTTP-01 issuer, without credentials, query or fragment.": "HTTP-01 발급 서버에는 자격 증명·쿼리·fragment가 없는 HTTP 루트 주소 또는 정규 Docker 참조를 사용하세요.",
+  "HTTP-01 listener IDs must be distinct members of this route’s public listener coverage, at most 64.": "HTTP-01 리스너 ID는 이 라우트의 공개 리스너에 포함되어야 하며 중복 없이 최대 64개입니다.",
+  "HTTP-01 forwarding cannot be combined with route CIDR denials, country, resource or workload policies. Global URL security still applies.": "HTTP-01 전달은 라우트의 CIDR 거부·국가·리소스·워크로드 정책과 함께 사용할 수 없습니다. 전역 URL 보안은 계속 적용됩니다."
 };
 const korean = { ...koStatic, ...koApp, ...koConsole, ...koOperations, ...koDocker, ...urlDefenseKorean };
 

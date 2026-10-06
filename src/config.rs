@@ -259,6 +259,8 @@ fn is_legacy_access_mode(mode: &AccessMode) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct HttpRoute {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_http01: Option<crate::acme_http01::Config>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listener_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_legacy_access_mode")]
@@ -570,6 +572,7 @@ impl Config {
         use anyhow::{Context, bail, ensure};
         use std::collections::HashSet;
         self.settings.validate()?;
+        crate::acme_http01::validate(self)?;
         ensure!(
             self.settings
                 .path_allowlists

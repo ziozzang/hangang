@@ -208,3 +208,52 @@ There is no issuer election: the lock holder is whichever instance took the lock
 The standalone `hangang-acme-issuer` keeps the same Cloudflare provider and its pending cleanup receipts across retries while its configuration is unchanged. If Cloudflare rejects a repeated TXT presentation with HTTP 400 after a process restart, the issuer queries that exact challenge name and key-authorization value. It adopts a receipt only when exactly one matching record exists, then verifies the record again before deletion. It never deletes an unrelated TXT record based on its name alone. Issuance logs show the authorization identifier, challenge type, presentation, propagation, readiness, certificate receipt, cleanup completion, and a bounded retry delay; they omit challenge values, credentials, private keys, and ACME authorization URLs.
 
 Cleanup receipts are not durable across a crash. If the CA gives the restarted issuer a **different** authorization value, a TXT record left by the crashed attempt cannot be proven to belong to the new attempt and is not automatically deleted. Operators should inspect the DNS provider's record metadata and remove only records they can independently attribute to that issuer. Avoid concurrent issuers for the same account and zone. Credential file replacement alone does not change a cached provider during an active retry sequence; replace the issuer configuration to reload the provider, after the previous attempt has ended.
+
+## HTTP-01 on the domain route
+
+For a separate HTTP-01 issuer, attach `acme_http01` to the existing domain route
+instead of creating a second route for `/.well-known/acme-challenge/`:
+
+```json
+{
+  "acme_http01": {
+    "backend": "http://issuer.internal:8081",
+    "listener_ids": ["default", "public-https"]
+  }
+}
+```
+
+The administrator editor keeps this service binding with the application's
+normal route. Exact domain names are required; wildcard and regex selectors cannot
+claim this exception. The optional listener list must be within that route's
+listener coverage; an empty list uses its coverage. The external issuer and its
+private account/certificate directories keep their existing lifecycle.
+
+The gateway handles only a bodyless GET with an exact ASCII base64url token and
+no query. It forwards a fresh request containing the actual requested Host, never
+application cookies, authorization, forwarding headers or a request body. Active
+challenge responses are bounded plain text; missing tokens return an ordinary
+404. Issuer cookies, redirects, internal headers and error bodies are discarded.
+The handler bypasses application authentication and HTTPS/canonical redirects
+only for this narrow configured challenge path. Global URL blocks, allowlists,
+rate limits and IP bans still apply; policies covering the challenge path can
+prevent certificate validation. Other URLs retain ordinary application behavior.
+
+Admission is limited to 64 concurrent delegated requests and 100 requests per
+second with a burst of 100 per gateway process. Responses are limited to 4 KiB,
+and a two-second deadline covers connection and response handling independently
+of application upstream timeouts. Default public responses
+do not identify Hangang or the private issuer. Debugging does not enable token
+or credential logging. After validating the domain service binding, remove the
+legacy challenge routes with the administrator API and its current revision.
+
+A binding is rejected when its owning route also uses `deny_cidrs`,
+`country_policy`, `resource_policy` or `workload_auth`; this prevents a hidden
+exception to those route policies. Apply explicit URL security settings when
+you need admission controls on the challenge service.
+
+Hostname resolution uses at most four native DNS workers. A canceled or timed-out
+request leaves that worker slot occupied until the actual resolver finishes;
+IP addresses and resolved Docker endpoints avoid those workers. Docker endpoint
+withdrawal is checked again after response waits. Workload listeners cannot
+enter the public HTTP-01 exception.

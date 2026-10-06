@@ -6,6 +6,9 @@
 
 ## 0.2.2 — 2026-10-06
 
+- Manage HTTP-01 challenge delegation on the existing domain route, with bounded
+  work and responses that omit issuer metadata and application credentials.
+
 - Add an offline, policy-aware migration tool for consolidating legacy listener
   copies into one route; keep distinct URL policies and conflicting routes separate.
 

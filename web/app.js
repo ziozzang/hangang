@@ -2017,6 +2017,18 @@ function canonicalDomainSection(route) {
     ] });
 }
 
+function acmeHttp01Section(route) {
+  const configured = isObject(route.acme_http01);
+  const value = configured ? route.acme_http01 : {};
+  return section({ title: 'ACME HTTP-01 forwarding', configured,
+    note: 'Use this domain route for HTTP-01 tokens without a separate challenge route. The external issuer still manages certificates; only the narrow GET challenge path is forwarded.',
+    fields: [
+      span2(field('Forward HTTP-01 challenges', 'acme_http01_enabled', configured, { checkbox: true, toggles: 'acme_http01', help: 'Unchecked removes forwarding. Requires exact domain hosts; wildcard and regular-expression host routes are not supported.' })),
+      span2(field('HTTP-01 issuer backend', 'acme_http01_backend', value.backend || '', { group: 'acme_http01', placeholder: 'docker://acme-issuer/edge/8080', maxlength: 2048, help: 'http://host[:port] with only a root path, or docker://container/network/port. No credentials, query or fragment. Ordinary application traffic keeps its existing backends.' })),
+      span2(field('HTTP-01 listener IDs', 'acme_http01_listener_ids', (value.listener_ids || []).join('\n'), { group: 'acme_http01', textarea: true, help: 'Optional: one public listener ID per line, at most 64. Must be a subset of this route’s listener coverage. Blank follows the domain route; no standalone ACME rows are created.' })),
+    ] });
+}
+
 function httpSections(route) {
   const editing = Boolean(state.editing.originalId);
   const auth = isObject(route.auth) ? route.auth : null;
@@ -2040,6 +2052,7 @@ function httpSections(route) {
       span2(field('Require TLS', 'require_tls', Boolean(route.require_tls), { checkbox: true, help: 'Plaintext requests (by terminated transport or, behind a trusted proxy, X-Forwarded-Proto) are answered with the HTTPS redirect configured by --https-redirect-code instead of being proxied.' })),
     ] }),
     canonicalDomainSection(route),
+    acmeHttp01Section(route),
     section({ title: 'Backends', open: true, fields: [
       backendFields('http', route),
       field('Upstream Host override', 'upstream_host', route.upstream_host || '', { placeholder: 'foo.bar', help: 'HTTP Host / HTTP/2 authority sent upstream; TLS SNI is configured under Upstream connection.' }),
@@ -2550,6 +2563,31 @@ function routeFromForm() {
       if (new Set(route.hosts.map(host => host.toLowerCase())).size !== route.hosts.length) throw new Error(t('Domain group hosts must be distinct, ignoring case'));
     }
     if (hostMode === 'regex' && !route.host_regex?.trim()) throw new Error(t('Enter a host regular expression'));
+    if (route.acme_http01 !== null && route.acme_http01 !== undefined && !isObject(route.acme_http01))
+      throw new Error(t('HTTP-01 settings must be an object.'));
+    if (checked('acme_http01_enabled')) {
+      const hosts = route.hosts?.length ? route.hosts : route.host ? [route.host] : [];
+      if (route.host_regex || !hosts.length || hosts.some(host => /[?*]/.test(host)))
+        throw new Error(t('HTTP-01 forwarding requires exact domain hosts without globs or regular expressions.'));
+      const backend = text('acme_http01_backend');
+      let valid = false;
+      if (backend.startsWith('docker://')) {
+        const parts = backend.slice(9).split('/');
+        valid = parts.length === 3 && parts.slice(0, 2).every(part => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$(?![\s\S])/.test(part)) &&
+          /^[1-9]\d{0,4}$(?![\s\S])/.test(parts[2]) && Number(parts[2]) <= 65535;
+      } else if (/^http:\/\/[^/?#\s@]+\/?$(?![\s\S])/.test(backend)) {
+        try { const url = new URL(backend); valid = url.protocol === 'http:' && !!url.hostname && !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash; } catch { /* invalid origin */ }
+      }
+      if (!valid || new TextEncoder().encode(backend).length > 2048)
+        throw new Error(t('Use an HTTP root origin or canonical Docker reference for the HTTP-01 issuer, without credentials, query or fragment.'));
+      const listenerIds = lines('acme_http01_listener_ids');
+      const coverage = route.listener_ids?.length ? route.listener_ids : ['default'];
+      if (listenerIds.length > 64 || new Set(listenerIds).size !== listenerIds.length || listenerIds.some(id => !/^[A-Za-z0-9._-]{1,64}$(?![\s\S])/.test(id) || !coverage.includes(id)))
+        throw new Error(t('HTTP-01 listener IDs must be distinct members of this route’s public listener coverage, at most 64.'));
+      route.acme_http01 = { ...(isObject(route.acme_http01) ? route.acme_http01 : {}), backend };
+      if (listenerIds.length) route.acme_http01.listener_ids = listenerIds;
+      else delete route.acme_http01.listener_ids;
+    } else delete route.acme_http01;
     if (checked('canonical_configured')) {
       const previous = isObject(route.canonical_domain) ? route.canonical_domain : {};
       const host = text('canonical_host').toLowerCase();
@@ -2885,6 +2923,8 @@ function routeFromForm() {
         handshake_timeout_ms: integer('inbound_tls_handshake_timeout_ms', 'Inbound TLS handshake timeout', { min: 1, max: 10000 }) };
     } else if (Object.hasOwn(route, 'inbound_tls')) route.inbound_tls = null;
   }
+  if (type === 'http' && route.acme_http01 && (route.deny_cidrs?.length || route.country_policy || route.resource_policy || route.workload_auth))
+    throw new Error(t('HTTP-01 forwarding cannot be combined with route CIDR denials, country, resource or workload policies. Global URL security still applies.'));
   return route;
 }
 function syncRouteJsonFromForm() {
@@ -2907,6 +2947,12 @@ function syncRouteControlsFromJson() {
   const form = $('#route-form');
   if (form.elements['access_mode'] && (draft.access_mode === undefined || typeof draft.access_mode === 'string'))
     form.elements['access_mode'].value = draft.access_mode || 'legacy';
+  if (form.elements.acme_http01_enabled && (draft.acme_http01 === null || draft.acme_http01 === undefined || isObject(draft.acme_http01))) {
+    const challenge = isObject(draft.acme_http01) ? draft.acme_http01 : null;
+    form.elements.acme_http01_enabled.checked = Boolean(challenge);
+    form.elements.acme_http01_backend.value = challenge?.backend ?? '';
+    form.elements.acme_http01_listener_ids.value = Array.isArray(challenge?.listener_ids) ? challenge.listener_ids.join('\n') : '';
+  }
   // Authorization is a single native editing unit. A JSON switch from Basic
   // to JWT (or a JWT plus external auth) must survive the next native edit.
   if (form.elements['basic_auth_credentials'] && (draft.basic_auth === null || draft.basic_auth === undefined || isObject(draft.basic_auth))) {

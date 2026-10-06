@@ -225,6 +225,15 @@ impl Discovery {
                 references.entry(backend.to_owned()).or_insert(reference);
             }
         }
+        for route in config.http.iter().filter(|route| route.enabled) {
+            if let Some(service) = &route.acme_http01
+                && let Some(reference) = parse_reference(&service.backend)?
+            {
+                references
+                    .entry(service.backend.clone())
+                    .or_insert(reference);
+            }
+        }
         if references.is_empty() {
             self.publish(generation, HashMap::new());
             return Ok(());

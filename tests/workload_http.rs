@@ -37,6 +37,47 @@ use tokio_util::sync::CancellationToken;
 const GOOD_ID: &str = "spiffe://example.org/ns/test/sa/allowed";
 const OTHER_ID: &str = "spiffe://example.org/ns/test/sa/other";
 
+#[tokio::test]
+async fn workload_evidence_cannot_use_a_default_public_acme_binding() {
+    let material = material();
+    let (backend, _, backend_task) = origin().await;
+    let (issuer, issuer_seen, issuer_task) = origin().await;
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let mut document = config(listen, backend, &material);
+    document.http.push(
+        serde_json::from_value(serde_json::json!({
+            "id":"public-domain","host":"private.test","backends":[format!("http://{backend}")],
+            "acme_http01":{"backend":format!("http://{issuer}")}
+        }))
+        .unwrap(),
+    );
+    let running = start(document, bound).await;
+    let good = connector(&material, Some(&material.good));
+    let socket = TcpStream::connect(listen).await.unwrap();
+    let mut tls = good
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    tls.write_all(b"GET /.well-known/acme-challenge/owned_01 HTTP/1.1\r\nHost: private.test\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut reply))
+        .await
+        .unwrap();
+    let response = String::from_utf8(reply).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 404") || response.starts_with("HTTP/1.1 403"),
+        "{response}"
+    );
+    assert!(
+        issuer_seen.lock().unwrap().is_empty(),
+        "authenticated workload reached a public/default ACME service"
+    );
+    running.shutdown().await;
+    backend_task.abort();
+    issuer_task.abort();
+}
+
 struct Material {
     _dir: tempfile::TempDir,
     server_cert: PathBuf,

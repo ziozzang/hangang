@@ -35,6 +35,364 @@ struct Seen {
 }
 
 #[tokio::test]
+async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = listener.local_addr().unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let issuer_task = tokio::spawn({
+        let received = received.clone();
+        async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let received = received.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let received = received.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            let bytes = body.collect().await.unwrap().to_bytes();
+                            let token = parts.uri.path().rsplit('/').next().unwrap().to_owned();
+                            received
+                                .lock()
+                                .unwrap()
+                                .push((parts.uri, parts.headers, bytes));
+                            let status = if token == "unknown" { 404 } else { 200 };
+                            let content = if token == "large" {
+                                Bytes::from(vec![b'x'; 5000])
+                            } else if token == "bad" {
+                                Bytes::from_static(b"invalid key authorization")
+                            } else if token == "unknown" {
+                                Bytes::from_static(b"private issuer error metadata")
+                            } else {
+                                Bytes::from(format!("{token}.{}", "A".repeat(43)))
+                            };
+                            let body: http_body_util::combinators::UnsyncBoxBody<
+                                Bytes,
+                                Infallible,
+                            > = if token == "slow" {
+                                http_body_util::StreamBody::new(futures_util::stream::once(
+                                    async move {
+                                        tokio::time::sleep(Duration::from_millis(2300)).await;
+                                        Ok::<_, Infallible>(hyper::body::Frame::data(content))
+                                    },
+                                ))
+                                .boxed_unsync()
+                            } else {
+                                Full::new(content).boxed_unsync()
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .header("set-cookie", "issuer-secret=value")
+                                    .header("location", "http://private-issuer/")
+                                    .header("x-hangang-gateway", "private-issuer")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        }
+    });
+    let (app, app_seen, app_task) = upstream("application").await;
+    let mut r = route(vec![format!("http://{app}")]);
+    r.hosts = vec!["example.test".into(), "www.example.test".into()];
+    r.path_prefix = Some("/app".into());
+    r.require_tls = true;
+    r.basic_auth = Some(hangang::config::BasicAuth {
+        realm: "restricted".into(),
+        credentials: vec![basic_credential("alice", "password")],
+        hide_credentials: true,
+        accept_proxy_authorization: false,
+        identity_header: None,
+    });
+    r.canonical_domain = Some(hangang::config::CanonicalDomain {
+        enabled: true,
+        host: "example.test".into(),
+        scheme: hangang::config::CanonicalScheme::Https,
+        status: 308,
+        path_prefixes: vec!["/".into()],
+        exclude_path_prefixes: vec![],
+        methods: vec!["GET".into(), "HEAD".into()],
+    });
+    r.acme_http01 = Some(hangang::acme_http01::Config {
+        backend: format!("http://{issuer}"),
+        listener_ids: vec![],
+    });
+    let ((proxy, policy), active) = proxy_with_settings(vec![r], Default::default());
+    let history = Arc::new(TrafficHistory::default());
+    let (front, front_task, _) = frontend(proxy.with_traffic_history(history.clone())).await;
+    let send = |method: &str, path: &str, host: &str, body: &'static str| {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("http://{front}{path}"))
+            .header("host", host)
+            .header("authorization", "Bearer do-not-forward")
+            .header("cookie", "secret=do-not-forward")
+            .header("x-forwarded-for", "198.51.100.7")
+            .body(Full::new(Bytes::from_static(body.as_bytes())))
+            .unwrap();
+        async move { client().request(request).await.unwrap() }
+    };
+    let reply = send(
+        "GET",
+        "/.well-known/acme-challenge/owned_01",
+        "www.example.test:80",
+        "",
+    )
+    .await;
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.headers()["cache-control"], "no-store");
+    for name in ["set-cookie", "location", "x-hangang-gateway"] {
+        assert!(!reply.headers().contains_key(name));
+    }
+    assert_eq!(
+        reply.into_body().collect().await.unwrap().to_bytes(),
+        format!("owned_01.{}", "A".repeat(43))
+    );
+    {
+        let recorded = received.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1["host"], "www.example.test:80");
+        assert!(recorded[0].2.is_empty());
+        for name in ["authorization", "cookie", "x-forwarded-for"] {
+            assert!(!recorded[0].1.contains_key(name));
+        }
+        assert!(recorded[0].0.query().is_none());
+    }
+    for (method, path, host, body, status) in [
+        (
+            "POST",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            "",
+            404,
+        ),
+        (
+            "GET",
+            "/.well-known/acme-challenge/owned%5f01",
+            "example.test",
+            "",
+            400,
+        ),
+        (
+            "GET",
+            "/.well-known/%61cme-challenge/owned_01",
+            "example.test",
+            "",
+            400,
+        ),
+        (
+            "GET",
+            "/.well-known/acme-challenge/owned_01?secret=x",
+            "example.test",
+            "",
+            400,
+        ),
+        (
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            "payload",
+            400,
+        ),
+        (
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "other.example",
+            "",
+            404,
+        ),
+    ] {
+        let reply = send(method, path, host, body).await;
+        assert_eq!(reply.status(), status, "{path}");
+        reply.into_body().collect().await.unwrap();
+    }
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "invalid requests contacted issuer"
+    );
+    for (token, status) in [
+        ("unknown", 404),
+        ("bad", 503),
+        ("large", 503),
+        ("slow", 503),
+    ] {
+        let path = format!("/.well-known/acme-challenge/{token}");
+        let reply = tokio::time::timeout(
+            Duration::from_millis(2200),
+            send("GET", &path, "example.test", ""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), status, "{token}");
+        for name in ["set-cookie", "location", "x-hangang-gateway"] {
+            assert!(!reply.headers().contains_key(name));
+        }
+        let body = reply.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.len() < 32);
+        assert!(!String::from_utf8_lossy(&body).contains("issuer"));
+    }
+    assert_eq!(
+        send("GET", "/app", "www.example.test", "").await.status(),
+        308
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].require_tls = false;
+    config.http[0].canonical_domain = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send("GET", "/app", "example.test", "").await.status(),
+        401,
+        "normal path bypassed authentication"
+    );
+    assert!(app_seen.lock().unwrap().is_empty());
+    let records = history.snapshot_since(None, 100).records;
+    assert!(
+        records
+            .iter()
+            .any(|row| row.path == "/.well-known/acme-challenge/_redacted")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|row| row.path.contains("owned_01") || row.path.contains("secret=")),
+        "challenge tokens or query leaked into telemetry"
+    );
+    let before = received.lock().unwrap().len();
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_blocks = Some(vec![hangang::path_blocks::Rule {
+        path: "/.well-known/acme-challenge".into(),
+        hosts: vec![],
+    }]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        404
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before,
+        "global block bypassed"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_blocks = None;
+    config.settings.path_allowlists = Some(vec![hangang::path_allowlists::Rule {
+        path: "/.well-known/acme-challenge".into(),
+        hosts: vec![],
+        include_subpaths: true,
+        allow_cidrs: vec!["203.0.113.0/24".parse().unwrap()],
+        allow_countries: vec![],
+    }]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        403
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before,
+        "global allowlist bypassed"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_allowlists = None;
+    config.settings.path_rate_limits = Some(vec![hangang::path_rate_limits::Rule {
+        path: "/.well-known/acme-challenge".into(),
+        include_subpaths: true,
+        hosts: vec![],
+        tps: Some(1),
+        burst: 1,
+        limits: vec![],
+    }]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        429
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before + 1,
+        "global URL budget bypassed"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_rate_limits = None;
+    config.settings.failure_ban_scope = Some(hangang::path_failure_bans::Scope::Global);
+    config.settings.path_failure_bans = Some(vec![hangang::path_failure_bans::Rule {
+        path: "/app".into(),
+        include_subpaths: false,
+        hosts: vec![],
+        failures: 1,
+        window_seconds: 60,
+        ban_seconds: 60,
+        statuses: vec![401],
+    }]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(send("GET", "/app", "example.test", "").await.status(), 401);
+    assert_eq!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        429
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        before + 1,
+        "global ban bypassed"
+    );
+    front_task.abort();
+    issuer_task.abort();
+    app_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn global_failure_ban_crosses_hosts_and_health_without_trusting_client_ip_spoofs() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = listener.local_addr().unwrap();
@@ -684,6 +1042,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         id: "route".into(),
         host: None,
         hosts: Vec::new(),
+        acme_http01: None,
         canonical_domain: None,
         path_prefix: None,
         path_match: Default::default(),

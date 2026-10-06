@@ -107,3 +107,50 @@ record는 10분 수명으로 게시하고 token이 설치된 동안 절반 시�
 standalone `hangang-acme-issuer`는 설정이 같은 동안 Cloudflare provider와 pending cleanup receipt를 retry 사이에 유지합니다. restart 뒤 Cloudflare가 같은 TXT presentation을 HTTP 400으로 거부하면 정확한 challenge name과 key-authorization value를 조회합니다. 일치 record가 정확히 하나일 때만 receipt를 adopt하고 삭제 전에 다시 확인합니다. 이름만으로 무관한 TXT를 삭제하지 않습니다. log에는 authorization ID, challenge type, presentation, propagation, readiness, certificate receipt, cleanup 완료, 제한 retry delay를 남기되 challenge value, credential, private key, ACME authorization URL은 남기지 않습니다.
 
 cleanup receipt는 crash 뒤 영속적이지 않습니다. 재시작한 issuer에 CA가 다른 authorization value를 주면 이전 TXT가 새 시도 소유임을 증명할 수 없어 자동 삭제하지 않습니다. 운영자는 provider metadata를 검사해 독립적으로 귀속할 수 있는 record만 제거해야 합니다. 같은 account와 zone에 동시 issuer를 피하십시오. credential file만 교체해도 active retry의 cached provider는 바뀌지 않으므로 이전 시도가 끝난 뒤 issuer 설정을 교체해 provider를 reload하십시오.
+
+## HTTP-01 on the domain route
+
+HTTP-01 발급기를 별도 운영한다면 `/.well-known/acme-challenge/`용 라우트를
+추가하지 말고 기존 도메인 라우트에 `acme_http01`을 붙입니다.
+
+```json
+{
+  "acme_http01": {
+    "backend": "http://issuer.internal:8081",
+    "listener_ids": ["default", "public-https"]
+  }
+}
+```
+
+관리자 편집기는 일반 애플리케이션 라우트 안에서 이 서비스 연결을 관리합니다.
+정확한 도메인 이름만 허용하며 wildcard나 regex 선택자는 이 예외를 사용할 수
+없습니다. 선택적인 listener 목록은 원래 라우트의 범위 안에 있어야 하며, 빈
+목록은 원래 범위를 사용합니다. 외부 발급기와 비공개 계정·인증서 디렉터리는
+기존 수명주기를 유지합니다.
+
+gateway는 본문 없는 GET, 정확한 ASCII base64url token, query 없는 요청만
+처리합니다. 실제 요청 Host만 담은 새 요청을 보내며 애플리케이션 cookie,
+authorization, forwarding header, 요청 본문을 전달하지 않습니다. 활성 challenge
+응답은 제한된 일반 텍스트이고 없는 token은 일반 404입니다. 발급기의 cookie,
+redirect, 내부 header, 오류 본문은 버립니다. 이 좁은 설정 경로에서만
+애플리케이션 인증과 HTTPS·canonical redirect를 건너뜁니다. 전역 URL 차단,
+화이트리스트, 사용량 제한, IP 차단은 계속 적용되므로 challenge 경로까지
+포함하는 정책은 인증서 검증을 막을 수 있습니다. 다른 URL은 기존 동작을 유지합니다.
+
+gateway process마다 동시 요청 64개, 초당 100개와 burst 100개로 조회량을
+제한합니다. 응답은 4 KiB까지이며 연결과 응답 처리를 합쳐 2초 안에 끝내야
+합니다. 애플리케이션 upstream timeout과 별개입니다. 기본 공개 응답에는 Hangang이나 비공개 발급기를 식별하는
+정보를 넣지 않습니다. 디버그를 켜도 token이나 자격 증명을 기록하지 않습니다.
+도메인 서비스 연결을 검증한 뒤 최신 revision을 사용하는 관리자 API로 예전
+challenge 라우트를 제거합니다.
+
+소유 라우트가 `deny_cidrs`, `country_policy`, `resource_policy`,
+`workload_auth`를 함께 사용하면 연결을 거부합니다. 해당 라우트 정책에
+숨은 예외를 만들지 않기 위한 제한입니다. challenge 서비스에 입장 제어가
+필요하면 명시적인 URL 보안 설정을 사용합니다.
+
+호스트 이름 조회는 native DNS worker를 최대 네 개 사용합니다. 요청이 취소되거나
+timeout이 나도 실제 조회가 끝날 때까지 worker 슬롯을 유지합니다. IP 주소와
+해석된 Docker endpoint는 해당 worker를 사용하지 않습니다. 응답을 기다린
+뒤에도 Docker endpoint 철회를 다시 확인하며, workload listener는 공개
+HTTP-01 예외에 들어갈 수 없습니다.

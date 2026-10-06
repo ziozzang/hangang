@@ -126,6 +126,7 @@ fn security_denied(status: u16) -> Response<Body> {
 
 #[derive(Clone)]
 pub struct Proxy {
+    acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
     policy: Arc<PolicyPool>,
     metrics: Arc<Metrics>,
@@ -220,7 +221,11 @@ impl TrafficContext {
             peer_port: peer.port(),
             client_ip: peer.ip(),
             method: request.method().clone(),
-            uri: request.uri().clone(),
+            uri: if crate::acme_http01::shaped(request.uri().path()) {
+                Uri::from_static("/.well-known/acme-challenge/_redacted")
+            } else {
+                request.uri().clone()
+            },
             route_id: None,
             listener,
             protocol: if request.version() == Version::HTTP_2 {
@@ -489,6 +494,7 @@ impl Proxy {
         );
         Self {
             active,
+            acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
             metrics,
             traffic: None,
@@ -1425,6 +1431,16 @@ impl Proxy {
                 hyper::header::HeaderValue::from_static("no-store"),
             );
             return Ok(denied);
+        }
+        if let Some(reply) = crate::acme_http01::serve(
+            &snapshot.http,
+            &request,
+            self.discovery.load_full(),
+            &self.acme_http01,
+        )
+        .await
+        {
+            return Ok(reply);
         }
         let connection_lease = request
             .extensions()
@@ -3962,6 +3978,7 @@ mod tests {
             id: "test".into(),
             host: None,
             hosts: Vec::new(),
+            acme_http01: None,
             canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),

@@ -1271,7 +1271,7 @@ async fn withdraw_acknowledged(
         )),
     }
 }
-fn valid_token(token: &str) -> bool {
+pub(crate) fn valid_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 256
         && token

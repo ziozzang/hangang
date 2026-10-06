@@ -31,6 +31,139 @@ struct Container {
     ip: String,
 }
 
+#[tokio::test]
+async fn automatic_http01_docker_retirement_fences_delayed_heads_bodies_and_missing_tokens() {
+    use http_body_util::BodyExt;
+    use hyper_util::rt::TokioExecutor;
+    for phase in ["head", "body", "missing"] {
+        let docker = FakeDocker::start(Duration::ZERO).await;
+        docker.set("issuer", true, "127.0.0.1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = listener.local_addr().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let issuer_task = tokio::spawn({
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service_fn(move |_: Request<hyper::body::Incoming>| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        let payload = Bytes::from(format!("owned_01.{}", "A".repeat(43)));
+                        let body: http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible> =
+                            if phase == "body" {
+                                http_body_util::StreamBody::new(futures_util::stream::once(
+                                    async move {
+                                        started.notify_one();
+                                        release.notified().await;
+                                        Ok::<_, Infallible>(hyper::body::Frame::data(payload))
+                                    },
+                                ))
+                                .boxed_unsync()
+                            } else {
+                                started.notify_one();
+                                release.notified().await;
+                                Full::new(payload).boxed_unsync()
+                            };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(if phase == "missing" { 404 } else { 200 })
+                                .body(body)
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let reference = format!("docker://issuer/edge/{}", issuer.port());
+        let document: Config = serde_json::from_value(serde_json::json!({"revision":1,"http":[{
+            "id":"domain","host":"owned.test","path_prefix":"/application",
+            "backends":["http://127.0.0.1:9"],"acme_http01":{"backend":reference}
+        }],"tcp":[]}))
+        .unwrap();
+        let discovery = Arc::new(Discovery::new(Some(Arc::new(DockerResolver::new(
+            docker.socket.clone(),
+        )))));
+        discovery.refresh(&document).await.unwrap();
+        assert!(
+            discovery.resolve(&reference, Protocol::Http).is_some(),
+            "delegated backend omitted from discovery"
+        );
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(document.clone()).unwrap(),
+        ));
+        let policy = Arc::new(hangang::policy::PolicyPool::new(
+            std::env::current_exe().unwrap(),
+            1,
+        ));
+        let proxy = Arc::new(
+            hangang::proxy::Proxy::new(
+                active,
+                policy.clone(),
+                Arc::new(hangang::metrics::Metrics::default()),
+            )
+            .with_discovery(discovery.clone()),
+        );
+        let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = front_listener.local_addr().unwrap();
+        let front_task = tokio::spawn({
+            let proxy = proxy.clone();
+            async move {
+                let (stream, peer) = front_listener.accept().await.unwrap();
+                let service = service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    async move { proxy.handle(request, peer).await }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let pending = tokio::spawn(async move {
+            let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                .build_http::<Full<Bytes>>();
+            let reply = client
+                .request(
+                    Request::builder()
+                        .uri(format!(
+                            "http://{front}/.well-known/acme-challenge/owned_01"
+                        ))
+                        .header("host", "owned.test")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = reply.status().as_u16();
+            reply.into_body().collect().await.unwrap();
+            status
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        docker.set("issuer", false, "127.0.0.1");
+        assert!(discovery.refresh(&document).await.is_err());
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap(),
+            503,
+            "retired {phase} reply escaped endpoint fence"
+        );
+        proxy.shutdown(Duration::ZERO).await;
+        policy.shutdown().await;
+        front_task.abort();
+        issuer_task.abort();
+    }
+}
+
 struct FakeDocker {
     _directory: TempDir,
     socket: PathBuf,

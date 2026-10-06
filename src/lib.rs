@@ -51,6 +51,7 @@ pub mod active_probe;
 pub mod admission;
 
 pub mod acme;
+pub mod acme_http01;
 
 pub mod sandbox;
 
