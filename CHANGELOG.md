@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Suppress `x-hangang-gateway` response headers and trailers by default,
+  including legacy route and origin values; permit them only with explicit
+  `settings.debug_gateway_header: true` for debugging.
 - Drop request trailers before policy and upstream forwarding so late HTTP/2
   fields cannot restore stripped authentication or forwarding headers.
 - Fence retired Docker discovery completions and timeout cleanup against newer

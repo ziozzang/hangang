@@ -6,6 +6,8 @@ This template runs one gateway with an HTTP listener and a local management port
 
 ## Build the image
 
+Hangang removes the deployment fingerprint header `x-hangang-gateway` from public responses and trailers by default, even when a route or origin sets it. For temporary debugging only, `settings.debug_gateway_header: true` permits existing values; it does not generate a header. Omit this setting or set it to `false` in production. Changes apply through the revision-checked configuration API without restarting.
+
 The repository [Dockerfile](../Dockerfile) packages the static `hangang` binary only. Build that binary on Linux x86_64 first, then build the image from the repository root:
 
 ```sh

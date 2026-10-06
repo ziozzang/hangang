@@ -47,6 +47,10 @@ fn is_zero(value: &u64) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    /// Permit the deployment fingerprint header only for explicit debugging.
+    /// This does not generate a header; it allows configured/origin values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_gateway_header: Option<bool>,
     /// Response-head metadata selection shared by the ring and access trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_recording: Option<crate::http_recording::Policy>,
@@ -134,6 +138,7 @@ impl Settings {
 /// `Settings` with names and durations parsed once per snapshot.
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
+    pub debug_gateway_header: Option<bool>,
     pub http_recording: Option<std::sync::Arc<crate::http_recording::CompiledPolicy>>,
     pub tcp_recent_recording: Option<std::sync::Arc<crate::tcp_recording::CompiledPolicy>>,
     pub trusted_proxy_cidrs: Option<std::sync::Arc<Vec<ipnet::IpNet>>>,
@@ -148,6 +153,7 @@ impl PreparedSettings {
         use anyhow::Context;
         settings.validate()?;
         Ok(Self {
+            debug_gateway_header: settings.debug_gateway_header,
             http_recording: settings
                 .http_recording
                 .as_ref()

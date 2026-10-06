@@ -5489,6 +5489,10 @@
         "additionalProperties": false,
         "description": "Process-wide runtime settings carried in the document so every instance of a fleet converges on them. A present field overrides the command-line value of the same name; an absent field keeps the process default. Applied on the next request after activation.",
         "properties": {
+          "debug_gateway_header": {
+            "type": ["boolean", "null"],
+            "description": "Permit configured or origin x-hangang-gateway response headers and trailers for temporary debugging. Default false, including when absent or null. Does not generate a header."
+          },
           "http_recording": {"anyOf":[{"$ref":"#/components/schemas/HttpRecordingPolicy"},{"type":"null"}]},
           "tcp_recent_recording": {"anyOf":[{"$ref":"#/components/schemas/TcpRecentRecordingPolicy"},{"type":"null"}]},
           "trusted_proxy_cidrs": {

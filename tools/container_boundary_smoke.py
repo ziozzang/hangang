@@ -24,6 +24,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Hangang-Gateway", "origin-debug")
         self.end_headers()
         self.wfile.write(data)
     def do_GET(self): self.handle_request()
@@ -100,6 +101,12 @@ for attempt in range(60):
     time.sleep(.1)
 else: raise AssertionError("gateway readiness failed")
 checks = []
+for path, auth in [("/public/marker", False), ("/private/marker", True)]:
+    status, data = request(path, auth)
+    assert status == 200
+    head = data.split(b"\r\n\r\n", 1)[0].lower()
+    assert (b"\r\nx-hangang-gateway:" in head) == EXPECT_GATEWAY_MARKER
+checks.append("gateway_marker_matches_explicit_debug_policy")
 assert request("/private/no-auth")[0] == 403
 checks.append("external_auth_denies_missing_credentials")
 assert request("/private/allowed", True)[0] == 200
@@ -156,7 +163,7 @@ def docker(*args):
     return result.stdout.strip()
 
 
-def run(image, python_image):
+def run(image, python_image, debug_gateway_header=False, expect_gateway_marker=False):
     gateway_id = docker("image", "inspect", image, "--format", "{{.Id}}")
     python_id = docker("image", "inspect", python_image, "--format", "{{.Id}}")
     prefix = "hangang-review-round4-" + uuid.uuid4().hex[:12]
@@ -169,13 +176,17 @@ def run(image, python_image):
         state_dir = root / "gateway-state"
         state_dir.mkdir(mode=0o700)
         (root / "origin.py").write_text(ORIGIN)
-        (root / "client.py").write_text(CLIENT)
+        (root / "client.py").write_text(
+            f"EXPECT_GATEWAY_MARKER = {expect_gateway_marker!r}\n" + CLIENT)
         config = {"http": [
             {"id": "private", "path_prefix": "/private", "backends": ["http://origin:8081"],
              "auth": {"url": "http://origin:8081/check", "request_headers": ["authorization"],
                       "response_headers": [], "forward_response": True}},
-            {"id": "public", "path_prefix": "/public", "backends": ["http://origin:8081"]}
+            {"id": "public", "path_prefix": "/public", "backends": ["http://origin:8081"],
+             "response_set_headers": {"x-hangang-gateway": "native-fixture"}}
         ]}
+        if debug_gateway_header:
+            config["settings"] = {"debug_gateway_header": True}
         (state_dir / "config.json").write_text(json.dumps(config))
         try:
             docker("network", "create", "--internal", "--label", "hangang.review=round4", network)
@@ -231,8 +242,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, help="Existing local gateway image")
     parser.add_argument("--python-image", default="python:3.12.13-slim")
+    parser.add_argument("--debug-gateway-header", action="store_true")
+    parser.add_argument("--expect-gateway-marker", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(run(args.image, args.python_image), indent=2))
+    print(json.dumps(run(args.image, args.python_image,
+                         args.debug_gateway_header, args.expect_gateway_marker), indent=2))
 
 
 if __name__ == "__main__":

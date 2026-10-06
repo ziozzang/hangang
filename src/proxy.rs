@@ -918,9 +918,27 @@ impl Proxy {
                 return Ok(response(503, "request capacity exhausted"));
             }
         };
-        let response = self
+        let debug_gateway_header = snapshot.settings.debug_gateway_header == Some(true);
+        let mut response = self
             .handle_inner(request, peer, snapshot, traffic.as_mut())
             .await?;
+        // Apply after every route/auth/cache/Lua/transform path so legacy
+        // configuration and origins cannot expose the deployment fingerprint.
+        if !debug_gateway_header {
+            response.headers_mut().remove("x-hangang-gateway");
+            let (parts, body) = response.into_parts();
+            response = Response::from_parts(
+                parts,
+                body.map_frame(|frame| match frame.into_trailers() {
+                    Ok(mut trailers) => {
+                        trailers.remove("x-hangang-gateway");
+                        hyper::body::Frame::trailers(trailers)
+                    }
+                    Err(frame) => frame,
+                })
+                .boxed_unsync(),
+            );
+        }
         if let Some(context) = &traffic {
             self.record_response_head(context, response.status().as_u16());
         }

@@ -35,6 +35,79 @@ struct Seen {
 }
 
 #[tokio::test]
+async fn gateway_fingerprint_is_default_denied_and_debug_opt_in_reloads() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(|_| async {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("x-hangang-gateway", "origin-debug")
+                                    .header("x-application", "preserved")
+                                    .body(Full::new(Bytes::from_static(b"payload")))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    let origin_route = route(vec![format!("http://{origin}")]);
+    let mut legacy_route = origin_route.clone();
+    legacy_route.id = "legacy".into();
+    legacy_route.path_prefix = Some("/legacy".into());
+    legacy_route.priority = 10;
+    legacy_route
+        .response_set_headers
+        .insert("x-hangang-gateway".into(), "native-20260912".into());
+    let routes = vec![origin_route, legacy_route];
+    let ((proxy, policy), active) = proxy_with_settings(routes.clone(), Default::default());
+    let (front, front_task, _) = frontend(proxy).await;
+    for enabled in [None, Some(true), Some(false), None] {
+        let settings = hangang::config::Settings {
+            debug_gateway_header: enabled,
+            ..Default::default()
+        };
+        let mut config = active.load().config.clone();
+        config.settings = settings;
+        config.revision += 1;
+        active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+        for (path, expected) in [("/", "origin-debug"), ("/legacy", "native-20260912")] {
+            let reply = client()
+                .request(
+                    Request::builder()
+                        .uri(format!("http://{front}{path}"))
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+            assert_eq!(reply.headers()["x-application"], "preserved");
+            if enabled == Some(true) {
+                assert_eq!(reply.headers()["x-hangang-gateway"], expected);
+            } else {
+                assert!(!reply.headers().contains_key("x-hangang-gateway"));
+            }
+            assert_eq!(
+                reply.into_body().collect().await.unwrap().to_bytes(),
+                "payload"
+            );
+        }
+    }
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn traffic_history_records_real_peer_and_trusted_client_without_query_or_headers() {
     let (origin, _seen, origin_task) = upstream("ok").await;
     let settings = hangang::config::Settings {
@@ -229,7 +302,22 @@ async fn request_trailer_boundary(h2_ingress: bool) {
                     let trailers = collected.trailers().cloned();
                     let bytes = collected.to_bytes();
                     *seen.lock().unwrap() = Some((parts.version, parts.headers, trailers, bytes));
-                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    let mut response_trailers = hyper::HeaderMap::new();
+                    response_trailers.insert("x-hangang-gateway", "origin-debug".parse().unwrap());
+                    response_trailers
+                        .insert("x-application-checksum", "preserved".parse().unwrap());
+                    let frames = vec![
+                        Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"ok"))),
+                        Ok(hyper::body::Frame::trailers(response_trailers)),
+                    ];
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("x-hangang-gateway", "origin-debug")
+                            .body(http_body_util::StreamBody::new(futures_util::stream::iter(
+                                frames,
+                            )))
+                            .unwrap(),
+                    )
                 }
             });
             let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
@@ -287,7 +375,14 @@ async fn request_trailer_boundary(h2_ingress: bool) {
             .await
             .unwrap();
         assert_eq!(reply.status(), 200);
-        reply.into_body().collect().await.unwrap();
+        assert!(!reply.headers().contains_key("x-hangang-gateway"));
+        let collected = reply.into_body().collect().await.unwrap();
+        let trailers = collected
+            .trailers()
+            .expect("unrelated response trailers retained");
+        assert!(!trailers.contains_key("x-hangang-gateway"));
+        assert_eq!(trailers["x-application-checksum"], "preserved");
+        assert_eq!(collected.to_bytes(), "ok");
         driver.abort();
     } else {
         let (status, text) = raw_request(front,

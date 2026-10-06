@@ -1003,6 +1003,7 @@ impl Admin {
         let mut settings_summary = serde_json::json!({
             "trusted_proxy_cidrs": settings.trusted_proxy_cidrs,
             "remove_response_headers": settings.remove_response_headers,
+            "debug_gateway_header": settings.debug_gateway_header.unwrap_or(false),
             "https_redirect_code": settings.https_redirect_code,
             "upstream_timeout_ms": settings.upstream_timeout_ms,
             "allow_dot_segments": settings.allow_dot_segments,
