@@ -35,6 +35,374 @@ struct Seen {
 }
 
 #[tokio::test]
+async fn csrf_profiles_use_verified_origins_and_leave_unselected_methods_and_static_paths_alone() {
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let profile: hangang::path_csrf::Rule = serde_json::from_value(serde_json::json!({
+        "path":"/login","allow_origins":["https://internal.example:443"]
+    }))
+    .unwrap();
+    let settings = hangang::config::Settings {
+        path_csrf: Some(vec![profile]),
+        ..Default::default()
+    };
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy).await;
+    let send =
+        |method: &str, path: &str, origins: Vec<&str>, referers: Vec<&str>, forwarded: bool| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("http://{front}{path}"))
+                .header("host", "app.example");
+            for origin in origins {
+                request = request.header("origin", origin);
+            }
+            for referer in referers {
+                request = request.header("referer", referer);
+            }
+            if forwarded {
+                request = request
+                    .header("x-forwarded-host", "edge.example:443")
+                    .header("x-forwarded-proto", "https");
+            }
+            let request = request.body(Full::new(Bytes::new())).unwrap();
+            async move {
+                let response = client().request(request).await.unwrap();
+                let status = response.status().as_u16();
+                let headers = response.headers().clone();
+                response.into_body().collect().await.unwrap();
+                (status, headers)
+            }
+        };
+    for (origins, referers, status) in [
+        (vec!["http://APP.EXAMPLE:80/"], vec![], 200),
+        (vec!["https://app.example"], vec![], 403),
+        (vec!["http://evil.example"], vec![], 403),
+        (vec!["https://INTERNAL.EXAMPLE:443/"], vec![], 200),
+        (vec!["https://internal.example:8443"], vec![], 403),
+        (vec!["null"], vec!["http://app.example/form"], 403),
+        (vec![], vec![], 403),
+        (
+            vec![],
+            vec!["http://app.example/form?csrf-secret-query=x"],
+            200,
+        ),
+        (vec![], vec!["http://evil.example/form"], 403),
+        (
+            vec!["http://app.example"],
+            vec!["file:///private/form"],
+            400,
+        ),
+        (
+            vec!["http://app.example", "http://app.example"],
+            vec![],
+            400,
+        ),
+        (
+            vec![],
+            vec!["http://app.example/form", "http://app.example/form"],
+            400,
+        ),
+        (vec!["http://app.example/."], vec![], 400),
+        (vec!["http://app.example/%2e"], vec![], 400),
+    ] {
+        let before = seen.lock().unwrap().len();
+        let (actual, headers) = send("POST", "/log%69n?ignored=1", origins, referers, false).await;
+        assert_eq!(actual, status);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before + usize::from(status == 200),
+            "denied CSRF request reached origin"
+        );
+        if status != 200 {
+            assert_eq!(headers["cache-control"], "no-store");
+        }
+    }
+    assert_eq!(
+        send(
+            "GET",
+            "/login",
+            vec!["invalid-origin", "duplicate"],
+            vec![],
+            false
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send("POST", "/login/image.png", vec![], vec![], false)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        send("POST", "/login-sibling", vec![], vec![], false)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        send("POST", "/login", vec!["https://edge.example"], vec![], true)
+            .await
+            .0,
+        403,
+        "untrusted forwarding spoof changed origin"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.trusted_proxy_cidrs = Some(vec!["127.0.0.1/32".parse().unwrap()]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "POST",
+            "/login",
+            vec!["https://EDGE.EXAMPLE:443"],
+            vec![],
+            true
+        )
+        .await
+        .0,
+        200
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_csrf.as_mut().unwrap()[0].allow_missing_origin = true;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(send("POST", "/login", vec![], vec![], false).await.0, 200);
+    assert_eq!(
+        send("POST", "/login", vec!["null"], vec![], false).await.0,
+        403,
+        "null origin is not missing origin"
+    );
+    assert_eq!(
+        send(
+            "pAtCh",
+            "/login",
+            vec!["http://evil.example"],
+            vec![],
+            false
+        )
+        .await
+        .0,
+        403,
+        "mixed-case unsafe method bypassed profile"
+    );
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn csrf_trusted_explicit_ports_cannot_alias_default_ports_or_internal_transport_ports() {
+    let (origin, _, origin_task) = upstream("ok").await;
+    let settings = hangang::config::Settings {
+        path_csrf: Some(vec![
+            serde_json::from_value(serde_json::json!({"path":"/login"})).unwrap(),
+        ]),
+        trusted_proxy_cidrs: Some(vec!["127.0.0.1/32".parse().unwrap()]),
+        ..Default::default()
+    };
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task) =
+        frontend_with_peer_transport_port(proxy, "127.0.0.1:12345".parse().unwrap(), true, 8443)
+            .await;
+    let send = |origin: &str, host: &str, port: Option<&str>| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{front}/login"))
+            .header("host", "app.example")
+            .header("origin", origin)
+            .header("x-forwarded-host", host)
+            .header("x-forwarded-proto", "https");
+        if let Some(port) = port {
+            request = request.header("x-forwarded-port", port);
+        }
+        let request = request.body(Full::new(Bytes::new())).unwrap();
+        async move {
+            let response = client().request(request).await.unwrap();
+            let status = response.status();
+            response.into_body().collect().await.unwrap();
+            status
+        }
+    };
+    assert_eq!(
+        send("https://app.example", "app.example", Some("8443")).await,
+        403
+    );
+    assert_eq!(
+        send("https://app.example:8443", "app.example", Some("8443")).await,
+        200
+    );
+    assert_eq!(
+        send("https://app.example:8443", "app.example:8443", Some("443")).await,
+        200,
+        "authority's explicitport mustwin"
+    );
+    assert_eq!(
+        send("https://app.example", "app.example:8443", Some("443")).await,
+        403
+    );
+    assert_eq!(
+        send("https://app.example", "app.example", None).await,
+        200,
+        "implicitinternal TLS8443 mustnotchangebrowser-origin443"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.trusted_proxy_cidrs = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send("https://app.example", "app.example", Some("8443")).await,
+        200,
+        "untrustedforwardedport mustbeignored"
+    );
+    assert_eq!(
+        send("https://app.example:8443", "app.example", Some("8443")).await,
+        403
+    );
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn csrf_denial_feeds_failure_bans_and_private_logs_without_origin_or_referer_values() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = reserve.local_addr().unwrap();
+    drop(reserve);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = directory.path().join("state.json");
+    let config:Config=serde_json::from_value(serde_json::json!({"revision":1,"http":[{"id":"login","backends":[format!("http://{origin}")]}],"tcp":[],"settings":{
+        "path_csrf":[{"path":"/login"}],
+        "path_failure_bans":[{"path":"/login","failures":1,"window_seconds":60,"ban_seconds":60,"statuses":[403]}]
+    }})).unwrap();
+    hangang::store::save(config_path.clone(), config)
+        .await
+        .unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hangang"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--listen",
+            &front.to_string(),
+            "--admin-socket",
+            directory.path().join("admin.sock").to_str().unwrap(),
+            "--threads",
+            "2",
+            "--lua-workers",
+            "1",
+        ])
+        .env_clear()
+        .env("HANGANG_ADMIN_TOKEN", "test-security-log-token")
+        .env("RUST_LOG", "warn")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut log_stream = child.stdout.take().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader = tokio::spawn({
+        let captured = captured.clone();
+        async move {
+            let mut buffer = [0; 4096];
+            while let Ok(size) = log_stream.read(&mut buffer).await {
+                if size == 0 {
+                    break;
+                }
+                let mut bytes = captured.lock().unwrap();
+                if bytes.len() + size > 65536 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..size]);
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "owned gateway failed startup"
+            );
+            if let Ok(reply) = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{front}/ready"))
+                .send()
+                .await
+                && reply.status() == 200
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let caller = reqwest::Client::builder().no_proxy().build().unwrap();
+    let denied = caller
+        .post(format!("http://{front}/login"))
+        .header("origin", "https://origin-secret.example")
+        .header(
+            "referer",
+            "https://origin-secret.example/form?csrf-secret-query=marker",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.headers()["cache-control"], "no-store");
+    denied.bytes().await.unwrap();
+    let banned = caller
+        .post(format!("http://{front}/login"))
+        .header("origin", format!("http://{front}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(banned.status(), 429);
+    banned.bytes().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let ready = {
+                let bytes = captured.lock().unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                text.contains("url_csrf_denied") && text.contains("ip_ban_created")
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("private CSRF/ban security events were not emitted");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "denied or banned mutation reached origin"
+    );
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    reader.await.unwrap();
+    let bytes = captured.lock().unwrap();
+    let logs = String::from_utf8_lossy(&bytes);
+    assert!(
+        !logs.contains("origin-secret.example") && !logs.contains("csrf-secret-query"),
+        "private log leaked request origin or referer"
+    );
+    origin_task.abort();
+}
+
+#[tokio::test]
 async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let issuer = listener.local_addr().unwrap();
@@ -2718,6 +3086,15 @@ async fn frontend_with_peer_transport(
     forced_peer: SocketAddr,
     transport_tls: bool,
 ) -> (SocketAddr, JoinHandle<()>) {
+    frontend_with_peer_transport_port(proxy, forced_peer, transport_tls, 443).await
+}
+
+async fn frontend_with_peer_transport_port(
+    proxy: Proxy,
+    forced_peer: SocketAddr,
+    transport_tls: bool,
+    local_port: u16,
+) -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let metrics = Arc::new(Metrics::default());
@@ -2742,7 +3119,7 @@ async fn frontend_with_peer_transport(
                             .extensions_mut()
                             .insert(hangang::tls::TransportInfo {
                                 tls: true,
-                                local_port: 443,
+                                local_port,
                             });
                     }
                     let proxy = proxy.clone();

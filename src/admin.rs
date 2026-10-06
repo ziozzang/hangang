@@ -1004,6 +1004,7 @@ impl Admin {
             "trusted_proxy_cidrs": settings.trusted_proxy_cidrs,
             "remove_response_headers": settings.remove_response_headers,
             "debug_gateway_header": settings.debug_gateway_header.unwrap_or(false),
+            "path_csrf_count": settings.path_csrf.as_ref().map_or(0, Vec::len),
             "path_blocks_count": settings.path_blocks.as_ref().map_or(0, Vec::len),
             "path_allowlists_count": settings.path_allowlists.as_ref().map_or(0, Vec::len),
             "path_rate_limits_count": settings.path_rate_limits.as_ref().map_or(0, Vec::len),

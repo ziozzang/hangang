@@ -85,7 +85,14 @@ const urlDefenseKorean = {
   "HTTP-01 forwarding requires exact domain hosts without globs or regular expressions.": "HTTP-01 전달에는 glob·정규식이 없는 정확한 도메인 호스트가 필요합니다.",
   "Use an HTTP root origin or canonical Docker reference for the HTTP-01 issuer, without credentials, query or fragment.": "HTTP-01 발급 서버에는 자격 증명·쿼리·fragment가 없는 HTTP 루트 주소 또는 정규 Docker 참조를 사용하세요.",
   "HTTP-01 listener IDs must be distinct members of this route’s public listener coverage, at most 64.": "HTTP-01 리스너 ID는 이 라우트의 공개 리스너에 포함되어야 하며 중복 없이 최대 64개입니다.",
-  "HTTP-01 forwarding cannot be combined with route CIDR denials, country, resource or workload policies. Global URL security still applies.": "HTTP-01 전달은 라우트의 CIDR 거부·국가·리소스·워크로드 정책과 함께 사용할 수 없습니다. 전역 URL 보안은 계속 적용됩니다."
+  "HTTP-01 forwarding cannot be combined with route CIDR denials, country, resource or workload policies. Global URL security still applies.": "HTTP-01 전달은 라우트의 CIDR 거부·국가·리소스·워크로드 정책과 함께 사용할 수 없습니다. 전역 URL 보안은 계속 적용됩니다.",
+  "URL CSRF origin policy": "URL CSRF 출처 정책",
+  "JSON array. Apply only to selected URLs and methods; default methods are POST, PUT, PATCH and DELETE, so safe GET requests and images are unaffected. Same-origin access is allowed by default, based on the verified gateway authority. Configure exact internal HTTP/HTTPS origins explicitly. Missing Origin uses Referer fallback and otherwise is denied by default; Origin: null is denied. This supplements application CSRF tokens.": "선택한 URL과 메서드에만 적용하는 JSON 배열입니다. 기본 메서드는 POST·PUT·PATCH·DELETE이므로 안전한 GET 요청과 이미지에는 영향을 주지 않습니다. 검증한 게이트웨이 주소를 기준으로 같은 출처를 기본 허용합니다. 내부 HTTP·HTTPS 출처를 정확히 지정할 수 있습니다. Origin이 없으면 Referer를 확인하고, 둘 다 없으면 기본 거부합니다. Origin: null도 거부합니다. 애플리케이션의 CSRF 토큰 검증을 보완하는 정책입니다.",
+  "CSRF origin flags must be true or false.": "CSRF 출처 옵션은 true 또는 false여야 합니다.",
+  "Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.": "자격 증명·쿼리·fragment·glob이 없는 서로 다른 정확한 HTTP·HTTPS 루트 출처를 최대 128개 사용하세요.",
+  "Enable same-origin access or configure at least one allowed origin.": "같은 출처 접근을 허용하거나 허용 출처를 하나 이상 설정하세요.",
+  "CSRF methods require 1–8 distinct uppercase standard methods; CONNECT is not supported.": "CSRF 메서드는 중복 없는 대문자 표준 메서드 1~8개여야 합니다. CONNECT는 지원하지 않습니다.",
+  "Keep unrelated services in separate certificate groups. A base domain, its www alias, and its matching wildcard share one management group; wildcard authorization requires DNS-01. A wildcard for an internal namespace can avoid listing individual service names, but publicly trusted certificates, including wildcards, are still published in Certificate Transparency logs.": "관련 없는 서비스는 별도 인증서 그룹으로 나누세요. 기본 도메인, www 별칭, 일치하는 와일드카드는 같은 관리 그룹입니다. 와일드카드 인증에는 DNS-01이 필요합니다. 내부 네임스페이스의 와일드카드는 개별 서비스 이름의 나열을 줄일 수 있지만, 와일드카드를 포함한 공개 신뢰 인증서는 여전히 Certificate Transparency 로그에 게시됩니다."
 };
 const korean = { ...koStatic, ...koApp, ...koConsole, ...koOperations, ...koDocker, ...urlDefenseKorean };
 

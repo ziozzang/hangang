@@ -184,3 +184,30 @@ test('authenticated country controls retain DB-IP attribution in both locales', 
   await expect(link).toHaveText('GeoIP 데이터: DB-IP');
   await expect(page.getByLabel('URL 국가·IP 허용 목록')).toBeVisible();
 });
+
+
+test('URL CSRF origin policy validates and round-trips alongside existing settings', async ({ page }) => {
+  const writes = await open(page, { health_path: '/healthz' });
+  const control = page.getByLabel('URL CSRF origin policy');
+  for (const rule of [
+    { path: '/login', allow_origins: ['https://portal.internal/path'] },
+    { path: '/login', allow_origins: ['https://portal.internal', 'https://PORTAL.internal:443/'] },
+    { path: '/login', allow_same_origin: false },
+    { path: '/login', methods: ['CONNECT'] },
+  ]) {
+    await control.fill(JSON.stringify([rule])); await expect(control).toHaveAttribute('aria-invalid', 'true');
+    await page.locator('#apply-config').click(); expect(writes).toHaveLength(0);
+  }
+  const rules = [{ path: '/login', hosts: ['app.example.test'], allow_origins: ['https://portal.internal.example.test'], allow_same_origin: true, allow_missing_origin: false, methods: ['POST', 'PUT'] }];
+  await control.fill(JSON.stringify(rules));
+  await page.locator('#locale-select').selectOption('ko'); await expect(page.getByLabel('URL CSRF 출처 정책')).toHaveValue(JSON.stringify(rules));
+  await page.locator('#apply-config').click(); await expect(page.locator('#config-message')).toContainText('8');
+  expect(writes[0].settings).toEqual({ health_path: '/healthz', path_csrf: rules });
+  await page.locator('#setting-path_csrf').fill(''); expect(JSON.parse(await page.locator('#config-editor').inputValue()).settings).toEqual({ health_path: '/healthz' });
+  await page.locator('[data-view="certificates"]').click();
+  await expect(page.locator('#view-certificates')).toContainText('Certificate Transparency');
+  await expect(page.locator('#view-certificates')).toContainText('www 별칭');
+  await expect(page.locator('#view-certificates')).toContainText('DNS-01');
+  await page.locator('#locale-select').selectOption('en');
+  await expect(page.locator('#view-certificates')).toContainText('A base domain, its www alias, and its matching wildcard share one management group');
+});

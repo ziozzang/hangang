@@ -4339,7 +4339,7 @@ function syncTcpRecordingToDocument() {
   } catch (error) { state.tcpRecordingError = error.message; message($('#tcp-recording-message'), error.message, 'error'); }
 }
 
-const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists'];
+const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists', 'path_csrf'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
 
@@ -4355,7 +4355,7 @@ function showSettings(settings) {
   $('#setting-health_path').value = typeof value.health_path === 'string' ? value.health_path : '';
   $('#setting-security_redis').value = present('security_redis') ? JSON.stringify(value.security_redis, null, 2) : '';
   $('#setting-failure_ban_scope').value = ['url', 'host', 'global'].includes(value.failure_ban_scope) ? value.failure_ban_scope : '';
-  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists']) {
+  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf']) {
     $(`#setting-${key}`).value = present(key) ? JSON.stringify(value[key], null, 2) : '';
   }
   for (const control of $$('#settings-form [name]')) control.setAttribute('aria-invalid', 'false');
@@ -4403,7 +4403,7 @@ function settingsFromForm() {
     if (!health.startsWith('/') || health.length > 256 || !/^[\x21-\x7e]+$/.test(health) || /[?#]/.test(health)) throw invalid('health_path', t('Health path must be an absolute path of printable ASCII without query, fragment or whitespace (at most 256 characters)'));
     settings.health_path = health;
   }
-  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists']) {
+  for (const key of ['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf']) {
     const raw = $(`#setting-${key}`).value.trim();
     if (!raw) continue;
     try { settings[key] = urlDefenseRulesFromJson(raw, key); }
@@ -4444,6 +4444,7 @@ function urlDefenseRulesFromJson(raw, kind) {
   const known = kind === 'path_blocks' ? ['path', 'hosts'] : kind === 'path_rate_limits'
     ? ['path', 'hosts', 'include_subpaths', 'tps', 'burst', 'limits']
     : kind === 'path_allowlists' ? ['path', 'hosts', 'include_subpaths', 'allow_cidrs', 'allow_countries']
+    : kind === 'path_csrf' ? ['path', 'hosts', 'include_subpaths', 'allow_origins', 'allow_same_origin', 'allow_missing_origin', 'methods']
     : ['path', 'hosts', 'include_subpaths', 'failures', 'window_seconds', 'ban_seconds', 'statuses'];
   const seen = new Set();
   let textBytes = 0;
@@ -4477,6 +4478,28 @@ function urlDefenseRulesFromJson(raw, kind) {
         fail(index, 'limits allows at most 8 windows with requests 1–1,000,000 and window_seconds 1–86,400.');
       if ((rule.tps === undefined || rule.tps === null) && limits.length === 0) fail(index, 'Configure TPS or at least one request window.');
       signature.limits = limits.map(limit => ({ requests: limit.requests, window_seconds: limit.window_seconds }));
+    }
+    if (kind === 'path_csrf') {
+      const origins = rule.allow_origins === undefined ? [] : rule.allow_origins;
+      const methods = rule.methods === undefined ? ['POST', 'PUT', 'PATCH', 'DELETE'] : rule.methods;
+      const same = rule.allow_same_origin === undefined ? true : rule.allow_same_origin;
+      const missing = rule.allow_missing_origin === undefined ? false : rule.allow_missing_origin;
+      if (typeof same !== 'boolean' || typeof missing !== 'boolean') fail(index, 'CSRF origin flags must be true or false.');
+      const normalized = [];
+      if (!Array.isArray(origins) || origins.length > 128) fail(index, 'Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.');
+      for (const origin of origins) {
+        let parsed;
+        try { if (typeof origin !== 'string' || bytes(origin) > 2048 || !/^https?:\/\/[^/?#\s@*]+\/?$(?![\s\S])/.test(origin)) throw new Error(); parsed = new URL(origin); } catch { fail(index, 'Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.'); }
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash)
+          fail(index, 'Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.');
+        normalized.push(parsed.origin);
+      }
+      if (new Set(normalized).size !== normalized.length) fail(index, 'Use at most 128 distinct exact HTTP or HTTPS root origins, without credentials, query, fragment or globs.');
+      if (!same && !origins.length) fail(index, 'Enable same-origin access or configure at least one allowed origin.');
+      if (!Array.isArray(methods) || !methods.length || methods.length > 8 || new Set(methods).size !== methods.length || methods.some(method => !['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE'].includes(method)))
+        fail(index, 'CSRF methods require 1–8 distinct uppercase standard methods; CONNECT is not supported.');
+      textBytes += origins.reduce((sum, origin) => sum + bytes(origin), 0) + methods.reduce((sum, method) => sum + bytes(method), 0);
+      signature.allow_origins = normalized; signature.methods = methods; signature.allow_same_origin = same; signature.allow_missing_origin = missing;
     }
     if (kind === 'path_allowlists') {
       const cidrs = rule.allow_cidrs === undefined ? [] : rule.allow_cidrs;
@@ -4549,7 +4572,7 @@ function renderSettings(settings) {
     health_path: typeof value.health_path === 'string' ? value.health_path : null,
     security_redis: ['redis', 'local'].includes(value.security_state_backend) ? t(value.security_state_backend === 'redis' ? 'Shared Redis' : 'Local state') : null,
     failure_ban_scope: ({ url: t('Configured URLs only'), host: t('Host: all paths, including images'), global: t('Global: all public HTTP hosts and paths') })[value.failure_ban_scope] ?? null,
-    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists'].map(key => [key,
+    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf'].map(key => [key,
       Number.isSafeInteger(value[`${key}_count`]) && value[`${key}_count`] >= 0 ? t('{count} configured rules', { count: value[`${key}_count`] }) : null])),
   };
   for (const key of SETTINGS_FIELDS) {

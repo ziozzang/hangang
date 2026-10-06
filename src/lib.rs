@@ -21,6 +21,7 @@ pub mod language_policy;
 pub mod metrics;
 pub mod path_allowlists;
 pub mod path_blocks;
+pub mod path_csrf;
 pub mod path_failure_bans;
 pub mod path_rate_limits;
 pub mod policy;

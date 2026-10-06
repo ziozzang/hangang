@@ -1327,6 +1327,18 @@ impl Proxy {
                 }
             }
         }
+        if let Err(status) = crate::path_csrf::check(
+            &snapshot.settings.path_csrf,
+            &request,
+            edge.forwarded_host
+                .as_ref()
+                .and_then(|host| host.to_str().ok()),
+            edge.proto,
+            edge.explicit_forwarded_port,
+        ) {
+            crate::security_events::record("url_csrf_denied", edge.client_ip, status, None);
+            return Ok(security_denied(status));
+        }
         if let Err(status) = crate::path_blocks::check(
             snapshot
                 .config
@@ -3409,6 +3421,7 @@ struct EdgeContext {
     proto: &'static str,
     forwarded_host: Option<HeaderValue>,
     forwarded_port: u16,
+    explicit_forwarded_port: Option<u16>,
 }
 
 impl Proxy {
@@ -3453,6 +3466,7 @@ impl Proxy {
                 proto,
                 forwarded_host: client_host,
                 forwarded_port: default_forwarded_port(proto, transport.local_port),
+                explicit_forwarded_port: None,
             });
         }
         let client_ip =
@@ -3470,7 +3484,9 @@ impl Proxy {
             return Err(crate::trusted_proxy::InvalidForwardedHeader);
         }
         let mut forwarded_ports = headers.get_all("x-forwarded-port").iter();
-        let forwarded_port = match forwarded_ports.next() {
+        let forwarded_port_value = forwarded_ports.next();
+        let forwarded_port_explicit = forwarded_port_value.is_some();
+        let forwarded_port = match forwarded_port_value {
             Some(value) => {
                 if forwarded_ports.next().is_some() {
                     return Err(crate::trusted_proxy::InvalidForwardedHeader);
@@ -3497,6 +3513,7 @@ impl Proxy {
             proto,
             forwarded_host,
             forwarded_port,
+            explicit_forwarded_port: forwarded_port_explicit.then_some(forwarded_port),
         })
     }
 }
@@ -3769,6 +3786,7 @@ mod tests {
         // This is the effective host after trusted-proxy resolution; it may
         // select the alias, but it can never become destination URL text.
         let edge = EdgeContext {
+            explicit_forwarded_port: None,
             client_ip: "192.0.2.1".parse().unwrap(),
             proto: "http",
             forwarded_host: Some(HeaderValue::from_static("www.example.test:8443")),
@@ -3792,6 +3810,7 @@ mod tests {
     fn canonical_redirect_exclusions_methods_boundaries_and_loop_guard() {
         let policy = canonical_policy();
         let edge = EdgeContext {
+            explicit_forwarded_port: None,
             client_ip: "192.0.2.1".parse().unwrap(),
             proto: "https",
             forwarded_host: Some(HeaderValue::from_static("www.example.test")),
@@ -3911,6 +3930,7 @@ mod tests {
             .body(full_body(Bytes::new()))
             .unwrap();
         let edge = EdgeContext {
+            explicit_forwarded_port: None,
             client_ip: "203.0.113.9".parse().unwrap(),
             proto: "https",
             forwarded_host: Some(HeaderValue::from_static("app.example")),

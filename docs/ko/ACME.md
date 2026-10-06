@@ -154,3 +154,37 @@ timeout이 나도 실제 조회가 끝날 때까지 worker 슬롯을 유지합�
 해석된 Docker endpoint는 해당 worker를 사용하지 않습니다. 응답을 기다린
 뒤에도 Docker endpoint 철회를 다시 확인하며, workload listener는 공개
 HTTP-01 예외에 들어갈 수 없습니다.
+
+## Certificate group privacy
+
+서로 다른 명시적 서비스 도메인은 발급기·출력·키 그룹을 분리합니다. 기본
+이름, 그 `www.` 별칭, 대응하는 wildcard는 같은 관리 그룹입니다. 예를 들어
+`foo.com`, `www.foo.com`, `*.foo.com`은 한 그룹이고 `api.other.com`은 별도입니다.
+요청한 이름만 포함하며 planner는 DNS record나 선언하지 않은 www 이름을
+추가하지 않습니다.
+
+```sh
+python3 tools/plan_certificate_groups.py issuer.json groups-plan.json
+```
+
+이 오프라인 도구는 발급기 설정이나 도메인 배열을 읽고 도메인 이름과
+DNS-01 필요 여부만 담은 비공개 계획을 씁니다. provider credentials를
+복사하거나 order를 시작하지 않습니다. 결과 발급기마다 독립적인 비공개
+account path와 output directory를 사용하십시오. gateway는 SNI로 모든
+그룹을 제공하면서 애플리케이션 라우트는 여러 listener를 공유할 수 있습니다.
+
+wildcard 인증에는 DNS-01이 필요하며 HTTP-01 delegate를 사용할 수 없습니다.
+발급기의 자동 challenge mode는 wildcard 그룹에 DNS-01을 선택하고 명시적인
+HTTP-01 선택은 거부합니다. wildcard 없는 그룹도 필요하면 DNS-01을 사용할
+수 있습니다. 같은 사이트 www 별칭인 `aiotanzania.org`, `www.aiotanzania.org`는
+함께 유지합니다.
+
+SAN과 인증서 키를 분리하면 한 TLS 인증서가 드러내는 서비스 이름을 줄일 수
+있습니다. 내부 namespace wildcard는 모든 실제 서비스 이름을 나열하지
+않습니다. 공인 ACME 인증서는 여전히 공개
+[Certificate Transparency 로그](https://letsencrypt.org/docs/ct-logs/)에 제출되며
+기존에 발표된 인증서 이름은 공개 이력에 남습니다.
+
+발급기는 관련 없는 인증서 그룹을 섞은 단일 설정을 CA·DNS provider에 접속하기
+전에 거부합니다. 예전 묶음은 오프라인 planner로 분리하고 별도 발급기 출력을
+준비한 뒤 gateway 연결을 바꾸십시오.

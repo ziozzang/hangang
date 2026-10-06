@@ -82,3 +82,48 @@
 로그 출력은 전용 worker 하나와 유한 큐(요청 이벤트 224개, 관리자 예약 이벤트 32개)를 사용합니다. 요청 처리 worker는 막힌 로그 저장소를 기다리지 않으며, 큐 초과도 생략 건수에 합산합니다.
 
 정확한 URL 규칙에서도 요청 끝의 선택적 슬래시 하나는 같은 URL로 취급합니다. `/login`과 `/login/`으로 로그인 처리 한도나 허용 목록을 우회하지 못하며 `/login/image.png`에는 하위 경로 옵션을 명시하지 않는 한 적용하지 않습니다.
+
+## Browser origin restrictions
+
+선택한 처리 URL에 `settings.path_csrf`를 설정하면 신뢰하지 않는 출처의
+브라우저 요청을 인증·cache·origin 처리 전에 막습니다.
+
+```json
+{
+  "path_csrf": [
+    {
+      "path": "/api/login",
+      "hosts": ["app.local.example.net"],
+      "allow_origins": ["https://console.local.example.net"],
+      "allow_same_origin": true,
+      "allow_missing_origin": false,
+      "methods": ["POST", "PUT", "PATCH", "DELETE"]
+    }
+  ]
+}
+```
+
+기본 메서드는 POST, PUT, PATCH, DELETE입니다. 명시적으로 선택하지 않은
+다른 메서드와 URL, 일반적인 이미지 GET에는 적용하지 않습니다. GET으로
+상태를 바꾸는 애플리케이션에는 GET도 포함하십시오. 선택자는 선택적인
+끝 슬래시 별칭을 포함한 정확한 정규화 경로이고, 하위 경로에는
+`include_subpaths: true`가 필요합니다. 겹치는 규칙은 모두 허용해야 합니다.
+
+허용 출처는 정확한 HTTP(S) scheme·host·실효 port이며 credentials, path,
+query, fragment, wildcard를 넣지 않습니다. host 대소문자와 기본 port는
+정규화합니다. `allow_same_origin`은 기본 true이고 검증된 gateway 요청의
+scheme·authority를 사용하므로 신뢰하지 않는 forwarded header로 바꿀 수
+없습니다. 형제 하위 도메인은 browser가 same-site로 분류해도 다른 origin입니다.
+
+Origin이 없으면 Referer의 origin 부분을 사용합니다. 둘 다 없으면 기본적으로
+거부하며 browser metadata 없는 client가 필요한 특정 endpoint에서만
+`allow_missing_origin`을 명시적으로 켜십시오. Origin `null`은 거부하고 Referer로
+대체하지 않습니다. 중복·잘못된 Origin/Referer는 일반400, 허용하지 않거나 없는
+출처는 일반403으로 응답합니다. 출처·referrer·query 값 없이 제한된 비공개
+보안 event를 기록하며 설정한 실패 차단 규칙이 해당 응답을 셀 수 있습니다.
+브라우저 출처 제한은 일반 인증과 함께 사용합니다. 브라우저가 아닌 caller는
+Origin header를 직접 보낼 수 있습니다.
+
+규칙마다 host pattern 최대16개, 허용 origin128개, 중복 없는 표준 메서드8개를
+지원하며 CONNECT는 제외합니다. 전체 규칙은 최대128개, 선택자·origin 문자열은
+합쳐32 KiB입니다. 관리자 status에는 설정 규칙 개수만 노출합니다.

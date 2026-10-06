@@ -48,6 +48,8 @@ fn is_zero(value: &u64) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_csrf: Option<Vec<crate::path_csrf::Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_allowlists: Option<Vec<crate::path_allowlists::Rule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_redis: Option<crate::security_redis::Settings>,
@@ -94,6 +96,9 @@ impl Settings {
         *self == Self::default()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(rules) = &self.path_csrf {
+            crate::path_csrf::validate(rules)?;
+        }
         if let Some(rules) = &self.path_allowlists {
             crate::path_allowlists::validate(rules)?;
         }
@@ -166,6 +171,7 @@ impl Settings {
 /// `Settings` with names and durations parsed once per snapshot.
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
+    pub path_csrf: Vec<std::sync::Arc<crate::path_csrf::Compiled>>,
     pub path_allowlists: Vec<std::sync::Arc<crate::path_allowlists::Compiled>>,
     pub(crate) security_redis: Option<std::sync::Arc<crate::security_redis::Backend>>,
     pub path_failure_bans: Vec<std::sync::Arc<crate::path_failure_bans::Bucket>>,
@@ -185,6 +191,7 @@ impl PreparedSettings {
         use anyhow::Context;
         settings.validate()?;
         Ok(Self {
+            path_csrf: crate::path_csrf::prepare(settings.path_csrf.as_deref().unwrap_or(&[]))?,
             path_allowlists: crate::path_allowlists::prepare(
                 settings.path_allowlists.as_deref().unwrap_or(&[]),
             )?,

@@ -5876,6 +5876,12 @@
             },
             "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
           },
+          "path_csrf": {
+            "type": ["array", "null"],
+            "maxItems": 128,
+            "items": {"$ref": "#/components/schemas/PathCsrfRule"},
+            "description": "Explicit per-URL and per-method Origin/Referer policy before auth/cache/Lua/origin. Defaults select POST/PUT/PATCH/DELETE, same-origin allowed, missing Origin denied unless Referer matches. Global URL methods and paths not selected by rules are unaffected. All matching rules apply. Malformed/duplicate headers are 400; untrusted/null origins are 403. Verified edge authority defines same origin; optional origins permit exact internal HTTP(S) origins. Total path/host/origin/method text per list is bounded to 32 KiB. Does not replace application CSRF tokens."
+          },
           "path_allowlists": {
             "type": [
               "array",
@@ -6845,6 +6851,104 @@
         }
       }
     ,
+      "PathCsrfRule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ],
+        "anyOf": [
+          {
+            "properties": {
+              "allow_same_origin": {
+                "const": true
+              }
+            }
+          },
+          {
+            "required": [
+              "allow_origins"
+            ],
+            "properties": {
+              "allow_origins": {
+                "minItems": 1
+              }
+            }
+          }
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^/",
+            "description": "Canonical absolute path, at most 2048 UTF-8 bytes; no escapes, dot/repeated separators, query/fragment or trailing slash except root."
+          },
+          "hosts": {
+            "type": "array",
+            "maxItems": 16,
+            "default": [],
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253
+            },
+            "description": "Optional bounded hostname/IP patterns; empty means all public hosts."
+          },
+          "include_subpaths": {
+            "type": "boolean",
+            "default": false
+          },
+          "allow_origins": {
+            "type": "array",
+            "maxItems": 128,
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "description": "Exact HTTP/HTTPS root origins only, without credentials, query, fragment, null or globs; DNS case, default ports and optional trailing root slash are normalized. Duplicate normalized origins are rejected."
+          },
+          "allow_same_origin": {
+            "type": "boolean",
+            "default": true
+          },
+          "allow_missing_origin": {
+            "type": "boolean",
+            "default": false,
+            "description": "Explicitly permits requests with neither Origin nor usable Referer. Absent Origin otherwise uses Referer fallback; Origin:null is always denied."
+          },
+          "methods": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "default": [
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE"
+            ],
+            "items": {
+              "type": "string",
+              "enum": [
+                "GET",
+                "HEAD",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "OPTIONS",
+                "TRACE"
+              ]
+            },
+            "description": "Only configured methods are selected. GET/HEAD can be explicitly opted in; CONNECT is unsupported."
+          }
+        },
+        "description": "Bounded CSRF origin policy for selected URLs. At least same-origin access or a nonempty allowed-origin list is required. Ordinary image/safe GET requests are unaffected by default; global HTTP security and administrator recovery boundaries remain independent."
+      },
       "RuntimeSettingsSummary": {
         "type": "object",
         "additionalProperties": false,
@@ -6903,6 +7007,10 @@
           "path_blocks_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "path_csrf_count": {
+            "type": "integer", "minimum": 0, "maximum": 128,
+            "description": "Configured URL CSRF rule count. No origin or URL policy details are exposed in the viewer summary."
           },
           "path_allowlists_count": {
             "type": "integer",

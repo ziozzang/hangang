@@ -257,3 +257,37 @@ request leaves that worker slot occupied until the actual resolver finishes;
 IP addresses and resolved Docker endpoints avoid those workers. Docker endpoint
 withdrawal is checked again after response waits. Workload listeners cannot
 enter the public HTTP-01 exception.
+
+## Certificate group privacy
+
+Keep unrelated explicit service domains in separate issuer/output/key groups.
+The normal base name, its `www.` alias, and a matching wildcard belong to one
+management group. For example `foo.com`, `www.foo.com` and `*.foo.com` are one
+group, while `api.other.com` is separate. Only requested names are included;
+the planner does not add DNS records or request an undeclared www name.
+
+```sh
+python3 tools/plan_certificate_groups.py issuer.json groups-plan.json
+```
+
+This offline tool reads either an issuer configuration or a domain array and
+writes a private plan containing only domain names and the DNS-01 requirement.
+It never copies provider credentials or starts orders. Use an independent private
+account path and output directory for each resulting issuer. The gateway can
+serve all groups by SNI while the application retains one multi-listener route.
+
+Wildcard authorization requires DNS-01; it cannot use the HTTP-01 delegate.
+The issuer's automatic challenge mode selects DNS-01 for a wildcard group, and
+an explicitly incompatible HTTP-01 selection is rejected. Nonwildcard groups
+may also use DNS-01 when appropriate. Same-site www aliases such as
+`aiotanzania.org` and `www.aiotanzania.org` remain together.
+
+Separating SANs and certificate keys limits the service names revealed by one
+TLS certificate. Internal namespace wildcards avoid listing every concrete
+service name. Public ACME certificates are still submitted to public
+[Certificate Transparency logs](https://letsencrypt.org/docs/ct-logs/), and
+previously published certificate names remain part of that public history.
+
+The issuer rejects a single configuration containing unrelated certificate groups
+before contacting the CA or DNS provider. Split legacy bundles with the offline
+planner and provision separate issuer outputs before changing gateway bindings.

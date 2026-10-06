@@ -175,6 +175,16 @@ impl AcmeDirectory {
     }
 }
 
+// Domains have already been normalized and validated before grouping.
+fn certificate_group(domain: &str) -> &str {
+    let base = domain.strip_prefix("*.").unwrap_or(domain);
+    if base.starts_with("www.") && base.split('.').count() >= 3 {
+        &base[4..]
+    } else {
+        base
+    }
+}
+
 /// Which ACME authorization challenge to use.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChallengeMode {
@@ -299,6 +309,13 @@ impl AcmeConfig {
             ensure!(seen.insert(domain.clone()), "duplicate ACME domain");
             result.push(domain);
         }
+        let group = certificate_group(&result[0]);
+        ensure!(
+            result
+                .iter()
+                .all(|domain| certificate_group(domain) == group),
+            "ACME issuer domains must share one base/www/wildcard certificate group; split unrelated services"
+        );
         let wildcard = result.iter().any(|d| d.starts_with("*."));
         ensure!(
             !(wildcard && self.challenge == ChallengeMode::Http01),

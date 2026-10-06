@@ -1958,6 +1958,42 @@ fn wildcard_requires_dns_and_directory_must_be_https() {
 }
 
 #[test]
+fn issuance_keeps_www_wildcard_groups_and_rejects_unrelated_service_sans() {
+    for domains in [
+        vec!["aiotanzania.org", "www.aiotanzania.org"],
+        vec!["foo.com", "www.foo.com", "*.foo.com"],
+        vec!["dev.jioh.net", "*.dev.jioh.net"],
+    ] {
+        let mut config = AcmeConfig::new(
+            domains.into_iter().map(str::to_owned).collect(),
+            "/tmp/hangang-group-test-account",
+        );
+        assert!(config.validate().is_ok());
+        if config.domains.iter().any(|domain| domain.starts_with("*.")) {
+            config.challenge = ChallengeMode::Http01;
+            assert!(config.validate().is_err());
+        }
+    }
+    for domains in [
+        vec!["dify.jioh.net", "llm-api.jioh.net"],
+        vec!["foo.com", "api.foo.com"],
+        vec!["foo.com", "unrelated.org"],
+    ] {
+        let config = AcmeConfig::new(
+            domains.into_iter().map(str::to_owned).collect(),
+            "/tmp/hangang-group-test-account",
+        );
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("certificate group")
+        );
+    }
+}
+
+#[test]
 fn runtime_json_keeps_eab_secret_out_of_debug() {
     let config = AcmeFileConfig {
         directory: Some("zerossl-production".into()),

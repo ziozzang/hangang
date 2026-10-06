@@ -6,6 +6,12 @@
 
 ## 0.2.2 — 2026-10-06
 
+- Add opt-in per-URL browser Origin/Referer checks with verified same-origin
+  handling, exact internal-origin allowlists, and bounded private denial logs.
+- Plan isolated certificate groups while keeping base/www aliases and matching
+  wildcards together; reject mixed-service issuer configurations before CA/DNS
+  work, and require DNS-01 validation for wildcard groups.
+
 - Manage HTTP-01 challenge delegation on the existing domain route, with bounded
   work and responses that omit issuer metadata and application credentials.
 

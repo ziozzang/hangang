@@ -78,3 +78,48 @@ Structured private events include path/allowlist denial, rate rejection, selecte
 Request security events are capped at10 per second per process. Administrator release events have an independent10-per-second budget, so public attack traffic cannot consume their log allowance. Accepted releases log inside their owned worker even if the caller disconnects. Suppressed counts accompany a later emitted event, preventing repeated rejected requests from producing unlimited security logs. Existing traffic/access logging has separate policy and retention controls.
 
 Log output runs on one dedicated worker with bounded queues (224 request events and32 reserved administrator events). Request processing never waits for a blocked log sink; queue overflow is counted as suppression.
+
+## Browser origin restrictions
+
+Configure `settings.path_csrf` on selected processing URLs to block browser
+requests from untrusted origins before authentication, cache or origin work:
+
+```json
+{
+  "path_csrf": [
+    {
+      "path": "/api/login",
+      "hosts": ["app.local.example.net"],
+      "allow_origins": ["https://console.local.example.net"],
+      "allow_same_origin": true,
+      "allow_missing_origin": false,
+      "methods": ["POST", "PUT", "PATCH", "DELETE"]
+    }
+  ]
+}
+```
+
+The default methods are POST, PUT, PATCH and DELETE. Other methods and URLs,
+including ordinary image GETs, are unaffected unless explicitly selected. Include
+GET when an application changes state through GET. Rules match exact normalized
+paths, including the optional trailing-slash alias; descendants require
+`include_subpaths: true`. Overlapping rules must all permit the request.
+
+An allowed origin is an exact HTTP(S) scheme, host and effective port, with no
+credentials, path, query, fragment or wildcard. Host case and default ports are
+normalized. `allow_same_origin` defaults to true and uses the verified gateway
+request scheme/authority; untrusted forwarded headers cannot alter it. A sibling
+subdomain is a different origin even when the browser calls it same-site.
+
+A missing Origin uses the origin portion of Referer. Missing both headers is
+denied by default; explicitly enable `allow_missing_origin` only for a selected
+endpoint that needs clients without browser metadata. Origin `null` is denied
+and never falls back to Referer. Duplicate or malformed Origin/Referer values
+return opaque400; disallowed or missing origins return opaque403. Decisions are
+private sampled security events, without origin/referrer/query values. Configured
+failure-ban rules can count those responses. Browser origin restrictions supplement
+normal authentication; non-browser callers can supply their own Origin header.
+
+Each rule supports at most16 host patterns,128 allowed origins and8 unique standard
+methods (CONNECT is excluded). There are at most128 rules and32 KiB combined
+selector/origin text. The admin status exposes only the configured rule count.
