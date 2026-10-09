@@ -1,3 +1,4 @@
+use anyhow::{Context as _, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -437,6 +438,169 @@ pub struct ExternalAuth {
     /// bounded response directly to the client instead of contacting upstream.
     #[serde(default)]
     pub terminal_response: bool,
+    /// Fixed headers added to every authorization call, as literals or
+    /// `{"env": "NAME"}` references resolved when a configuration is
+    /// activated. Environment values are never serialized, logged or shown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub static_request_headers: BTreeMap<String, StaticHeaderValue>,
+}
+
+/// A static authorization request header value: a literal or a reference to a
+/// process environment variable. Only the reference is ever part of the
+/// configuration; the resolved value lives in the prepared runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StaticHeaderValue {
+    Literal(String),
+    Env(StaticHeaderEnv),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticHeaderEnv {
+    pub env: String,
+}
+
+const MAX_STATIC_REQUEST_HEADERS: usize = 16;
+const MAX_STATIC_HEADER_VALUE: usize = 1024;
+
+fn valid_static_env_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && (bytes[0] == b'_' || bytes[0].is_ascii_uppercase())
+        && bytes[1..]
+            .iter()
+            .all(|b| *b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Names the proxy owns on the authorization call: connection-management,
+/// framing and generated-context headers.
+fn unsafe_auth_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "keep-alive"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "x-real-ip"
+            | "proxy-authenticate"
+            | "x-original-method"
+            | "x-original-uri"
+            | "x-original-url"
+            | "x-original-client-ip"
+    ) || name.starts_with("x-forwarded-")
+        || name == "forwarded"
+}
+
+fn validate_static_request_headers(auth: &ExternalAuth) -> anyhow::Result<()> {
+    ensure!(
+        auth.static_request_headers.len() <= MAX_STATIC_REQUEST_HEADERS,
+        "too many static authorization request headers"
+    );
+    for (name, value) in &auth.static_request_headers {
+        let parsed: hyper::header::HeaderName = name
+            .parse()
+            .with_context(|| format!("invalid static authorization header name {name:?}"))?;
+        ensure!(
+            parsed.as_str() == name,
+            "static authorization header name {name:?} must be lowercase"
+        );
+        ensure!(
+            name != "x-hangang-auth-terminal"
+                && !unsafe_auth_header(name)
+                && !name.starts_with("x-original-"),
+            "static authorization header {name:?} is reserved"
+        );
+        ensure!(
+            !auth
+                .request_headers
+                .iter()
+                .chain(&auth.response_headers)
+                .any(|other| other.eq_ignore_ascii_case(name)),
+            "static authorization header {name:?} collides with a listed request or response header"
+        );
+        match value {
+            StaticHeaderValue::Literal(text) => {
+                ensure!(
+                    text.len() <= MAX_STATIC_HEADER_VALUE
+                        && hyper::header::HeaderValue::from_str(text).is_ok(),
+                    "static authorization header {name:?} has an invalid literal value"
+                );
+            }
+            StaticHeaderValue::Env(reference) => ensure!(
+                valid_static_env_name(&reference.env),
+                "static authorization header {name:?} has an invalid environment variable name"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Resolve static authorization headers for activation. Errors name the
+/// variable, never its value. Values are marked sensitive so `Debug` output
+/// of the resulting `HeaderValue` is redacted.
+pub fn resolve_static_request_headers(
+    auth: &ExternalAuth,
+) -> anyhow::Result<Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>> {
+    resolve_static_request_headers_with(auth, |name| std::env::var_os(name))
+}
+
+fn resolve_static_request_headers_with(
+    auth: &ExternalAuth,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>> {
+    let mut resolved = Vec::with_capacity(auth.static_request_headers.len());
+    for (name, value) in &auth.static_request_headers {
+        let header_name: hyper::header::HeaderName = name
+            .parse()
+            .with_context(|| format!("invalid static authorization header name {name:?}"))?;
+        let mut header_value = match value {
+            StaticHeaderValue::Literal(text) => hyper::header::HeaderValue::from_str(text)
+                .with_context(|| format!("invalid static authorization header {name:?}"))?,
+            StaticHeaderValue::Env(reference) => {
+                ensure!(
+                    valid_static_env_name(&reference.env),
+                    "invalid environment variable name for static authorization header {name:?}"
+                );
+                let raw = lookup(&reference.env).with_context(|| {
+                    format!(
+                        "environment variable {} for static authorization header {name:?} is not set",
+                        reference.env
+                    )
+                })?;
+                let raw = raw.into_string().map_err(|_| {
+                    anyhow::anyhow!(
+                        "environment variable {} for static authorization header {name:?} is not valid UTF-8",
+                        reference.env
+                    )
+                })?;
+                ensure!(
+                    !raw.is_empty(),
+                    "environment variable {} for static authorization header {name:?} is empty",
+                    reference.env
+                );
+                ensure!(
+                    raw.len() <= MAX_STATIC_HEADER_VALUE,
+                    "environment variable {} for static authorization header {name:?} is too long",
+                    reference.env
+                );
+                hyper::header::HeaderValue::from_str(&raw).map_err(|_| {
+                    anyhow::anyhow!(
+                        "environment variable {} for static authorization header {name:?} is not a valid header value",
+                        reference.env
+                    )
+                })?
+            }
+        };
+        header_value.set_sensitive(true);
+        resolved.push((header_name, header_value));
+    }
+    Ok(resolved)
 }
 fn auth_timeout() -> u64 {
     1000
@@ -1303,29 +1467,11 @@ impl Config {
                         continue;
                     }
                     ensure!(
-                        !matches!(
-                            name.as_str(),
-                            "host"
-                                | "connection"
-                                | "content-length"
-                                | "transfer-encoding"
-                                | "upgrade"
-                                | "te"
-                                | "trailer"
-                                | "keep-alive"
-                                | "proxy-authorization"
-                                | "proxy-connection"
-                                | "x-real-ip"
-                                | "proxy-authenticate"
-                                | "x-original-method"
-                                | "x-original-uri"
-                                | "x-original-url"
-                                | "x-original-client-ip"
-                        ) && !name.as_str().starts_with("x-forwarded-")
-                            && name != "forwarded",
+                        !unsafe_auth_header(name.as_str()),
                         "unsafe authorization header"
                     );
                 }
+                validate_static_request_headers(auth)?;
             }
             ensure!(
                 !r.backends.is_empty() && r.backends.len() <= 128,
@@ -1659,6 +1805,9 @@ pub struct HttpRuntime {
     pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
     pub workload_auth: Option<std::sync::Arc<crate::workload_auth::Runtime>>,
     pub auth_reserved: Vec<hyper::header::HeaderName>,
+    /// Resolved `auth.static_request_headers` (values marked sensitive). Held
+    /// only in the prepared runtime; never serialized.
+    pub auth_static_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -2028,6 +2177,14 @@ impl Snapshot {
                         .expect("validated authentication identity header")
                 })
                 .collect();
+        let mut auth_static_headers = std::collections::HashMap::new();
+        for route in config.http.iter().filter(|route| route.enabled) {
+            if let Some(auth) = &route.auth {
+                let resolved = resolve_static_request_headers(auth)
+                    .with_context(|| format!("route {} external authorization", route.id))?;
+                auth_static_headers.insert(route.id.clone(), resolved);
+            }
+        }
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
@@ -2064,6 +2221,7 @@ impl Snapshot {
                     jwt_auth,
                     workload_auth,
                     auth_reserved,
+                    auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
@@ -2883,6 +3041,7 @@ mod tests {
                 timeout_ms: 1000,
                 forward_response: false,
                 terminal_response: false,
+                static_request_headers: Default::default(),
             });
             assert!(
                 config.validate().is_err(),
@@ -3515,6 +3674,7 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
         });
         c.http[0].request_transform = Some(set.clone());
         assert!(c.validate().is_err());
@@ -3529,6 +3689,7 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
         });
         assert!(c.validate().is_err());
         // An unrelated header, or the same name on the response transform
@@ -3580,7 +3741,168 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
         });
         assert!(document.validate().is_err());
+    }
+
+    fn static_auth(headers: serde_json::Value) -> Config {
+        let mut config = route();
+        config.http[0].auth = Some(
+            serde_json::from_value(serde_json::json!({
+                "url": "http://127.0.0.1:9/check",
+                "request_headers": ["authorization"],
+                "response_headers": ["x-user"],
+                "static_request_headers": headers,
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn static_request_headers_accept_literals_and_env_references() {
+        let config = static_auth(serde_json::json!({
+            "x-hopae-contract": "1",
+            "x-hopae-gateway-key": {"env": "HANGANG_HOPAE_KEY"},
+        }));
+        config.validate().unwrap();
+        // Round trip emits the reference, never a resolved value.
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains(r#""x-hopae-gateway-key":{"env":"HANGANG_HOPAE_KEY"}"#));
+        assert_eq!(
+            serde_json::from_str::<Config>(&text).unwrap().http[0].auth,
+            config.http[0].auth
+        );
+    }
+
+    #[test]
+    fn static_request_headers_reject_collisions_and_reserved_names() {
+        for name in [
+            "authorization", // also listed in request_headers
+            "x-user",        // also listed in response_headers
+            "x-hangang-auth-terminal",
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "proxy-authorization",
+            "connection",
+            "keep-alive",
+            "upgrade",
+            "te",
+            "trailer",
+            "forwarded",
+            "x-real-ip",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-original-uri",
+            "x-original-anything",
+            "X-Upper",
+            "bad name",
+            "",
+        ] {
+            let config = static_auth(serde_json::json!({ name: "v" }));
+            assert!(
+                config.validate().is_err(),
+                "static header name {name:?} must be rejected"
+            );
+        }
+        static_auth(serde_json::json!({"x-ok": "v"}))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn static_request_headers_enforce_value_and_count_limits() {
+        let invalid = [
+            serde_json::json!({"x-a": "line\nbreak"}),
+            serde_json::json!({"x-a": "a".repeat(1025)}),
+            serde_json::json!({"x-a": {"env": "lowercase"}}),
+            serde_json::json!({"x-a": {"env": "1STARTS_DIGIT"}}),
+            serde_json::json!({"x-a": {"env": ""}}),
+            serde_json::json!({"x-a": {"env": "A".repeat(129)}}),
+        ];
+        for headers in invalid {
+            assert!(
+                static_auth(headers.clone()).validate().is_err(),
+                "{headers}"
+            );
+        }
+        static_auth(serde_json::json!({"x-a": "a".repeat(1024)}))
+            .validate()
+            .unwrap();
+        static_auth(serde_json::json!({"x-a": {"env": "A".repeat(128)}}))
+            .validate()
+            .unwrap();
+        let many = |count: usize| {
+            serde_json::Value::Object(
+                (0..count)
+                    .map(|i| (format!("x-extra-{i}"), serde_json::json!("v")))
+                    .collect(),
+            )
+        };
+        static_auth(many(16)).validate().unwrap();
+        assert!(static_auth(many(17)).validate().is_err());
+        // The object form rejects unknown fields.
+        assert!(
+            serde_json::from_value::<StaticHeaderValue>(
+                serde_json::json!({"env": "A", "extra": 1})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn static_request_headers_resolve_sensitive_values_and_name_only_the_variable() {
+        let config = static_auth(serde_json::json!({
+            "x-literal": "plain",
+            "x-secret": {"env": "HANGANG_TEST_SECRET"},
+        }));
+        let auth = config.http[0].auth.as_ref().unwrap();
+        let resolved = resolve_static_request_headers_with(auth, |name| {
+            (name == "HANGANG_TEST_SECRET").then(|| "s3cr3t-value".into())
+        })
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+        let secret = resolved.iter().find(|(n, _)| n == "x-secret").unwrap();
+        assert_eq!(secret.1.as_bytes(), b"s3cr3t-value");
+        assert!(secret.1.is_sensitive());
+        assert!(!format!("{resolved:?}").contains("s3cr3t-value"));
+        // Missing, empty and malformed values reject with the variable name.
+        for value in [
+            None,
+            Some(""),
+            Some("bad\nvalue-xyz"),
+            Some("é\u{1}secret-xyz"),
+        ] {
+            let error = resolve_static_request_headers_with(auth, |name| {
+                (name == "HANGANG_TEST_SECRET")
+                    .then(|| value.map(std::ffi::OsString::from))
+                    .flatten()
+            })
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("HANGANG_TEST_SECRET"), "{text}");
+            assert!(!text.contains("xyz"), "{text}");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_unset_static_header_variable_and_never_serializes_value() {
+        let config = static_auth(serde_json::json!({
+            "x-key": {"env": "HANGANG_HC3_DEFINITELY_UNSET"},
+        }));
+        let error = Snapshot::new(config).err().expect("unset variable rejects");
+        assert!(format!("{error:#}").contains("HANGANG_HC3_DEFINITELY_UNSET"));
+        // PATH is always present in a test process: use it as the "secret".
+        let secret = std::env::var("PATH").unwrap();
+        let config = static_auth(serde_json::json!({"x-key": {"env": "PATH"}}));
+        let snapshot = Snapshot::new(config).unwrap();
+        assert_eq!(snapshot.http[0].auth_static_headers.len(), 1);
+        assert!(snapshot.http[0].auth_static_headers[0].1.is_sensitive());
+        let dumped = serde_json::to_string(&snapshot.config).unwrap()
+            + &serde_json::to_string(&snapshot.http[0].route).unwrap();
+        assert!(dumped.contains(r#"{"env":"PATH"}"#));
+        assert!(!dumped.contains(&secret));
     }
 }

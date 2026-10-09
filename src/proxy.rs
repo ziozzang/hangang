@@ -647,6 +647,7 @@ impl Proxy {
     async fn authorize(
         &self,
         auth: &crate::config::ExternalAuth,
+        static_headers: &[(HeaderName, HeaderValue)],
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
@@ -676,6 +677,11 @@ impl Proxy {
                     HeaderName::from_static(name),
                     HeaderValue::from_str(&value).map_err(|_| 503u16)?,
                 );
+            }
+            // Configured static headers are applied last with `insert`, so a
+            // client copy of the same name can never reach the service.
+            for (name, value) in static_headers {
+                request.headers_mut().insert(name.clone(), value.clone());
             }
             let response = self.client.request(request).await.map_err(|_| 503u16)?;
             let (mut parts, body_stream) = response.into_parts();
@@ -2187,7 +2193,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);

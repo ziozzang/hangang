@@ -35,6 +35,22 @@ General Lua application-header/body/supported backend-selection transformations 
 
 `protected` does not require transport TLS automatically, validate JWT/OIDC, authenticate inbound client certificates, evaluate device posture, enforce user-specific scopes, revoke established public streams, or create durable audit. Configure current transport/authenticator controls explicitly and qualify their topology. In particular, SNI passthrough cannot establish a gateway-verified client certificate without a terminating/authenticated identity hop.
 
+## Static authorization request headers
+
+A route's external authenticator (`auth`) can receive fixed headers on every authorization call, for example a caller key and a contract version expected by an identity service such as hopae:
+
+```json
+"auth": {
+  "url": "https://id.internal/verify",
+  "static_request_headers": {
+    "x-hopae-contract": "1",
+    "x-hopae-gateway-key": {"env": "HANGANG_HOPAE_KEY"}
+  }
+}
+```
+
+A value is a literal string or `{"env": "NAME"}`. Environment references are resolved when a configuration is activated, not per request. An unset or empty variable, or a value that is not a valid header value, rejects the configuration and the error names only the variable. At most 16 headers are allowed; names must be lowercase HTTP header names, literal values at most 1024 bytes and variable names must match `^[A-Z_][A-Z0-9_]{0,127}$`. A name may not be hop-by-hop, `host`, `content-length`, `transfer-encoding`, `proxy-authorization`, `x-hangang-auth-terminal`, a generated context header (`x-forwarded-*`, `forwarded`, `x-real-ip`, `x-original-*`), or appear in `request_headers` or `response_headers`. A client-supplied header with a configured name is never forwarded to the authorization service. Resolved environment values are held only in the prepared runtime, marked sensitive, and are never serialized, logged or returned by the admin API, which shows only the `{"env": "NAME"}` reference. Editing or removing the variable takes effect on the next activation.
+
 ## Upgrade compatibility
 
 Older gateway binaries do not understand `access_mode` and may reject configurations containing it. Upgrade every intended reader before publishing explicit modes to shared configuration. A rollback to a pre-feature binary is not automatically compatible once such a document is stored; do not silently strip protection to make a rollback load. The active-snapshot transition guard also intentionally rejects older-editor replacements omitting a protected declaration. Coordinate reader versions before publishing new fields.

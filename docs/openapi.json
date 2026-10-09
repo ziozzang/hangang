@@ -3913,6 +3913,36 @@
             "type": "boolean",
             "default": false,
             "description": "Opt-in: a configured authorization server may return a bounded terminal 2xx response with exactly one X-Hangang-Auth-Terminal: 1 header. The marker is never forwarded."
+          },
+          "static_request_headers": {
+            "type": "object",
+            "maxProperties": 16,
+            "default": {},
+            "propertyNames": {
+              "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$"
+            },
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "maxLength": 1024
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "env"
+                  ],
+                  "properties": {
+                    "env": {
+                      "type": "string",
+                      "pattern": "^[A-Z_][A-Z0-9_]{0,127}$"
+                    }
+                  }
+                }
+              ]
+            },
+            "description": "Fixed headers sent on every authorization call, as a literal or an {\"env\": \"NAME\"} reference resolved at configuration activation (an unset or empty variable rejects the configuration; the value is never serialized, logged or returned). Names must be lowercase and may not be hop-by-hop, host, content-length, transfer-encoding, proxy-authorization, x-hangang-auth-terminal, generated context headers (x-forwarded-*, forwarded, x-real-ip, x-original-*) or listed in request_headers or response_headers. Client headers of the same name are never forwarded."
           }
         }
       },

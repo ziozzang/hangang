@@ -2468,6 +2468,7 @@ async fn external_authorization_is_bounded_fail_closed_and_replaces_spoofed_iden
         timeout_ms: 500,
         forward_response: false,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![secured]);
     let (front, front_task, _) = frontend(proxy).await;
@@ -2567,6 +2568,7 @@ async fn authorization_service_receives_edge_resolved_forward_auth_context() {
         timeout_ms: 500,
         forward_response: false,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![secured]);
     let proxy = proxy.with_trusted_proxies(vec!["127.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
@@ -2735,6 +2737,7 @@ async fn sso_identity_under_forwarded_prefix_reaches_the_upstream_unspoofed() {
         timeout_ms: 500,
         forward_response: false,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     // Identity names are accepted as response headers but never as inputs.
     let mut rejected = secured.clone();
@@ -3413,6 +3416,7 @@ async fn client_connection_token_cannot_erase_auth_injected_header() {
         timeout_ms: 500,
         forward_response: false,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![secured]);
     let (front, front_task, _) = frontend(proxy).await;
@@ -4521,6 +4525,7 @@ async fn terminal_auth_2xx_never_contacts_upstream_or_leaks_marker() {
         timeout_ms: 500,
         forward_response: true,
         terminal_response: true,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![secured]);
     let (front, front_task, _) = frontend(proxy).await;
@@ -4785,6 +4790,7 @@ async fn external_auth_forward_response_drives_sso_redirect_and_cookie() {
         timeout_ms: 500,
         forward_response: true,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![secured]);
     let (front, front_task, _) = frontend(proxy).await;
@@ -5200,6 +5206,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
         language_policy: None,
         country_policy: None,
         auth_reserved: Vec::new(),
+        auth_static_headers: Vec::new(),
         jwt_auth: None,
         workload_auth: None,
         host_regex: None,
@@ -5519,6 +5526,7 @@ async fn http2_cookie_join_precedes_route_matching_and_external_auth() {
         timeout_ms: 500,
         forward_response: false,
         terminal_response: false,
+        static_request_headers: Default::default(),
     });
     let (proxy, policy) = proxy(vec![configured]);
     let (front, front_task) = frontend_h2(proxy).await;
@@ -6177,4 +6185,95 @@ async fn conditional_response_transform_preserves_unmatched_streams_and_fences_b
     front_task.abort();
     origin_task.abort();
     policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
+    let seen_context = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
+    let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_address = auth_listener.local_addr().unwrap();
+    let recorder = seen_context.clone();
+    let auth_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = auth_listener.accept().await {
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let mut context = recorder.lock().unwrap();
+                        context.clear();
+                        for (name, value) in request.headers() {
+                            context.push((
+                                name.as_str().to_owned(),
+                                value.to_str().unwrap_or("<binary>").to_owned(),
+                                value.is_sensitive(),
+                            ));
+                        }
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(200)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let (backend, _seen, backend_task) = upstream("allowed").await;
+    let mut secured = route(vec![format!("http://{backend}")]);
+    // PATH is always set in a test process; it stands in for the secret
+    // without mutating the shared environment.
+    let key = std::env::var("PATH").unwrap();
+    secured.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "url": format!("http://{auth_address}/check"),
+            "request_headers": ["authorization"],
+            "static_request_headers": {
+                "x-hopae-contract": "1",
+                "x-hopae-gateway-key": {"env": "PATH"},
+            },
+        }))
+        .unwrap(),
+    );
+    let (proxy, policy) = proxy(vec![secured]);
+    let (front, front_task, _) = frontend(proxy).await;
+    for _ in 0..2 {
+        let response = client()
+            .request(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("http://{front}/private/item?x=1"))
+                    .header("authorization", "Bearer abc")
+                    .header("x-hopae-gateway-key", "evil")
+                    .header("x-hopae-contract", "999")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let context = seen_context.lock().unwrap().clone();
+        let all = |name: &str| -> Vec<String> {
+            context
+                .iter()
+                .filter(|(n, _, _)| n == name)
+                .map(|(_, v, _)| v.clone())
+                .collect()
+        };
+        assert_eq!(all("x-hopae-gateway-key"), vec![key.clone()]);
+        assert_eq!(all("x-hopae-contract"), vec!["1".to_owned()]);
+        assert!(!context.iter().any(|(_, v, _)| v == "evil" || v == "999"));
+        // Alongside the generated context and the listed client header.
+        assert_eq!(all("x-original-method"), vec!["PUT".to_owned()]);
+        assert_eq!(all("x-forwarded-uri"), vec!["/private/item?x=1".to_owned()]);
+        assert_eq!(all("authorization"), vec!["Bearer abc".to_owned()]);
+    }
+    policy.shutdown().await;
+    front_task.abort();
+    backend_task.abort();
+    auth_task.abort();
 }

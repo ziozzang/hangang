@@ -7263,3 +7263,48 @@ async fn sequenced_receipt_pages_export_pinned_prefix_across_new_http_writes() {
     assert_eq!(json(&body)["receipts"], serde_json::json!([]));
     assert_eq!(manager.active.load().config.revision, 3);
 }
+
+#[tokio::test]
+async fn static_auth_request_header_env_values_never_appear_in_admin_output() {
+    // PATH is present in every test process, so it stands in for the secret
+    // without mutating the process environment.
+    let secret = std::env::var("PATH").unwrap();
+    assert!(secret.len() > 3);
+    let (address, _manager, _dir) = server().await;
+    let unset = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"],
+        "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"HANGANG_HC3_ADMIN_UNSET"}}}}"#;
+    let (status, _, body) = request(address, "POST", "/v1/routes/http", Some(unset), Some(0)).await;
+    assert!((400..500).contains(&status), "{status}");
+    // The admin problem response is deliberately generic; it must at least
+    // never carry a value.
+    assert!(!String::from_utf8_lossy(&body).contains(&secret));
+    let route = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"],
+        "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"PATH"},"x-contract":"1"}}}"#;
+    let (status, _, body) = request(address, "POST", "/v1/routes/http", Some(route), Some(0)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let mut outputs = vec![body];
+    for path in [
+        "/v1/routes/http",
+        "/v1/routes/http/web",
+        "/v1/config",
+        "/v1/config/operations",
+        "/v1/status",
+        "/v1/config/validate",
+    ] {
+        let (status, _, body) = request(address, "GET", path, None, None).await;
+        assert!(status == 200 || status == 405, "{path} {status}");
+        outputs.push(body);
+    }
+    let (status, _, body) = request(address, "GET", "/v1/routes/http/web", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        json(&body)["auth"]["static_request_headers"]["x-key"],
+        serde_json::json!({"env": "PATH"})
+    );
+    for output in outputs {
+        assert!(
+            !String::from_utf8_lossy(&output).contains(&secret),
+            "resolved environment value leaked"
+        );
+    }
+}

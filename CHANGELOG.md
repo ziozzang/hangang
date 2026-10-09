@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Add `auth.static_request_headers` for fixed headers, literal or resolved
+  from an environment variable at activation, on external-authorization calls;
+  reserved and colliding names are rejected, client copies are never sent, and
+  resolved values are never serialized or logged.
+
 ## 0.2.5 — 2026-10-06
 
 - Add a dedicated Lua policies menu to find route/request/response scripts and

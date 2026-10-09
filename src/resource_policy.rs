@@ -357,6 +357,7 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
         }
     }
 
