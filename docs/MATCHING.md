@@ -48,6 +48,10 @@ Identical SNI host patterns or identical regex source strings at the same priori
 
 Once a route is selected, authorization, source-IP denial, admission failure or an upstream failure does not fall through to a lower-priority route. Priority does not bypass policy enforcement. New configuration affects new work; existing tunnels retain the route under which they were admitted.
 
+## Path case
+
+`path_prefix` matching is byte-exact (`path_case: "sensitive"`) by default, except that a route with `auth`, `basic_auth`, `jwt_auth` or `access_mode: protected` and a `path_prefix` defaults to ASCII case-insensitive matching (`"insensitive"`) so a case variant cannot select a public sibling route. Folding is ASCII-only, affects comparison only (the upstream receives the original path) and leaves priority and ties unchanged. Routes whose prefixes differ only in case, on possibly overlapping hosts, with different effective `path_case` are rejected. See [Access policy](ACCESS_POLICY.md#path-case).
+
 ## Example
 
 ```json

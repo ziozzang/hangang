@@ -62,3 +62,31 @@ fn check_resolves_static_header_variables_and_reports_names_only() {
     // A disabled route is never selected, so it needs no variable.
     assert!(check(None, false).status.success());
 }
+
+#[test]
+fn check_prints_path_case_warning_for_sensitive_protected_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    let config = serde_json::json!({"revision":0,"tcp":[],"http":[{
+        "id":"admin","path_prefix":"/admin","path_case":"sensitive",
+        "basic_auth":{"realm":"r","credentials":["u:00000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000"]},
+        "backends":["http://127.0.0.1:9"]
+    }]});
+    std::fs::write(&path, config.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hangang"))
+        .arg("--config")
+        .arg(&path)
+        .arg("--check")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        all.contains("warning") && all.contains("admin") && all.contains("case"),
+        "{all}"
+    );
+}

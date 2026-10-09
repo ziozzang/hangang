@@ -1461,6 +1461,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         canonical_domain: None,
         path_prefix: None,
         path_match: Default::default(),
+        path_case: None,
         max_requests: None,
         upstream_timeout_ms: None,
         retries: 0,
@@ -6359,4 +6360,155 @@ async fn route_without_static_header_variable_fails_closed_and_other_routes_keep
     front_task.abort();
     gated_task.abort();
     open_task.abort();
+}
+
+fn protected_route(backend: SocketAddr, id: &str, prefix: &str) -> HttpRoute {
+    let mut r = route(vec![format!("http://{backend}")]);
+    r.id = id.into();
+    r.host = Some("app.test".into());
+    r.path_prefix = Some(prefix.into());
+    r.basic_auth = Some(hangang::config::BasicAuth {
+        realm: "restricted".into(),
+        credentials: vec![basic_credential("alice", "s3cret")],
+        hide_credentials: true,
+        accept_proxy_authorization: false,
+        identity_header: None,
+    });
+    r.priority = 10;
+    r
+}
+
+fn public_sibling(backend: SocketAddr) -> HttpRoute {
+    let mut r = route(vec![format!("http://{backend}")]);
+    r.id = "public".into();
+    r.host = Some("app.test".into());
+    r
+}
+
+async fn status_for(front: SocketAddr, path: &str) -> u16 {
+    raw_request(
+        front,
+        &format!("GET {path} HTTP/1.1\r\nhost: app.test\r\nconnection: close\r\n\r\n"),
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn protected_prefix_routes_match_ascii_case_insensitively_by_default() {
+    let (admin, admin_seen, admin_task) = raw_upstream().await;
+    let (public, public_seen, public_task) = raw_upstream().await;
+    let mut seg = protected_route(admin, "admin", "/admin");
+    seg.path_match = hangang::config::PathMatch::SegmentPrefix;
+    let (proxy, policy) = proxy(vec![seg, public_sibling(public)]);
+    let (front, front_task, _) = frontend(proxy).await;
+
+    for path in ["/admin/x", "/ADMIN/x", "/Admin/x", "/admin/X", "/ADMIN"] {
+        assert_eq!(status_for(front, path).await, 401, "{path}");
+    }
+    // Segment boundary and ASCII-only folding are preserved.
+    assert_eq!(status_for(front, "/administrator").await, 200);
+    assert_eq!(status_for(front, "/ADMINISTRATOR").await, 200);
+    assert_eq!(status_for(front, "/%C3%A5dmin").await, 200);
+    assert!(admin_seen.lock().unwrap().is_empty());
+    assert_eq!(public_seen.lock().unwrap().len(), 3);
+    policy.shutdown().await;
+    front_task.abort();
+    admin_task.abort();
+    public_task.abort();
+}
+
+#[tokio::test]
+async fn case_folded_match_forwards_the_original_case_path_upstream() {
+    let (admin, admin_seen, admin_task) = raw_upstream().await;
+    let (public, _, public_task) = raw_upstream().await;
+    let (proxy, policy) = proxy(vec![
+        protected_route(admin, "admin", "/admin"),
+        public_sibling(public),
+    ]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let (status, _) = raw_request(
+        front,
+        &format!(
+            "GET /ADMIN/Mixed?Q=1 HTTP/1.1\r\nhost: app.test\r\nauthorization: Basic {}\r\nconnection: close\r\n\r\n",
+            {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode("alice:s3cret")
+            }
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    {
+        let seen = admin_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let head = String::from_utf8_lossy(&seen[0]).into_owned();
+        assert!(head.starts_with("GET /ADMIN/Mixed?Q=1 HTTP/1.1"), "{head}");
+    }
+    policy.shutdown().await;
+    front_task.abort();
+    admin_task.abort();
+    public_task.abort();
+}
+
+#[tokio::test]
+async fn public_routes_stay_byte_exact_unless_path_case_is_insensitive() {
+    let (api, api_seen, api_task) = raw_upstream().await;
+    let (public, public_seen, public_task) = raw_upstream().await;
+    let mut sensitive = route(vec![format!("http://{api}")]);
+    sensitive.id = "api".into();
+    sensitive.host = Some("app.test".into());
+    sensitive.path_prefix = Some("/api".into());
+    sensitive.priority = 10;
+    let mut insensitive = sensitive.clone();
+    insensitive.id = "docs".into();
+    insensitive.path_prefix = Some("/docs".into());
+    insensitive.path_case = Some(hangang::config::PathCase::Insensitive);
+    let (proxy, policy) = proxy(vec![sensitive, insensitive, public_sibling(public)]);
+    let (front, front_task, _) = frontend(proxy).await;
+    assert_eq!(status_for(front, "/api/x").await, 200);
+    assert_eq!(status_for(front, "/API/x").await, 200);
+    assert_eq!(api_seen.lock().unwrap().len(), 1, "/API must miss /api");
+    assert_eq!(public_seen.lock().unwrap().len(), 1);
+    assert_eq!(status_for(front, "/DOCS/x").await, 200);
+    assert_eq!(api_seen.lock().unwrap().len(), 2, "/DOCS selects /docs");
+    policy.shutdown().await;
+    front_task.abort();
+    api_task.abort();
+    public_task.abort();
+}
+
+#[tokio::test]
+async fn explicit_sensitive_protected_prefix_keeps_byte_exact_matching() {
+    let (admin, _, admin_task) = raw_upstream().await;
+    let (public, _, public_task) = raw_upstream().await;
+    let mut admin_route = protected_route(admin, "admin", "/admin");
+    admin_route.path_case = Some(hangang::config::PathCase::Sensitive);
+    let (proxy, policy) = proxy(vec![admin_route, public_sibling(public)]);
+    let (front, front_task, _) = frontend(proxy).await;
+    assert_eq!(status_for(front, "/admin/x").await, 401);
+    assert_eq!(status_for(front, "/ADMIN/x").await, 200);
+    policy.shutdown().await;
+    front_task.abort();
+    admin_task.abort();
+    public_task.abort();
+}
+
+#[tokio::test]
+async fn path_case_does_not_change_priority_or_tie_order() {
+    let (first, first_seen, first_task) = raw_upstream().await;
+    let (second, second_seen, second_task) = raw_upstream().await;
+    let mut a = protected_route(first, "a", "/admin");
+    a.priority = 0;
+    let mut b = protected_route(second, "b", "/ADMIN");
+    b.priority = 0;
+    let (proxy, policy) = proxy(vec![a, b]);
+    let (front, front_task, _) = frontend(proxy).await;
+    // Both are insensitive and equal-priority: configuration order wins.
+    assert_eq!(status_for(front, "/Admin").await, 401);
+    assert!(first_seen.lock().unwrap().is_empty() && second_seen.lock().unwrap().is_empty());
+    policy.shutdown().await;
+    front_task.abort();
+    first_task.abort();
+    second_task.abort();
 }

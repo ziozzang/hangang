@@ -823,6 +823,9 @@ async fn run(args: Args) -> Result<()> {
                 hangang::fleet_collector::Runtime::open(path, args.admin_token.as_deref()).await?;
         }
         config.validate()?;
+        for warning in config.warnings() {
+            println!("warning: {warning}");
+        }
         config.check_static_request_headers()?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             hangang::certificates::load(&config.certificates)?;
@@ -878,6 +881,7 @@ async fn run(args: Args) -> Result<()> {
             None => Snapshot::new(config.clone())?,
         },
     ));
+    config.log_warnings();
     active.load().activated();
     let docker_state = match args.docker_connection_state.clone() {
         Some(path) => path,

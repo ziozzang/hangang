@@ -3547,6 +3547,19 @@
             "default": null,
             "description": "Path operand interpreted by path_match. It must begin with /. Null disables path matching."
           },
+          "path_case": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "sensitive",
+              "insensitive",
+              null
+            ],
+            "default": null,
+            "description": "ASCII case handling of path_prefix comparison; the upstream path is never rewritten. When absent, a route with auth, basic_auth, jwt_auth or access_mode protected and a path_prefix is insensitive, otherwise sensitive. An explicit sensitive on such a route is accepted with a warning. Routes on overlapping hosts whose prefixes differ only in case and whose effective path_case differs are rejected."
+          },
           "path_match": {
             "type": "string",
             "enum": [

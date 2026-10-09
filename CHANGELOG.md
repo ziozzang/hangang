@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Add the HTTP route field `path_case` (`sensitive` | `insensitive`). Routes with
+  `auth`, `basic_auth`, `jwt_auth` or `access_mode: protected` and a
+  `path_prefix` now default to ASCII case-insensitive prefix matching so
+  `/ADMIN/x` selects a protected `/admin` route; other routes stay byte-exact.
+  The upstream still receives the original path. An explicit `sensitive` on a
+  protected prefix route is warned about (log at activation and `--check`), and
+  same-host routes whose prefixes differ only in case with different effective
+  case handling are rejected.
 - Add `auth.static_request_headers` for fixed headers, literal or resolved
   from an environment variable at activation, on external-authorization calls;
   reserved and colliding names are rejected, client copies are never sent, and

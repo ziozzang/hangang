@@ -253,6 +253,14 @@ pub enum PathMatch {
     Exact,
     SegmentPrefix,
 }
+/// ASCII case handling for `path_prefix` comparison. Folding never changes the
+/// request path forwarded upstream and never applies Unicode case folding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathCase {
+    Sensitive,
+    Insensitive,
+}
 /// Declared gateway authentication boundary for an HTTP route. This is a
 /// classification and validation constraint, not a complete Zero Trust policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +356,11 @@ pub struct HttpRoute {
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub path_match: PathMatch,
+    /// ASCII case handling of `path_prefix`. Absent: insensitive for a route
+    /// that has authentication or `access_mode: protected` and a prefix,
+    /// otherwise sensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_case: Option<PathCase>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// RFC 6901 JSON pointers mapped to expected values.
@@ -968,6 +981,7 @@ impl Config {
                 <= 256,
             "at most 256 host regular expressions per configuration"
         );
+        self.validate_path_case_overlap()?;
         let mut ids = HashSet::new();
         for id in self
             .http
@@ -1672,6 +1686,58 @@ impl Config {
     /// downgrade when an existing protected route keeps its ID. Older editors
     /// omit access_mode and authentication fields; serde would otherwise turn
     /// that replacement into an anonymous Legacy route.
+    /// Two routes whose prefixes differ only in ASCII case, may serve the same
+    /// host, and disagree on case sensitivity would select by an ambiguous
+    /// rule: the sensitive route would be reachable only through exact-case
+    /// requests while the insensitive one claims every variant. Reject them;
+    /// an operator resolves it by setting `path_case` on both routes.
+    fn validate_path_case_overlap(&self) -> anyhow::Result<()> {
+        for (index, left) in self.http.iter().enumerate() {
+            let Some(left_prefix) = &left.path_prefix else {
+                continue;
+            };
+            for right in &self.http[index + 1..] {
+                let Some(right_prefix) = &right.path_prefix else {
+                    continue;
+                };
+                if left_prefix != right_prefix
+                    && left_prefix.eq_ignore_ascii_case(right_prefix)
+                    && left.path_case_insensitive() != right.path_case_insensitive()
+                    && hosts_may_overlap(left, right)
+                {
+                    anyhow::bail!(
+                        "routes {} and {} have path_prefix values that differ only in case but different path_case; set path_case explicitly on both routes",
+                        left.id,
+                        right.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Non-fatal findings. They are logged when a configuration is activated
+    /// and printed by `--check`; they never reject a configuration.
+    pub fn warnings(&self) -> Vec<String> {
+        self.http
+            .iter()
+            .filter(|route| {
+                route.path_case == Some(PathCase::Sensitive) && route.is_path_scoped_protection()
+            })
+            .map(|route| {
+                format!(
+                    "route {} protects path_prefix {} with path_case sensitive: a case variant of the prefix selects a sibling route and bypasses this protection when the upstream is case-insensitive",
+                    route.id,
+                    route.path_prefix.as_deref().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+    /// Emit [`Config::warnings`] at warn level.
+    pub fn log_warnings(&self) {
+        for warning in self.warnings() {
+            tracing::warn!("{warning}");
+        }
+    }
     pub fn validate_transition_from(&self, previous: &Self) -> anyhow::Result<()> {
         use anyhow::ensure;
         for old in &previous.http {
@@ -1686,6 +1752,7 @@ impl Config {
                         && resource_hosts_preserved(old, new)
                         && new.path_prefix == old.path_prefix
                         && new.path_match == old.path_match
+                        && new.path_case_insensitive() == old.path_case_insensitive()
                         && effective_public_listeners(new) == effective_public_listeners(old)
                 }),
                 "resource {} scope cannot be removed or moved; first publish enforce=false at its existing scope",
@@ -1790,6 +1857,29 @@ where
         ));
     }
     Ok(hosts)
+}
+
+/// Conservative: an unconstrained host, a regex or a glob may match anything.
+fn hosts_may_overlap(left: &HttpRoute, right: &HttpRoute) -> bool {
+    fn patterns(route: &HttpRoute) -> Option<Vec<String>> {
+        if route.host_regex.is_some() {
+            return None;
+        }
+        let mut all: Vec<String> = route.hosts.clone();
+        all.extend(route.host.clone());
+        if all.is_empty() || all.iter().any(|h| h.contains(['*', '?'])) {
+            return None;
+        }
+        Some(
+            all.iter()
+                .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+        )
+    }
+    match (patterns(left), patterns(right)) {
+        (Some(a), Some(b)) => a.iter().any(|h| b.contains(h)),
+        _ => true,
+    }
 }
 
 fn validate_http_match_host(host: &str) -> anyhow::Result<()> {
@@ -2719,6 +2809,23 @@ fn authentication_identity_headers(
 }
 
 impl HttpRoute {
+    /// A route that authenticates or is declared protected and has a path
+    /// prefix is scoped case-insensitively unless it says otherwise.
+    fn is_path_scoped_protection(&self) -> bool {
+        self.path_prefix.is_some()
+            && (self.auth.is_some()
+                || self.basic_auth.is_some()
+                || self.jwt_auth.is_some()
+                || self.access_mode == AccessMode::Protected)
+    }
+    /// Effective ASCII case handling of `path_prefix` for route selection.
+    pub fn path_case_insensitive(&self) -> bool {
+        match self.path_case {
+            Some(PathCase::Insensitive) => true,
+            Some(PathCase::Sensitive) => false,
+            None => self.is_path_scoped_protection(),
+        }
+    }
     /// All scripts must compile before a configuration can become active.
     pub fn scripts(&self) -> impl Iterator<Item = &str> {
         self.lua.as_deref().into_iter().chain(

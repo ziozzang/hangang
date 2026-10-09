@@ -82,3 +82,70 @@ fn tcp_glob_and_regex_limits_are_separate_from_certificate_names() {
     let config:Config=serde_json::from_value(json!({"certificates":[{"id":"cert","hosts":["f??.bar.com"],"cert_file":"/tmp/cert.pem","key_file":"/tmp/key.pem"}]})).unwrap();
     assert!(config.validate().is_err());
 }
+
+fn case_config(routes: serde_json::Value) -> anyhow::Result<()> {
+    let config: Config = serde_json::from_value(json!({"http": routes}))?;
+    config.validate()
+}
+
+fn basic() -> serde_json::Value {
+    json!({"realm":"r","credentials":["u:00000000000000000000000000000000:0000000000000000000000000000000000000000000000000000000000000000"]})
+}
+
+#[test]
+fn path_case_round_trips_and_rejects_unknown_values() {
+    let config: Config = serde_json::from_value(json!({"http":[
+        {"id":"a","path_prefix":"/a","path_case":"insensitive","backends":["http://localhost"]}]}))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["http"][0]["path_case"],
+        "insensitive"
+    );
+    let absent: Config = serde_json::from_value(json!({"http":[
+        {"id":"a","backends":["http://localhost"]}]}))
+    .unwrap();
+    assert!(
+        serde_json::to_value(&absent).unwrap()["http"][0]
+            .get("path_case")
+            .is_none()
+    );
+    assert!(
+        serde_json::from_value::<Config>(json!({"http":[
+        {"id":"a","path_case":"fold","backends":["http://localhost"]}]}))
+        .is_err()
+    );
+}
+
+#[test]
+fn mixed_case_sensitivity_on_same_prefix_and_host_is_rejected() {
+    let protected = json!({"id":"p","host":"a.test","path_prefix":"/admin","basic_auth":basic(),"backends":["http://localhost"]});
+    let public_variant = json!({"id":"q","host":"A.test","path_prefix":"/ADMIN/open","backends":["http://localhost"]});
+    // /ADMIN/open differs from /admin by more than case: no conflict.
+    case_config(json!([protected, public_variant])).unwrap();
+    let same =
+        json!({"id":"q","host":"A.test","path_prefix":"/Admin","backends":["http://localhost"]});
+    let error = case_config(json!([protected, same]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("path_case"), "{error}");
+    // Different hosts do not overlap; explicit insensitive on both is consistent.
+    let other_host =
+        json!({"id":"q","host":"b.test","path_prefix":"/Admin","backends":["http://localhost"]});
+    case_config(json!([protected, other_host])).unwrap();
+    let both = json!({"id":"q","host":"a.test","path_prefix":"/Admin","path_case":"insensitive","backends":["http://localhost"]});
+    case_config(json!([protected, both])).unwrap();
+}
+
+#[test]
+fn explicit_sensitive_protected_prefix_is_accepted_with_a_named_warning() {
+    let sensitive = json!({"id":"p","path_prefix":"/admin","path_case":"sensitive","access_mode":"protected","basic_auth":basic(),"backends":["http://localhost"]});
+    let config: Config = serde_json::from_value(json!({"http":[sensitive]})).unwrap();
+    config.validate().unwrap();
+    let warnings = config.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("p") && warnings[0].contains("case variant"));
+    let default: Config = serde_json::from_value(json!({"http":[
+        {"id":"p","path_prefix":"/admin","basic_auth":basic(),"backends":["http://localhost"]}]}))
+    .unwrap();
+    assert!(default.warnings().is_empty());
+}

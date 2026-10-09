@@ -2178,6 +2178,7 @@ function httpSections(route) {
       ...hostMatchFields(route),
       field('Path prefix', 'path_prefix', route.path_prefix || '', { placeholder: '/v1/', help: 'Must start with /. Blank matches every path.' }),
       field('Path match mode', 'path_match', route.path_match || 'prefix', { select: [['prefix', 'prefix – byte prefix'], ['exact', 'exact – whole path only'], ['segment_prefix', 'segment_prefix – path or its / descendants']], help: 'Ignored when the path prefix is blank.' }),
+      field('Path case', 'path_case', route.path_case || '', { select: [['', 'default – insensitive when protected, else sensitive'], ['sensitive', 'sensitive – byte-exact'], ['insensitive', 'insensitive – ASCII case folded']], help: 'Comparison only; the upstream receives the original path. Sensitive on a protected prefix lets case variants bypass it on a case-insensitive upstream.' }),
       field('Header matches', 'headers', pairsToLines(route.headers), { textarea: true, help: 'One name: value per line; at most 64.' }),
       field('JSON matches', 'json', jsonPairsToLines(route.json), { textarea: true, help: 'One RFC 6901 pointer = JSON value per line; at most 64. Disables route caching.' }),
       span2(field('Denied CIDRs', 'deny_cidrs', (route.deny_cidrs || []).join('\n'), { textarea: true, help: 'One IPv4 or IPv6 network per line (192.0.2.0/24, 2001:db8::/32); at most 1,024.' })),
@@ -2758,6 +2759,7 @@ function routeFromForm() {
     route.path_prefix = optionalText('path_prefix');
     if (route.path_prefix && !route.path_prefix.startsWith('/')) throw new Error(t('Path prefix must start with /'));
     route.path_match = raw('path_match');
+    if (raw('path_case')) route.path_case = raw('path_case'); else delete route.path_case;
     route.headers = parseHeaderLines(raw('headers'), 'Header match');
     route.json = parseJsonLines(raw('json'));
     if (Object.keys(route.headers).length > 64 || Object.keys(route.json).length > 64) throw new Error(t('At most 64 header matches and 64 JSON matches are allowed'));

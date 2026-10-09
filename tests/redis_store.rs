@@ -41,6 +41,7 @@ fn config(revision: u64, id: &str) -> Config {
             canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
+            path_case: None,
             headers: BTreeMap::new(),
             json: BTreeMap::new(),
             backends: vec!["http://127.0.0.1:8080".into()],

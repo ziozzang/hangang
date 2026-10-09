@@ -4267,6 +4267,7 @@ mod tests {
             canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
+            path_case: None,
             max_requests: None,
             upstream_timeout_ms: None,
             retries: 0,

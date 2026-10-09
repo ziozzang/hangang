@@ -513,6 +513,7 @@ impl Manager {
         let revision = config.revision;
         let prepared = async {
             config.validate()?;
+            config.log_warnings();
             // Even a fresh attachment may inherit a live protected route from
             // an earlier generation. A same-ID legacy downgrade needs an
             // explicit mode choice before replacing that active policy.
@@ -655,6 +656,7 @@ impl Manager {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("revision exhausted"))?;
         config.validate()?;
+        config.log_warnings();
         for route in &config.http {
             for script in route.scripts() {
                 self.policy.validate(script).await?;

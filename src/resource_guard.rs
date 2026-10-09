@@ -72,16 +72,28 @@ pub(crate) fn path_matches(route: &HttpRoute, path: &str) -> bool {
     let Some(prefix) = &route.path_prefix else {
         return true;
     };
+    // ASCII-only folding of the comparison; the path itself is never rewritten.
+    let fold = route.path_case_insensitive();
+    let same = |left: &[u8], right: &[u8]| {
+        if fold {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
+        }
+    };
+    let starts = |prefix: &str| {
+        path.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| same(head, prefix.as_bytes()))
+    };
     match route.path_match {
-        PathMatch::Prefix => path.starts_with(prefix),
-        PathMatch::Exact => path == prefix,
+        PathMatch::Prefix => starts(prefix),
+        PathMatch::Exact => same(path.as_bytes(), prefix.as_bytes()),
         PathMatch::SegmentPrefix => {
             let base = prefix.trim_end_matches('/');
             base.is_empty()
-                || path == base
-                || path
-                    .strip_prefix(base)
-                    .is_some_and(|tail| tail.starts_with('/'))
+                || (starts(base)
+                    && (path.len() == base.len() || path.as_bytes()[base.len()] == b'/'))
         }
     }
 }
