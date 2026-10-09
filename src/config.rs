@@ -1693,20 +1693,22 @@ impl Config {
     /// an operator resolves it by setting `path_case` on both routes.
     fn validate_path_case_overlap(&self) -> anyhow::Result<()> {
         for (index, left) in self.http.iter().enumerate() {
-            let Some(left_prefix) = &left.path_prefix else {
+            if left.path_prefix.is_none() {
                 continue;
-            };
+            }
             for right in &self.http[index + 1..] {
-                let Some(right_prefix) = &right.path_prefix else {
+                if right.path_prefix.is_none() {
                     continue;
-                };
-                let (left_operand, right_operand) = (
-                    effective_operand(left, left_prefix),
-                    effective_operand(right, right_prefix),
-                );
-                if left_operand != right_operand
-                    && left_operand.eq_ignore_ascii_case(right_operand)
-                    && left.path_case_insensitive() != right.path_case_insensitive()
+                }
+                let (left_scope, right_scope) = (route_scope(left), route_scope(right));
+                // Reject only when the scopes meet solely through case folding:
+                // nested layouts such as /admin and /admin/open stay valid.
+                if left.path_case_insensitive() != right.path_case_insensitive()
+                    && crate::resource_guard::scopes_intersect(left_scope, right_scope)
+                    && !crate::resource_guard::scopes_intersect(
+                        (left_scope.0, left_scope.1, false),
+                        (right_scope.0, right_scope.1, false),
+                    )
                     && hosts_may_overlap(left, right)
                     && !effective_public_listeners(left)
                         .is_disjoint(&effective_public_listeners(right))
@@ -1726,13 +1728,10 @@ impl Config {
     pub fn warnings(&self) -> Vec<String> {
         let mut shadow = Vec::new();
         for (pi, protected) in self.http.iter().enumerate() {
-            let Some(prefix) = &protected.path_prefix else {
-                continue;
-            };
+            let prefix = protected.path_prefix.as_deref().unwrap_or("/");
             if !protected.is_path_scoped_protection() || !protected.enabled {
                 continue;
             }
-            let operand = effective_operand(protected, prefix);
             for (qi, other) in self.http.iter().enumerate() {
                 if qi == pi
                     || !other.enabled
@@ -1748,23 +1747,13 @@ impl Config {
                 {
                     continue;
                 }
-                let covers = match &other.path_prefix {
-                    None => true,
-                    Some(theirs) if other.path_match != PathMatch::Exact => {
-                        let theirs = effective_operand(other, theirs);
-                        let (a, b) = (operand.as_bytes(), theirs.as_bytes());
-                        a.len() >= b.len()
-                            && if other.path_case_insensitive() {
-                                a[..b.len()].eq_ignore_ascii_case(b)
-                            } else {
-                                &a[..b.len()] == b
-                            }
-                    }
-                    Some(_) => false,
-                };
+                let covers = crate::resource_guard::scopes_intersect(
+                    route_scope(other),
+                    route_scope(protected),
+                );
                 if covers {
                     shadow.push(format!(
-                        "route {} (unauthenticated) is selected before protected route {} and its path_prefix covers {}: it can shadow the protection on overlapping hosts",
+                        "route {} (unauthenticated) is selected before protected route {} and its path scope intersects {}: it can shadow the protection on overlapping hosts",
                         other.id, protected.id, prefix
                     ));
                 }
@@ -1947,12 +1936,12 @@ fn hosts_may_overlap(left: &HttpRoute, right: &HttpRoute) -> bool {
     }
 }
 
-/// The operand route selection actually compares, after the mode's own
-/// normalization (`segment_prefix` trims trailing slashes).
-fn effective_operand<'a>(route: &HttpRoute, prefix: &'a str) -> &'a str {
-    match route.path_match {
-        PathMatch::SegmentPrefix => prefix.trim_end_matches('/'),
-        _ => prefix,
+/// The (mode, operand, case-insensitive) scope a route selects by. A route
+/// without a prefix selects every path.
+fn route_scope(route: &HttpRoute) -> (PathMatch, &str, bool) {
+    match &route.path_prefix {
+        Some(prefix) => (route.path_match, prefix, route.path_case_insensitive()),
+        None => (PathMatch::Prefix, "", false),
     }
 }
 

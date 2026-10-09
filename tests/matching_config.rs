@@ -120,8 +120,9 @@ fn path_case_round_trips_and_rejects_unknown_values() {
 fn mixed_case_sensitivity_on_same_prefix_and_host_is_rejected() {
     let protected = json!({"id":"p","host":"a.test","path_prefix":"/admin","basic_auth":basic(),"backends":["http://localhost"]});
     let public_variant = json!({"id":"q","host":"A.test","path_prefix":"/ADMIN/open","backends":["http://localhost"]});
-    // /ADMIN/open differs from /admin by more than case: no conflict.
-    case_config(json!([protected, public_variant])).unwrap();
+    // A partial namespace spelled with a case variant meets the protected
+    // prefix only through folding: rejected as well.
+    assert!(case_config(json!([protected, public_variant])).is_err());
     let same =
         json!({"id":"q","host":"A.test","path_prefix":"/Admin","backends":["http://localhost"]});
     let error = case_config(json!([protected, same]))
@@ -254,4 +255,67 @@ fn higher_priority_public_route_shadowing_a_protected_prefix_warns() {
     let fallback = route_json("q", "a.test", "/", json!({"priority":-5}));
     let config: Config = serde_json::from_value(json!({"http":[protected, fallback]})).unwrap();
     assert!(config.warnings().is_empty());
+}
+
+#[test]
+fn reported_mode_mix_counterexamples_are_rejected_and_s4_does_not_warn() {
+    let seg = |id: &str, prefix: &str, mode: &str, extra: serde_json::Value| {
+        let mut base = json!({"path_match":mode});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        route_json(id, "a.test", prefix, base)
+    };
+    let protected = seg(
+        "p",
+        "/admin/",
+        "segment_prefix",
+        json!({"basic_auth":basic(),"priority":10}),
+    );
+    let public = seg("q", "/ADMIN/", "prefix", json!({"priority":20}));
+    assert!(case_config(json!([protected, public])).is_err());
+    let protected = seg(
+        "p",
+        "/admin/",
+        "prefix",
+        json!({"basic_auth":basic(),"priority":10}),
+    );
+    let public = seg("q", "/ADMIN/", "segment_prefix", json!({"priority":20}));
+    assert!(case_config(json!([protected, public])).is_err());
+    let protected = seg(
+        "p",
+        "/admin",
+        "segment_prefix",
+        json!({"basic_auth":basic(),"priority":10}),
+    );
+    let public = seg("q", "/ADMIN", "exact", json!({"priority":20}));
+    assert!(case_config(json!([protected, public])).is_err());
+    // Nested layouts that differ in more than case are fine and warn instead.
+    let protected = seg(
+        "p",
+        "/admin",
+        "segment_prefix",
+        json!({"basic_auth":basic()}),
+    );
+    let nested = seg("q", "/admin/open", "prefix", json!({"priority":5}));
+    let config: Config =
+        serde_json::from_value(json!({"http":[protected.clone(), nested]})).unwrap();
+    config.validate().unwrap();
+    assert!(config.warnings().iter().any(|w| w.contains("shadow")));
+    // Partial namespace with a case variant of the protected prefix.
+    let partial = seg("q", "/ADMIN/open", "prefix", json!({"priority":5}));
+    assert!(case_config(json!([protected.clone(), partial])).is_err());
+    // S4: /ad as a segment prefix does not cover /admin.
+    let ad = seg("q", "/ad", "segment_prefix", json!({"priority":5}));
+    let config: Config = serde_json::from_value(json!({"http":[protected.clone(), ad]})).unwrap();
+    config.validate().unwrap();
+    assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    // Exact public route above the protected namespace, and an equal-priority earlier tie.
+    let exact = seg("q", "/admin", "exact", json!({"priority":5}));
+    let config: Config =
+        serde_json::from_value(json!({"http":[protected.clone(), exact]})).unwrap();
+    assert!(config.warnings().iter().any(|w| w.contains("shadow")));
+    let tie_first = seg("q", "/", "prefix", json!({}));
+    let config: Config = serde_json::from_value(json!({"http":[tie_first, protected]})).unwrap();
+    assert!(config.warnings().iter().any(|w| w.contains("shadow")));
 }

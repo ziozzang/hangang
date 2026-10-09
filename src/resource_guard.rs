@@ -97,6 +97,57 @@ pub(crate) fn path_matches(route: &HttpRoute, path: &str) -> bool {
         }
     }
 }
+/// A scope is (mode, operand, ASCII-case-insensitive). Report whether some
+/// request path is matched by both scopes under their own modes and case
+/// handling. Each scope is a union of atoms: `exact(x)` or `prefix(x)`;
+/// `segment_prefix` is `exact(base)` plus `prefix(base/)`, or everything when
+/// the base is empty. Two atoms meet when their common leading bytes agree; a
+/// path can take the casing either side demands, so folding applies whenever
+/// either side is insensitive.
+pub(crate) fn scopes_intersect(a: (PathMatch, &str, bool), b: (PathMatch, &str, bool)) -> bool {
+    enum Atom {
+        Exact(String),
+        Prefix(String),
+    }
+    fn atoms(scope: (PathMatch, &str, bool)) -> Vec<Atom> {
+        let operand = scope.1;
+        match scope.0 {
+            PathMatch::Prefix => vec![Atom::Prefix(operand.to_owned())],
+            PathMatch::Exact => vec![Atom::Exact(operand.to_owned())],
+            PathMatch::SegmentPrefix => {
+                let base = operand.trim_end_matches('/');
+                if base.is_empty() {
+                    vec![Atom::Prefix(String::new())]
+                } else {
+                    vec![
+                        Atom::Exact(base.to_owned()),
+                        Atom::Prefix(format!("{base}/")),
+                    ]
+                }
+            }
+        }
+    }
+    let fold = a.2 || b.2;
+    let same = |left: &[u8], right: &[u8]| {
+        if fold {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
+        }
+    };
+    atoms(a).iter().any(|left| {
+        atoms(b).iter().any(|right| match (left, right) {
+            (Atom::Exact(x), Atom::Exact(y)) => same(x.as_bytes(), y.as_bytes()),
+            (Atom::Exact(x), Atom::Prefix(y)) | (Atom::Prefix(y), Atom::Exact(x)) => {
+                x.len() >= y.len() && same(&x.as_bytes()[..y.len()], y.as_bytes())
+            }
+            (Atom::Prefix(x), Atom::Prefix(y)) => {
+                let n = x.len().min(y.len());
+                same(&x.as_bytes()[..n], &y.as_bytes()[..n])
+            }
+        })
+    })
+}
 fn scope_host(runtime: &HttpRuntime, host: Option<&str>) -> bool {
     host_matches(&runtime.route, runtime.host_regex.as_ref(), host)
         || host.is_some_and(|host| {
@@ -195,6 +246,84 @@ mod tests {
     use super::*;
     use crate::config::{Config, Snapshot};
     use serde_json::json;
+
+    fn scope_route(mode: PathMatch, operand: &str, insensitive: bool) -> HttpRoute {
+        let mode = match mode {
+            PathMatch::Prefix => "prefix",
+            PathMatch::Exact => "exact",
+            PathMatch::SegmentPrefix => "segment_prefix",
+        };
+        serde_json::from_value(json!({"id":"r","path_prefix":operand,"path_match":mode,
+            "path_case":if insensitive {"insensitive"} else {"sensitive"},
+            "backends":["http://127.0.0.1:9"]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn scopes_intersect_agrees_with_path_matches_over_candidate_paths() {
+        let modes = [
+            PathMatch::Prefix,
+            PathMatch::SegmentPrefix,
+            PathMatch::Exact,
+        ];
+        let operands = [
+            "/admin",
+            "/ADMIN",
+            "/admin/",
+            "/ADMIN/",
+            "/ad",
+            "/AD/",
+            "/admin/open",
+            "/ADMIN/open",
+            "/administrator",
+            "/",
+            "/Admin/Open/",
+        ];
+        let mut checked = 0;
+        for (ma, mb) in modes
+            .iter()
+            .flat_map(|a| modes.iter().map(move |b| (*a, *b)))
+        {
+            for (oa, ob) in operands
+                .iter()
+                .flat_map(|a| operands.iter().map(move |b| (*a, *b)))
+            {
+                for (ia, ib) in [(false, false), (false, true), (true, false), (true, true)] {
+                    let (ra, rb) = (scope_route(ma, oa, ia), scope_route(mb, ob, ib));
+                    let mut candidates = Vec::new();
+                    for base in [oa, ob, oa.trim_end_matches('/'), ob.trim_end_matches('/')] {
+                        for variant in [
+                            base.to_owned(),
+                            base.to_ascii_uppercase(),
+                            base.to_ascii_lowercase(),
+                        ] {
+                            for suffix in ["", "/x", "x", "/", "/open", "/OPEN/x"] {
+                                candidates.push(format!("{variant}{suffix}"));
+                            }
+                        }
+                    }
+                    // Cross-casing witnesses: one operand's casing over the other's tail.
+                    for (x, y) in [(oa, ob), (ob, oa)] {
+                        if x.len() >= y.len() {
+                            candidates.push(format!("{y}{}", &x[y.len()..]));
+                            candidates.push(format!("{y}{}/x", &x[y.len()..]));
+                        }
+                        candidates.push(format!("{}/x", y.trim_end_matches('/')));
+                        candidates.push(format!("{}/x", x.trim_end_matches('/')));
+                    }
+                    let oracle = candidates
+                        .iter()
+                        .any(|path| path_matches(&ra, path) && path_matches(&rb, path));
+                    let sa = (ma, oa, ia);
+                    let sb = (mb, ob, ib);
+                    assert_eq!(scopes_intersect(sa, sb), oracle, "{sa:?} vs {sb:?}");
+                    assert_eq!(scopes_intersect(sb, sa), oracle, "{sb:?} vs {sa:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000);
+    }
 
     #[test]
     fn path_scoped_transforms_normalize_aliases_and_retain_disabled_namespaces() {
