@@ -7441,3 +7441,106 @@ async fn follower_without_static_header_variable_activates_route_fail_closed() {
     a.policy.shutdown().await;
     b.policy.shutdown().await;
 }
+
+fn unavailable_file_config(auth: serde_json::Value, enabled: bool) -> Config {
+    serde_json::from_value(serde_json::json!({"revision":0,"tcp":[],"http":[{
+        "id":"web","path_prefix":"/","enabled":enabled,"backends":["http://127.0.0.1:9"],
+        "auth":auth
+    }]}))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn file_readiness_recovers_after_unavailable_route_is_corrected() {
+    use std::sync::atomic::Ordering;
+    let unset = serde_json::json!({"url":"http://127.0.0.1:9/check",
+        "static_request_headers":{"x-key":{"env":"HANGANG_HC3_RECOVER_UNSET"}}});
+    let literal = serde_json::json!({"url":"http://127.0.0.1:9/check",
+        "static_request_headers":{"x-key":"literal"}});
+    let (address, manager, _dir) = server().await;
+    let health = || async move { request(address, "GET", "/healthz", None, None).await.0 };
+    assert_eq!(health().await, 200);
+
+    // Each correction (literal value, route disabled, route removed, variable
+    // reference dropped) must restore readiness through a file reload.
+    let corrections = [
+        unavailable_file_config(literal.clone(), true),
+        unavailable_file_config(unset.clone(), false),
+        unavailable_file_config(serde_json::json!({"url":"http://127.0.0.1:9/check"}), true),
+        Config::default(),
+    ];
+    for corrected in corrections {
+        hangang::store::save(
+            manager.state_path.clone(),
+            unavailable_file_config(unset.clone(), true),
+        )
+        .await
+        .unwrap();
+        assert!(manager.reload_file().await.unwrap());
+        assert_eq!(manager.active.load().unavailable_authorization().len(), 1);
+        assert!(!manager.ready.load(Ordering::Acquire));
+        assert_eq!(health().await, 503);
+
+        hangang::store::save(manager.state_path.clone(), corrected)
+            .await
+            .unwrap();
+        assert!(manager.reload_file().await.unwrap());
+        assert!(manager.active.load().unavailable_authorization().is_empty());
+        assert!(manager.ready.load(Ordering::Acquire));
+        assert_eq!(health().await, 200);
+    }
+
+    // Draining is never overridden by recovery.
+    hangang::store::save(
+        manager.state_path.clone(),
+        unavailable_file_config(unset.clone(), true),
+    )
+    .await
+    .unwrap();
+    assert!(manager.reload_file().await.unwrap());
+    assert_eq!(health().await, 503);
+    manager.withdraw_now();
+    hangang::store::save(
+        manager.state_path.clone(),
+        unavailable_file_config(literal, true),
+    )
+    .await
+    .unwrap();
+    assert!(manager.reload_file().await.is_err());
+    assert!(!manager.ready.load(Ordering::Acquire));
+    manager.policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_mutation_restores_readiness_after_unavailable_route() {
+    use std::sync::atomic::Ordering;
+    let unset = serde_json::json!({"url":"http://127.0.0.1:9/check",
+        "static_request_headers":{"x-key":{"env":"HANGANG_HC3_RECOVER_UNSET"}}});
+    let (address, manager, _dir) = server().await;
+    hangang::store::save(
+        manager.state_path.clone(),
+        unavailable_file_config(unset, true),
+    )
+    .await
+    .unwrap();
+    assert!(manager.reload_file().await.unwrap());
+    let revision = manager.active.load().config.revision;
+    assert!(!manager.ready.load(Ordering::Acquire));
+    assert_eq!(request(address, "GET", "/healthz", None, None).await.0, 503);
+    // Correct the route through the admin API (strict path).
+    let fixed = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"],
+        "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":"literal"}}}"#;
+    let (status, _, body) = request(
+        address,
+        "PUT",
+        "/v1/routes/http/web",
+        Some(fixed),
+        Some(revision),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(manager.active.load().unavailable_authorization().is_empty());
+    assert!(manager.ready.load(Ordering::Acquire));
+    assert_eq!(request(address, "GET", "/healthz", None, None).await.0, 200);
+    manager.policy.shutdown().await;
+}

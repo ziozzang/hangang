@@ -187,10 +187,19 @@ impl Manager {
         })
         .await?
     }
-    /// Readiness stays down while any enabled route fails closed here.
-    fn withdraw_for_unavailable_routes(&self, snapshot: &Snapshot) {
+    /// Readiness follows the published snapshot: it stays down while any
+    /// enabled route fails closed here, and local-file authority restores it
+    /// once a later publication clears them (drain/handoff flags are
+    /// respected by `advertise_ready`). Shared-store and controller modes
+    /// recover only through their own authority confirmation.
+    fn sync_route_readiness(&self, snapshot: &Snapshot) {
         if !snapshot.unavailable_authorization().is_empty() {
             self.ready.store(false, Ordering::Release);
+        } else if self.config_store.is_none()
+            && !self.externally_managed
+            && !self.stopping.load(Ordering::Acquire)
+        {
+            self.advertise_ready();
         }
     }
     pub async fn stop_updates(&self) {
@@ -555,7 +564,7 @@ impl Manager {
         self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
         self.attach_epoch(epoch);
         self.store_confirmed();
-        self.withdraw_for_unavailable_routes(&self.active.load());
+        self.sync_route_readiness(&self.active.load());
         Ok(true)
     }
 
@@ -795,7 +804,7 @@ impl Manager {
                 })
                 .await?;
             self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
-            self.withdraw_for_unavailable_routes(&self.active.load());
+            self.sync_route_readiness(&self.active.load());
             Ok(config)
         }
         .await;
