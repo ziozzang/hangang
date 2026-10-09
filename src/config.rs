@@ -456,6 +456,11 @@ pub struct ExternalAuth {
     /// activated. Environment values are never serialized, logged or shown.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub static_request_headers: BTreeMap<String, StaticHeaderValue>,
+    /// Cookie names removed from the request sent upstream after an allowed
+    /// authorization. The authorization call still receives the full listed
+    /// `cookie` header. Names are exact and case-sensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_request_cookies: Vec<String>,
 }
 
 /// A static authorization request header value: a literal or a reference to a
@@ -475,6 +480,31 @@ pub struct StaticHeaderEnv {
 
 const MAX_STATIC_REQUEST_HEADERS: usize = 16;
 const MAX_STATIC_HEADER_VALUE: usize = 1024;
+const MAX_STRIP_REQUEST_COOKIES: usize = 16;
+const MAX_COOKIE_NAME: usize = 128;
+
+fn validate_strip_request_cookies(auth: &ExternalAuth) -> anyhow::Result<()> {
+    ensure!(
+        auth.strip_request_cookies.len() <= MAX_STRIP_REQUEST_COOKIES,
+        "too many strip_request_cookies entries"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for name in &auth.strip_request_cookies {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= MAX_COOKIE_NAME
+                && name.bytes().all(|b| matches!(b,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                    | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')),
+            "invalid strip_request_cookies name {name:?}"
+        );
+        ensure!(
+            seen.insert(name.as_str()),
+            "duplicate strip_request_cookies name {name:?}"
+        );
+    }
+    Ok(())
+}
 
 fn valid_static_env_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -1523,6 +1553,7 @@ impl Config {
                     );
                 }
                 validate_static_request_headers(auth)?;
+                validate_strip_request_cookies(auth)?;
             }
             ensure!(
                 !r.backends.is_empty() && r.backends.len() <= 128,
@@ -3316,6 +3347,7 @@ mod tests {
                 forward_response: false,
                 terminal_response: false,
                 static_request_headers: Default::default(),
+                strip_request_cookies: Default::default(),
             });
             assert!(
                 config.validate().is_err(),
@@ -3949,6 +3981,7 @@ mod tests {
             forward_response: false,
             terminal_response: false,
             static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         c.http[0].request_transform = Some(set.clone());
         assert!(c.validate().is_err());
@@ -3964,6 +3997,7 @@ mod tests {
             forward_response: false,
             terminal_response: false,
             static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         assert!(c.validate().is_err());
         // An unrelated header, or the same name on the response transform
@@ -4016,6 +4050,7 @@ mod tests {
             forward_response: false,
             terminal_response: false,
             static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         assert!(document.validate().is_err());
     }
@@ -4178,5 +4213,52 @@ mod tests {
             + &serde_json::to_string(&snapshot.http[0].route).unwrap();
         assert!(dumped.contains(r#"{"env":"PATH"}"#));
         assert!(!dumped.contains(&secret));
+    }
+}
+
+#[cfg(test)]
+mod strip_cookie_tests {
+    use super::*;
+
+    fn auth_with(names: &[&str]) -> ExternalAuth {
+        serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/check",
+            "strip_request_cookies": names,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_valid_names_and_round_trips() {
+        let auth = auth_with(&["__Host-hopae", "__Host-hopae_bind", "Hopae", "hopae"]);
+        validate_strip_request_cookies(&auth).unwrap();
+        let again: ExternalAuth =
+            serde_json::from_str(&serde_json::to_string(&auth).unwrap()).unwrap();
+        assert_eq!(again, auth);
+        let empty = auth_with(&[]);
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("strip_request_cookies")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicates_bad_names_and_excess() {
+        assert!(validate_strip_request_cookies(&auth_with(&["a", "a"])).is_err());
+        for bad in ["", "a b", "a=b", "a;b", "a,b", "a\"b", "é", "a\tb", "(x)"] {
+            assert!(
+                validate_strip_request_cookies(&auth_with(&[bad])).is_err(),
+                "{bad:?}"
+            );
+        }
+        let long = "a".repeat(129);
+        assert!(validate_strip_request_cookies(&auth_with(&[long.as_str()])).is_err());
+        let ok = "a".repeat(128);
+        assert!(validate_strip_request_cookies(&auth_with(&[ok.as_str()])).is_ok());
+        let names: Vec<String> = (0..17).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(validate_strip_request_cookies(&auth_with(&refs)).is_err());
+        assert!(validate_strip_request_cookies(&auth_with(&refs[..16])).is_ok());
     }
 }

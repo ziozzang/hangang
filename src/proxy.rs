@@ -2378,6 +2378,16 @@ impl Proxy {
             return Ok(denied);
         }
 
+        // Only an Allow reaches this point on an auth route. Remove the
+        // configured session cookies from every Cookie field after the
+        // authorization call, Lua and its header mutations, and before the
+        // request transform, retries and upgrades build the upstream request.
+        if let Some(auth) = &runtime.route.auth
+            && !auth.strip_request_cookies.is_empty()
+        {
+            strip_request_cookies(request.headers_mut(), &auth.strip_request_cookies);
+        }
+
         // Explicitly protected routes check gateway authentication and any
         // configured Lua policy before honoring a cache-only request. Their
         // cache is ineligible, so no origin content follows this shortcut.
@@ -3452,6 +3462,46 @@ fn collapse_duplicate_policy_headers(headers: &mut HeaderMap) -> Result<(), ()> 
     Ok(())
 }
 
+/// Remove every cookie pair whose name exactly equals one of `names` from all
+/// Cookie fields. Other pairs keep their order and are rejoined with `; `;
+/// pairs without `=` are kept unless the whole pair equals a listed name.
+/// The header is removed when nothing remains.
+fn strip_request_cookies(headers: &mut HeaderMap, names: &[String]) {
+    if !headers.contains_key(header::COOKIE) {
+        return;
+    }
+    let mut kept: Vec<u8> = Vec::new();
+    let mut sensitive = false;
+    for value in headers.get_all(header::COOKIE) {
+        sensitive |= value.is_sensitive();
+        for pair in value.as_bytes().split(|b| *b == b';') {
+            let pair = pair.trim_ascii();
+            if pair.is_empty() {
+                continue;
+            }
+            let name = pair
+                .iter()
+                .position(|b| *b == b'=')
+                .map_or(pair, |at| pair[..at].trim_ascii());
+            if names.iter().any(|n| n.as_bytes() == name) {
+                continue;
+            }
+            if !kept.is_empty() {
+                kept.extend_from_slice(b"; ");
+            }
+            kept.extend_from_slice(pair);
+        }
+    }
+    headers.remove(header::COOKIE);
+    if kept.is_empty() {
+        return;
+    }
+    if let Ok(mut value) = HeaderValue::from_bytes(&kept) {
+        value.set_sensitive(sensitive);
+        headers.insert(header::COOKIE, value);
+    }
+}
+
 /// RFC 9113 section 8.2.3: join Cookie fields with `; ` before exposing
 /// them to a generic application or HTTP/1 peer. Do not apply list joining
 /// to Set-Cookie or any other header. Preserve byte order and sensitivity.
@@ -4027,6 +4077,21 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strip_request_cookies_keeps_order_and_removes_empty_header() {
+        let names = vec!["s".to_owned()];
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; s=x"));
+        headers.append(header::COOKIE, HeaderValue::from_static("bare; s; c=3"));
+        strip_request_cookies(&mut headers, &names);
+        assert_eq!(headers.get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!(headers[header::COOKIE], "a=1; bare; c=3");
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("s=x; s=y"));
+        strip_request_cookies(&mut headers, &names);
+        assert!(!headers.contains_key(header::COOKIE));
+    }
+
     use super::*;
     use ipnet::IpNet;
 

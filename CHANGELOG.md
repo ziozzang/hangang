@@ -31,6 +31,11 @@
   of keeping an older revision live. `--check` and `POST /v1/config/validate`
   now resolve static header variables and report missing, empty or invalid
   ones by name.
+- Add `auth.strip_request_cookies` to remove named cookies from every `Cookie`
+  field of the upstream request after an allowed authorization, so session
+  cookies listed for the authorization call do not reach the application. The
+  authorization call is unchanged; matching is exact and case-sensitive, the
+  other pairs keep their order, and the header is dropped when empty.
 
 ## 0.2.5 — 2026-10-06
 

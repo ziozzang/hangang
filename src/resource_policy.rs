@@ -358,6 +358,7 @@ mod tests {
             forward_response: false,
             terminal_response: false,
             static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         }
     }
 

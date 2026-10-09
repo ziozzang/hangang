@@ -53,6 +53,20 @@ A value is a literal string or `{"env": "NAME"}`. Environment references are res
 
 Strictness depends on the path. Process startup, admin API writes and `hangang --check` / `POST /v1/config/validate` reject a configuration whose variable is missing, empty or invalid on the local node, naming the variable. A follower that receives such a revision from the shared store (or a local file reload) cannot be allowed to keep serving an older revision in which that route may have been public, so it activates the revision with the affected route failing closed: every request to that route is answered `503 route authorization unavailable` before any authorization call or upstream contact, other routes are unaffected, readiness stays false while any enabled route is in this state, `/v1/status` lists the route and variable under `authorization_unavailable`, and a warning names them. The process environment is fixed at start, so fix the variable and restart the instance, or publish a corrected configuration (a literal value, or the route disabled or removed), after which a local-file instance becomes ready again and shared-store members recover on their next confirmed poll. Policy changes apply to requests that acquire their configuration snapshot after activation; in-flight requests finish under the snapshot they acquired.
 
+## Stripping session cookies before the upstream
+
+When `cookie` is listed in `auth.request_headers`, the authorization service receives the client's cookies, and by default the upstream application also receives the original `Cookie` header. List the cookies that only the authorization service needs in `strip_request_cookies` so the application never sees them:
+
+```json
+"auth": {
+  "url": "https://id.internal/verify",
+  "request_headers": ["cookie"],
+  "strip_request_cookies": ["__Host-hopae", "__Host-hopae_bind"]
+}
+```
+
+The authorization call is unchanged and still receives the full listed `cookie` header. Only after an allowed authorization, every cookie pair whose name exactly equals a listed name is removed from all `Cookie` fields of the upstream request (split HTTP/2 or repeated HTTP/1.1 fields are joined first). The remaining pairs keep their order and are rejoined with `; `; if none remain the `Cookie` header is removed. Matching is exact and case-sensitive (`__Host-hopae2` is kept); a malformed pair without `=` is kept unless its text equals a listed name. The removal runs after authorization and after any Lua header mutation (Lua cannot set `Cookie`), and before request transforms, retries and WebSocket upgrades, so those all see the stripped header. Terminal and forwarded authorization responses never reach the upstream and are unaffected. At most 16 names are allowed, each a valid cookie name (RFC 6265 token characters, at most 128 bytes), without duplicates.
+
 ## Path case
 
 A route's `path_prefix` is compared with `path_case`: `"sensitive"` (byte-exact) or `"insensitive"`. When the field is absent, a route that has `auth`, `basic_auth`, `jwt_auth` or `access_mode: protected` together with a `path_prefix` is **insensitive**, so `/ADMIN/x`, `/Admin/x` and `/admin/X` select a protected `/admin` route instead of falling through to a public sibling route in front of a case-insensitive upstream. Every other route defaults to `sensitive`.
