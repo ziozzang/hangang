@@ -163,7 +163,8 @@ pub fn client_config(extra_ca: Option<&Path>) -> Result<ClientConfig> {
 #[derive(Clone, Copy, Default)]
 pub struct TransportInfo {
     pub tls: bool,
-    /// Local port the client connected to, for X-Forwarded-Port generation.
+    /// Port used as the default X-Forwarded-Port: the local port the client
+    /// connected to, or the listener's configured advertised port.
     pub local_port: u16,
 }
 #[cfg(test)]

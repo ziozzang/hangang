@@ -108,6 +108,11 @@ struct Args {
     database_plaintext: bool,
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// Externally visible port of the public listener (for example behind a
+    /// port forward), used as the default X-Forwarded-Port and in generated
+    /// original URLs. A trusted proxy's explicit X-Forwarded-Port still wins.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    advertised_port: Option<u16>,
     #[arg(long, default_value = "127.0.0.1:9000")]
     admin: SocketAddr,
     /// Serve administration only on this private Unix socket, with no TCP admin listener.
@@ -1220,6 +1225,7 @@ async fn run(args: Args) -> Result<()> {
             tls: public_tls,
             idle_timeout: Duration::from_secs(args.connection_idle_seconds),
             header_bytes: args.max_header_bytes,
+            advertised_port: args.advertised_port,
         },
     ));
     let admin = Arc::new(admin);
@@ -1245,6 +1251,7 @@ async fn run(args: Args) -> Result<()> {
                 tls: admin_tls,
                 idle_timeout: Duration::from_secs(10),
                 header_bytes: args.max_header_bytes,
+                advertised_port: None,
             },
         ))
     };
@@ -1261,6 +1268,7 @@ async fn run(args: Args) -> Result<()> {
                 tls: None,
                 idle_timeout: Duration::from_secs(10),
                 header_bytes: 32768,
+                advertised_port: None,
             },
         ))
     });
@@ -1442,6 +1450,7 @@ struct ListenerPolicy {
     tls: Option<Arc<hangang::tls::ReloadingTls>>,
     idle_timeout: Duration,
     header_bytes: usize,
+    advertised_port: Option<u16>,
 }
 async fn serve(
     listener: TcpListener,
@@ -1450,7 +1459,6 @@ async fn serve(
     metrics: Arc<Metrics>,
     policy: ListenerPolicy,
 ) {
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let ListenerPolicy {
         config_tls,
         limit,
@@ -1458,7 +1466,10 @@ async fn serve(
         tls,
         idle_timeout,
         header_bytes,
+        advertised_port,
     } = policy;
+    let local_port =
+        advertised_port.unwrap_or_else(|| listener.local_addr().map(|a| a.port()).unwrap_or(0));
     let permits = Arc::new(Semaphore::new(limit));
     let mut tasks = JoinSet::new();
     loop {

@@ -4045,7 +4045,8 @@
           "listen": { "type": "string", "description": "Nonzero IP socket address bound by this instance, for example 0.0.0.0:8080 or [::]:8443." },
           "enabled": { "type": "boolean", "default": true },
           "certificates": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/components/schemas/CertificateFiles" }, "default": [], "description": "Empty serves plaintext HTTP; nonempty serves HTTPS using this listener's file-backed SNI set. Certificate paths resolve on each instance. The combined input bytes of all certificate and key PEM files for one named listener are limited to 1 MiB; at most 1,024 certificate entries may be configured across all named public listeners. This is separate from the legacy global certificate set limit." },
-          "trusted_proxy_cidrs": { "type": "array", "maxItems": 1024, "uniqueItems": true, "items": { "type": "string", "description": "IPv4 or IPv6 CIDR" }, "default": [], "description": "Only peers in this explicit list may supply forwarding headers. Empty means none; this does not inherit settings.trusted_proxy_cidrs." }
+          "trusted_proxy_cidrs": { "type": "array", "maxItems": 1024, "uniqueItems": true, "items": { "type": "string", "description": "IPv4 or IPv6 CIDR" }, "default": [], "description": "Only peers in this explicit list may supply forwarding headers. Empty means none; this does not inherit settings.trusted_proxy_cidrs." },
+          "advertised_port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Externally visible port used as the default forwarded port (x-forwarded-port, x-original-url) instead of the local port when no trusted X-Forwarded-Port is present, for example behind a port forward. Absent uses the local port." }
         }
       },
       "WorkloadHttpListener": {

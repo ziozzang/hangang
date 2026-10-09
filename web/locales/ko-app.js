@@ -17,6 +17,8 @@ export default {
   "Add public listener": "공개 리스너 추가",
   "Listener ID": "리스너 ID",
   "Listen address": "수신 주소",
+  "Advertised port": "외부 공개 포트",
+  "Advertised port must be 1–65535": "외부 공개 포트는 1–65535 범위여야 합니다",
   "Allowed proxy peer CIDRs": "허용할 프록시 피어 CIDR",
   "Certificate entries use file paths and SNI hosts. A default certificate has no hosts. Empty entries serve plain HTTP.": "인증서 항목에는 파일 경로와 SNI 호스트를 입력합니다. 기본 인증서는 호스트를 비워 둡니다. 인증서 항목이 없으면 일반 HTTP를 제공합니다.",
   "Add certificate": "인증서 추가",

@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Add the optional public listener field `advertised_port` (1-65535) and the
+  CLI flag `--advertised-port`. Behind a port forward that adds no forwarding
+  headers, it replaces the local port as the default forwarded port, so
+  `x-forwarded-port` and `x-original-url` sent to external authorization and
+  upstreams carry the externally visible port (and omit a scheme-default
+  port). A trusted proxy's explicit `X-Forwarded-Port` still wins; `0` is
+  rejected.
 - Add the HTTP route field `path_case` (`sensitive` | `insensitive`). Routes with
   `auth`, `basic_auth`, `jwt_auth` or `access_mode: protected` and a
   `path_prefix` now default to ASCII case-insensitive prefix matching so

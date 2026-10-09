@@ -601,3 +601,178 @@ async fn upgraded_websocket_closes_when_listener_trust_changes() {
     running.shutdown().await;
     backend_task.abort();
 }
+
+type SeenAuth = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+async fn auth_mock() -> (SocketAddr, SeenAuth, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen: SeenAuth = Arc::default();
+    let record = seen.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let record = record.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let record = record.clone();
+                    async move {
+                        let mut seen = record.lock().unwrap();
+                        seen.clear();
+                        for (name, value) in request.headers() {
+                            seen.push((
+                                name.as_str().to_owned(),
+                                value.to_str().unwrap_or("").to_owned(),
+                            ));
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (address, seen, task)
+}
+
+fn seen_header(seen: &SeenAuth, name: &str) -> Option<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, value)| value.clone())
+}
+
+/// Starts a listener with the given extra listener fields and a route with
+/// external authorization and `require_tls`, and returns what the
+/// authorization service saw for one request.
+async fn auth_context(advertised: Option<u16>, trusted: bool, headers: &str) -> (SeenAuth, String) {
+    let bound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = bound.local_addr().unwrap();
+    let (backend, origin_task) = origin().await;
+    let (auth, seen, auth_task) = auth_mock().await;
+    let mut listener = serde_json::json!({"id": "edge", "listen": listen});
+    if let Some(port) = advertised {
+        listener["advertised_port"] = port.into();
+    }
+    if trusted {
+        listener["trusted_proxy_cidrs"] = serde_json::json!(["127.0.0.0/8"]);
+    }
+    let candidate: Config = serde_json::from_value(serde_json::json!({
+        "revision": 1,
+        "public_http": [listener],
+        "http": [{
+            "id": "edge-route", "path_prefix": "/edge", "listener_ids": ["edge"],
+            "backends": [format!("http://{backend}")],
+            "auth": {"url": format!("http://{auth}/check")}
+        }]
+    }))
+    .unwrap();
+    let running = start(candidate, bound).await;
+    let response = status_with(listen, "/edge", headers).await;
+    running.shutdown().await;
+    origin_task.abort();
+    auth_task.abort();
+    (seen, response)
+}
+
+#[tokio::test]
+async fn advertised_port_replaces_local_port_in_authorization_context() {
+    let (seen, response) = auth_context(Some(443), false, "").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    // The listener is plaintext, so the scheme is http; the advertised port is
+    // still the default for the generated forwarding fields.
+    assert_eq!(
+        seen_header(&seen, "x-forwarded-port").as_deref(),
+        Some("443")
+    );
+}
+
+#[tokio::test]
+async fn advertised_port_443_is_omitted_from_https_original_url() {
+    // A TLS listener cannot be built here without certificate files, so the
+    // https scheme is supplied by a trusted proxy while the port stays the
+    // advertised default.
+    let (seen, _) = auth_context(
+        Some(443),
+        true,
+        "X-Forwarded-Proto: https\r\nX-Forwarded-For: 203.0.113.9\r\n",
+    )
+    .await;
+    assert_eq!(
+        seen_header(&seen, "x-forwarded-port").as_deref(),
+        Some("443")
+    );
+    assert_eq!(
+        seen_header(&seen, "x-original-url").as_deref(),
+        Some("https://localhost/edge")
+    );
+}
+
+#[tokio::test]
+async fn without_advertised_port_the_local_port_is_used() {
+    let (seen, _) = auth_context(
+        None,
+        true,
+        "X-Forwarded-Proto: https\r\nX-Forwarded-For: 203.0.113.9\r\n",
+    )
+    .await;
+    let port = seen_header(&seen, "x-forwarded-port").unwrap();
+    assert_ne!(port, "443");
+    assert_eq!(
+        seen_header(&seen, "x-original-url").unwrap(),
+        format!("https://localhost:{port}/edge")
+    );
+}
+
+#[tokio::test]
+async fn trusted_forwarded_port_wins_over_advertised_port() {
+    let (seen, _) = auth_context(
+        Some(443),
+        true,
+        "X-Forwarded-Proto: https\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Port: 9443\r\n",
+    )
+    .await;
+    assert_eq!(
+        seen_header(&seen, "x-forwarded-port").as_deref(),
+        Some("9443")
+    );
+    assert_eq!(
+        seen_header(&seen, "x-original-url").as_deref(),
+        Some("https://localhost:9443/edge")
+    );
+}
+
+#[tokio::test]
+async fn untrusted_forwarded_port_is_ignored_and_advertised_port_applies() {
+    let (seen, _) = auth_context(Some(8443), false, "X-Forwarded-Port: 9443\r\n").await;
+    assert_eq!(
+        seen_header(&seen, "x-forwarded-port").as_deref(),
+        Some("8443")
+    );
+}
+
+#[test]
+fn advertised_port_zero_is_rejected_and_round_trips() {
+    let zero = serde_json::json!({"id": "edge", "listen": "127.0.0.1:8443", "advertised_port": 0});
+    let listener: hangang::public_listener_config::Listener = serde_json::from_value(zero).unwrap();
+    assert!(listener.validate().is_err());
+    let ok = serde_json::json!({"id": "edge", "listen": "127.0.0.1:8443", "advertised_port": 443});
+    let listener: hangang::public_listener_config::Listener =
+        serde_json::from_value(ok.clone()).unwrap();
+    listener.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(&listener).unwrap()["advertised_port"],
+        ok["advertised_port"]
+    );
+    let plain: hangang::public_listener_config::Listener =
+        serde_json::from_value(serde_json::json!({"id": "edge", "listen": "127.0.0.1:8443"}))
+            .unwrap();
+    assert!(
+        serde_json::to_value(&plain)
+            .unwrap()
+            .get("advertised_port")
+            .is_none()
+    );
+}

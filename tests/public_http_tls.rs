@@ -36,6 +36,7 @@ fn listener(id: &str, port: u16, certificates: Vec<CertificateFiles>) -> Listene
         enabled: true,
         certificates,
         trusted_proxy_cidrs: vec![],
+        advertised_port: None,
     }
 }
 

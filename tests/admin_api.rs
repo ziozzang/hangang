@@ -1868,6 +1868,7 @@ async fn certificate_inventory_scopes_named_listeners_without_id_collision() {
             enabled: true,
             certificates: vec![certificate("active")],
             trusted_proxy_cidrs: vec![],
+            advertised_port: None,
         },
         hangang::public_listener_config::Listener {
             id: "inactive".into(),
@@ -1875,6 +1876,7 @@ async fn certificate_inventory_scopes_named_listeners_without_id_collision() {
             enabled: false,
             certificates: vec![certificate("inactive")],
             trusted_proxy_cidrs: vec![],
+            advertised_port: None,
         },
     ];
     let (address, _) = server_on(
