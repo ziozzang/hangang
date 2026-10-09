@@ -95,7 +95,7 @@ pub fn matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn parse_ip(value: &str) -> Option<IpAddr> {
+pub(crate) fn parse_ip(value: &str) -> Option<IpAddr> {
     value
         .parse()
         .ok()

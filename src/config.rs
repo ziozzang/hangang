@@ -1700,10 +1700,16 @@ impl Config {
                 let Some(right_prefix) = &right.path_prefix else {
                     continue;
                 };
-                if left_prefix != right_prefix
-                    && left_prefix.eq_ignore_ascii_case(right_prefix)
+                let (left_operand, right_operand) = (
+                    effective_operand(left, left_prefix),
+                    effective_operand(right, right_prefix),
+                );
+                if left_operand != right_operand
+                    && left_operand.eq_ignore_ascii_case(right_operand)
                     && left.path_case_insensitive() != right.path_case_insensitive()
                     && hosts_may_overlap(left, right)
+                    && !effective_public_listeners(left)
+                        .is_disjoint(&effective_public_listeners(right))
                 {
                     anyhow::bail!(
                         "routes {} and {} have path_prefix values that differ only in case but different path_case; set path_case explicitly on both routes",
@@ -1718,7 +1724,55 @@ impl Config {
     /// Non-fatal findings. They are logged when a configuration is activated
     /// and printed by `--check`; they never reject a configuration.
     pub fn warnings(&self) -> Vec<String> {
-        self.http
+        let mut shadow = Vec::new();
+        for (pi, protected) in self.http.iter().enumerate() {
+            let Some(prefix) = &protected.path_prefix else {
+                continue;
+            };
+            if !protected.is_path_scoped_protection() || !protected.enabled {
+                continue;
+            }
+            let operand = effective_operand(protected, prefix);
+            for (qi, other) in self.http.iter().enumerate() {
+                if qi == pi
+                    || !other.enabled
+                    || other.is_path_scoped_protection()
+                    || other.auth.is_some()
+                    || other.basic_auth.is_some()
+                    || other.jwt_auth.is_some()
+                    || other.access_mode == AccessMode::Protected
+                    || !selected_before((qi, other), (pi, protected))
+                    || !hosts_may_overlap(other, protected)
+                    || effective_public_listeners(other)
+                        .is_disjoint(&effective_public_listeners(protected))
+                {
+                    continue;
+                }
+                let covers = match &other.path_prefix {
+                    None => true,
+                    Some(theirs) if other.path_match != PathMatch::Exact => {
+                        let theirs = effective_operand(other, theirs);
+                        let (a, b) = (operand.as_bytes(), theirs.as_bytes());
+                        a.len() >= b.len()
+                            && if other.path_case_insensitive() {
+                                a[..b.len()].eq_ignore_ascii_case(b)
+                            } else {
+                                &a[..b.len()] == b
+                            }
+                    }
+                    Some(_) => false,
+                };
+                if covers {
+                    shadow.push(format!(
+                        "route {} (unauthenticated) is selected before protected route {} and its path_prefix covers {}: it can shadow the protection on overlapping hosts",
+                        other.id, protected.id, prefix
+                    ));
+                }
+            }
+        }
+        shadow
+            .into_iter()
+            .chain(self.http
             .iter()
             .filter(|route| {
                 route.path_case == Some(PathCase::Sensitive) && route.is_path_scoped_protection()
@@ -1729,7 +1783,7 @@ impl Config {
                     route.id,
                     route.path_prefix.as_deref().unwrap_or_default()
                 )
-            })
+            }))
             .collect()
     }
     /// Emit [`Config::warnings`] at warn level.
@@ -1861,18 +1915,29 @@ where
 
 /// Conservative: an unconstrained host, a regex or a glob may match anything.
 fn hosts_may_overlap(left: &HttpRoute, right: &HttpRoute) -> bool {
-    fn patterns(route: &HttpRoute) -> Option<Vec<String>> {
+    #[derive(PartialEq)]
+    enum Key {
+        Ip(std::net::IpAddr),
+        Name(String),
+    }
+    fn patterns(route: &HttpRoute) -> Option<Vec<Key>> {
         if route.host_regex.is_some() {
             return None;
         }
-        let mut all: Vec<String> = route.hosts.clone();
-        all.extend(route.host.clone());
+        let mut all: Vec<&String> = route.hosts.iter().collect();
+        all.extend(route.host.iter());
         if all.is_empty() || all.iter().any(|h| h.contains(['*', '?'])) {
             return None;
         }
+        // Same equivalence as host_match::matches: IP literals compare as
+        // addresses, names ASCII case-insensitively (also without a root dot,
+        // which guarded hosts trim).
         Some(
             all.iter()
-                .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+                .map(|h| match crate::host_match::parse_ip(h) {
+                    Some(ip) => Key::Ip(ip),
+                    None => Key::Name(h.trim_end_matches('.').to_ascii_lowercase()),
+                })
                 .collect(),
         )
     }
@@ -1880,6 +1945,21 @@ fn hosts_may_overlap(left: &HttpRoute, right: &HttpRoute) -> bool {
         (Some(a), Some(b)) => a.iter().any(|h| b.contains(h)),
         _ => true,
     }
+}
+
+/// The operand route selection actually compares, after the mode's own
+/// normalization (`segment_prefix` trims trailing slashes).
+fn effective_operand<'a>(route: &HttpRoute, prefix: &'a str) -> &'a str {
+    match route.path_match {
+        PathMatch::SegmentPrefix => prefix.trim_end_matches('/'),
+        _ => prefix,
+    }
+}
+
+/// Selection order: higher priority first, ties by configuration order.
+fn selected_before(first: (usize, &HttpRoute), second: (usize, &HttpRoute)) -> bool {
+    first.1.priority > second.1.priority
+        || (first.1.priority == second.1.priority && first.0 < second.0)
 }
 
 fn validate_http_match_host(host: &str) -> anyhow::Result<()> {

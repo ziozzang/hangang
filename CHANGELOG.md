@@ -11,7 +11,9 @@
   The upstream still receives the original path. An explicit `sensitive` on a
   protected prefix route is warned about (log at activation and `--check`), and
   same-host routes whose prefixes differ only in case with different effective
-  case handling are rejected.
+  case handling and a shared listener are rejected (IP-literal hosts and
+  segment_prefix operands are compared in normalized form); an earlier-selected
+  unauthenticated route covering a protected prefix now produces a warning.
 - Add `auth.static_request_headers` for fixed headers, literal or resolved
   from an environment variable at activation, on external-authorization calls;
   reserved and colliding names are rejected, client copies are never sent, and

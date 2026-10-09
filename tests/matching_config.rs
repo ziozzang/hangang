@@ -149,3 +149,109 @@ fn explicit_sensitive_protected_prefix_is_accepted_with_a_named_warning() {
     .unwrap();
     assert!(default.warnings().is_empty());
 }
+
+fn route_json(id: &str, host: &str, prefix: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut route =
+        json!({"id":id,"host":host,"path_prefix":prefix,"backends":["http://localhost"]});
+    for (key, value) in extra.as_object().unwrap() {
+        route[key] = value.clone();
+    }
+    route
+}
+
+#[test]
+fn equivalent_ip_literals_overlap_for_case_conflicts() {
+    let protected = route_json(
+        "p",
+        "[::1]",
+        "/admin",
+        json!({"basic_auth":basic(),"priority":10}),
+    );
+    let public = route_json("q", "[0:0:0:0:0:0:0:1]", "/ADMIN", json!({"priority":20}));
+    assert!(case_config(json!([protected, public])).is_err());
+    let grouped = json!({"id":"q","hosts":["x.test","::1"],"path_prefix":"/ADMIN","backends":["http://localhost"]});
+    assert!(case_config(json!([protected, grouped])).is_err());
+    let other = route_json("q", "[::2]", "/ADMIN", json!({}));
+    case_config(json!([protected, other])).unwrap();
+}
+
+#[test]
+fn segment_prefix_operands_are_compared_after_normalization() {
+    let protected = route_json(
+        "p",
+        "a.test",
+        "/admin/",
+        json!({"path_match":"segment_prefix","basic_auth":basic()}),
+    );
+    let public = route_json(
+        "q",
+        "a.test",
+        "/ADMIN",
+        json!({"path_match":"segment_prefix"}),
+    );
+    assert!(case_config(json!([protected, public])).is_err());
+    // Identical after normalization is not a case variant.
+    let same = route_json(
+        "q",
+        "a.test",
+        "/admin",
+        json!({"path_match":"segment_prefix"}),
+    );
+    case_config(json!([protected, same])).unwrap();
+}
+
+#[test]
+fn disjoint_listener_sets_do_not_conflict() {
+    let one = route_json(
+        "p",
+        "a.test",
+        "/api",
+        json!({"listener_ids":["default"],"path_case":"insensitive"}),
+    );
+    let two = route_json("q", "a.test", "/API", json!({"listener_ids":["other"]}));
+    let config: Config =
+        serde_json::from_value(json!({"http":[one.clone(), two.clone()]})).unwrap();
+    // Listener existence is validated elsewhere; only the overlap rule matters here.
+    if let Err(error) = config.validate() {
+        assert!(!error.to_string().contains("path_case"), "{error}");
+    }
+    let shared = route_json(
+        "q",
+        "a.test",
+        "/API",
+        json!({"listener_ids":["other","default"]}),
+    );
+    let config: Config = serde_json::from_value(json!({"http":[one, shared]})).unwrap();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("path_case")
+    );
+}
+
+#[test]
+fn higher_priority_public_route_shadowing_a_protected_prefix_warns() {
+    let protected = route_json(
+        "p",
+        "a.test",
+        "/admin",
+        json!({"basic_auth":basic(),"priority":0}),
+    );
+    let shadow = route_json("q", "a.test", "/", json!({"priority":5}));
+    let config: Config =
+        serde_json::from_value(json!({"http":[protected.clone(), shadow]})).unwrap();
+    config.validate().unwrap();
+    let warnings = config.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("q") && w.contains("shadow")),
+        "{warnings:?}"
+    );
+    // A lower-priority public fallback is the normal layout: no warning.
+    let fallback = route_json("q", "a.test", "/", json!({"priority":-5}));
+    let config: Config = serde_json::from_value(json!({"http":[protected, fallback]})).unwrap();
+    assert!(config.warnings().is_empty());
+}
