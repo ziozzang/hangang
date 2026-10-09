@@ -42,6 +42,7 @@ fn config(revision: u64, id: &str) -> Config {
             path_prefix: None,
             path_match: Default::default(),
             path_case: None,
+            strip_request_cookies: Vec::new(),
             headers: BTreeMap::new(),
             json: BTreeMap::new(),
             backends: vec!["http://127.0.0.1:8080".into()],

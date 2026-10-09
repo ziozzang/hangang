@@ -361,6 +361,12 @@ pub struct HttpRoute {
     /// otherwise sensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_case: Option<PathCase>,
+    /// Cookie names removed (exact, case-sensitive) from the request sent
+    /// upstream, with or without `auth`. The effective set is the union with
+    /// `auth.strip_request_cookies`. The authorization call still receives the
+    /// full listed `cookie` header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_request_cookies: Vec<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// RFC 6901 JSON pointers mapped to expected values.
@@ -483,13 +489,13 @@ const MAX_STATIC_HEADER_VALUE: usize = 1024;
 const MAX_STRIP_REQUEST_COOKIES: usize = 16;
 const MAX_COOKIE_NAME: usize = 128;
 
-fn validate_strip_request_cookies(auth: &ExternalAuth) -> anyhow::Result<()> {
+fn validate_strip_request_cookies(names: &[String]) -> anyhow::Result<()> {
     ensure!(
-        auth.strip_request_cookies.len() <= MAX_STRIP_REQUEST_COOKIES,
+        names.len() <= MAX_STRIP_REQUEST_COOKIES,
         "too many strip_request_cookies entries"
     );
     let mut seen = std::collections::HashSet::new();
-    for name in &auth.strip_request_cookies {
+    for name in names {
         ensure!(
             !name.is_empty()
                 && name.len() <= MAX_COOKIE_NAME
@@ -1553,8 +1559,9 @@ impl Config {
                     );
                 }
                 validate_static_request_headers(auth)?;
-                validate_strip_request_cookies(auth)?;
+                validate_strip_request_cookies(&auth.strip_request_cookies)?;
             }
+            validate_strip_request_cookies(&r.strip_request_cookies)?;
             ensure!(
                 !r.backends.is_empty() && r.backends.len() <= 128,
                 "route {} needs 1..128 backends",
@@ -2905,10 +2912,28 @@ fn authentication_identity_headers(
             );
         }
     }
+    ensure!(
+        !names.contains("cookie"),
+        "cookie cannot be an authentication identity output header"
+    );
     Ok(names)
 }
 
 impl HttpRoute {
+    /// Cookie names removed from the upstream request: the union of the route
+    /// field and `auth.strip_request_cookies`.
+    pub fn effective_strip_cookies(&self) -> Vec<String> {
+        let mut names = self.strip_request_cookies.clone();
+        if let Some(auth) = &self.auth {
+            for name in &auth.strip_request_cookies {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
     /// A route that authenticates or is declared protected and has a path
     /// prefix is scoped case-insensitively unless it says otherwise.
     fn is_path_scoped_protection(&self) -> bool {
@@ -4231,7 +4256,7 @@ mod strip_cookie_tests {
     #[test]
     fn accepts_valid_names_and_round_trips() {
         let auth = auth_with(&["__Host-hopae", "__Host-hopae_bind", "Hopae", "hopae"]);
-        validate_strip_request_cookies(&auth).unwrap();
+        validate_strip_request_cookies(&auth.strip_request_cookies).unwrap();
         let again: ExternalAuth =
             serde_json::from_str(&serde_json::to_string(&auth).unwrap()).unwrap();
         assert_eq!(again, auth);
@@ -4245,20 +4270,30 @@ mod strip_cookie_tests {
 
     #[test]
     fn rejects_duplicates_bad_names_and_excess() {
-        assert!(validate_strip_request_cookies(&auth_with(&["a", "a"])).is_err());
+        assert!(
+            validate_strip_request_cookies(&auth_with(&["a", "a"]).strip_request_cookies).is_err()
+        );
         for bad in ["", "a b", "a=b", "a;b", "a,b", "a\"b", "é", "a\tb", "(x)"] {
             assert!(
-                validate_strip_request_cookies(&auth_with(&[bad])).is_err(),
+                validate_strip_request_cookies(&auth_with(&[bad]).strip_request_cookies).is_err(),
                 "{bad:?}"
             );
         }
         let long = "a".repeat(129);
-        assert!(validate_strip_request_cookies(&auth_with(&[long.as_str()])).is_err());
+        assert!(
+            validate_strip_request_cookies(&auth_with(&[long.as_str()]).strip_request_cookies)
+                .is_err()
+        );
         let ok = "a".repeat(128);
-        assert!(validate_strip_request_cookies(&auth_with(&[ok.as_str()])).is_ok());
+        assert!(
+            validate_strip_request_cookies(&auth_with(&[ok.as_str()]).strip_request_cookies)
+                .is_ok()
+        );
         let names: Vec<String> = (0..17).map(|i| format!("c{i}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        assert!(validate_strip_request_cookies(&auth_with(&refs)).is_err());
-        assert!(validate_strip_request_cookies(&auth_with(&refs[..16])).is_ok());
+        assert!(validate_strip_request_cookies(&auth_with(&refs).strip_request_cookies).is_err());
+        assert!(
+            validate_strip_request_cookies(&auth_with(&refs[..16]).strip_request_cookies).is_ok()
+        );
     }
 }

@@ -1462,6 +1462,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         path_prefix: None,
         path_match: Default::default(),
         path_case: None,
+        strip_request_cookies: Vec::new(),
         max_requests: None,
         upstream_timeout_ms: None,
         retries: 0,
@@ -6558,6 +6559,13 @@ async fn cookie_recording_auth() -> (SocketAddr, Arc<Mutex<Vec<String>>>, JoinHa
 /// Sends the cookie lines through a route that strips the Hopae cookies and
 /// returns (cookie fields seen by auth, cookie fields seen by upstream).
 async fn strip_cookie_roundtrip(lines: &[&str]) -> (Vec<String>, Vec<String>) {
+    strip_cookie_roundtrip_with(lines, |_| {}).await
+}
+
+async fn strip_cookie_roundtrip_with(
+    lines: &[&str],
+    mutate: impl FnOnce(&mut HttpRoute),
+) -> (Vec<String>, Vec<String>) {
     let (auth_address, auth_seen, auth_task) = cookie_recording_auth().await;
     let (backend, seen, backend_task) = upstream("ok").await;
     let mut secured = route(vec![format!("http://{backend}")]);
@@ -6569,6 +6577,7 @@ async fn strip_cookie_roundtrip(lines: &[&str]) -> (Vec<String>, Vec<String>) {
         }))
         .unwrap(),
     );
+    mutate(&mut secured);
     let (proxy, policy) = proxy(vec![secured]);
     let (front, front_task, _) = frontend(proxy).await;
     let mut builder = Request::builder().uri(format!("http://{front}/private/x"));
@@ -6635,4 +6644,167 @@ async fn strip_request_cookies_matches_whole_names_and_keeps_malformed_pairs() {
         upstream,
         vec!["__Host-hopae2=keep; junk; __host-hopae=keep2; __Host-hopae_bind_x=k3".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn strip_request_cookies_drops_header_for_whitespace_separated_cookie() {
+    for line in [
+        "a=1 __Host-hopae=SECRET; b=2",
+        "a=1\t__Host-hopae_bind=B; b=2",
+    ] {
+        let (auth, upstream) = strip_cookie_roundtrip(&[line]).await;
+        assert_eq!(auth, vec![line.to_owned()]);
+        assert!(upstream.is_empty(), "{upstream:?}");
+    }
+}
+
+#[tokio::test]
+async fn strip_request_cookies_respects_quoted_semicolons() {
+    // A removed quoted value leaves no fragment behind.
+    let (_, upstream) = strip_cookie_roundtrip(&["__Host-hopae=\"prefix;SECRET\"; a=1"]).await;
+    assert_eq!(upstream, vec!["a=1".to_owned()]);
+    // A quoted value of an unrelated cookie is never altered, and an
+    // ambiguous remainder drops the whole header.
+    let (_, upstream) =
+        strip_cookie_roundtrip(&["a=\"before;__Host-hopae=part;after\"; __Host-hopae=SESSION"])
+            .await;
+    assert!(upstream.is_empty(), "{upstream:?}");
+    let (_, upstream) = strip_cookie_roundtrip(&["a=\"x;y\"; __Host-hopae=S; b=2"]).await;
+    assert_eq!(upstream, vec!["a=\"x;y\"; b=2".to_owned()]);
+    // An unbalanced quote cannot be parsed safely.
+    let (_, upstream) = strip_cookie_roundtrip(&["a=\"x; __Host-hopae=S"]).await;
+    assert!(upstream.is_empty(), "{upstream:?}");
+}
+
+#[tokio::test]
+async fn strip_request_cookies_wins_over_request_transform() {
+    let (auth, upstream) = strip_cookie_roundtrip_with(&["a=1; __Host-hopae=SECRET"], |route| {
+        route.request_transform = Some(hangang::transform::BodyTransform {
+            operations: vec![hangang::transform::Operation::Replace {
+                from: "unused".into(),
+                to: "unused".into(),
+            }],
+            set_headers: BTreeMap::from([("cookie".into(), "__Host-hopae=RESTORED; c=3".into())]),
+            ..Default::default()
+        });
+    })
+    .await;
+    assert_eq!(auth, vec!["a=1; __Host-hopae=SECRET".to_owned()]);
+    assert_eq!(upstream, vec!["c=3".to_owned()]);
+}
+
+#[tokio::test]
+async fn route_level_strip_request_cookies_works_without_auth() {
+    let (backend, seen, backend_task) = upstream("ok").await;
+    let mut public = route(vec![format!("http://{backend}")]);
+    public.auth = None;
+    public.strip_request_cookies = vec!["__Host-hopae".into(), "__Host-hopae_bind".into()];
+    let (proxy, policy) = proxy(vec![public]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let response = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/public"))
+                .header("cookie", "a=1; __Host-hopae=SECRET; __Host-hopae_bind=B")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(seen.lock().unwrap()[0].headers["cookie"], "a=1");
+    policy.shutdown().await;
+    front_task.abort();
+    backend_task.abort();
+}
+
+#[tokio::test]
+async fn route_and_auth_strip_lists_are_unioned() {
+    let (auth, upstream) = strip_cookie_roundtrip_with(
+        &["a=1; __Host-hopae=S; __Host-hopae_bind=B; extra=E"],
+        |route| route.strip_request_cookies = vec!["extra".into()],
+    )
+    .await;
+    assert_eq!(auth.len(), 1);
+    assert_eq!(upstream, vec!["a=1".to_owned()]);
+}
+
+#[tokio::test]
+async fn websocket_upgrade_strips_request_cookies() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let recorder = seen.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let recorder = recorder.clone();
+            async move {
+                for value in request.headers().get_all("cookie") {
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(value.to_str().unwrap().to_owned());
+                }
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(101)
+                        .header("connection", "upgrade")
+                        .header("upgrade", "websocket")
+                        .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades()
+            .await;
+    });
+    let mut socket = route(vec![format!("http://{address}")]);
+    socket.auth = None;
+    socket.strip_request_cookies = vec!["__Host-hopae".into()];
+    let (proxy, policy) = proxy(vec![socket]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let mut stream = TcpStream::connect(front).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {front}\r\nCookie: a=1; __Host-hopae=SECRET\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" // gitleaks:allow -- protocol/test fixture
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        headers.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 101"));
+    assert_eq!(*seen.lock().unwrap(), vec!["a=1".to_owned()]);
+    drop(stream);
+    policy.shutdown().await;
+    front_task.abort();
+    upstream_task.abort();
+}
+
+#[test]
+fn cookie_cannot_be_an_authentication_identity_output() {
+    let mut with_auth = route(vec!["http://127.0.0.1:9".into()]);
+    with_auth.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/check",
+            "response_headers": ["cookie"],
+        }))
+        .unwrap(),
+    );
+    let config = Config {
+        revision: 1,
+        http: vec![with_auth],
+        ..Config::default()
+    };
+    assert!(config.validate().is_err());
 }

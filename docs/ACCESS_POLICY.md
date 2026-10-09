@@ -55,17 +55,22 @@ Strictness depends on the path. Process startup, admin API writes and `hangang -
 
 ## Stripping session cookies before the upstream
 
-When `cookie` is listed in `auth.request_headers`, the authorization service receives the client's cookies, and by default the upstream application also receives the original `Cookie` header. List the cookies that only the authorization service needs in `strip_request_cookies` so the application never sees them:
+When `cookie` is listed in `auth.request_headers`, the authorization service receives the client's cookies, and the upstream application would also receive the original `Cookie` header. Browsers also send session cookies scoped to `Path=/` to sibling routes of the same host that have no `auth`. List the cookies only the authorization service needs in the route-level `strip_request_cookies`, which works with or without `auth`:
 
 ```json
-"auth": {
-  "url": "https://id.internal/verify",
-  "request_headers": ["cookie"],
-  "strip_request_cookies": ["__Host-hopae", "__Host-hopae_bind"]
+{
+  "id": "site-public",
+  "path_prefix": "/",
+  "strip_request_cookies": ["__Host-hopae", "__Host-hopae_bind"],
+  "backends": ["http://app.internal:8080"]
 }
 ```
 
-The authorization call is unchanged and still receives the full listed `cookie` header. Only after an allowed authorization, every cookie pair whose name exactly equals a listed name is removed from all `Cookie` fields of the upstream request (split HTTP/2 or repeated HTTP/1.1 fields are joined first). The remaining pairs keep their order and are rejoined with `; `; if none remain the `Cookie` header is removed. Matching is exact and case-sensitive (`__Host-hopae2` is kept); a malformed pair without `=` is kept unless its text equals a listed name. The removal runs after authorization and after any Lua header mutation (Lua cannot set `Cookie`), and before request transforms, retries and WebSocket upgrades, so those all see the stripped header. Terminal and forwarded authorization responses never reach the upstream and are unaffected. At most 16 names are allowed, each a valid cookie name (RFC 6265 token characters, at most 128 bytes), without duplicates.
+`auth.strip_request_cookies` is still accepted; the effective set is the union of both fields. The authorization call is unchanged and still receives the full listed `cookie` header. Each field allows at most 16 names, each a valid cookie name (RFC 6265 token characters, at most 128 bytes) without duplicates; matching is exact and case-sensitive (`__Host-hopae2` is kept).
+
+Removal is the last header mutation before the request is dispatched upstream: after authorization (only an Allow continues), Lua, request transforms, forwarding headers and identity reassertion, and before retry headers are captured and before a WebSocket upgrade is sent. A transform or script that sets `Cookie` therefore cannot restore a listed cookie. `cookie` cannot be an authentication identity output header (`auth.response_headers`, Basic, JWT or workload `identity_header`); the configuration is rejected. Terminal and forwarded authorization responses never reach the upstream and are unaffected.
+
+All `Cookie` fields are joined first. Pairs are split on `;` outside double-quoted values, so a `;` inside `"..."` does not split. Listed pairs are removed, the other pairs keep their bytes and order and are rejoined with `; `, and the header is removed when nothing remains. If the result could still carry a listed cookie, the whole `Cookie` header is dropped for the upstream instead: an unbalanced quote, or a listed name still present at a token boundary in the remainder (for example the whitespace-separated `a=1 __Host-hopae=X`, or a listed name inside another cookie's quoted value). Fragments of a removed value are never forwarded and unrelated cookies are never altered.
 
 ## Path case
 

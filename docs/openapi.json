@@ -3835,6 +3835,19 @@
               }
             ],
             "description": "Selected-route Accept-Language admission before cache/Lua/origin; not identity or country proof. Routes sharing resource_id require the same policy."
+          },
+          "strip_request_cookies": {
+            "type": "array",
+            "maxItems": 16,
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            },
+            "description": "Cookie names removed (exact, case-sensitive) from the request sent upstream, with or without auth. The effective set is the union with auth.strip_request_cookies. Removal is the last header mutation before dispatch; an unparseable or ambiguous Cookie header that could still carry a listed cookie is dropped entirely. The authorization call still receives the full listed cookie header."
           }
         },
         "example": {

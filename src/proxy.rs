@@ -2378,16 +2378,6 @@ impl Proxy {
             return Ok(denied);
         }
 
-        // Only an Allow reaches this point on an auth route. Remove the
-        // configured session cookies from every Cookie field after the
-        // authorization call, Lua and its header mutations, and before the
-        // request transform, retries and upgrades build the upstream request.
-        if let Some(auth) = &runtime.route.auth
-            && !auth.strip_request_cookies.is_empty()
-        {
-            strip_request_cookies(request.headers_mut(), &auth.strip_request_cookies);
-        }
-
         // Explicitly protected routes check gateway authentication and any
         // configured Lua policy before honoring a cache-only request. Their
         // cache is ineligible, so no origin content follows this shortcut.
@@ -2624,6 +2614,13 @@ impl Proxy {
         // live under `x-forwarded-user`-style names that the forwarding pass
         // above just cleared; the authenticated values always win.
         reassert_identity_headers(request.headers_mut(), &established_identity, auth_reserved);
+        // Last header mutation before dispatch: after authorization, Lua,
+        // request transforms, forwarding headers and identity reassertion,
+        // and before retry headers are captured. Nothing below may add Cookie.
+        let strip_cookies = runtime.route.effective_strip_cookies();
+        if !strip_cookies.is_empty() {
+            strip_request_cookies(request.headers_mut(), &strip_cookies);
+        }
         *request.version_mut() = Version::HTTP_11;
         // Regenerate HTTP/1 framing for an unknown-length body now that the
         // incoming Transfer-Encoding is gone. Without an explicit header the
@@ -3462,19 +3459,73 @@ fn collapse_duplicate_policy_headers(headers: &mut HeaderMap) -> Result<(), ()> 
     Ok(())
 }
 
+fn is_cookie_token_byte(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// True when `name` occurs in `bytes` delimited on both sides by a non-token
+/// byte (or an end). Deliberately over-approximate: it is the fail-safe check.
+fn contains_cookie_name(bytes: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() || bytes.len() < name.len() {
+        return false;
+    }
+    (0..=bytes.len() - name.len()).any(|at| {
+        &bytes[at..at + name.len()] == name
+            && (at == 0 || !is_cookie_token_byte(bytes[at - 1]))
+            && bytes
+                .get(at + name.len())
+                .is_none_or(|b| !is_cookie_token_byte(*b))
+    })
+}
+
+/// Split on `;` outside double quotes. `None` when a quote is left open.
+fn split_cookie_pairs(value: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut pairs = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b';' if !quoted => {
+                pairs.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if quoted {
+        return None;
+    }
+    pairs.push(&value[start.min(value.len())..]);
+    Some(pairs)
+}
+
 /// Remove every cookie pair whose name exactly equals one of `names` from all
-/// Cookie fields. Other pairs keep their order and are rejoined with `; `;
-/// pairs without `=` are kept unless the whole pair equals a listed name.
-/// The header is removed when nothing remains.
+/// Cookie fields. Pairs are split on `;` outside quoted values; the other
+/// pairs keep their bytes and order and are rejoined with `; `. If nothing
+/// remains, or the result could still carry a listed cookie (an unbalanced
+/// quote, or a listed name still present at a token boundary such as in
+/// `a=1 name=v`), the whole header is dropped rather than risk forwarding
+/// part of a removed cookie or corrupting another one.
 fn strip_request_cookies(headers: &mut HeaderMap, names: &[String]) {
     if !headers.contains_key(header::COOKIE) {
         return;
     }
     let mut kept: Vec<u8> = Vec::new();
     let mut sensitive = false;
+    let mut clean = true;
     for value in headers.get_all(header::COOKIE) {
         sensitive |= value.is_sensitive();
-        for pair in value.as_bytes().split(|b| *b == b';') {
+        let Some(pairs) = split_cookie_pairs(value.as_bytes()) else {
+            clean = false;
+            break;
+        };
+        for pair in pairs {
             let pair = pair.trim_ascii();
             if pair.is_empty() {
                 continue;
@@ -3492,8 +3543,12 @@ fn strip_request_cookies(headers: &mut HeaderMap, names: &[String]) {
             kept.extend_from_slice(pair);
         }
     }
+    clean = clean
+        && !names
+            .iter()
+            .any(|n| contains_cookie_name(&kept, n.as_bytes()));
     headers.remove(header::COOKIE);
-    if kept.is_empty() {
+    if !clean || kept.is_empty() {
         return;
     }
     if let Ok(mut value) = HeaderValue::from_bytes(&kept) {
@@ -4078,6 +4133,29 @@ impl hyper::body::Body for RequestBody {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn strip_request_cookies_parser_is_quote_aware_and_fails_safe() {
+        let names = vec!["s".to_owned()];
+        let run = |input: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.append(header::COOKIE, HeaderValue::from_static(input));
+            strip_request_cookies(&mut headers, &names);
+            headers
+                .get(header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(run("s=\"p;q\"; a=1").as_deref(), Some("a=1"));
+        assert_eq!(run("a=\"x;y\"; s=1").as_deref(), Some("a=\"x;y\""));
+        assert_eq!(run("a=1 s=2; b=3"), None);
+        assert_eq!(run("a=1\ts=2"), None);
+        assert_eq!(run("a=\"x; s=2"), None);
+        assert_eq!(run("a=\"s=1;\"; s=2"), None);
+        assert_eq!(
+            run("s2=1; ss=2; a_s=3").as_deref(),
+            Some("s2=1; ss=2; a_s=3")
+        );
+    }
+
+    #[test]
     fn strip_request_cookies_keeps_order_and_removes_empty_header() {
         let names = vec!["s".to_owned()];
         let mut headers = HeaderMap::new();
@@ -4333,6 +4411,7 @@ mod tests {
             path_prefix: None,
             path_match: Default::default(),
             path_case: None,
+            strip_request_cookies: Vec::new(),
             max_requests: None,
             upstream_timeout_ms: None,
             retries: 0,
