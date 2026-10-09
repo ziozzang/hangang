@@ -5207,6 +5207,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
         country_policy: None,
         auth_reserved: Vec::new(),
         auth_static_headers: Vec::new(),
+        auth_unavailable: None,
         jwt_auth: None,
         workload_auth: None,
         host_regex: None,
@@ -6276,4 +6277,86 @@ async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
     front_task.abort();
     backend_task.abort();
     auth_task.abort();
+}
+
+#[tokio::test]
+async fn route_without_static_header_variable_fails_closed_and_other_routes_keep_working() {
+    let (gated_backend, gated_seen, gated_task) = upstream("gated").await;
+    let (open_backend, open_seen, open_task) = upstream("open").await;
+    let mut gated = route(vec![format!("http://{gated_backend}")]);
+    gated.id = "gated".into();
+    gated.path_prefix = Some("/gated".into());
+    let mut open = route(vec![format!("http://{open_backend}")]);
+    open.id = "open".into();
+    open.path_prefix = Some("/open".into());
+    let config = |routes: Vec<HttpRoute>, revision| Config {
+        geoip_database: None,
+        certificates: vec![],
+        cache: None,
+        revision,
+        http: routes,
+        tcp: Vec::new(),
+        workload_http: Vec::new(),
+        udp: Vec::new(),
+        public_http: Vec::new(),
+        settings: Default::default(),
+        cache_generation_floor: 0,
+    };
+    // Revision 1: both routes are public and served.
+    let first = Snapshot::new(config(vec![gated.clone(), open.clone()], 1)).unwrap();
+    let active = Arc::new(ArcSwap::from_pointee(first));
+    let policy = Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1));
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let proxy = Proxy::new(active.clone(), policy.clone(), Arc::new(Metrics::default()))
+        .with_readiness(ready);
+    let (front, front_task, _) = frontend(proxy).await;
+    let get = |path: &'static str| {
+        let request = Request::builder()
+            .uri(format!("http://{front}{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        async move { client().request(request).await.unwrap() }
+    };
+    assert_eq!(get("/gated/x").await.status(), 200);
+    assert_eq!(get("/open/x").await.status(), 200);
+    assert_eq!(gated_seen.lock().unwrap().len(), 1);
+
+    // Revision 2 protects `gated` with a variable this node does not have.
+    gated.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/check",
+            "static_request_headers": {"x-key": {"env": "HANGANG_HC3_PROXY_UNSET"}},
+        }))
+        .unwrap(),
+    );
+    let second = config(vec![gated, open], 2);
+    // Authoring and startup (strict) reject, naming the variable only.
+    let error = Snapshot::replace(second.clone(), &active.load())
+        .err()
+        .expect("strict preparation rejects");
+    assert!(format!("{error:#}").contains("HANGANG_HC3_PROXY_UNSET"));
+    // A passive follower activates it, failing that route closed.
+    let follower = Snapshot::replace_follower(second, &active.load()).unwrap();
+    assert_eq!(
+        follower.unavailable_authorization(),
+        vec![("gated", "HANGANG_HC3_PROXY_UNSET")]
+    );
+    active.store(Arc::new(follower));
+    let response = get("/gated/x").await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "route authorization unavailable"
+    );
+    assert_eq!(get("/open/x").await.status(), 200);
+    assert_eq!(
+        gated_seen.lock().unwrap().len(),
+        1,
+        "the unavailable route must never contact its upstream"
+    );
+    assert_eq!(open_seen.lock().unwrap().len(), 2);
+    policy.shutdown().await;
+    front_task.abort();
+    gated_task.abort();
+    open_task.abort();
 }

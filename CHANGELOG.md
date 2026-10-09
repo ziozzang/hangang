@@ -8,6 +8,12 @@
   from an environment variable at activation, on external-authorization calls;
   reserved and colliding names are rejected, client copies are never sent, and
   resolved values are never serialized or logged.
+- Shared-store polls and file reloads that cannot resolve a static header
+  variable now activate the revision with that route failing closed (503,
+  readiness false, listed in `/v1/status` `authorization_unavailable`) instead
+  of keeping an older revision live. `--check` and `POST /v1/config/validate`
+  now resolve static header variables and report missing, empty or invalid
+  ones by name.
 
 ## 0.2.5 — 2026-10-06
 

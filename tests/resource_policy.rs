@@ -602,6 +602,7 @@ async fn resource_policy_rejects_native_identity_transform_and_defensively_reass
         country_policy: None,
         auth_reserved: Vec::new(),
         auth_static_headers: Vec::new(),
+        auth_unavailable: None,
         jwt_auth: None,
         workload_auth: None,
         host_regex: previous.host_regex.clone(),

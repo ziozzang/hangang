@@ -1673,6 +1673,15 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.clone());
         }
+        // This node could not prepare the route's external authorization
+        // (a static header variable is unusable here). Fail closed before any
+        // authorization call, Lua, cache or upstream contact.
+        if runtime.auth_unavailable.is_some() {
+            self.metrics
+                .rejected_requests
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(response(503, "route authorization unavailable"));
+        }
         if protected_resource.is_some_and(|id| {
             !runtime
                 .route

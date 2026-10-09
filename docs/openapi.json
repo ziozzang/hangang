@@ -4569,6 +4569,26 @@
           "settings"
         ],
         "properties": {
+          "authorization_unavailable": {
+            "type": "array",
+            "description": "Enabled routes that fail closed with 503 on this node because a static authorization header environment variable is unset, empty or invalid here. Readiness stays false while any entry is present. Names only; never values.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "route_id",
+                "variable"
+              ],
+              "properties": {
+                "route_id": {
+                  "type": "string"
+                },
+                "variable": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "geoip_metrics": {
             "$ref": "#/components/schemas/CountryMetrics"
           },

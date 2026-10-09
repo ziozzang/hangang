@@ -541,6 +541,37 @@ fn validate_static_request_headers(auth: &ExternalAuth) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A static authorization header whose environment variable could not be
+/// resolved on this node. Names the variable, never a value.
+#[derive(Debug)]
+pub struct StaticHeaderEnvError {
+    pub variable: String,
+    message: String,
+}
+impl std::fmt::Display for StaticHeaderEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for StaticHeaderEnvError {}
+
+/// A route whose external authorization cannot run on this node because a
+/// static header variable is unusable. Requests to it fail closed with 503.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthUnavailable {
+    pub variable: String,
+}
+
+/// How a snapshot treats unusable static-header environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPolicy {
+    /// Reject the snapshot: authoring paths and process startup.
+    Strict,
+    /// Activate the snapshot but fail the affected routes closed: passive
+    /// follower paths that must not keep serving an older, weaker revision.
+    FailClosed,
+}
+
 /// Resolve static authorization headers for activation. Errors name the
 /// variable, never its value. Values are marked sensitive so `Debug` output
 /// of the resulting `HeaderValue` is redacted.
@@ -567,34 +598,27 @@ fn resolve_static_request_headers_with(
                     valid_static_env_name(&reference.env),
                     "invalid environment variable name for static authorization header {name:?}"
                 );
-                let raw = lookup(&reference.env).with_context(|| {
-                    format!(
-                        "environment variable {} for static authorization header {name:?} is not set",
-                        reference.env
-                    )
-                })?;
-                let raw = raw.into_string().map_err(|_| {
-                    anyhow::anyhow!(
-                        "environment variable {} for static authorization header {name:?} is not valid UTF-8",
-                        reference.env
-                    )
-                })?;
-                ensure!(
-                    !raw.is_empty(),
-                    "environment variable {} for static authorization header {name:?} is empty",
-                    reference.env
-                );
-                ensure!(
-                    raw.len() <= MAX_STATIC_HEADER_VALUE,
-                    "environment variable {} for static authorization header {name:?} is too long",
-                    reference.env
-                );
-                hyper::header::HeaderValue::from_str(&raw).map_err(|_| {
-                    anyhow::anyhow!(
-                        "environment variable {} for static authorization header {name:?} is not a valid header value",
-                        reference.env
-                    )
-                })?
+                let fail = |reason: &str| {
+                    anyhow::Error::new(StaticHeaderEnvError {
+                        variable: reference.env.clone(),
+                        message: format!(
+                            "environment variable {} for static authorization header {name:?} {reason}",
+                            reference.env
+                        ),
+                    })
+                };
+                let raw = lookup(&reference.env)
+                    .ok_or_else(|| fail("is not set"))?
+                    .into_string()
+                    .map_err(|_| fail("is not valid UTF-8"))?;
+                if raw.is_empty() {
+                    return Err(fail("is empty"));
+                }
+                if raw.len() > MAX_STATIC_HEADER_VALUE {
+                    return Err(fail("is too long"));
+                }
+                hyper::header::HeaderValue::from_str(&raw)
+                    .map_err(|_| fail("is not a valid header value"))?
             }
         };
         header_value.set_sensitive(true);
@@ -679,6 +703,19 @@ struct PreparedUpstreamTls {
 }
 
 impl Config {
+    /// Resolve every enabled route's static authorization header values and
+    /// discard them: preflight for `--check` and configuration validation.
+    /// Errors name the route and variable, never a value.
+    pub fn check_static_request_headers(&self) -> anyhow::Result<()> {
+        for route in self.http.iter().filter(|route| route.enabled) {
+            if let Some(auth) = &route.auth {
+                resolve_static_request_headers(auth).map_err(|error| {
+                    anyhow::anyhow!("route {} external authorization: {error:#}", route.id)
+                })?;
+            }
+        }
+        Ok(())
+    }
     /// Whether this document uses identified pool members. Shared-store
     /// writers must gate this wire format until all readers support it.
     pub fn has_named_members(&self) -> bool {
@@ -1808,6 +1845,9 @@ pub struct HttpRuntime {
     /// Resolved `auth.static_request_headers` (values marked sensitive). Held
     /// only in the prepared runtime; never serialized.
     pub auth_static_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    /// Set when a passive path activated this route without its static
+    /// header variable; every request to the route is answered with 503.
+    pub auth_unavailable: Option<AuthUnavailable>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -1954,16 +1994,33 @@ fn prepare_http_balancer(
 
 impl Snapshot {
     pub fn new(config: Config) -> anyhow::Result<Self> {
-        Self::build(config, None)
+        Self::build(config, None, EnvPolicy::Strict)
     }
     pub fn replace(config: Config, previous: &Self) -> anyhow::Result<Self> {
-        Self::build(config, Some(previous))
+        Self::build(config, Some(previous), EnvPolicy::Strict)
+    }
+    /// Like [`Self::replace`] for passive paths (shared-store polls, file
+    /// reloads): a route whose static-header variable is unusable on this
+    /// node activates fail-closed instead of rejecting the whole snapshot.
+    pub fn replace_follower(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::build(config, Some(previous), EnvPolicy::FailClosed)
     }
     /// Reset runtime/cache history while still retiring the replaced generation
     /// at publication. Used when attaching to a fresh authority epoch.
     pub fn replace_fresh(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::replace_fresh_with(config, previous, EnvPolicy::Strict)
+    }
+    /// [`Self::replace_fresh`] for a passive attachment (fail-closed routes).
+    pub fn replace_fresh_follower(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::replace_fresh_with(config, previous, EnvPolicy::FailClosed)
+    }
+    fn replace_fresh_with(
+        config: Config,
+        previous: &Self,
+        policy: EnvPolicy,
+    ) -> anyhow::Result<Self> {
         config.validate_transition_from(&previous.config)?;
-        let mut next = Self::new(config)?;
+        let mut next = Self::build(config, None, policy)?;
         if next.config.geoip_database == previous.config.geoip_database {
             next.geoip = previous.geoip.clone();
         }
@@ -2028,6 +2085,19 @@ impl Snapshot {
 
     /// Side effects that belong to publication, not preparation: call once
     /// immediately before this snapshot becomes visible. Idempotent.
+    /// Enabled routes that fail closed because this node lacks a static
+    /// authorization header variable, as `(route id, variable name)`.
+    pub fn unavailable_authorization(&self) -> Vec<(&str, &str)> {
+        self.http
+            .iter()
+            .filter_map(|runtime| {
+                runtime
+                    .auth_unavailable
+                    .as_ref()
+                    .map(|unavailable| (runtime.route.id.as_str(), unavailable.variable.as_str()))
+            })
+            .collect()
+    }
     pub fn activated(&self) {
         // Keep the lock through retirement: concurrent idempotent callers must
         // not return while another caller is still closing predecessor gates.
@@ -2042,7 +2112,7 @@ impl Snapshot {
             runtime.adopt_generation(settings.generation);
         }
     }
-    fn build(config: Config, previous: Option<&Self>) -> anyhow::Result<Self> {
+    fn build(config: Config, previous: Option<&Self>, policy: EnvPolicy) -> anyhow::Result<Self> {
         config.validate()?;
         if let Some(previous) = previous {
             config.validate_transition_from(&previous.config)?;
@@ -2178,11 +2248,38 @@ impl Snapshot {
                 })
                 .collect();
         let mut auth_static_headers = std::collections::HashMap::new();
+        let mut auth_unavailable = std::collections::HashMap::new();
         for route in config.http.iter().filter(|route| route.enabled) {
             if let Some(auth) = &route.auth {
-                let resolved = resolve_static_request_headers(auth)
-                    .with_context(|| format!("route {} external authorization", route.id))?;
-                auth_static_headers.insert(route.id.clone(), resolved);
+                match resolve_static_request_headers(auth) {
+                    Ok(resolved) => {
+                        auth_static_headers.insert(route.id.clone(), resolved);
+                    }
+                    Err(error) => {
+                        let unavailable = error.downcast_ref::<StaticHeaderEnvError>();
+                        match (policy, unavailable) {
+                            (EnvPolicy::FailClosed, Some(failure)) => {
+                                tracing::warn!(
+                                    route = %route.id,
+                                    variable = %failure.variable,
+                                    "route authorization unavailable on this node; the route fails closed with 503"
+                                );
+                                auth_unavailable.insert(
+                                    route.id.clone(),
+                                    AuthUnavailable {
+                                        variable: failure.variable.clone(),
+                                    },
+                                );
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "route {} external authorization: {error:#}",
+                                    route.id
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
@@ -2222,6 +2319,7 @@ impl Snapshot {
                     workload_auth,
                     auth_reserved,
                     auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
+                    auth_unavailable: auth_unavailable.remove(&route.id),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),

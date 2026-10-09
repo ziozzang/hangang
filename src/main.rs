@@ -823,6 +823,7 @@ async fn run(args: Args) -> Result<()> {
                 hangang::fleet_collector::Runtime::open(path, args.admin_token.as_deref()).await?;
         }
         config.validate()?;
+        config.check_static_request_headers()?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             hangang::certificates::load(&config.certificates)?;
             config.prepare_upstream_tls()?;

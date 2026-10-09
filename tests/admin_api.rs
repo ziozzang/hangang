@@ -7275,8 +7275,9 @@ async fn static_auth_request_header_env_values_never_appear_in_admin_output() {
         "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"HANGANG_HC3_ADMIN_UNSET"}}}}"#;
     let (status, _, body) = request(address, "POST", "/v1/routes/http", Some(unset), Some(0)).await;
     assert!((400..500).contains(&status), "{status}");
-    // The admin problem response is deliberately generic; it must at least
-    // never carry a value.
+    // Admin write failures are deliberately generic (the warn log names the
+    // variable; POST /v1/config/validate returns it). Never a value.
+    assert_eq!(status, 422);
     assert!(!String::from_utf8_lossy(&body).contains(&secret));
     let route = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"],
         "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"PATH"},"x-contract":"1"}}}"#;
@@ -7289,10 +7290,9 @@ async fn static_auth_request_header_env_values_never_appear_in_admin_output() {
         "/v1/config",
         "/v1/config/operations",
         "/v1/status",
-        "/v1/config/validate",
     ] {
         let (status, _, body) = request(address, "GET", path, None, None).await;
-        assert!(status == 200 || status == 405, "{path} {status}");
+        assert_eq!(status, 200, "{path}");
         outputs.push(body);
     }
     let (status, _, body) = request(address, "GET", "/v1/routes/http/web", None, None).await;
@@ -7307,4 +7307,137 @@ async fn static_auth_request_header_env_values_never_appear_in_admin_output() {
             "resolved environment value leaked"
         );
     }
+}
+
+#[tokio::test]
+async fn config_validate_resolves_static_auth_header_variables_without_leaking_values() {
+    let secret = std::env::var("PATH").unwrap();
+    let (address, manager, _dir) = server().await;
+    let body = |env: &str, enabled: bool| {
+        serde_json::json!({"revision":0,"tcp":[],"http":[{
+            "id":"web","path_prefix":"/","enabled":enabled,"backends":["http://127.0.0.1:9"],
+            "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":env}}}
+        }]})
+        .to_string()
+    };
+    let validate = |payload: String| async move {
+        request(address, "POST", "/v1/config/validate", Some(&payload), None).await
+    };
+    // Missing variable: rejected, naming the variable only.
+    let (status, _, response) = validate(body("HANGANG_HC3_VALIDATE_UNSET", true)).await;
+    assert_eq!(status, 422);
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("HANGANG_HC3_VALIDATE_UNSET"), "{text}");
+    assert!(text.contains("web"), "{text}");
+    assert!(!text.contains(&secret));
+    // A disabled route is never selected, so it does not need the variable.
+    assert_eq!(
+        validate(body("HANGANG_HC3_VALIDATE_UNSET", false)).await.0,
+        200
+    );
+    // A usable variable validates; the value is discarded and never returned.
+    let (status, _, response) = validate(body("PATH", true)).await;
+    assert_eq!(status, 200);
+    assert!(!String::from_utf8_lossy(&response).contains(&secret));
+    // Validation commits nothing.
+    assert_eq!(manager.active.load().config.revision, 0);
+    // A malformed variable name fails ordinary validation without echoing input.
+    let (status, _, _) = validate(body("lower_case", true)).await;
+    assert_eq!(status, 422);
+    manager.policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn follower_without_static_header_variable_activates_route_fail_closed() {
+    use hangang::config_store::{ConfigStore, SqliteConfigStore};
+    use std::sync::atomic::Ordering;
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = directory.path().join("shared.db");
+    let seed_path = directory.path().join("seed.json");
+    let seed = Config::default();
+    hangang::store::save(seed_path.clone(), seed.clone())
+        .await
+        .unwrap();
+    let writer_store: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap());
+    let follower_store: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap());
+    writer_store.bootstrap(seed.clone()).await.unwrap();
+    // The writer has the variable (PATH stands in); the follower does not.
+    let (writer, a) = server_on(
+        seed_path.clone(),
+        seed.clone(),
+        Some(writer_store),
+        false,
+        8,
+        8,
+    )
+    .await;
+    let (follower, b) = server_on(seed_path, seed, Some(follower_store), false, 8, 8).await;
+    assert!(!a.reload_file().await.unwrap());
+    assert!(!b.reload_file().await.unwrap());
+    let route = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"]}"#;
+    assert_eq!(
+        request(writer, "POST", "/v1/routes/http", Some(route), Some(0))
+            .await
+            .0,
+        201
+    );
+    assert!(b.reload_file().await.unwrap());
+    assert!(b.ready.load(Ordering::Acquire));
+    assert!(b.active.load().unavailable_authorization().is_empty());
+
+    // The writer protects the route with a variable the follower lacks.
+    let protected = r#"{"id":"web","path_prefix":"/","backends":["http://127.0.0.1:9"],
+        "auth":{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"HANGANG_HC3_FOLLOWER_UNSET"}}}}"#;
+    // Authoring on the follower is strict: immediate operator feedback.
+    let (status, _, body) = request(
+        follower,
+        "PUT",
+        "/v1/routes/http/web",
+        Some(protected),
+        Some(1),
+    )
+    .await;
+    assert_eq!(status, 422, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(b.active.load().config.revision, 1);
+    // A fleet member that holds the variable commits revision 2 with it.
+    let mut doc = a.active.load().config.clone();
+    doc.http[0].auth = Some(
+        serde_json::from_str(
+            r#"{"url":"http://127.0.0.1:9/check","static_request_headers":{"x-key":{"env":"HANGANG_HC3_FOLLOWER_UNSET"}}}"#,
+        )
+        .unwrap(),
+    );
+    doc.revision = 2;
+    let direct: Arc<dyn ConfigStore> =
+        Arc::new(SqliteConfigStore::open(db.to_str().unwrap()).await.unwrap());
+    direct
+        .compare_and_swap(&a.recorded_epoch().unwrap(), 1, doc)
+        .await
+        .unwrap();
+
+    // The follower activates revision 2 with the route failing closed rather
+    // than retaining revision 1 (a public route) and withdraws readiness.
+    assert!(b.reload_file().await.unwrap());
+    assert_eq!(b.active.load().config.revision, 2);
+    assert!(!b.ready.load(Ordering::Acquire));
+    assert_eq!(
+        b.active.load().unavailable_authorization(),
+        vec![("web", "HANGANG_HC3_FOLLOWER_UNSET")]
+    );
+    let (status, _, body) = request(follower, "GET", "/v1/status", None, None).await;
+    assert_eq!(status, 200);
+    let status = json(&body);
+    assert_eq!(status["state"]["ready"], false);
+    assert_eq!(
+        status["authorization_unavailable"],
+        serde_json::json!([{"route_id":"web","variable":"HANGANG_HC3_FOLLOWER_UNSET"}])
+    );
+    // Readiness does not come back on a later confirmed poll.
+    assert!(!b.reload_file().await.unwrap());
+    assert!(!b.ready.load(Ordering::Acquire));
+    a.policy.shutdown().await;
+    b.policy.shutdown().await;
 }
