@@ -28,6 +28,33 @@ use tokio_util::sync::CancellationToken;
     after_help = "Source: https://github.com/ziozzang/hangang\nAuthor: Jioh Jung <jung@jioh.net>",
     group(clap::ArgGroup::new("update_source").args(["update_manifest", "update_github"])))]
 struct Args {
+    /// Opt-in hangang-guard origin (loopback HTTP or remote HTTPS).
+    #[arg(long)]
+    guard_url: Option<String>,
+    /// Opt-in persistent binary decision pool for loopback no-signal queries.
+    #[arg(long, requires = "guard_url")]
+    guard_decision_tcp: Option<SocketAddr>,
+    /// Query every request by default; snapshot opts into local prefix enforcement.
+    #[arg(long, value_enum, default_value = "query")]
+    guard_mode: hangang::guard::TransportMode,
+    /// Fail closed by default in query mode; snapshot always expires open.
+    #[arg(long, value_enum, default_value = "deny")]
+    guard_failure_mode: hangang::guard::FailureMode,
+    #[arg(long, default_value_t = 100)]
+    guard_timeout_ms: u64,
+    /// Optional per-IP query cache; zero disables caching.
+    #[arg(long, default_value_t = 0)]
+    guard_cache_ms: u64,
+    #[arg(long, default_value = "hangang")]
+    guard_source_id: String,
+    #[arg(long, default_value = "HANGANG_GUARD_COLLECTOR_TOKEN")]
+    guard_token_env: String,
+    /// Exact path generating honeypot evidence; repeat for multiple paths.
+    #[arg(long, requires = "guard_url")]
+    guard_honeypot_path: Vec<String>,
+    /// Exact path generating scanner evidence; repeat for multiple paths.
+    #[arg(long, requires = "guard_url")]
+    guard_scanner_path: Vec<String>,
     /// Print version, project URL, and author without starting the gateway.
     #[arg(long)]
     about: bool,
@@ -1002,6 +1029,28 @@ async fn run(args: Args) -> Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(
         !args.kubernetes_controller && !shared_store,
     ));
+    let cancel = CancellationToken::new();
+    let guard = args
+        .guard_url
+        .as_ref()
+        .map(|url| {
+            hangang::guard::GuardClient::start(
+                hangang::guard::Config {
+                    decision_tcp: args.guard_decision_tcp,
+                    transport_mode: args.guard_mode,
+                    failure_mode: args.guard_failure_mode,
+                    timeout_ms: args.guard_timeout_ms,
+                    cache_ms: args.guard_cache_ms,
+                    url: url.clone(),
+                    source_id: args.guard_source_id.clone(),
+                    token_env: args.guard_token_env.clone(),
+                    honeypot_paths: args.guard_honeypot_path.clone(),
+                    scanner_paths: args.guard_scanner_path.clone(),
+                },
+                cancel.clone(),
+            )
+        })
+        .transpose()?;
     let traffic = Arc::new(hangang::traffic::TrafficHistory::default());
     let proxy = Proxy::with_client_config_and_idle_limit(
         active.clone(),
@@ -1023,6 +1072,7 @@ async fn run(args: Args) -> Result<()> {
     .with_https_redirect_code(args.https_redirect_code)
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
+    .with_guard(guard)
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
     tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
     let manager = Arc::new(Manager {
@@ -1107,7 +1157,6 @@ async fn run(args: Args) -> Result<()> {
         }),
         docker: Some(docker.clone()),
     };
-    let cancel = CancellationToken::new();
     let fleet_observer_task =
         fleet_observer.map(|runtime| tokio::spawn(runtime.watch(cancel.clone())));
     let fleet_collector_task =
