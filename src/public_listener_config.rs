@@ -15,6 +15,11 @@ pub struct Listener {
     pub certificates: Vec<crate::certificates::CertificateFiles>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    /// Externally visible port used as the default forwarded port when no
+    /// trusted `X-Forwarded-Port` is present (for example behind a port
+    /// forward that adds no headers). Absent means the local port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_port: Option<u16>,
 }
 
 fn enabled_default() -> bool {
@@ -38,6 +43,10 @@ impl Listener {
         ensure!(
             self.listen.port() != 0,
             "public HTTP listener port must be nonzero"
+        );
+        ensure!(
+            self.advertised_port != Some(0),
+            "public HTTP listener advertised_port must be 1-65535"
         );
         ensure!(
             self.trusted_proxy_cidrs.len() <= 1024,

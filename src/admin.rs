@@ -167,10 +167,40 @@ impl Manager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    async fn prepare_snapshot(&self, config: Config) -> anyhow::Result<Arc<Snapshot>> {
+    /// `passive` paths (shared-store polls, local file reloads) activate a
+    /// route whose static authorization header variable is unusable on this
+    /// node fail-closed instead of rejecting the revision: rejecting would
+    /// leave an older, possibly unauthenticated, revision of that route live.
+    async fn prepare_snapshot(
+        &self,
+        config: Config,
+        passive: bool,
+    ) -> anyhow::Result<Arc<Snapshot>> {
         let previous = self.active.load_full();
-        tokio::task::spawn_blocking(move || Snapshot::replace(config, &previous).map(Arc::new))
-            .await?
+        tokio::task::spawn_blocking(move || {
+            if passive {
+                Snapshot::replace_follower(config, &previous)
+            } else {
+                Snapshot::replace(config, &previous)
+            }
+            .map(Arc::new)
+        })
+        .await?
+    }
+    /// Readiness follows the published snapshot: it stays down while any
+    /// enabled route fails closed here, and local-file authority restores it
+    /// once a later publication clears them (drain/handoff flags are
+    /// respected by `advertise_ready`). Shared-store and controller modes
+    /// recover only through their own authority confirmation.
+    fn sync_route_readiness(&self, snapshot: &Snapshot) {
+        if !snapshot.unavailable_authorization().is_empty() {
+            self.ready.store(false, Ordering::Release);
+        } else if self.config_store.is_none()
+            && !self.externally_managed
+            && !self.stopping.load(Ordering::Acquire)
+        {
+            self.advertise_ready();
+        }
     }
     pub async fn stop_updates(&self) {
         // Close admission before waiting for an in-flight transaction. A file
@@ -221,7 +251,9 @@ impl Manager {
     // The RMW acquires a concurrent withdrawal's ready=false publication.
     // The second flag check then prevents late confirmation from reviving it.
     fn advertise_ready(&self) {
-        if self.withdrawing.load(Ordering::Acquire) {
+        if self.withdrawing.load(Ordering::Acquire)
+            || !self.active.load().unavailable_authorization().is_empty()
+        {
             return;
         }
         self.ready.swap(true, Ordering::AcqRel);
@@ -277,7 +309,7 @@ impl Manager {
             let _permit = permit;
             let _guard = manager.writes.lock().await;
             manager
-                .apply_locked(config, expected, true, None, authority)
+                .apply_locked(config, expected, true, false, None, authority)
                 .await
         })
         .await?
@@ -320,7 +352,7 @@ impl Manager {
                 config
             } else {
                 manager
-                    .apply_locked(config, current.config.revision, false, tls, None)
+                    .apply_locked(config, current.config.revision, false, false, tls, None)
                     .await?
             };
             if !manager.stopping.load(Ordering::Acquire) {
@@ -353,7 +385,7 @@ impl Manager {
         if config == current.config {
             return Ok(false);
         }
-        self.apply_locked(config, current.config.revision, false, None, None)
+        self.apply_locked(config, current.config.revision, false, true, None, None)
             .await?;
         Ok(true)
     }
@@ -481,6 +513,7 @@ impl Manager {
         let revision = config.revision;
         let prepared = async {
             config.validate()?;
+            config.log_warnings();
             // Even a fresh attachment may inherit a live protected route from
             // an earlier generation. A same-ID legacy downgrade needs an
             // explicit mode choice before replacing that active policy.
@@ -497,11 +530,11 @@ impl Manager {
                 let config = config.clone();
                 let current = current.clone();
                 tokio::task::spawn_blocking(move || {
-                    Snapshot::replace_fresh(config, &current).map(Arc::new)
+                    Snapshot::replace_fresh_follower(config, &current).map(Arc::new)
                 })
                 .await??
             } else {
-                self.prepare_snapshot(config.clone()).await?
+                self.prepare_snapshot(config.clone(), true).await?
             };
             let tcp = self.tcp.prepare(&config).await?;
             anyhow::Ok((next, tcp))
@@ -532,6 +565,7 @@ impl Manager {
         self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
         self.attach_epoch(epoch);
         self.store_confirmed();
+        self.sync_route_readiness(&self.active.load());
         Ok(true)
     }
 
@@ -578,6 +612,7 @@ impl Manager {
         mut config: Config,
         expected: u64,
         persist: bool,
+        passive: bool,
         tls: Option<Arc<rustls::ServerConfig>>,
         authority: Option<ConfigAuthority>,
     ) -> anyhow::Result<Config> {
@@ -621,12 +656,13 @@ impl Manager {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("revision exhausted"))?;
         config.validate()?;
+        config.log_warnings();
         for route in &config.http {
             for script in route.scripts() {
                 self.policy.validate(script).await?;
             }
         }
-        let mut next = self.prepare_snapshot(config.clone()).await?;
+        let mut next = self.prepare_snapshot(config.clone(), passive).await?;
         if let Some(tls) = tls {
             Arc::get_mut(&mut next)
                 .expect("unpublished snapshot is exclusive")
@@ -770,6 +806,7 @@ impl Manager {
                 })
                 .await?;
             self.metrics.config_updates.fetch_add(1, Ordering::Relaxed);
+            self.sync_route_readiness(&self.active.load());
             Ok(config)
         }
         .await;
@@ -1028,6 +1065,8 @@ impl Admin {
             "udp_routes": snapshot.config.udp.len(),
             "udp": self.manager.tcp.udp.status(),
             "geoip_metrics": metrics.geoip.snapshot(),
+            "authorization_unavailable": snapshot.unavailable_authorization().into_iter().map(|(route, variable)|
+                serde_json::json!({"route_id":route, "variable":variable})).collect::<Vec<_>>(),
             "workload_materials": snapshot.tcp_inbound_tls.iter().map(|(id, slot)|
                 serde_json::json!({"kind":"tcp", "id":id, "ready":slot.load().is_some()}))
                 .chain(snapshot.http_workload_tls.iter().map(|(id, slot)|
@@ -2391,6 +2430,10 @@ impl Admin {
             if let Err(error) = config.validate_transition_from(&self.manager.active.load().config)
             {
                 return Ok(problem(422, "Configuration Invalid", &error.to_string()));
+            }
+            // Dry-run activation on this node: names the variable, never its value.
+            if let Err(error) = config.check_static_request_headers() {
+                return Ok(problem(422, "Configuration Invalid", &format!("{error:#}")));
             }
             for route in &config.http {
                 for script in route.scripts() {

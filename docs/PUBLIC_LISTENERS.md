@@ -4,9 +4,11 @@
 
 `public_http` adds independently configured public HTTP/HTTPS sockets to the existing CLI public listener. All listeners use the same configuration revision, administrator authority, route inventory and process metrics. This is one node; it does not establish fleet membership or multi-node deployment acknowledgement.
 
-A named listener has an ASCII `id` (1–64 alphanumeric, `.`, `_`, `-` characters), nonzero socket `listen`, optional `enabled` (default true), `certificates` and `trusted_proxy_cidrs`. At most64 listeners and1,024 named certificate entries are accepted per document. The reserved ID `default` identifies the existing CLI public listener and cannot name an additional listener.
+A named listener has an ASCII `id` (1–64 alphanumeric, `.`, `_`, `-` characters), nonzero socket `listen`, optional `enabled` (default true), `certificates`, `trusted_proxy_cidrs` and `advertised_port`. At most64 listeners and1,024 named certificate entries are accepted per document. The reserved ID `default` identifies the existing CLI public listener and cannot name an additional listener.
 
 An empty certificate list means HTTP. A nonempty list means HTTPS, including a list whose certificates are all disabled: that listener rejects TLS handshakes rather than falling back to plaintext. Each set uses the existing certificate ID/host/default/enabled/file/issuer-status fields. Certificate files and keys remain on the node; PEM content is not part of API configuration. Named listeners accept at most1 MiB combined certificate/key PEM input per listener; the legacy global set retains its16 MiB limit. These limits bound accepted input, not total process memory.
+
+`advertised_port` (1–65535, default absent) is the externally visible port when the socket is reached through a port forward that adds no `X-Forwarded-*` headers, for example public 443 forwarded to a local 8443. When set, it replaces the listener's local port as the default forwarded port: the `x-forwarded-port` and `x-original-url` sent to external authorization and upstreams, and the `X-Forwarded-Port` regenerated for upstreams, use it, and `x-original-url` omits the port when it is the scheme default (443 for https, 80 for http). An explicit `X-Forwarded-Port` from a peer in this listener's `trusted_proxy_cidrs` still wins; from other peers it is ignored. The value `0` is rejected. It does not change which port the socket binds. The CLI listener accepts the same setting as `--advertised-port`.
 
 ## Route scope and trust
 

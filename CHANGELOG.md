@@ -16,6 +16,42 @@
   and503 for unavailable authority by default, with explicit fail-allow support.
 - Separate backbone responsibilities: hopae manages users/principals; guard
   manages IP/network controls, risk scoring, GeoIP/ASN and dynamic decision rules.
+- Add the optional public listener field `advertised_port` (1-65535) and the
+  CLI flag `--advertised-port`. Behind a port forward that adds no forwarding
+  headers, it replaces the local port as the default forwarded port, so
+  `x-forwarded-port` and `x-original-url` sent to external authorization and
+  upstreams carry the externally visible port (and omit a scheme-default
+  port). A trusted proxy's explicit `X-Forwarded-Port` still wins; `0` is
+  rejected.
+- Add the HTTP route field `path_case` (`sensitive` | `insensitive`). Routes with
+  `auth`, `basic_auth`, `jwt_auth` or `access_mode: protected` and a
+  `path_prefix` now default to ASCII case-insensitive prefix matching so
+  `/ADMIN/x` selects a protected `/admin` route; other routes stay byte-exact.
+  The upstream still receives the original path. An explicit `sensitive` on a
+  protected prefix route is warned about (log at activation and `--check`), and
+  same-host routes whose prefixes differ only in case with different effective
+  case handling and a shared listener are rejected (IP-literal hosts and
+  segment_prefix operands are compared in normalized form); an earlier-selected
+  unauthenticated route covering a protected prefix now produces a warning.
+- Add `auth.static_request_headers` for fixed headers, literal or resolved
+  from an environment variable at activation, on external-authorization calls;
+  reserved and colliding names are rejected, client copies are never sent, and
+  resolved values are never serialized or logged.
+- Shared-store polls and file reloads that cannot resolve a static header
+  variable now activate the revision with that route failing closed (503,
+  readiness false, listed in `/v1/status` `authorization_unavailable`) instead
+  of keeping an older revision live. `--check` and `POST /v1/config/validate`
+  now resolve static header variables and report missing, empty or invalid
+  ones by name.
+- Add route-level `strip_request_cookies` (also accepted as
+  `auth.strip_request_cookies`; the effective set is the union) to remove named
+  cookies from the request sent upstream, with or without `auth`. Removal is
+  the last header mutation before dispatch (after Lua, request transforms and
+  identity reassertion; before retries and WebSocket upgrades), matching is
+  exact and case-sensitive, quoted values are respected, and a Cookie header
+  that could still carry a listed cookie is dropped entirely. The authorization
+  call is unchanged. `cookie` is rejected as an authentication identity output
+  header.
 
 ## 0.2.5 — 2026-10-06
 

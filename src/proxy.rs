@@ -654,6 +654,7 @@ impl Proxy {
     async fn authorize(
         &self,
         auth: &crate::config::ExternalAuth,
+        static_headers: &[(HeaderName, HeaderValue)],
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
@@ -683,6 +684,11 @@ impl Proxy {
                     HeaderName::from_static(name),
                     HeaderValue::from_str(&value).map_err(|_| 503u16)?,
                 );
+            }
+            // Configured static headers are applied last with `insert`, so a
+            // client copy of the same name can never reach the service.
+            for (name, value) in static_headers {
+                request.headers_mut().insert(name.clone(), value.clone());
             }
             let response = self.client.request(request).await.map_err(|_| 503u16)?;
             let (mut parts, body_stream) = response.into_parts();
@@ -1679,6 +1685,15 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.clone());
         }
+        // This node could not prepare the route's external authorization
+        // (a static header variable is unusable here). Fail closed before any
+        // authorization call, Lua, cache or upstream contact.
+        if runtime.auth_unavailable.is_some() {
+            self.metrics
+                .rejected_requests
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(response(503, "route authorization unavailable"));
+        }
         if protected_resource.is_some_and(|id| {
             !runtime
                 .route
@@ -2199,7 +2214,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);
@@ -2611,6 +2626,13 @@ impl Proxy {
         // live under `x-forwarded-user`-style names that the forwarding pass
         // above just cleared; the authenticated values always win.
         reassert_identity_headers(request.headers_mut(), &established_identity, auth_reserved);
+        // Last header mutation before dispatch: after authorization, Lua,
+        // request transforms, forwarding headers and identity reassertion,
+        // and before retry headers are captured. Nothing below may add Cookie.
+        let strip_cookies = runtime.route.effective_strip_cookies();
+        if !strip_cookies.is_empty() {
+            strip_request_cookies(request.headers_mut(), &strip_cookies);
+        }
         *request.version_mut() = Version::HTTP_11;
         // Regenerate HTTP/1 framing for an unknown-length body now that the
         // incoming Transfer-Encoding is gone. Without an explicit header the
@@ -3449,6 +3471,104 @@ fn collapse_duplicate_policy_headers(headers: &mut HeaderMap) -> Result<(), ()> 
     Ok(())
 }
 
+fn is_cookie_token_byte(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// True when `name` occurs in `bytes` delimited on both sides by a non-token
+/// byte (or an end). Deliberately over-approximate: it is the fail-safe check.
+fn contains_cookie_name(bytes: &[u8], name: &[u8]) -> bool {
+    if name.is_empty() || bytes.len() < name.len() {
+        return false;
+    }
+    (0..=bytes.len() - name.len()).any(|at| {
+        &bytes[at..at + name.len()] == name
+            && (at == 0 || !is_cookie_token_byte(bytes[at - 1]))
+            && bytes
+                .get(at + name.len())
+                .is_none_or(|b| !is_cookie_token_byte(*b))
+    })
+}
+
+/// Split on `;` outside double quotes. `None` when a quote is left open.
+fn split_cookie_pairs(value: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut pairs = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut i = 0;
+    while i < value.len() {
+        match value[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b';' if !quoted => {
+                pairs.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if quoted {
+        return None;
+    }
+    pairs.push(&value[start.min(value.len())..]);
+    Some(pairs)
+}
+
+/// Remove every cookie pair whose name exactly equals one of `names` from all
+/// Cookie fields. Pairs are split on `;` outside quoted values; the other
+/// pairs keep their bytes and order and are rejoined with `; `. If nothing
+/// remains, or the result could still carry a listed cookie (an unbalanced
+/// quote, or a listed name still present at a token boundary such as in
+/// `a=1 name=v`), the whole header is dropped rather than risk forwarding
+/// part of a removed cookie or corrupting another one.
+fn strip_request_cookies(headers: &mut HeaderMap, names: &[String]) {
+    if !headers.contains_key(header::COOKIE) {
+        return;
+    }
+    let mut kept: Vec<u8> = Vec::new();
+    let mut sensitive = false;
+    let mut clean = true;
+    for value in headers.get_all(header::COOKIE) {
+        sensitive |= value.is_sensitive();
+        let Some(pairs) = split_cookie_pairs(value.as_bytes()) else {
+            clean = false;
+            break;
+        };
+        for pair in pairs {
+            let pair = pair.trim_ascii();
+            if pair.is_empty() {
+                continue;
+            }
+            let name = pair
+                .iter()
+                .position(|b| *b == b'=')
+                .map_or(pair, |at| pair[..at].trim_ascii());
+            if names.iter().any(|n| n.as_bytes() == name) {
+                continue;
+            }
+            if !kept.is_empty() {
+                kept.extend_from_slice(b"; ");
+            }
+            kept.extend_from_slice(pair);
+        }
+    }
+    clean = clean
+        && !names
+            .iter()
+            .any(|n| contains_cookie_name(&kept, n.as_bytes()));
+    headers.remove(header::COOKIE);
+    if !clean || kept.is_empty() {
+        return;
+    }
+    if let Ok(mut value) = HeaderValue::from_bytes(&kept) {
+        value.set_sensitive(sensitive);
+        headers.insert(header::COOKIE, value);
+    }
+}
+
 /// RFC 9113 section 8.2.3: join Cookie fields with `; ` before exposing
 /// them to a generic application or HTTP/1 peer. Do not apply list joining
 /// to Set-Cookie or any other header. Preserve byte order and sensitivity.
@@ -4024,6 +4144,44 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strip_request_cookies_parser_is_quote_aware_and_fails_safe() {
+        let names = vec!["s".to_owned()];
+        let run = |input: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.append(header::COOKIE, HeaderValue::from_static(input));
+            strip_request_cookies(&mut headers, &names);
+            headers
+                .get(header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(run("s=\"p;q\"; a=1").as_deref(), Some("a=1"));
+        assert_eq!(run("a=\"x;y\"; s=1").as_deref(), Some("a=\"x;y\""));
+        assert_eq!(run("a=1 s=2; b=3"), None);
+        assert_eq!(run("a=1\ts=2"), None);
+        assert_eq!(run("a=\"x; s=2"), None);
+        assert_eq!(run("a=\"s=1;\"; s=2"), None);
+        assert_eq!(
+            run("s2=1; ss=2; a_s=3").as_deref(),
+            Some("s2=1; ss=2; a_s=3")
+        );
+    }
+
+    #[test]
+    fn strip_request_cookies_keeps_order_and_removes_empty_header() {
+        let names = vec!["s".to_owned()];
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1; s=x"));
+        headers.append(header::COOKIE, HeaderValue::from_static("bare; s; c=3"));
+        strip_request_cookies(&mut headers, &names);
+        assert_eq!(headers.get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!(headers[header::COOKIE], "a=1; bare; c=3");
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("s=x; s=y"));
+        strip_request_cookies(&mut headers, &names);
+        assert!(!headers.contains_key(header::COOKIE));
+    }
+
     use super::*;
     use ipnet::IpNet;
 
@@ -4264,6 +4422,8 @@ mod tests {
             canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
+            path_case: None,
+            strip_request_cookies: Vec::new(),
             max_requests: None,
             upstream_timeout_ms: None,
             retries: 0,

@@ -64,6 +64,8 @@ fn config(revision: u64, id: &str) -> Config {
             canonical_domain: None,
             path_prefix: None,
             path_match: Default::default(),
+            path_case: None,
+            strip_request_cookies: Vec::new(),
             max_requests: None,
             upstream_timeout_ms: None,
             retries: 0,

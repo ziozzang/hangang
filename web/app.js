@@ -2178,6 +2178,7 @@ function httpSections(route) {
       ...hostMatchFields(route),
       field('Path prefix', 'path_prefix', route.path_prefix || '', { placeholder: '/v1/', help: 'Must start with /. Blank matches every path.' }),
       field('Path match mode', 'path_match', route.path_match || 'prefix', { select: [['prefix', 'prefix – byte prefix'], ['exact', 'exact – whole path only'], ['segment_prefix', 'segment_prefix – path or its / descendants']], help: 'Ignored when the path prefix is blank.' }),
+      field('Path case', 'path_case', route.path_case || '', { select: [['', 'default – insensitive when protected, else sensitive'], ['sensitive', 'sensitive – byte-exact'], ['insensitive', 'insensitive – ASCII case folded']], help: 'Comparison only; the upstream receives the original path. Sensitive on a protected prefix lets case variants bypass it on a case-insensitive upstream.' }),
       field('Header matches', 'headers', pairsToLines(route.headers), { textarea: true, help: 'One name: value per line; at most 64.' }),
       field('JSON matches', 'json', jsonPairsToLines(route.json), { textarea: true, help: 'One RFC 6901 pointer = JSON value per line; at most 64. Disables route caching.' }),
       span2(field('Denied CIDRs', 'deny_cidrs', (route.deny_cidrs || []).join('\n'), { textarea: true, help: 'One IPv4 or IPv6 network per line (192.0.2.0/24, 2001:db8::/32); at most 1,024.' })),
@@ -2758,6 +2759,7 @@ function routeFromForm() {
     route.path_prefix = optionalText('path_prefix');
     if (route.path_prefix && !route.path_prefix.startsWith('/')) throw new Error(t('Path prefix must start with /'));
     route.path_match = raw('path_match');
+    if (raw('path_case')) route.path_case = raw('path_case'); else delete route.path_case;
     route.headers = parseHeaderLines(raw('headers'), 'Header match');
     route.json = parseJsonLines(raw('json'));
     if (Object.keys(route.headers).length > 64 || Object.keys(route.json).length > 64) throw new Error(t('At most 64 header matches and 64 JSON matches are allowed'));
@@ -3886,7 +3888,7 @@ function ensurePublicListenersPanel() {
     if (options.checkbox) wrap.classList.add('user-enabled');
     wrap.append(caption, input); form.append(wrap);
   };
-  control('Listener ID', 'id'); control('Listen address', 'listen'); control('Listener enabled', 'enabled', { checkbox: true });
+  control('Listener ID', 'id'); control('Listen address', 'listen'); control('Listener enabled', 'enabled', { checkbox: true }); control('Advertised port', 'advertised_port');
   control('Allowed proxy peer CIDRs', 'trusted_proxy_cidrs', { textarea: true });
   const certNote = document.createElement('p'); certNote.className = 'section-note span-2'; copy(certNote, 'Certificate entries use file paths and SNI hosts. A default certificate has no hosts. Empty entries serve plain HTTP.'); form.append(certNote);
   const certs = document.createElement('div'); certs.id = 'public-http-certificates'; certs.className = 'span-2 user-list'; form.append(certs);
@@ -3918,6 +3920,8 @@ function publicListenerFromForm(form) {
   if (!socket || +socket[1] < 1 || +socket[1] > 65535) throw new Error(t('Public listen address must be ip:port with a nonzero port'));
   const cidrs = nonemptyLines(form.querySelector('#public-http-trusted_proxy_cidrs').value);
   if (cidrs.length > 1024 || cidrs.some((cidr) => !/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(cidr))) throw new Error(t('Public trusted proxies require address/prefix CIDRs, at most 1,024'));
+  const advertisedText = form.querySelector('#public-http-advertised_port').value.trim();
+  if (advertisedText && (!/^\d{1,5}$/.test(advertisedText) || +advertisedText < 1 || +advertisedText > 65535)) throw new Error(t('Advertised port must be 1–65535'));
   const certificates = [...form.querySelectorAll('.public-certificate')].map((row) => {
     const get = (name) => row.querySelector(`[name="${name}"]`), value = (name) => get(name).value.trim();
     const cert = { id: value('id'), hosts: nonemptyLines(value('hosts')), cert_file: value('cert_file'), key_file: value('key_file') };
@@ -3927,7 +3931,7 @@ function publicListenerFromForm(form) {
     if (get('default').checked) cert.default = true; if (!get('enabled').checked) cert.enabled = false; return cert;
   });
   if (certificates.length > 1024 || new Set(certificates.map((cert) => cert.id)).size !== certificates.length) throw new Error(t('Certificate IDs must be unique, at most 1,024'));
-  return { id, listen, ...(form.querySelector('#public-http-enabled').checked ? {} : { enabled: false }), certificates, trusted_proxy_cidrs: cidrs };
+  return { id, listen, ...(form.querySelector('#public-http-enabled').checked ? {} : { enabled: false }), certificates, trusted_proxy_cidrs: cidrs, ...(advertisedText ? { advertised_port: +advertisedText } : {}) };
 }
 function mutatePublicListeners(change) {
   const draft = parseConfigEditor();
@@ -3939,6 +3943,7 @@ function openPublicListener(index) {
   try { const draft = parseConfigEditor(), item = index < 0 ? null : draft.public_http?.[index];
     const form = $('#public-http-form'); form.dataset.editIndex = String(index); form.hidden = false;
     form.querySelector('#public-http-id').value = item?.id || ''; form.querySelector('#public-http-listen').value = item?.listen || ''; form.querySelector('#public-http-enabled').checked = item?.enabled !== false;
+    form.querySelector('#public-http-advertised_port').value = item?.advertised_port ? String(item.advertised_port) : '';
     form.querySelector('#public-http-trusted_proxy_cidrs').value = Array.isArray(item?.trusted_proxy_cidrs) ? item.trusted_proxy_cidrs.join('\n') : '';
     $('#public-http-certificates').replaceChildren(); for (const cert of item?.certificates || []) addPublicCertificate(cert); form.querySelector('#public-http-id').focus();
   } catch (error) { message($('#public-http-message'), error.message, 'error'); }

@@ -36,6 +36,10 @@ impl Evidence {
     pub fn listen(&self) -> SocketAddr {
         self.0.listener.listen
     }
+    /// Port advertised in generated client-facing URLs, if configured.
+    pub fn advertised_port(&self) -> Option<u16> {
+        self.0.listener.advertised_port
+    }
     pub fn trusted_proxy_cidrs(&self) -> &[IpNet] {
         &self.0.listener.trusted_proxy_cidrs
     }
@@ -268,12 +272,13 @@ async fn serve_io<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         _lease: lease.clone(),
     };
     let (io, idle) = crate::idle::IdleIo::new(io, idle_timeout);
+    let edge_port = evidence.advertised_port().unwrap_or_else(|| local.port());
     let service = service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
         request.extensions_mut().insert(evidence.clone());
         request.extensions_mut().insert(lease.clone());
         request.extensions_mut().insert(crate::tls::TransportInfo {
             tls,
-            local_port: local.port(),
+            local_port: edge_port,
         });
         let proxy = proxy.clone();
         async move { proxy.handle(request, peer).await }

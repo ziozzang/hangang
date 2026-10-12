@@ -1,3 +1,4 @@
+use anyhow::{Context as _, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -252,6 +253,14 @@ pub enum PathMatch {
     Exact,
     SegmentPrefix,
 }
+/// ASCII case handling for `path_prefix` comparison. Folding never changes the
+/// request path forwarded upstream and never applies Unicode case folding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathCase {
+    Sensitive,
+    Insensitive,
+}
 /// Declared gateway authentication boundary for an HTTP route. This is a
 /// classification and validation constraint, not a complete Zero Trust policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +356,17 @@ pub struct HttpRoute {
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub path_match: PathMatch,
+    /// ASCII case handling of `path_prefix`. Absent: insensitive for a route
+    /// that has authentication or `access_mode: protected` and a prefix,
+    /// otherwise sensitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_case: Option<PathCase>,
+    /// Cookie names removed (exact, case-sensitive) from the request sent
+    /// upstream, with or without `auth`. The effective set is the union with
+    /// `auth.strip_request_cookies`. The authorization call still receives the
+    /// full listed `cookie` header.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_request_cookies: Vec<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// RFC 6901 JSON pointers mapped to expected values.
@@ -437,6 +457,223 @@ pub struct ExternalAuth {
     /// bounded response directly to the client instead of contacting upstream.
     #[serde(default)]
     pub terminal_response: bool,
+    /// Fixed headers added to every authorization call, as literals or
+    /// `{"env": "NAME"}` references resolved when a configuration is
+    /// activated. Environment values are never serialized, logged or shown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub static_request_headers: BTreeMap<String, StaticHeaderValue>,
+    /// Cookie names removed from the request sent upstream after an allowed
+    /// authorization. The authorization call still receives the full listed
+    /// `cookie` header. Names are exact and case-sensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_request_cookies: Vec<String>,
+}
+
+/// A static authorization request header value: a literal or a reference to a
+/// process environment variable. Only the reference is ever part of the
+/// configuration; the resolved value lives in the prepared runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StaticHeaderValue {
+    Literal(String),
+    Env(StaticHeaderEnv),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticHeaderEnv {
+    pub env: String,
+}
+
+const MAX_STATIC_REQUEST_HEADERS: usize = 16;
+const MAX_STATIC_HEADER_VALUE: usize = 1024;
+const MAX_STRIP_REQUEST_COOKIES: usize = 16;
+const MAX_COOKIE_NAME: usize = 128;
+
+fn validate_strip_request_cookies(names: &[String]) -> anyhow::Result<()> {
+    ensure!(
+        names.len() <= MAX_STRIP_REQUEST_COOKIES,
+        "too many strip_request_cookies entries"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= MAX_COOKIE_NAME
+                && name.bytes().all(|b| matches!(b,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                    | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')),
+            "invalid strip_request_cookies name {name:?}"
+        );
+        ensure!(
+            seen.insert(name.as_str()),
+            "duplicate strip_request_cookies name {name:?}"
+        );
+    }
+    Ok(())
+}
+
+fn valid_static_env_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && (bytes[0] == b'_' || bytes[0].is_ascii_uppercase())
+        && bytes[1..]
+            .iter()
+            .all(|b| *b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Names the proxy owns on the authorization call: connection-management,
+/// framing and generated-context headers.
+fn unsafe_auth_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "keep-alive"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "x-real-ip"
+            | "proxy-authenticate"
+            | "x-original-method"
+            | "x-original-uri"
+            | "x-original-url"
+            | "x-original-client-ip"
+    ) || name.starts_with("x-forwarded-")
+        || name == "forwarded"
+}
+
+fn validate_static_request_headers(auth: &ExternalAuth) -> anyhow::Result<()> {
+    ensure!(
+        auth.static_request_headers.len() <= MAX_STATIC_REQUEST_HEADERS,
+        "too many static authorization request headers"
+    );
+    for (name, value) in &auth.static_request_headers {
+        let parsed: hyper::header::HeaderName = name
+            .parse()
+            .with_context(|| format!("invalid static authorization header name {name:?}"))?;
+        ensure!(
+            parsed.as_str() == name,
+            "static authorization header name {name:?} must be lowercase"
+        );
+        ensure!(
+            name != "x-hangang-auth-terminal"
+                && !unsafe_auth_header(name)
+                && !name.starts_with("x-original-"),
+            "static authorization header {name:?} is reserved"
+        );
+        ensure!(
+            !auth
+                .request_headers
+                .iter()
+                .chain(&auth.response_headers)
+                .any(|other| other.eq_ignore_ascii_case(name)),
+            "static authorization header {name:?} collides with a listed request or response header"
+        );
+        match value {
+            StaticHeaderValue::Literal(text) => {
+                ensure!(
+                    text.len() <= MAX_STATIC_HEADER_VALUE
+                        && hyper::header::HeaderValue::from_str(text).is_ok(),
+                    "static authorization header {name:?} has an invalid literal value"
+                );
+            }
+            StaticHeaderValue::Env(reference) => ensure!(
+                valid_static_env_name(&reference.env),
+                "static authorization header {name:?} has an invalid environment variable name"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// A static authorization header whose environment variable could not be
+/// resolved on this node. Names the variable, never a value.
+#[derive(Debug)]
+pub struct StaticHeaderEnvError {
+    pub variable: String,
+    message: String,
+}
+impl std::fmt::Display for StaticHeaderEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for StaticHeaderEnvError {}
+
+/// A route whose external authorization cannot run on this node because a
+/// static header variable is unusable. Requests to it fail closed with 503.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthUnavailable {
+    pub variable: String,
+}
+
+/// How a snapshot treats unusable static-header environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPolicy {
+    /// Reject the snapshot: authoring paths and process startup.
+    Strict,
+    /// Activate the snapshot but fail the affected routes closed: passive
+    /// follower paths that must not keep serving an older, weaker revision.
+    FailClosed,
+}
+
+/// Resolve static authorization headers for activation. Errors name the
+/// variable, never its value. Values are marked sensitive so `Debug` output
+/// of the resulting `HeaderValue` is redacted.
+pub fn resolve_static_request_headers(
+    auth: &ExternalAuth,
+) -> anyhow::Result<Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>> {
+    resolve_static_request_headers_with(auth, |name| std::env::var_os(name))
+}
+
+fn resolve_static_request_headers_with(
+    auth: &ExternalAuth,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>> {
+    let mut resolved = Vec::with_capacity(auth.static_request_headers.len());
+    for (name, value) in &auth.static_request_headers {
+        let header_name: hyper::header::HeaderName = name
+            .parse()
+            .with_context(|| format!("invalid static authorization header name {name:?}"))?;
+        let mut header_value = match value {
+            StaticHeaderValue::Literal(text) => hyper::header::HeaderValue::from_str(text)
+                .with_context(|| format!("invalid static authorization header {name:?}"))?,
+            StaticHeaderValue::Env(reference) => {
+                ensure!(
+                    valid_static_env_name(&reference.env),
+                    "invalid environment variable name for static authorization header {name:?}"
+                );
+                let fail = |reason: &str| {
+                    anyhow::Error::new(StaticHeaderEnvError {
+                        variable: reference.env.clone(),
+                        message: format!(
+                            "environment variable {} for static authorization header {name:?} {reason}",
+                            reference.env
+                        ),
+                    })
+                };
+                let raw = lookup(&reference.env)
+                    .ok_or_else(|| fail("is not set"))?
+                    .into_string()
+                    .map_err(|_| fail("is not valid UTF-8"))?;
+                if raw.is_empty() {
+                    return Err(fail("is empty"));
+                }
+                if raw.len() > MAX_STATIC_HEADER_VALUE {
+                    return Err(fail("is too long"));
+                }
+                hyper::header::HeaderValue::from_str(&raw)
+                    .map_err(|_| fail("is not a valid header value"))?
+            }
+        };
+        header_value.set_sensitive(true);
+        resolved.push((header_name, header_value));
+    }
+    Ok(resolved)
 }
 fn auth_timeout() -> u64 {
     1000
@@ -515,6 +752,19 @@ struct PreparedUpstreamTls {
 }
 
 impl Config {
+    /// Resolve every enabled route's static authorization header values and
+    /// discard them: preflight for `--check` and configuration validation.
+    /// Errors name the route and variable, never a value.
+    pub fn check_static_request_headers(&self) -> anyhow::Result<()> {
+        for route in self.http.iter().filter(|route| route.enabled) {
+            if let Some(auth) = &route.auth {
+                resolve_static_request_headers(auth).map_err(|error| {
+                    anyhow::anyhow!("route {} external authorization: {error:#}", route.id)
+                })?;
+            }
+        }
+        Ok(())
+    }
     /// Whether this document uses identified pool members. Shared-store
     /// writers must gate this wire format until all readers support it.
     pub fn has_named_members(&self) -> bool {
@@ -767,6 +1017,7 @@ impl Config {
                 <= 256,
             "at most 256 host regular expressions per configuration"
         );
+        self.validate_path_case_overlap()?;
         let mut ids = HashSet::new();
         for id in self
             .http
@@ -1303,30 +1554,14 @@ impl Config {
                         continue;
                     }
                     ensure!(
-                        !matches!(
-                            name.as_str(),
-                            "host"
-                                | "connection"
-                                | "content-length"
-                                | "transfer-encoding"
-                                | "upgrade"
-                                | "te"
-                                | "trailer"
-                                | "keep-alive"
-                                | "proxy-authorization"
-                                | "proxy-connection"
-                                | "x-real-ip"
-                                | "proxy-authenticate"
-                                | "x-original-method"
-                                | "x-original-uri"
-                                | "x-original-url"
-                                | "x-original-client-ip"
-                        ) && !name.as_str().starts_with("x-forwarded-")
-                            && name != "forwarded",
+                        !unsafe_auth_header(name.as_str()),
                         "unsafe authorization header"
                     );
                 }
+                validate_static_request_headers(auth)?;
+                validate_strip_request_cookies(&auth.strip_request_cookies)?;
             }
+            validate_strip_request_cookies(&r.strip_request_cookies)?;
             ensure!(
                 !r.backends.is_empty() && r.backends.len() <= 128,
                 "route {} needs 1..128 backends",
@@ -1489,6 +1724,101 @@ impl Config {
     /// downgrade when an existing protected route keeps its ID. Older editors
     /// omit access_mode and authentication fields; serde would otherwise turn
     /// that replacement into an anonymous Legacy route.
+    /// Two routes whose prefixes differ only in ASCII case, may serve the same
+    /// host, and disagree on case sensitivity would select by an ambiguous
+    /// rule: the sensitive route would be reachable only through exact-case
+    /// requests while the insensitive one claims every variant. Reject them;
+    /// an operator resolves it by setting `path_case` on both routes.
+    fn validate_path_case_overlap(&self) -> anyhow::Result<()> {
+        for (index, left) in self.http.iter().enumerate() {
+            if left.path_prefix.is_none() {
+                continue;
+            }
+            for right in &self.http[index + 1..] {
+                if right.path_prefix.is_none() {
+                    continue;
+                }
+                let (left_scope, right_scope) = (route_scope(left), route_scope(right));
+                // Reject only when the scopes meet solely through case folding:
+                // nested layouts such as /admin and /admin/open stay valid.
+                if left.path_case_insensitive() != right.path_case_insensitive()
+                    && crate::resource_guard::scopes_intersect(left_scope, right_scope)
+                    && !crate::resource_guard::scopes_intersect(
+                        (left_scope.0, left_scope.1, false),
+                        (right_scope.0, right_scope.1, false),
+                    )
+                    && hosts_may_overlap(left, right)
+                    && !effective_public_listeners(left)
+                        .is_disjoint(&effective_public_listeners(right))
+                {
+                    anyhow::bail!(
+                        "routes {} and {} have path_prefix values that differ only in case but different path_case; set path_case explicitly on both routes",
+                        left.id,
+                        right.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Non-fatal findings. They are logged when a configuration is activated
+    /// and printed by `--check`; they never reject a configuration.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut shadow = Vec::new();
+        for (pi, protected) in self.http.iter().enumerate() {
+            let prefix = protected.path_prefix.as_deref().unwrap_or("/");
+            if !protected.is_path_scoped_protection() || !protected.enabled {
+                continue;
+            }
+            for (qi, other) in self.http.iter().enumerate() {
+                if qi == pi
+                    || !other.enabled
+                    || other.is_path_scoped_protection()
+                    || other.auth.is_some()
+                    || other.basic_auth.is_some()
+                    || other.jwt_auth.is_some()
+                    || other.access_mode == AccessMode::Protected
+                    || !selected_before((qi, other), (pi, protected))
+                    || !hosts_may_overlap(other, protected)
+                    || effective_public_listeners(other)
+                        .is_disjoint(&effective_public_listeners(protected))
+                {
+                    continue;
+                }
+                let covers = crate::resource_guard::scopes_intersect(
+                    route_scope(other),
+                    route_scope(protected),
+                );
+                if covers {
+                    shadow.push(format!(
+                        "route {} (unauthenticated) is selected before protected route {} and its path scope intersects {}: it can shadow the protection on overlapping hosts",
+                        other.id, protected.id, prefix
+                    ));
+                }
+            }
+        }
+        shadow
+            .into_iter()
+            .chain(self.http
+            .iter()
+            .filter(|route| {
+                route.path_case == Some(PathCase::Sensitive) && route.is_path_scoped_protection()
+            })
+            .map(|route| {
+                format!(
+                    "route {} protects path_prefix {} with path_case sensitive: a case variant of the prefix selects a sibling route and bypasses this protection when the upstream is case-insensitive",
+                    route.id,
+                    route.path_prefix.as_deref().unwrap_or_default()
+                )
+            }))
+            .collect()
+    }
+    /// Emit [`Config::warnings`] at warn level.
+    pub fn log_warnings(&self) {
+        for warning in self.warnings() {
+            tracing::warn!("{warning}");
+        }
+    }
     pub fn validate_transition_from(&self, previous: &Self) -> anyhow::Result<()> {
         use anyhow::ensure;
         for old in &previous.http {
@@ -1503,6 +1833,7 @@ impl Config {
                         && resource_hosts_preserved(old, new)
                         && new.path_prefix == old.path_prefix
                         && new.path_match == old.path_match
+                        && new.path_case_insensitive() == old.path_case_insensitive()
                         && effective_public_listeners(new) == effective_public_listeners(old)
                 }),
                 "resource {} scope cannot be removed or moved; first publish enforce=false at its existing scope",
@@ -1609,6 +1940,55 @@ where
     Ok(hosts)
 }
 
+/// Conservative: an unconstrained host, a regex or a glob may match anything.
+fn hosts_may_overlap(left: &HttpRoute, right: &HttpRoute) -> bool {
+    #[derive(PartialEq)]
+    enum Key {
+        Ip(std::net::IpAddr),
+        Name(String),
+    }
+    fn patterns(route: &HttpRoute) -> Option<Vec<Key>> {
+        if route.host_regex.is_some() {
+            return None;
+        }
+        let mut all: Vec<&String> = route.hosts.iter().collect();
+        all.extend(route.host.iter());
+        if all.is_empty() || all.iter().any(|h| h.contains(['*', '?'])) {
+            return None;
+        }
+        // Same equivalence as host_match::matches: IP literals compare as
+        // addresses, names ASCII case-insensitively (also without a root dot,
+        // which guarded hosts trim).
+        Some(
+            all.iter()
+                .map(|h| match crate::host_match::parse_ip(h) {
+                    Some(ip) => Key::Ip(ip),
+                    None => Key::Name(h.trim_end_matches('.').to_ascii_lowercase()),
+                })
+                .collect(),
+        )
+    }
+    match (patterns(left), patterns(right)) {
+        (Some(a), Some(b)) => a.iter().any(|h| b.contains(h)),
+        _ => true,
+    }
+}
+
+/// The (mode, operand, case-insensitive) scope a route selects by. A route
+/// without a prefix selects every path.
+fn route_scope(route: &HttpRoute) -> (PathMatch, &str, bool) {
+    match &route.path_prefix {
+        Some(prefix) => (route.path_match, prefix, route.path_case_insensitive()),
+        None => (PathMatch::Prefix, "", false),
+    }
+}
+
+/// Selection order: higher priority first, ties by configuration order.
+fn selected_before(first: (usize, &HttpRoute), second: (usize, &HttpRoute)) -> bool {
+    first.1.priority > second.1.priority
+        || (first.1.priority == second.1.priority && first.0 < second.0)
+}
+
 fn validate_http_match_host(host: &str) -> anyhow::Result<()> {
     use anyhow::ensure;
     if crate::host_match::is_glob(host) {
@@ -1659,6 +2039,12 @@ pub struct HttpRuntime {
     pub jwt_auth: Option<std::sync::Arc<crate::jwt_runtime::Runtime>>,
     pub workload_auth: Option<std::sync::Arc<crate::workload_auth::Runtime>>,
     pub auth_reserved: Vec<hyper::header::HeaderName>,
+    /// Resolved `auth.static_request_headers` (values marked sensitive). Held
+    /// only in the prepared runtime; never serialized.
+    pub auth_static_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    /// Set when a passive path activated this route without its static
+    /// header variable; every request to the route is answered with 503.
+    pub auth_unavailable: Option<AuthUnavailable>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -1805,16 +2191,33 @@ fn prepare_http_balancer(
 
 impl Snapshot {
     pub fn new(config: Config) -> anyhow::Result<Self> {
-        Self::build(config, None)
+        Self::build(config, None, EnvPolicy::Strict)
     }
     pub fn replace(config: Config, previous: &Self) -> anyhow::Result<Self> {
-        Self::build(config, Some(previous))
+        Self::build(config, Some(previous), EnvPolicy::Strict)
+    }
+    /// Like [`Self::replace`] for passive paths (shared-store polls, file
+    /// reloads): a route whose static-header variable is unusable on this
+    /// node activates fail-closed instead of rejecting the whole snapshot.
+    pub fn replace_follower(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::build(config, Some(previous), EnvPolicy::FailClosed)
     }
     /// Reset runtime/cache history while still retiring the replaced generation
     /// at publication. Used when attaching to a fresh authority epoch.
     pub fn replace_fresh(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::replace_fresh_with(config, previous, EnvPolicy::Strict)
+    }
+    /// [`Self::replace_fresh`] for a passive attachment (fail-closed routes).
+    pub fn replace_fresh_follower(config: Config, previous: &Self) -> anyhow::Result<Self> {
+        Self::replace_fresh_with(config, previous, EnvPolicy::FailClosed)
+    }
+    fn replace_fresh_with(
+        config: Config,
+        previous: &Self,
+        policy: EnvPolicy,
+    ) -> anyhow::Result<Self> {
         config.validate_transition_from(&previous.config)?;
-        let mut next = Self::new(config)?;
+        let mut next = Self::build(config, None, policy)?;
         if next.config.geoip_database == previous.config.geoip_database {
             next.geoip = previous.geoip.clone();
         }
@@ -1879,6 +2282,19 @@ impl Snapshot {
 
     /// Side effects that belong to publication, not preparation: call once
     /// immediately before this snapshot becomes visible. Idempotent.
+    /// Enabled routes that fail closed because this node lacks a static
+    /// authorization header variable, as `(route id, variable name)`.
+    pub fn unavailable_authorization(&self) -> Vec<(&str, &str)> {
+        self.http
+            .iter()
+            .filter_map(|runtime| {
+                runtime
+                    .auth_unavailable
+                    .as_ref()
+                    .map(|unavailable| (runtime.route.id.as_str(), unavailable.variable.as_str()))
+            })
+            .collect()
+    }
     pub fn activated(&self) {
         // Keep the lock through retirement: concurrent idempotent callers must
         // not return while another caller is still closing predecessor gates.
@@ -1893,7 +2309,7 @@ impl Snapshot {
             runtime.adopt_generation(settings.generation);
         }
     }
-    fn build(config: Config, previous: Option<&Self>) -> anyhow::Result<Self> {
+    fn build(config: Config, previous: Option<&Self>, policy: EnvPolicy) -> anyhow::Result<Self> {
         config.validate()?;
         if let Some(previous) = previous {
             config.validate_transition_from(&previous.config)?;
@@ -2028,6 +2444,41 @@ impl Snapshot {
                         .expect("validated authentication identity header")
                 })
                 .collect();
+        let mut auth_static_headers = std::collections::HashMap::new();
+        let mut auth_unavailable = std::collections::HashMap::new();
+        for route in config.http.iter().filter(|route| route.enabled) {
+            if let Some(auth) = &route.auth {
+                match resolve_static_request_headers(auth) {
+                    Ok(resolved) => {
+                        auth_static_headers.insert(route.id.clone(), resolved);
+                    }
+                    Err(error) => {
+                        let unavailable = error.downcast_ref::<StaticHeaderEnvError>();
+                        match (policy, unavailable) {
+                            (EnvPolicy::FailClosed, Some(failure)) => {
+                                tracing::warn!(
+                                    route = %route.id,
+                                    variable = %failure.variable,
+                                    "route authorization unavailable on this node; the route fails closed with 503"
+                                );
+                                auth_unavailable.insert(
+                                    route.id.clone(),
+                                    AuthUnavailable {
+                                        variable: failure.variable.clone(),
+                                    },
+                                );
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "route {} external authorization: {error:#}",
+                                    route.id
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
@@ -2064,6 +2515,8 @@ impl Snapshot {
                     jwt_auth,
                     workload_auth,
                     auth_reserved,
+                    auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
+                    auth_unavailable: auth_unavailable.remove(&route.id),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
@@ -2459,10 +2912,45 @@ fn authentication_identity_headers(
             );
         }
     }
+    ensure!(
+        !names.contains("cookie"),
+        "cookie cannot be an authentication identity output header"
+    );
     Ok(names)
 }
 
 impl HttpRoute {
+    /// Cookie names removed from the upstream request: the union of the route
+    /// field and `auth.strip_request_cookies`.
+    pub fn effective_strip_cookies(&self) -> Vec<String> {
+        let mut names = self.strip_request_cookies.clone();
+        if let Some(auth) = &self.auth {
+            for name in &auth.strip_request_cookies {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
+    /// A route that authenticates or is declared protected and has a path
+    /// prefix is scoped case-insensitively unless it says otherwise.
+    fn is_path_scoped_protection(&self) -> bool {
+        self.path_prefix.is_some()
+            && (self.auth.is_some()
+                || self.basic_auth.is_some()
+                || self.jwt_auth.is_some()
+                || self.access_mode == AccessMode::Protected)
+    }
+    /// Effective ASCII case handling of `path_prefix` for route selection.
+    pub fn path_case_insensitive(&self) -> bool {
+        match self.path_case {
+            Some(PathCase::Insensitive) => true,
+            Some(PathCase::Sensitive) => false,
+            None => self.is_path_scoped_protection(),
+        }
+    }
     /// All scripts must compile before a configuration can become active.
     pub fn scripts(&self) -> impl Iterator<Item = &str> {
         self.lua.as_deref().into_iter().chain(
@@ -2883,6 +3371,8 @@ mod tests {
                 timeout_ms: 1000,
                 forward_response: false,
                 terminal_response: false,
+                static_request_headers: Default::default(),
+                strip_request_cookies: Default::default(),
             });
             assert!(
                 config.validate().is_err(),
@@ -3515,6 +4005,8 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         c.http[0].request_transform = Some(set.clone());
         assert!(c.validate().is_err());
@@ -3529,6 +4021,8 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         assert!(c.validate().is_err());
         // An unrelated header, or the same name on the response transform
@@ -3580,7 +4074,226 @@ mod tests {
             timeout_ms: 1000,
             forward_response: false,
             terminal_response: false,
+            static_request_headers: Default::default(),
+            strip_request_cookies: Default::default(),
         });
         assert!(document.validate().is_err());
+    }
+
+    fn static_auth(headers: serde_json::Value) -> Config {
+        let mut config = route();
+        config.http[0].auth = Some(
+            serde_json::from_value(serde_json::json!({
+                "url": "http://127.0.0.1:9/check",
+                "request_headers": ["authorization"],
+                "response_headers": ["x-user"],
+                "static_request_headers": headers,
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn static_request_headers_accept_literals_and_env_references() {
+        let config = static_auth(serde_json::json!({
+            "x-hopae-contract": "1",
+            "x-hopae-gateway-key": {"env": "HANGANG_HOPAE_KEY"},
+        }));
+        config.validate().unwrap();
+        // Round trip emits the reference, never a resolved value.
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains(r#""x-hopae-gateway-key":{"env":"HANGANG_HOPAE_KEY"}"#));
+        assert_eq!(
+            serde_json::from_str::<Config>(&text).unwrap().http[0].auth,
+            config.http[0].auth
+        );
+    }
+
+    #[test]
+    fn static_request_headers_reject_collisions_and_reserved_names() {
+        for name in [
+            "authorization", // also listed in request_headers
+            "x-user",        // also listed in response_headers
+            "x-hangang-auth-terminal",
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "proxy-authorization",
+            "connection",
+            "keep-alive",
+            "upgrade",
+            "te",
+            "trailer",
+            "forwarded",
+            "x-real-ip",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-original-uri",
+            "x-original-anything",
+            "X-Upper",
+            "bad name",
+            "",
+        ] {
+            let config = static_auth(serde_json::json!({ name: "v" }));
+            assert!(
+                config.validate().is_err(),
+                "static header name {name:?} must be rejected"
+            );
+        }
+        static_auth(serde_json::json!({"x-ok": "v"}))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn static_request_headers_enforce_value_and_count_limits() {
+        let invalid = [
+            serde_json::json!({"x-a": "line\nbreak"}),
+            serde_json::json!({"x-a": "a".repeat(1025)}),
+            serde_json::json!({"x-a": {"env": "lowercase"}}),
+            serde_json::json!({"x-a": {"env": "1STARTS_DIGIT"}}),
+            serde_json::json!({"x-a": {"env": ""}}),
+            serde_json::json!({"x-a": {"env": "A".repeat(129)}}),
+        ];
+        for headers in invalid {
+            assert!(
+                static_auth(headers.clone()).validate().is_err(),
+                "{headers}"
+            );
+        }
+        static_auth(serde_json::json!({"x-a": "a".repeat(1024)}))
+            .validate()
+            .unwrap();
+        static_auth(serde_json::json!({"x-a": {"env": "A".repeat(128)}}))
+            .validate()
+            .unwrap();
+        let many = |count: usize| {
+            serde_json::Value::Object(
+                (0..count)
+                    .map(|i| (format!("x-extra-{i}"), serde_json::json!("v")))
+                    .collect(),
+            )
+        };
+        static_auth(many(16)).validate().unwrap();
+        assert!(static_auth(many(17)).validate().is_err());
+        // The object form rejects unknown fields.
+        assert!(
+            serde_json::from_value::<StaticHeaderValue>(
+                serde_json::json!({"env": "A", "extra": 1})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn static_request_headers_resolve_sensitive_values_and_name_only_the_variable() {
+        let config = static_auth(serde_json::json!({
+            "x-literal": "plain",
+            "x-secret": {"env": "HANGANG_TEST_SECRET"},
+        }));
+        let auth = config.http[0].auth.as_ref().unwrap();
+        let resolved = resolve_static_request_headers_with(auth, |name| {
+            (name == "HANGANG_TEST_SECRET").then(|| "s3cr3t-value".into())
+        })
+        .unwrap();
+        assert_eq!(resolved.len(), 2);
+        let secret = resolved.iter().find(|(n, _)| n == "x-secret").unwrap();
+        assert_eq!(secret.1.as_bytes(), b"s3cr3t-value");
+        assert!(secret.1.is_sensitive());
+        assert!(!format!("{resolved:?}").contains("s3cr3t-value"));
+        // Missing, empty and malformed values reject with the variable name.
+        for value in [
+            None,
+            Some(""),
+            Some("bad\nvalue-xyz"),
+            Some("é\u{1}secret-xyz"),
+        ] {
+            let error = resolve_static_request_headers_with(auth, |name| {
+                (name == "HANGANG_TEST_SECRET")
+                    .then(|| value.map(std::ffi::OsString::from))
+                    .flatten()
+            })
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("HANGANG_TEST_SECRET"), "{text}");
+            assert!(!text.contains("xyz"), "{text}");
+        }
+    }
+
+    #[test]
+    fn activation_rejects_unset_static_header_variable_and_never_serializes_value() {
+        let config = static_auth(serde_json::json!({
+            "x-key": {"env": "HANGANG_HC3_DEFINITELY_UNSET"},
+        }));
+        let error = Snapshot::new(config).err().expect("unset variable rejects");
+        assert!(format!("{error:#}").contains("HANGANG_HC3_DEFINITELY_UNSET"));
+        // PATH is always present in a test process: use it as the "secret".
+        let secret = std::env::var("PATH").unwrap();
+        let config = static_auth(serde_json::json!({"x-key": {"env": "PATH"}}));
+        let snapshot = Snapshot::new(config).unwrap();
+        assert_eq!(snapshot.http[0].auth_static_headers.len(), 1);
+        assert!(snapshot.http[0].auth_static_headers[0].1.is_sensitive());
+        let dumped = serde_json::to_string(&snapshot.config).unwrap()
+            + &serde_json::to_string(&snapshot.http[0].route).unwrap();
+        assert!(dumped.contains(r#"{"env":"PATH"}"#));
+        assert!(!dumped.contains(&secret));
+    }
+}
+
+#[cfg(test)]
+mod strip_cookie_tests {
+    use super::*;
+
+    fn auth_with(names: &[&str]) -> ExternalAuth {
+        serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/check",
+            "strip_request_cookies": names,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_valid_names_and_round_trips() {
+        let auth = auth_with(&["__Host-hopae", "__Host-hopae_bind", "Hopae", "hopae"]);
+        validate_strip_request_cookies(&auth.strip_request_cookies).unwrap();
+        let again: ExternalAuth =
+            serde_json::from_str(&serde_json::to_string(&auth).unwrap()).unwrap();
+        assert_eq!(again, auth);
+        let empty = auth_with(&[]);
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("strip_request_cookies")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicates_bad_names_and_excess() {
+        assert!(
+            validate_strip_request_cookies(&auth_with(&["a", "a"]).strip_request_cookies).is_err()
+        );
+        for bad in ["", "a b", "a=b", "a;b", "a,b", "a\"b", "é", "a\tb", "(x)"] {
+            assert!(
+                validate_strip_request_cookies(&auth_with(&[bad]).strip_request_cookies).is_err(),
+                "{bad:?}"
+            );
+        }
+        let long = "a".repeat(129);
+        assert!(
+            validate_strip_request_cookies(&auth_with(&[long.as_str()]).strip_request_cookies)
+                .is_err()
+        );
+        let ok = "a".repeat(128);
+        assert!(
+            validate_strip_request_cookies(&auth_with(&[ok.as_str()]).strip_request_cookies)
+                .is_ok()
+        );
+        let names: Vec<String> = (0..17).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(validate_strip_request_cookies(&auth_with(&refs).strip_request_cookies).is_err());
+        assert!(
+            validate_strip_request_cookies(&auth_with(&refs[..16]).strip_request_cookies).is_ok()
+        );
     }
 }
