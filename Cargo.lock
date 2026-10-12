@@ -904,6 +904,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "guard-core"
+version = "0.3.1"
+source = "git+https://github.com/ziozzang/hangang-guard?rev=ee34be662cb04fb4c199e977127338e0ea8247ec#ee34be662cb04fb4c199e977127338e0ea8247ec"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "serde",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,6 +960,7 @@ dependencies = [
  "memchr",
  "mlua",
  "p256",
+ "pumgye-core",
  "quick-xml",
  "rand 0.8.8",
  "rcgen",
@@ -2029,6 +2040,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pumgye-core"
+version = "0.1.0"
+source = "git+https://github.com/ziozzang/pumgye?rev=3c1ec20cf42709d72187ab7d4cbeff01ee6125c3#3c1ec20cf42709d72187ab7d4cbeff01ee6125c3"
+dependencies = [
+ "anyhow",
+ "guard-core",
+ "ipnet",
+ "serde",
 ]
 
 [[package]]

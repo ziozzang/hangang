@@ -323,19 +323,21 @@ impl JwtRouteLease {
 
 #[derive(Clone, Default)]
 struct AuthRouteLease {
+    pumgye: Option<(Arc<ArcSwap<Snapshot>>, u64)>,
     workload: Option<WorkloadRouteLease>,
     jwt: Option<JwtRouteLease>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct AuthRetirement {
+    pumgye: bool,
     workload: bool,
     jwt: bool,
 }
 
 impl AuthRetirement {
     fn any(self) -> bool {
-        self.workload || self.jwt
+        self.workload || self.jwt || self.pumgye
     }
 
     fn record(self, metrics: &Metrics) {
@@ -355,6 +357,10 @@ impl AuthRetirement {
 impl AuthRouteLease {
     fn retirement(&self) -> AuthRetirement {
         AuthRetirement {
+            pumgye: self
+                .pumgye
+                .as_ref()
+                .is_some_and(|(active, revision)| active.load().config.revision != *revision),
             workload: self.workload.as_ref().is_some_and(|lease| !lease.current()),
             jwt: self.jwt.as_ref().is_some_and(|lease| !lease.current()),
         }
@@ -1802,7 +1808,17 @@ impl Proxy {
         let mut auth_route_lease = workload_route_lease.map(|workload| AuthRouteLease {
             workload: Some(workload),
             jwt: None,
+            pumgye: None,
         });
+        if runtime
+            .route
+            .resource_policy
+            .as_ref()
+            .is_some_and(|policy| policy.enforce && policy.pumgye.is_some())
+        {
+            auth_route_lease.get_or_insert_with(Default::default).pumgye =
+                Some((self.active.clone(), snapshot.config.revision));
+        }
         // Canonical-domain policy precedes require_tls so an alias needs only
         // one redirect. The destination is entirely operator configured; the
         // request contributes only its already parsed path and query.
@@ -2279,10 +2295,38 @@ impl Proxy {
                             crate::resource_policy::PrincipalSource::External { .. }
                         )
                     {
-                        resource_allowed = policy.allows(
-                            request.method().as_str(),
-                            crate::resource_policy::PrincipalEvidence::External(&headers),
-                        );
+                        resource_allowed = if let Some(gate) = &policy.pumgye {
+                            let identity = crate::pumgye::identity(&headers);
+                            let evidence = match &self.guard {
+                                Some(guard) => guard.authorization_evidence(edge.client_ip).await,
+                                None => pumgye_core::GuardEvidence::Unavailable,
+                            };
+                            match (
+                                snapshot.pumgye.as_ref(),
+                                identity,
+                                gate.permissions.get(request.method().as_str()),
+                            ) {
+                                (Some(compiled), Some((subject, aal)), Some(permissions)) => {
+                                    permissions.iter().all(|permission| {
+                                        compiled.evaluate(
+                                            &gate.service_id,
+                                            subject,
+                                            edge.client_ip,
+                                            permission,
+                                            &gate.information_class,
+                                            aal,
+                                            evidence,
+                                        ) == pumgye_core::Decision::Allow
+                                    })
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            policy.allows(
+                                request.method().as_str(),
+                                crate::resource_policy::PrincipalEvidence::External(&headers),
+                            )
+                        };
                     }
                     for (name, value) in headers.iter() {
                         request.headers_mut().insert(name.clone(), value.clone());

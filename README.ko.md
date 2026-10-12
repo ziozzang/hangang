@@ -172,3 +172,5 @@ make check-docs  # Staged documentation and publication checks
 일부 통합 테스트 대상에는 Docker 또는 추가 의존성이 필요합니다. [개발](docs/DEVELOPMENT.md)과 [문서 작성 규칙](docs/DOCUMENTATION.md)을 참조하세요. Hangang의 라이선스는 [MIT](LICENSE)입니다.
 
 Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUGINS.md).
+
+[품계 네이티브 권한·매트릭스](docs/ko/PUMGYE.md) · [English](docs/PUMGYE.md)

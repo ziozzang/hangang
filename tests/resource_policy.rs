@@ -685,3 +685,128 @@ async fn concurrent_subjects_cannot_share_resource_permission() {
     upstream_task.abort();
     policy.shutdown().await;
 }
+
+async fn pumgye_identity() -> (SocketAddr, Arc<Mutex<String>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let subject = Arc::new(Mutex::new("u_reader".to_owned()));
+    let selected = subject.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let selected = selected.clone();
+            tokio::spawn(async move {
+                let mut header = [0u8; 16];
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let (id, n) = hangang::hopae_wire::parse_header(header).unwrap();
+                assert_eq!(id, 0);
+                let mut key = vec![0; n];
+                stream.read_exact(&mut key).await.unwrap();
+                assert_eq!(key, b"fixture-native-key-0123456789");
+                stream
+                    .write_all(&hangang::hopae_wire::frame_header(0, 1).unwrap())
+                    .await
+                    .unwrap();
+                stream.write_all(&[1]).await.unwrap();
+                while stream.read_exact(&mut header).await.is_ok() {
+                    let (id, n) = hangang::hopae_wire::parse_header(header).unwrap();
+                    let mut body = vec![0; n];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let subject = selected.lock().unwrap().clone();
+                    let reply = hangang::hopae_wire::Reply {
+                        status: 200,
+                        headers: vec![
+                            ("x-forwarded-user".into(), subject.into_bytes()),
+                            ("x-hopae-aal".into(), b"2".to_vec()),
+                        ],
+                        body: vec![],
+                    };
+                    let data = hangang::hopae_wire::encode_reply(&reply).unwrap();
+                    stream
+                        .write_all(&hangang::hopae_wire::frame_header(id, data.len()).unwrap())
+                        .await
+                        .unwrap();
+                    stream.write_all(&data).await.unwrap();
+                }
+            });
+        }
+    });
+    (address, subject, task)
+}
+fn pumgye_document(origin: SocketAddr, native: SocketAddr, require_guard: bool) -> Value {
+    json!({"http":[{
+        "id":"pumgye","host":"foo.test","path_prefix":"/secure","path_match":"segment_prefix","access_mode":"protected","backends":[format!("http://{origin}")],
+        "auth":{"url":"http://127.0.0.1:8701/_hopae/verify","native":{"address":native.to_string()},"response_headers":["x-forwarded-user","x-hopae-aal"],"static_request_headers":{"x-hopae-gateway-key":"fixture-native-key-0123456789"}},
+        "resource_policy":{"resource_id":"orders","principal":{"source":"external","subject_header":"x-forwarded-user"},"allow":[],"pumgye":{"service_id":"orders","information_class":"internal","permissions":{"GET":["read"],"POST":["write"]}}}
+    }],"pumgye":{"version":1,"information_classes":["internal"],"services":{"orders":{"permissions":["read","write"],"require_guard":require_guard,
+    "roles":{"reader":{"permissions":["read"],"information_classes":["internal"]}},"users":{"u_reader":["reader"]},"networks":[{"cidr":"127.0.0.1/32","roles":["reader"]}]}}}})
+}
+#[tokio::test]
+async fn native_pumgye_guest_method_network_and_guard_gates() {
+    let (origin, hits, origin_task) = origin("allowed").await;
+    let (native, subject, native_task) = pumgye_identity().await;
+    let (front, policy, task) = gateway_document(pumgye_document(origin, native, false)).await;
+    assert_eq!(request(front, "GET", "/secure", None, &[], None).await, 200);
+    assert_eq!(
+        request(front, "POST", "/secure", None, &[], None).await,
+        403
+    );
+    *subject.lock().unwrap() = "unassigned".into();
+    assert_eq!(
+        request(
+            front,
+            "GET",
+            "/secure",
+            None,
+            &[("x-forwarded-user", "u_reader"), ("x-hopae-aal", "3")],
+            None
+        )
+        .await,
+        403
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    *subject.lock().unwrap() = "u_reader".into();
+    let mut document = pumgye_document(origin, native, false);
+    document["pumgye"]["services"]["orders"]["networks"] = json!([]);
+    let (no_network, p2, t2) = gateway_document(document).await;
+    assert_eq!(
+        request(no_network, "GET", "/secure", None, &[], None).await,
+        403
+    );
+    let (mandatory, p3, t3) = gateway_document(pumgye_document(origin, native, true)).await;
+    assert_eq!(
+        request(mandatory, "GET", "/secure", None, &[], None).await,
+        403
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    task.abort();
+    t2.abort();
+    t3.abort();
+    native_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+    p2.shutdown().await;
+    p3.shutdown().await;
+}
+
+#[test]
+fn pumgye_scope_cannot_be_silently_downgraded() {
+    let old: Config = serde_json::from_value(pumgye_document(
+        "127.0.0.1:19000".parse().unwrap(),
+        "127.0.0.1:19001".parse().unwrap(),
+        true,
+    ))
+    .unwrap();
+    old.validate().unwrap();
+    let mut new = old.clone();
+    new.http[0].resource_policy.as_mut().unwrap().pumgye = None;
+    assert!(new.validate_transition_from(&old).is_err());
+    let mut disabled = old.clone();
+    disabled.http[0].resource_policy.as_mut().unwrap().enforce = false;
+    assert!(disabled.validate_transition_from(&old).is_ok());
+    assert!(new.validate_transition_from(&disabled).is_ok());
+    let mut missing = old.clone();
+    missing.pumgye = None;
+    assert!(missing.validate().is_err());
+}

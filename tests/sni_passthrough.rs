@@ -88,6 +88,7 @@ fn regex_route(
 
 fn config(routes: Vec<TcpRoute>) -> Config {
     Config {
+        pumgye: None,
         geoip_database: None,
         revision: 0,
         cache: None,

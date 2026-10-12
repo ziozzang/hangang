@@ -524,6 +524,51 @@ impl GuardClient {
     pub async fn admit(&self, ip: IpAddr, path: &str) -> bool {
         self.rejection(ip, path).await.is_none()
     }
+    /// Fresh authenticated evidence for mandatory Pumgye authorization; never fail open.
+    pub async fn authorization_evidence(&self, ip: IpAddr) -> pumgye_core::GuardEvidence {
+        use pumgye_core::GuardEvidence;
+        if self.transport_mode == TransportMode::Snapshot {
+            return GuardEvidence::Unavailable;
+        }
+        let result: Result<Decision> = async {
+            if let Some(pool) = &self.tcp {
+                return pool.query(ip.to_canonical()).await;
+            }
+            let response = self
+                .http
+                .post(format!("{}/v1/decision", self.base))
+                .header(reqwest::header::AUTHORIZATION, self.auth.clone())
+                .json(&serde_json::json!({"source_id":self.source,"ip":ip.to_canonical()}))
+                .send()
+                .await?;
+            let body = Self::bounded_body(response).await?;
+            let decision: Decision = serde_json::from_slice(&body)?;
+            ensure!(
+                decision.version == 1 && decision.ttl_ms <= 5000,
+                "invalid decision"
+            );
+            Ok(decision)
+        }
+        .await;
+        match result {
+            Ok(Decision {
+                mode: Mode::Enforce,
+                action: Action::Allow,
+                ..
+            }) => GuardEvidence::EnforcedAllow,
+            Ok(Decision {
+                mode: Mode::Enforce,
+                action: Action::Deny,
+                ..
+            }) => GuardEvidence::Deny,
+            Ok(Decision {
+                mode: Mode::Observe,
+                action: Action::Allow,
+                ..
+            }) => GuardEvidence::Observe,
+            _ => GuardEvidence::Unavailable,
+        }
+    }
     /// Explicit denials are 403; unavailable query authority fails closed with 503.
     pub async fn rejection(&self, ip: IpAddr, path: &str) -> Option<u16> {
         let ip = ip.to_canonical();
@@ -1304,6 +1349,43 @@ mod tests {
         assert_eq!(tcp.connections.load(Ordering::Relaxed), 2);
         assert_eq!(tcp.requests.lock().unwrap().len(), 2);
         assert_eq!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().len(), 1);
+        cancel.cancel();
+        tcp.task.abort();
+    }
+    #[tokio::test]
+    async fn pumgye_fresh_evidence_ignores_cache_and_fail_open() {
+        use pumgye_core::GuardEvidence;
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address);
+        config.cache_ms = 5000;
+        config.failure_mode = FailureMode::Allow;
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            GuardEvidence::EnforcedAllow
+        );
+        tcp.response.lock().unwrap()[1] = 1;
+        assert_eq!(guard.authorization_evidence(ip).await, GuardEvidence::Deny);
+        {
+            let mut response = tcp.response.lock().unwrap();
+            response[1] = 0;
+            response[2] = 0;
+        }
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            GuardEvidence::Observe
+        );
+        assert_eq!(tcp.requests.lock().unwrap().len(), 3);
+        tcp.delay_ms.store(5000, Ordering::Relaxed);
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            GuardEvidence::Unavailable
+        );
         cancel.cancel();
         tcp.task.abort();
     }

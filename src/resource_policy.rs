@@ -23,6 +23,8 @@ const MAX_POLICY_TEXT: usize = 32 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourcePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pumgye: Option<crate::pumgye::Gate>,
     /// Opaque audit/policy identifier; route host and path predicates define its URL namespace.
     pub resource_id: String,
     /// Explicit first step for removing a protected namespace. A disabled
@@ -128,6 +130,24 @@ impl ResourcePolicy {
             external_auth.is_none_or(|auth| !auth.terminal_response),
             "resource policy cannot use external auth terminal_response"
         );
+        if self.pumgye.is_some() {
+            ensure!(
+                external_auth.is_some_and(|auth| auth.native.is_some()
+                    && auth
+                        .response_headers
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("x-hopae-aal"))),
+                "Pumgye requires native Hopae assurance evidence"
+            );
+            ensure!(
+                self.allow.is_empty(),
+                "Pumgye cannot combine legacy allow rules"
+            );
+            ensure!(
+                matches!(&self.principal, PrincipalSource::External { subject_header } if subject_header == "x-forwarded-user"),
+                "Pumgye requires trusted Hopae subject"
+            );
+        }
         match &self.principal {
             PrincipalSource::Workload => ensure!(
                 workload_auth.is_some(),
@@ -337,6 +357,7 @@ mod tests {
 
     fn policy() -> ResourcePolicy {
         ResourcePolicy {
+            pumgye: None,
             resource_id: "billing.read".into(),
             enforce: true,
             principal: PrincipalSource::External {

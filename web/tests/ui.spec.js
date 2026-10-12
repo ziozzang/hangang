@@ -1835,3 +1835,31 @@ test('Hopae SSO callback activates the mapped Hangang account and removes callba
   expect(calls.filter(c=>c.path==='/v1/auth/sso/exchange')).toHaveLength(1);
   await expect(page.locator('[data-view="users"]')).toBeHidden();
 });
+
+
+test('Pumgye matrix publishes user and IP assignments with CAS', async ({ page }) => {
+  let active=structuredClone(config);
+  const calls=await fixtures(page, {'/v1/config': async route => {
+    if(route.request().method()==='PUT') {
+      expect(route.request().headers()['if-match']).toBe('"7"');
+      active=route.request().postDataJSON();active.revision=8;
+    }
+    await route.fulfill({json:active,headers:{etag:`"${active.revision}"`}});
+  }});
+  await login(page);await page.locator('[data-view="pumgye"]').click();
+  await page.locator('#pumgye-new-service').fill('orders');
+  await page.locator('#pumgye-service-form button').click();
+  await page.locator('#pumgye-subject').fill('u_reader');
+  await page.locator('#pumgye-assignment-roles').fill('reader');
+  await page.locator('#pumgye-assignment-form button').click();
+  await page.locator('#pumgye-kind').selectOption('network');
+  await page.locator('#pumgye-subject').fill('192.0.2.0/24');
+  await page.locator('#pumgye-assignment-form button').click();
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toHaveText('Authorization policy published.');
+  expect(active.pumgye.services.orders.users.u_reader).toEqual(['reader']);
+  expect(active.pumgye.services.orders.networks[0]).toEqual({cidr:'192.0.2.0/24',roles:['reader']});
+  expect(active.http).toEqual(config.http);
+  expect(calls.filter(c=>c.path==='/v1/config'&&c.method==='PUT')).toHaveLength(1);
+});
