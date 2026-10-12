@@ -715,7 +715,7 @@ mod portability_tests {
     #[test]
     fn send_timeout_preserves_small_budgets_and_rejects_platform_overflow() {
         use std::os::fd::AsFd;
-        let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         super::set_send_timeout(socket.as_fd(), std::time::Duration::from_millis(50)).unwrap();
         let error =
             super::set_send_timeout(socket.as_fd(), std::time::Duration::from_secs(u64::MAX))
