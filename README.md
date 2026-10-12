@@ -6,6 +6,14 @@
 
 Hangang brings reverse proxying, load balancing, TLS certificate management, access policies, and traffic visibility into one Rust binary. Configure routes in the browser or through the API, inspect live traffic, and extend request handling with Lua—without deploying a separate console service. The console supports English and Korean; this README and the English guides are the reference documentation.
 
+## Zero-trust backbone
+
+Hangang integrates with the decision backbone through native
+[hangang-guard support](docs/GUARD.md). **hopae** manages users and principals;
+**guard** manages IP/network controls and risk decisions, with room for broader
+policy contexts. A guard allow never replaces Hangang route authentication.
+Per-request remote decisions are the default;1–5second caching is optional.
+
 ## From laptop to enterprise deployment
 
 Develop and demonstrate on macOS Intel or Apple Silicon, then deploy the same configuration model on Linux x86-64 or ARM64. The native build matrix covers all four targets. **Linux remains the reference for supervised upgrades, syscall-isolated Lua, and IPVS DSR.** macOS offers ordinary gateway execution with explicit limitations; trusted development Lua requires `--allow-unsandboxed-lua`. Native Windows binaries are not available; use a Linux environment such as WSL2. See [platform support and release targets](docs/PLATFORMS.md) for qualification requirements and limits.

@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-12
+
+- Add native integration with the zero-trust decision backbone: Hangang resolves
+  trusted client identity and asks hangang-guard for each request's admission.
+- Support authenticated HTTP decisions and optional persistent, pooled binary TCP
+  transport with fixed-size frames, bounded timeouts and connection cleanup.
+- Keep decision caching disabled by default; allow an explicit 1–5 second cache.
+- Export explicit honeypot/scanner evidence without request credentials or bodies.
+- Preserve route authentication after a guard allow; return403 for explicit deny
+  and503 for unavailable authority by default, with explicit fail-allow support.
+- Separate backbone responsibilities: hopae manages users/principals; guard
+  manages IP/network controls, risk scoring, GeoIP/ASN and dynamic decision rules.
+
 ## 0.2.5 — 2026-10-06
 
 - Add a dedicated Lua policies menu to find route/request/response scripts and
