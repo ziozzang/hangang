@@ -52,7 +52,7 @@ impl Role {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct User {
     pub id: i64,
     pub username: String,
@@ -76,6 +76,7 @@ pub enum Change {
 
 /// The account used for a management mutation. `Session` contains an opaque
 /// bearer secret, so this type deliberately has no Debug or Serialize impl.
+#[derive(Clone)]
 pub enum MutationAuthority {
     System,
     Session(String),
@@ -1556,7 +1557,7 @@ fn valid_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn random_hex_id() -> Result<String> {
+pub(crate) fn random_hex_id() -> Result<String> {
     Ok(random_bytes::<16>()?
         .iter()
         .map(|byte| format!("{byte:02x}"))

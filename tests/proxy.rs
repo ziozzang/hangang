@@ -2464,6 +2464,7 @@ async fn external_authorization_is_bounded_fail_closed_and_replaces_spoofed_iden
     let (backend, seen, backend_task) = upstream("allowed").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["authorization".into()],
         response_headers: vec!["x-user".into()],
@@ -2563,6 +2564,7 @@ async fn authorization_service_receives_edge_resolved_forward_auth_context() {
     let (backend, _seen, backend_task) = upstream("allowed").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/check"),
         // Generated names cannot be configured as inputs (validation rejects
         // them); a client pre-filling them is ignored either way.
@@ -2735,6 +2737,7 @@ async fn sso_identity_under_forwarded_prefix_reaches_the_upstream_unspoofed() {
     let (backend, seen, backend_task) = upstream("allowed").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec![],
         response_headers: vec!["x-forwarded-user".into(), "x-forwarded-groups".into()],
@@ -3415,6 +3418,7 @@ async fn client_connection_token_cannot_erase_auth_injected_header() {
     let (backend, seen, backend_task) = upstream("allowed").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["authorization".into()],
         response_headers: vec!["x-user".into()],
@@ -4525,6 +4529,7 @@ async fn terminal_auth_2xx_never_contacts_upstream_or_leaks_marker() {
     let (backend, seen, backend_task) = upstream("upstream").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/authorize"),
         request_headers: vec![],
         response_headers: vec![],
@@ -4791,6 +4796,7 @@ async fn external_auth_forward_response_drives_sso_redirect_and_cookie() {
     let (backend, _seen, backend_task) = upstream("app").await;
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["cookie".into()],
         response_headers: vec![],
@@ -5215,6 +5221,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
         country_policy: None,
         auth_reserved: Vec::new(),
         auth_static_headers: Vec::new(),
+        auth_native: None,
         auth_unavailable: None,
         jwt_auth: None,
         workload_auth: None,
@@ -5529,6 +5536,7 @@ async fn http2_cookie_join_precedes_route_matching_and_external_auth() {
         .headers
         .insert("cookie".into(), "a=1; session=ok".into());
     configured.auth = Some(hangang::config::ExternalAuth {
+        native: None,
         url: format!("http://{auth}/check"),
         request_headers: vec!["cookie".into()],
         response_headers: vec![],
@@ -7341,4 +7349,127 @@ async fn multipart_spooling_preserves_large_uploads_and_denies_late_controls_bef
     front_task.abort();
     origin_task.abort();
     policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_hopae_transport_uses_normal_identity_cookie_and_terminal_handling() {
+    use hangang::hopae_wire as wire;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let native = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        async fn receive(s: &mut TcpStream) -> (u64, Vec<u8>) {
+            let mut h = [0; 16];
+            s.read_exact(&mut h).await.unwrap();
+            let (id, n) = wire::parse_header(h).unwrap();
+            let mut b = vec![0; n];
+            s.read_exact(&mut b).await.unwrap();
+            (id, b)
+        }
+        let (id, key) = receive(&mut socket).await;
+        assert_eq!(id, 0);
+        assert_eq!(key, b"fixture-native-key");
+        socket
+            .write_all(&wire::frame_header(0, 1).unwrap())
+            .await
+            .unwrap();
+        socket.write_all(&[1]).await.unwrap();
+        for index in 0..3 {
+            let (id, bytes) = receive(&mut socket).await;
+            let headers = wire::decode_request(&bytes).unwrap();
+            assert!(!headers.iter().any(|(n, _)| n == "x-hopae-gateway-key"));
+            assert!(headers.iter().any(|(n, v)| n == "x-original-uri"
+                && v == if index == 0 {
+                    b"/private".as_slice()
+                } else if index == 1 {
+                    b"/_hopae/login".as_slice()
+                } else {
+                    b"/_hopae/logout".as_slice()
+                }));
+            let reply = match index {
+                0 => wire::Reply {
+                    status: 200,
+                    headers: vec![
+                        ("x-user".into(), b"verified".to_vec()),
+                        (
+                            "set-cookie".into(),
+                            b"__Host-hopae=refreshed; Secure; HttpOnly".to_vec(),
+                        ),
+                    ],
+                    body: vec![],
+                },
+                1 => wire::Reply {
+                    status: 302,
+                    headers: vec![(
+                        "location".into(),
+                        b"https://auth.example.test/login".to_vec(),
+                    )],
+                    body: b"redirect".to_vec(),
+                },
+                _ => wire::Reply {
+                    status: 200,
+                    headers: vec![
+                        ("x-hangang-auth-terminal".into(), b"1".to_vec()),
+                        ("content-type".into(), b"text/plain".to_vec()),
+                    ],
+                    body: b"confirmation".to_vec(),
+                },
+            };
+            let bytes = wire::encode_reply(&reply).unwrap();
+            let mut out = wire::frame_header(id, bytes.len()).unwrap().to_vec();
+            out.extend_from_slice(&bytes);
+            socket.write_all(&out).await.unwrap();
+        }
+    });
+    let (backend, seen, backend_task) = upstream("allowed").await;
+    let mut secured = route(vec![format!("http://{backend}")]);
+    secured.auth = Some(hangang::config::ExternalAuth {
+        native: Some(hangang::config::HopaeNative {
+            address: native,
+            pool_size: 2,
+        }),
+        url: "http://127.0.0.1:1/_hopae/verify".into(),
+        request_headers: vec!["cookie".into()],
+        response_headers: vec!["x-user".into()],
+        timeout_ms: 500,
+        forward_response: true,
+        terminal_response: true,
+        static_request_headers: BTreeMap::from([(
+            "x-hopae-gateway-key".into(),
+            hangang::config::StaticHeaderValue::Literal("fixture-native-key".into()),
+        )]),
+        strip_request_cookies: vec!["__Host-hopae".into()],
+    });
+    let (proxy, policy) = proxy(vec![secured]);
+    let (front, front_task, _) = frontend(proxy).await;
+    for (path, status) in [
+        ("/private", 200),
+        ("/_hopae/login", 302),
+        ("/_hopae/logout", 200),
+    ] {
+        let request = Request::builder()
+            .uri(format!("http://{front}{path}"))
+            .header("cookie", "__Host-hopae=secret; app=ordinary")
+            .header("x-user", "spoofed")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = client().request(request).await.unwrap();
+        assert_eq!(response.status(), status);
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if path == "/private" {
+            assert!(headers.get("set-cookie").is_some());
+        } else if path == "/_hopae/login" {
+            assert_eq!(headers["location"], "https://auth.example.test/login");
+        } else {
+            assert_eq!(body, b"confirmation".as_slice());
+        }
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(seen.lock().unwrap()[0].headers["x-user"], "verified");
+    assert_eq!(seen.lock().unwrap()[0].headers["cookie"], "app=ordinary");
+    task.await.unwrap();
+    policy.shutdown().await;
+    front_task.abort();
+    backend_task.abort();
 }

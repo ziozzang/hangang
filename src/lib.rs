@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_plugins;
 pub mod admin_socket;
 pub mod admin_users;
 pub mod api_spec;
@@ -108,3 +109,8 @@ pub mod github_release;
 pub mod cli_about;
 
 pub mod guard;
+
+pub mod hopae_native;
+pub mod hopae_wire;
+
+pub mod console_delegation_wire;

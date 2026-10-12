@@ -175,3 +175,5 @@ make check-docs  # Staged documentation and publication checks
 ```
 
 Some integration targets need Docker or additional dependencies. See [development](docs/DEVELOPMENT.md) and [documentation conventions](docs/DOCUMENTATION.md). Hangang is licensed under [MIT](LICENSE).
+
+Trusted Guard/Hopae menus and native Hopae transport: [console integration](docs/CONSOLE_PLUGINS.md).

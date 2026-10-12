@@ -251,6 +251,7 @@ pub async fn serve(
                     let (io, idle_watch) = crate::idle::IdleIo::new(stream, Duration::from_secs(10));
                     let service = service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
                         request.extensions_mut().insert(lease.clone());
+                        if let Ok(context)=crate::admin_plugins::client_context(&request,std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)){request.extensions_mut().insert(context);}
                         request.extensions_mut().insert(crate::tls::TransportInfo { tls: false, local_port: 0 });
                         let admin = admin.clone();
                         async move { admin.handle(request).await }

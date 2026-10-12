@@ -1324,7 +1324,7 @@ test('route id conflicts and stale revisions are reported without losing the dra
 test('the advanced JSON editor remains authoritative for fields it introduces', async ({ page }) => {
   const calls = await fixtures(page, { '/v1/routes/tcp/db': route => route.fulfill({ json: config.tcp[0], headers: { etag: '"7"' } }) });
   await login(page); await page.getByRole('link', { name: 'TCP routes' }).click(); await page.getByRole('button', { name: 'Edit' }).click();
-  await page.locator('details.advanced-editor summary').click();
+  await page.locator('#route-form details.advanced-editor summary').click();
   const editor = page.locator('#route-json');
   const current = JSON.parse(await editor.inputValue());
   await editor.fill(JSON.stringify({ ...current, experimental: { enabled: true } }));
@@ -1780,4 +1780,31 @@ test('failed config response from previous certificate scope cannot overwrite cu
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await expect(page.locator('#certificate-message')).toContainText('Invalid certificate JSON');
   await expect(page.locator('#certificate-message')).not.toContainText('old edge config failed');
+});
+
+test('trusted console menu mounts through host API and clears on logout', async ({page}) => {
+  const calls=await fixtures(page, {
+    '/v1/plugins':r=>r.fulfill({json:{api_version:1,plugins:[{id:'fixture',name:'Fixture',version:'0.1.0',entry:'/ui/plugins/fixture/index.js',api_base:'/v1/plugins/fixture'}]}}),
+    '/v1/plugins/fixture/status':r=>r.fulfill({json:{message:'delegated backend'}}),
+  });
+  await page.route('**/ui/plugins/fixture/index.js',r=>r.fulfill({contentType:'text/javascript',body:`export async function mount(host){const p=document.createElement('p');const {data}=await host.api('status');p.textContent=data.message;host.root.append(p);return {pause(){},resume(){},dispose(){host.root.replaceChildren();}};}`}));
+  await page.route('**/ui/plugins/fixture/style.css',r=>r.fulfill({contentType:'text/css',body:''}));
+  await login(page);
+  await expect(page.locator('.sidebar').getByText('ZERO TRUST')).toBeVisible();
+  await page.getByRole('link',{name:'Fixture'}).click();
+  await expect(page.locator('#view-plugin-fixture')).toContainText('delegated backend');
+  expect(calls.find(c=>c.path==='/v1/plugins/fixture/status').headers.authorization).toBe('Bearer correct-token');
+  await page.locator('#logout-button').click();
+  await expect(page.locator('[data-console-plugin]')).toHaveCount(0);
+  await expect(page.locator('#view-plugin-fixture')).toHaveCount(0);
+});
+
+test('viewer does not discover or mount administrator console plugins',async ({page})=>{
+  const calls=await fixtures(page,{
+    '/v1/auth/setup':r=>r.fulfill({json:{bootstrap_required:false}}),
+    '/v1/auth/login':r=>r.fulfill({json:{token:'viewer-session',user:{id:2,username:'reader',role:'viewer',enabled:true}}}),
+    '/v1/plugins':r=>r.fulfill({json:{api_version:1,plugins:[]}}),
+  });
+  await page.goto('/ui/');await page.locator('#login-username').fill('reader');await page.locator('#login-password').fill('password');await page.getByRole('button',{name:'Sign in'}).click();
+  await expect(page.getByRole('heading',{name:'Proxy status'})).toBeVisible();expect(calls.some(c=>c.path==='/v1/plugins')).toBe(false);await expect(page.locator('[data-console-plugin]')).toHaveCount(0);
 });

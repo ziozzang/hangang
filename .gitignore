@@ -104,3 +104,6 @@ coverage*
 /deploy/*.local.yaml
 /deploy/*.local.yml
 !/docs/SQL_RECEIPT_RELEASE.md
+
+# Public trusted-extension contract; other local console notes stay ignored.
+!/docs/CONSOLE_PLUGINS.md

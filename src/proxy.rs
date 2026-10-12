@@ -31,7 +31,7 @@ type BoxError = Box<dyn Error + Send + Sync + 'static>;
 pub struct BodyError(BoxError);
 
 impl BodyError {
-    pub(crate) fn from_error(error: impl Error + Send + Sync + 'static) -> Self {
+    pub fn from_error(error: impl Error + Send + Sync + 'static) -> Self {
         Self(Box::new(error))
     }
 }
@@ -46,6 +46,12 @@ impl Error for BodyError {
         Some(self.0.as_ref())
     }
 }
+impl From<reqwest::Error> for BodyError {
+    fn from(error: reqwest::Error) -> Self {
+        Self(Box::new(error))
+    }
+}
+
 impl From<http_body_util::LengthLimitError> for BodyError {
     fn from(error: http_body_util::LengthLimitError) -> Self {
         Self(Box::new(error))
@@ -659,6 +665,7 @@ impl Proxy {
         &self,
         auth: &crate::config::ExternalAuth,
         static_headers: &[(HeaderName, HeaderValue)],
+        native: Option<&crate::hopae_native::Client>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
@@ -694,7 +701,15 @@ impl Proxy {
             for (name, value) in static_headers {
                 request.headers_mut().insert(name.clone(), value.clone());
             }
-            let response = self.client.request(request).await.map_err(|_| 503u16)?;
+            let response = if let Some(native) = native {
+                native.verify(request.headers()).await.map_err(|_| 503u16)?
+            } else {
+                self.client
+                    .request(request)
+                    .await
+                    .map_err(|_| 503u16)?
+                    .map(|body| body.map_err(BodyError::from_error).boxed_unsync())
+            };
             let (mut parts, body_stream) = response.into_parts();
             if auth.terminal_response
                 && connection_tokens(&parts.headers)
@@ -2251,7 +2266,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_deref(), &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);
@@ -4152,7 +4167,7 @@ fn boxed_incoming(body: Incoming) -> Body {
         .boxed_unsync()
 }
 
-fn full_body(bytes: Bytes) -> Body {
+pub(crate) fn full_body(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never| -> BodyError { match never {} })
         .boxed_unsync()
