@@ -268,4 +268,6 @@ export default {
   'settings.allow_dot_segments; otherwise --allow-dot-segments.': 'settings.allow_dot_segments; 없으면 --allow-dot-segments를 따릅니다.',
   'settings.health_path; otherwise --health-path.': 'settings.health_path; 없으면 --health-path를 따릅니다.',
   '↑ ↓ to navigate · Enter to open · Esc to close': '↑ ↓ 탐색 · Enter 열기 · Esc 닫기',
+  "Sign in with SSO": "SSO 로그인",
+  "SSO login failed. Your Hopae identity must be linked to an enabled Hangang account.": "SSO 로그인에 실패했습니다. Hopae 사용자가 활성화된 Hangang 계정에 연결되어 있어야 합니다.",
 };

@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assertion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
     pub actor_id: i64,
     pub actor_name: String,
     pub timestamp: u64,
@@ -61,6 +63,7 @@ mod tests {
     #[test]
     fn scope_and_freshness_are_signed() {
         let a = Assertion {
+            authority: None,
             actor_id: 1,
             actor_name: "operator".into(),
             timestamp: 100,

@@ -20,7 +20,7 @@ Hangang의 ZERO TRUST 메뉴에 Guard·Hopae 관리 패키지를 불러옵니다
 서로 다른 서비스 간 원자적으로 보장하지는 않습니다.
 
 Hopae 관리 위임은 전용 키로 작업자·시각·nonce·메서드/경로·본문 해시와 handle/클라이언트
-근거를 서명합니다. 기존 Hopae handle·grant·역할·인증 강도·freshness·CSRF·변경 fence를
+근거를 서명합니다. 기본 native 모드에서는 기존 Hopae handle·grant·역할·인증 강도·freshness·CSRF·변경 fence를
 유지합니다. Hangang 관리자 역할만으로 Hopae grant를 만들지 않습니다.
 브라우저 방식은 두 권한을 모두 요구합니다. Hopae 관리자 origin을 콘솔 origin에 맞추고
 `/_hopae/`를 forward-auth로 연결합니다. 로그인/로그아웃은 네이티브 엔트리를 사용하며
@@ -37,3 +37,33 @@ grant 회수·위임 감사·콘솔 수명주기를 검증합니다. Hopae 전�
 
 Hopae 진입 라우트는 콘솔 / 라우트보다 높은 priority를 주거나 같은 priority에서 먼저 배치합니다.
 Hangang은 가장 긴 prefix 자동 정렬 대신 priority와 설정 순서를 사용합니다.
+
+## Hangang 통합 권한과 SSO
+
+Hangang 로그인·역할을 따르는 통합 콘솔은 Hopae 플러그인 binding에
+`delegation_authority: "hangang"`을 설정하고 `delegation_cookie`를 제거합니다.
+Hopae의 `admin.hangang_delegation.authority`도 `"hangang"`으로 설정하며 전용 키를
+맞춥니다. 명시적 통합 모드에서는 기존 제한된 API 목록에 대해 Hangang 관리자의
+서명 요청만 허용합니다. 권한 모드·요청을 서명에 묶고, 일회성 요청을 5초 이내로
+제한하며 변경 트랜잭션에서도 다시 검증합니다. 기본 `native` 모드와 독립 Hopae
+관리자 인증은 기존 grant·세션·freshness·assurance 검사를 유지합니다.
+통합 메뉴는 별도 Hopae 로그인·로그아웃 링크를 숨깁니다. 콘솔 권한은 Hangang,
+프로바이더 자격 증명·사용자·세션 데이터는 Hopae가 소유합니다.
+
+어댑터에 `--hopae-sso /private/console-sso.json`을 지정하면 ID/PW 로그인 아래에
+**SSO 로그인** 버튼이 표시됩니다. 영어 문서의 JSON 예시처럼 private 일반 파일
+(0600)에 공개 origin, 루프백 native 주소, caller/system 키의 환경변수 이름,
+쿠키 이름, `accounts` 매핑을 설정합니다. Hopae의 불변 사용자 ID를 기존 Hangang
+계정명에 명시적으로 연결합니다. 이메일/표시명으로 자동 연결하거나 사용자·권한을
+생성하지 않으며 기존 활성 Hangang 계정의 현재 역할을 적용합니다.
+
+프로바이더 인증은 Hopae 네이티브 `/_hopae/login`에서 처리합니다. 쿠키와 함께
+`/ui/?sso=hopae`로 돌아와 같은 origin의 POST로 불투명 콘솔 bearer를 발급합니다.
+시스템 키·프로바이더 토큰·upstream lease는 브라우저에 전달하지 않습니다.
+SSO 요청마다 Hopae 쿠키·클라이언트 IP/UA·현재 세션을 확인하고 5초짜리 private
+Hangang lease를 사용합니다(최대 1초 재사용). Hangang 계정·역할도 재검증합니다.
+로그아웃은 해당 콘솔 세션과 현재 lease를 회수하며 다른 Hopae 앱을 전역 로그아웃하지
+않습니다. 어댑터 재시작 후에는 남은 Hopae 세션으로 다시 로그인합니다.
+
+요청별 세션 회수, 같은 origin 교환, 명시적 계정 연결, bearer 직접 우회 차단,
+계정 비활성화·만료, 브라우저 복귀, 통합 Hopae 조회·변경·재전송·감사를 검증합니다.

@@ -1808,3 +1808,30 @@ test('viewer does not discover or mount administrator console plugins',async ({p
   await page.goto('/ui/');await page.locator('#login-username').fill('reader');await page.locator('#login-password').fill('password');await page.getByRole('button',{name:'Sign in'}).click();
   await expect(page.getByRole('heading',{name:'Proxy status'})).toBeVisible();expect(calls.some(c=>c.path==='/v1/plugins')).toBe(false);await expect(page.locator('[data-console-plugin]')).toHaveCount(0);
 });
+
+test('Hopae SSO button appears below account sign-in only when configured', async ({page})=>{
+  await fixtures(page,{
+    '/v1/auth/setup':r=>r.fulfill({json:{bootstrap_required:false}}),
+    '/v1/auth/sso/config':r=>r.fulfill({json:{provider:'hopae',login_url:'/_hopae/login?return=%2Fui%2F%3Fsso%3Dhopae'}}),
+  });
+  await page.goto('/ui/');
+  const button=page.getByRole('link',{name:'Sign in with SSO',exact:true});await expect(button).toBeVisible();
+  await expect(page.locator('#login-password')).toBeVisible();
+  expect((await button.boundingBox()).y).toBeGreaterThan((await page.locator('#login-submit').boundingBox()).y);
+  await expect(button).toHaveAttribute('href','/_hopae/login?return=%2Fui%2F%3Fsso%3Dhopae');
+});
+
+test('Hopae SSO callback activates the mapped Hangang account and removes callback marker',async({page})=>{
+  const user={id:7,username:'operator',role:'viewer',enabled:true};
+  const calls=await fixtures(page,{
+    '/v1/auth/sso/exchange':r=>r.fulfill({json:{token:'hsso_fixture',user}}),
+    '/v1/auth/me':r=>r.fulfill({json:{user}}),
+  });
+  await page.goto('/ui/?sso=hopae');await expect(page.locator('#signed-in-user')).toHaveText('operator · viewer');
+  expect(new URL(page.url()).searchParams.has('sso')).toBe(false);
+  const exchange=calls.find(c=>c.path==='/v1/auth/sso/exchange');expect(exchange.method).toBe('POST');expect(exchange.headers['x-hangang-sso']).toBe('1');
+  expect(await page.evaluate(()=>sessionStorage.getItem('hangang.account.session.v1'))).toBe('hsso_fixture');
+  await page.reload();await expect(page.locator('#signed-in-user')).toHaveText('operator · viewer');
+  expect(calls.filter(c=>c.path==='/v1/auth/sso/exchange')).toHaveLength(1);
+  await expect(page.locator('[data-view="users"]')).toBeHidden();
+});

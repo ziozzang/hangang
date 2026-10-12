@@ -905,6 +905,29 @@ impl Store {
         }).await?
     }
 
+    /// System-authorized SSO broker: existing enabled accounts only, five-second lease.
+    /// The browser never receives this lease; the broker rechecks Hopae before each request.
+    pub async fn sso_lease(&self, username: String) -> Result<Option<Login>> {
+        validate_username(&username)?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut db=connection(&path)?;
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let user=tx.query_row("SELECT id,username,role,enabled FROM users WHERE username=?1 COLLATE NOCASE AND enabled=1",[username],|r|Ok(User {id:r.get(0)?,username:r.get(1)?,role:Role::parse(&r.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,enabled:true})).optional()?;
+            let Some(user)=user else {return Ok(None);};
+            let now=now()?;
+            tx.execute("DELETE FROM sessions WHERE expires_at<=?1",[now])?;
+            let total:i64=tx.query_row("SELECT count(*) FROM sessions",[],|r|r.get(0))?;
+            let own:i64=tx.query_row("SELECT count(*) FROM sessions WHERE user_id=?1",[user.id],|r|r.get(0))?;
+            if total>=MAX_SESSIONS || own>=MAX_SESSIONS_PER_USER {return Ok(None);}
+            let token=random_token()?;
+            let hash:[u8;32]=Sha256::digest(token.as_bytes()).into();
+            tx.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![hash.as_slice(),user.id,now+5,now])?;
+            tx.commit()?;
+            Ok(Some(Login {token,user,expires_in_seconds:5}))
+        }).await?
+    }
+
     pub async fn session(&self, token: String) -> Result<Option<User>> {
         if !valid_session_token(&token) {
             return Ok(None);
@@ -2361,6 +2384,28 @@ mod tests {
         let path = directory.path().join("accounts.sqlite3");
         let store = Arc::new(Store::open(path).unwrap());
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn sso_lease_requires_existing_enabled_account_and_expires() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(d.path().join("users.sqlite3")).unwrap();
+        assert!(store.sso_lease("unknown".into()).await.unwrap().is_none());
+        let user = store
+            .bootstrap("operator".into(), "strong operator password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = store.sso_lease("operator".into()).await.unwrap().unwrap();
+        assert_eq!(lease.user.id, user.id);
+        assert_eq!(lease.expires_in_seconds, 5);
+        assert!(store.session(lease.token.clone()).await.unwrap().is_some());
+        let db = connection(&store.path).unwrap();
+        db.execute("UPDATE sessions SET expires_at=0", []).unwrap();
+        assert!(store.session(lease.token).await.unwrap().is_none());
+        db.execute("UPDATE users SET enabled=0", []).unwrap();
+        assert!(store.sso_lease("operator".into()).await.unwrap().is_none());
     }
 
     #[tokio::test]

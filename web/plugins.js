@@ -31,7 +31,7 @@ export async function loadPlugin(name) {
     const module=await import(p.entry);
     if(epoch!==generation || controller.signal.aborted)return;
     if(typeof module.mount!=='function')throw Error('Console plugin has no mount function');
-    record.instance=await module.mount(Object.freeze({root:p.root,signal:controller.signal,locale:host.locale,
+    record.instance=await module.mount(Object.freeze({root:p.root,signal:controller.signal,locale:host.locale,authentication:p.authentication==='hangang'?'hangang':'native',
       api:(path,options={})=>{if(controller.signal.aborted) return Promise.reject(Error('Session ended'));if(!/^[a-z0-9-]+(?:\/[a-z0-9-]+)*$/.test(path))return Promise.reject(Error('Invalid plugin API path'));return host.api(p.api_base+'/'+path,{...options,signal:controller.signal});},
       asset:(file)=>{if(!/^[a-zA-Z0-9_-]+\.(html|css)$/.test(file))return Promise.reject(Error('Invalid plugin asset'));return fetch(base+file,{signal:controller.signal,cache:'no-store'}).then(r=>{if(!r.ok)throw Error('Plugin asset unavailable');return r;});}
     }));

@@ -57,7 +57,7 @@ revocation of an operation already accepted by a backend.
 
 ## Hopae management and login
 
-Hopae preserves its existing native handle authentication, grant/role, assurance,
+The default native delegation mode preserves Hopae handle authentication, grant/role, assurance,
 freshness, CSRF and transactional mutation fence. See Hopae's `HANGANG_NATIVE.md`.
 An explicitly configured dedicated delegation key signs actor ID/name, timestamp,
 nonce, method/path, body digest and handle/client-context evidence. It is not the
@@ -96,3 +96,48 @@ End-to-end identity throughput still requires deployment-specific load profiling
 Guard transport benchmarks are not evidence for Hopae session throughput.
 
 The reserved Hopae entry route must outrank the broad console `/` route: use a higher `priority` or place it first at equal priority. Hangang uses priority then configuration order, not automatic longest-prefix ordering.
+
+## Unified Hangang authority and SSO
+
+For a console that follows Hangang login/roles, set the Hopae binding's
+`delegation_authority` to `"hangang"` and remove `delegation_cookie`. In Hopae set
+`admin.hangang_delegation.authority` to `"hangang"` with the same dedicated key.
+This explicit mode accepts only signed Hangang administrator requests on the
+existing narrow route allowlist. Assertions bind the authority mode and request,
+are single-use, and expire within five seconds; the mutation transaction checks
+the proof again. Standalone Hopae authentication and the default `native` mode
+retain native grants, sessions, freshness and assurance checks. The embedded
+package hides its separate login/logout links in unified mode. Hangang owns the
+console authority; Hopae still owns provider credentials, identities and sessions.
+
+Run the adapter with `--hopae-sso /private/console-sso.json` to add **Sign in with
+SSO** beneath account sign-in. The configuration is a private regular file (0600):
+
+```json
+{
+  "public_url": "https://console.example.test/",
+  "native_address": "127.0.0.1:8703",
+  "gateway_key_env": "CONSOLE_HOPAE_GATEWAY_KEY",
+  "upstream_token_env": "CONSOLE_HANGANG_SYSTEM_TOKEN",
+  "cookie": "__Host-hopae",
+  "accounts": {"u_example": "operator"}
+}
+```
+
+Account mappings use opaque Hopae user IDs, never unverified email/name claims.
+Only existing enabled Hangang accounts can sign in, with their current Hangang
+role; no account or privilege is automatically created. The private broker system
+credential is never delivered to the browser. Hopae performs provider login at
+`/_hopae/login`; its native cookie returns to `/ui/?sso=hopae`, where a same-origin
+POST exchanges it for an opaque console bearer. The browser never receives an
+upstream lease or provider token. Every SSO request verifies the bound Hopae
+cookie, client IP/UA and current native session before acquiring a private
+five-second upstream lease (reused for at most one second). Hangang rechecks its
+local account/role. Logout revokes the opaque console session and current lease;
+it does not globally log the user out of other Hopae applications. Adapter restart
+invalidates opaque SSO sessions; sign in again using the retained Hopae session.
+Configuration discovery reveals only the provider name and fixed entry URL.
+
+Validation: native per-request revocation, same-origin exchange, explicit account
+mapping, opaque-bearer isolation, local account disable/expiry, browser callback,
+and Hangang-authority Hopae reads/mutations/replay/audit are covered by tests.
