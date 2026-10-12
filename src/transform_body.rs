@@ -677,13 +677,11 @@ mod reader_tests {
             eof: false,
             skip_lf: false,
         };
-        // All frames are ready and have no byte weight. Without cooperative
-        // admission the line future completes before timeout is ever polled.
-        assert!(
-            tokio::time::timeout(Duration::ZERO, reader.line(32, false))
-                .await
-                .is_err()
-        );
+        // All frames are ready and have no byte weight. Assert the initial
+        // poll yields so an enclosing deadline can run, independently of the
+        // platform timer's resolution and when a zero-duration timer fires.
+        let mut line = Box::pin(reader.line(32, false));
+        assert!(futures_util::poll!(&mut line).is_pending());
     }
 
     #[tokio::test]
@@ -692,11 +690,8 @@ mod reader_tests {
             .map(|_| Ok::<_, BodyError>(Frame::data(Bytes::new())))
             .chain(std::iter::once(Ok(Frame::data(Bytes::from_static(b"x")))));
         let body = StreamBody::new(futures_util::stream::iter(frames)).boxed_unsync();
-        assert!(
-            tokio::time::timeout(Duration::ZERO, collect_buffered(body, 32))
-                .await
-                .is_err()
-        );
+        let mut collect = Box::pin(collect_buffered(body, 32));
+        assert!(futures_util::poll!(&mut collect).is_pending());
     }
 
     #[tokio::test]
