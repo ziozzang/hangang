@@ -240,3 +240,19 @@ test('response security native rules preserve CSP, scope preset, validate and ro
   await page.locator('#setting-response_security').fill('');
   expect(JSON.parse(await page.locator('#config-editor').inputValue()).settings).not.toHaveProperty('response_security');
 });
+
+test('request parameter blocks validate generic conditions, preserve settings and wipe on logout', async ({ page }) => {
+  const writes = await open(page, { health_path: '/ready', future_setting: { keep: true } });
+  const rules = [{ path: '/control', hosts: ['app.example.test'], include_subpaths: true, methods: ['POST'], max_body_bytes: 65536, timeout_ms: 2000, multipart_spool: { directory: '/data/request-inspection-spool', max_body_bytes: 68719476736, timeout_ms: 7200000, idle_timeout_ms: 60000, max_field_bytes: 65536 }, params: [{ name: 'action', values: ['delete'], match: 'exact', case_insensitive: true }, { name: 'request', values: ['safe.api'], negate: true, json_field: 'api', strip_pattern: '^prefix:' }, { name: 'command', values: ['', 'list'], negate: true, default_value: '' }] }];
+  await page.getByLabel('Request parameter blocks').fill(JSON.stringify(rules));
+  expect(JSON.parse(await page.locator('#config-editor').inputValue()).settings).toMatchObject({ request_blocks: rules, future_setting: { keep: true }, health_path: '/ready' });
+  await page.locator('#locale-select').selectOption('ko'); await expect(page.getByLabel('요청 파라미터 차단')).toHaveValue(JSON.stringify(rules));
+  await page.locator('#apply-config').click(); await expect.poll(() => writes.length).toBe(1); await expect(page.locator('#config-message')).toContainText('8'); await expect(page.locator('#apply-config')).toBeEnabled();
+  expect(writes[0].settings.request_blocks).toEqual(rules);
+  for (const draft of [ [{ path: '/control', params: [{ name: 'action[]' }] }], [{ path: '/control', params: [{ name: '%61ction' }] }], [{ path: '/control', params: [{ name: 'action' }, { name: 'action' }] }], [{ path: '/control', params: [{ name: 'action', mystery: true }] }], [{ path: '/control', max_body_bytes: 16777217, params: [{ name: 'action' }] }], [{ path: '/control', params: [{ name: 'action', default_value: '' }] }], [{ path: '/control', params: [{ name: 'compound', json_field: 'api', values: ['read'], default_value: '' }] }], [{ path: '/control', params: [{ name: 'action' }], multipart_spool: { directory: '../spool', max_body_bytes: 1 } }], [{ path: '/control', params: [{ name: 'action' }], multipart_spool: { directory: '/spool', max_body_bytes: 68719476737 } }], [{ path: '/control', params: [{ name: 'action' }], multipart_spool: { directory: '/spool', max_body_bytes: 1, idle_timeout_ms: 120001 } }] ]) {
+    await page.locator('#setting-request_blocks').fill(JSON.stringify(draft)); await page.locator('#apply-config').click(); expect(writes).toHaveLength(1);
+  }
+  await page.locator('#setting-request_blocks').fill(''); expect(JSON.parse(await page.locator('#config-editor').inputValue()).settings).not.toHaveProperty('request_blocks');
+  await page.locator('#setting-request_blocks').fill(JSON.stringify(rules)); await page.locator('#logout-button').click(); await expect(page.locator('#setting-request_blocks')).toHaveValue('');
+  await page.locator('#locale-select-login').selectOption('en'); await expect(page.locator('#setting-request_blocks')).toHaveValue('');
+});

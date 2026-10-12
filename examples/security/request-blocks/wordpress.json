@@ -1,0 +1,221 @@
+{
+  "settings": {
+    "path_blocks": [
+      {
+        "path": "/xmlrpc.php",
+        "hosts": [
+          "app.example.test"
+        ]
+      },
+      {
+        "path": "/wp-json/wp/v2/users",
+        "hosts": [
+          "app.example.test"
+        ]
+      },
+      {
+        "path": "/index.php/wp-json/wp/v2/users",
+        "hosts": [
+          "app.example.test"
+        ]
+      },
+      {
+        "path": "/author",
+        "hosts": [
+          "app.example.test"
+        ]
+      }
+    ],
+    "request_blocks": [
+      {
+        "path": "/",
+        "hosts": [
+          "app.example.test"
+        ],
+        "include_subpaths": true,
+        "params": [
+          {
+            "name": "rest_route",
+            "values": [
+              "/wp/v2/users"
+            ],
+            "match": "path_prefix",
+            "case_insensitive": true
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/",
+        "hosts": [
+          "app.example.test"
+        ],
+        "include_subpaths": true,
+        "params": [
+          {
+            "name": "author"
+          },
+          {
+            "name": "rest_route",
+            "negate": true
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/wp-admin/admin-ajax.php",
+        "hosts": [
+          "app.example.test"
+        ],
+        "params": [
+          {
+            "name": "action",
+            "values": [
+              "mb_uploader",
+              "mb_user",
+              "skin_mb_user",
+              "skin_mb_uploader"
+            ]
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "include_subpaths": true,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/wp-admin/admin-ajax.php",
+        "hosts": [
+          "app.example.test"
+        ],
+        "params": [
+          {
+            "name": "action",
+            "values": [
+              "mb_",
+              "skin_mb_"
+            ],
+            "match": "prefix"
+          },
+          {
+            "name": "mode",
+            "values": [
+              "user"
+            ],
+            "strip_pattern": "[^0-9a-zA-Z&_.,=-]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "include_subpaths": true,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/wp-admin/admin-ajax.php",
+        "hosts": [
+          "app.example.test"
+        ],
+        "params": [
+          {
+            "name": "action",
+            "values": [
+              "mb_",
+              "skin_mb_"
+            ],
+            "match": "prefix"
+          },
+          {
+            "name": "board_name",
+            "values": [
+              "users",
+              "commerce_users"
+            ],
+            "strip_pattern": "[^0-9a-zA-Z&_.,=-]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "include_subpaths": true,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/wp-admin/admin-ajax.php",
+        "hosts": [
+          "app.example.test"
+        ],
+        "params": [
+          {
+            "name": "action",
+            "values": [
+              "mb_board",
+              "skin_mb_board",
+              "mb_comment",
+              "skin_mb_comment"
+            ]
+          },
+          {
+            "name": "board_action",
+            "values": [
+              "",
+              "list",
+              "load",
+              "content",
+              "view",
+              "read",
+              "search",
+              "file_download",
+              "board_hit"
+            ],
+            "default_value": "",
+            "negate": true,
+            "strip_pattern": "[^0-9a-zA-Z&_.,=-]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "include_subpaths": true,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      }
+    ]
+  }
+}

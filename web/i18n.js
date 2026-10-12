@@ -6,6 +6,13 @@ import koOperations from './locales/ko-operations.js';
 
 const STORAGE_KEY = 'hangang-locale';
 const urlDefenseKorean = {
+"Large multipart uploads require explicit multipart_spool on every scoped rule: a pre-created private 0700 directory owned by the gateway UID, maximum 64 GiB, maximum 2 hours, and bounded idle time. Two disk inspection slots share 128 GiB. Files are fully inspected before origin forwarding and then replayed unchanged; JSON and URL-encoded limits stay unchanged.":"대용량 multipart 업로드는 범위에 속한 모든 규칙에서 multipart_spool을 명시해야 합니다. 게이트웨이 UID 소유의 사전 생성된 비공개 0700 디렉터리, 최대 64 GiB·2시간 및 제한된 유휴 시간을 사용합니다. 디스크 검사 슬롯 2개가 128 GiB를 공유합니다. 원본으로 전달하기 전에 전체 검사한 뒤 원래 바이트로 재생하며, JSON·URL 인코딩 제한은 유지합니다.",
+
+"Request parameter blocks":"요청 파라미터 차단",
+"Request blocks must be a valid JSON array.":"요청 차단은 유효한 JSON 배열이어야 합니다.",
+"Request blocks require at most 128 rules, 1–16 unique canonical parameter names per rule, valid matchers and limits, and at most 32 KiB policy text.":"요청 차단은 최대 128개 규칙, 규칙당 1–16개의 고유한 정규 파라미터 이름, 유효한 비교 방식과 제한, 전체 정책 텍스트 최대 32 KiB를 요구합니다.",
+"JSON rules: conditions AND, rules OR. Empty values means presence. Only selected paths inspect query, forms, multipart and JSON; multipart is fully buffered before forwarding. Default body cap 64 KiB and timeout 2 seconds; explicit maximum 16 MiB and 5 seconds. Unknown encodings, aliases or duplicate protected parameters fail closed. No cookie or authentication exemption. Regex and parsing are validated by the server.":"JSON 규칙: 조건은 AND, 규칙은 OR로 결합하며 빈 값 목록은 존재 여부입니다. 선택한 경로만 쿼리·폼·multipart·JSON을 검사하며 multipart는 전달 전에 전체 버퍼링합니다. 기본 본문 제한 64 KiB·시간 제한 2초, 명시적 최대 16 MiB·5초입니다. 알 수 없는 인코딩, 별칭, 중복 보호 파라미터는 거부합니다. 쿠키나 인증에 따른 예외는 없으며 정규식과 파싱은 서버가 검증합니다.",
+
 "Lua policies":"Lua 정책",
 "HTTP route scripts":"HTTP 라우트 스크립트",
 "Find route policies and body scripts, then edit the exact phase in the existing route editor. Script contents stay out of this inventory.":"라우트 정책과 본문 스크립트를 찾고 기존 라우트 편집기에서 해당 단계를 편집합니다. 목록에는 스크립트 본문을 표시하지 않습니다.",

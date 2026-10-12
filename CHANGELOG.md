@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## 0.2.6 — 2026-10-06
+
+- Add configurable request parameter deny profiles for query, form, multipart
+  and bounded JSON inputs, including nested JSON fields and normalization.
+- Reject ambiguous protected parameter aliases and duplicates before origin
+  work; retain bounded inspection capacity through forwarded body ownership.
+- Add opt-in bounded anonymous disk inspection and byte-exact replay for
+  large multipart uploads, with private directories, shared quotas and strict framing.
+- Keep application-specific rules in separate configuration examples.
+
 ## 0.2.5 — 2026-10-06
 
 - Add a dedicated Lua policies menu to find route/request/response scripts and
