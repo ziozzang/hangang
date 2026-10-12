@@ -103,3 +103,5 @@ pub mod udp;
 pub mod github_release;
 
 pub mod cli_about;
+
+pub mod guard;

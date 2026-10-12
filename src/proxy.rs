@@ -129,6 +129,7 @@ fn security_denied(status: u16) -> Response<Body> {
 
 #[derive(Clone)]
 pub struct Proxy {
+    guard: Option<Arc<crate::guard::GuardClient>>,
     acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
     policy: Arc<PolicyPool>,
@@ -497,6 +498,7 @@ impl Proxy {
         );
         Self {
             active,
+            guard: None,
             acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
             metrics,
@@ -521,6 +523,11 @@ impl Proxy {
             _shutdown_guard: Arc::new(ShutdownGuard(shutdown.clone())),
             shutdown,
         }
+    }
+
+    pub fn with_guard(mut self, guard: Option<Arc<crate::guard::GuardClient>>) -> Self {
+        self.guard = guard;
+        self
     }
 
     pub fn with_health_path(mut self, path: Option<String>) -> Self {
@@ -1371,6 +1378,11 @@ impl Proxy {
         };
         if let Some(context) = traffic.as_mut() {
             context.client_ip = edge.client_ip;
+        }
+        if let Some(guard) = &self.guard
+            && let Some(status) = guard.rejection(edge.client_ip, request.uri().path()).await
+        {
+            return Ok(security_denied(status));
         }
         let peer = SocketAddr::new(edge.client_ip, peer.port());
         if let Some(capture) = request.extensions().get::<FailureCapture>().cloned() {
