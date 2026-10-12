@@ -29,6 +29,7 @@ COMMON_BINARIES = (
 )
 TARGETS = {
     "x86_64-unknown-linux-gnu": ("linux", "amd64", COMMON_BINARIES),
+    "x86_64-unknown-linux-musl": ("linux-musl", "amd64", COMMON_BINARIES),
     "aarch64-unknown-linux-gnu": ("linux", "arm64", COMMON_BINARIES),
     "x86_64-apple-darwin": ("darwin", "amd64", tuple(name for name in COMMON_BINARIES if name != "hangang-dsr")),
     "aarch64-apple-darwin": ("darwin", "arm64", tuple(name for name in COMMON_BINARIES if name != "hangang-dsr")),

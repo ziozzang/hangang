@@ -681,9 +681,14 @@ fn set_cloexec(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
 
 fn set_send_timeout(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<()> {
     let value = libc::timeval {
-        tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+        tv_sec: timeout.as_secs().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send timeout exceeds platform range",
+            )
+        })?,
         // subsec_micros is below one million, fitting Darwin's i32 and Linux's i64.
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        tv_usec: timeout.subsec_micros() as _,
     };
     // SAFETY: value is a valid timeval and its size is passed exactly.
     if unsafe {
@@ -703,4 +708,18 @@ fn set_send_timeout(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<()> {
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod portability_tests {
+    #[test]
+    fn send_timeout_preserves_small_budgets_and_rejects_platform_overflow() {
+        use std::os::fd::AsFd;
+        let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        super::set_send_timeout(socket.as_fd(), std::time::Duration::from_millis(50)).unwrap();
+        let error =
+            super::set_send_timeout(socket.as_fd(), std::time::Duration::from_secs(u64::MAX))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }
