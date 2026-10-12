@@ -34,3 +34,6 @@ Lua가 필요하지 않습니다. 로그아웃 확인/CSRF를 유지하고 앱 u
 코덱·쿠키 중복·잘못된/재사용 ID·키 거부·취소·재연결·포화·실제 세션 및 엔트리 parity·
 grant 회수·위임 감사·콘솔 수명주기를 검증합니다. Hopae 전체 처리량은 별도 환경 부하 검증이
 필요하며 Guard transport 수치를 그대로 가져오지 않습니다.
+
+Hopae 진입 라우트는 콘솔 / 라우트보다 높은 priority를 주거나 같은 priority에서 먼저 배치합니다.
+Hangang은 가장 긴 prefix 자동 정렬 대신 priority와 설정 순서를 사용합니다.

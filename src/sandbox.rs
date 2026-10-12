@@ -144,16 +144,20 @@ pub fn self_check() -> Result<()> {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
         "unexpected socket error"
     );
-    // SAFETY: requests a fresh private page; on unexpected success it is unmapped.
+    // Probe the kernel boundary directly: musl rewrites anonymous mmap EPERM
+    // to ENOMEM in its wrapper, which must not weaken this seccomp assertion.
+    // SAFETY: this Linux 64-bit syscall requests a fresh page; a mistakenly
+    // successful mapping is unmapped below. No user pointer is dereferenced.
     let memory = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            4096,
+        libc::syscall(
+            libc::SYS_mmap,
+            std::ptr::null_mut::<libc::c_void>(),
+            4096_usize,
             libc::PROT_READ | libc::PROT_EXEC,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
-            0,
-        )
+            0_usize,
+        ) as *mut libc::c_void
     };
     if memory != libc::MAP_FAILED {
         unsafe { libc::munmap(memory, 4096) };

@@ -94,3 +94,5 @@ key rejection, cancellation/reconnect/saturation, real session and entry-point
 parity, native grant revocation, signed delegated actor audit and console lifecycle.
 End-to-end identity throughput still requires deployment-specific load profiling;
 Guard transport benchmarks are not evidence for Hopae session throughput.
+
+The reserved Hopae entry route must outrank the broad console `/` route: use a higher `priority` or place it first at equal priority. Hangang uses priority then configuration order, not automatic longest-prefix ordering.
