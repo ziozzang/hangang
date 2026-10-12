@@ -31,6 +31,9 @@ struct Args {
     /// Opt-in hangang-guard origin (loopback HTTP or remote HTTPS).
     #[arg(long)]
     guard_url: Option<String>,
+    /// Opt-in persistent binary decision pool for loopback no-signal queries.
+    #[arg(long, requires = "guard_url")]
+    guard_decision_tcp: Option<SocketAddr>,
     /// Query every request by default; snapshot opts into local prefix enforcement.
     #[arg(long, value_enum, default_value = "query")]
     guard_mode: hangang::guard::TransportMode,
@@ -1033,6 +1036,7 @@ async fn run(args: Args) -> Result<()> {
         .map(|url| {
             hangang::guard::GuardClient::start(
                 hangang::guard::Config {
+                    decision_tcp: args.guard_decision_tcp,
                     transport_mode: args.guard_mode,
                     failure_mode: args.guard_failure_mode,
                     timeout_ms: args.guard_timeout_ms,

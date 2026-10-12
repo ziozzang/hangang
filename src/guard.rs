@@ -6,14 +6,18 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{Semaphore, mpsc},
+};
 use tokio_util::sync::CancellationToken;
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -182,6 +186,119 @@ impl Policy {
     }
 }
 
+const TCP_POOL_SIZE: usize = 64;
+const TCP_IDLE_RETIRE: Duration = Duration::from_secs(25);
+struct IdleSocket {
+    socket: TcpStream,
+    last_used: std::time::Instant,
+}
+struct TcpPool {
+    address: SocketAddr,
+    token: Vec<u8>,
+    timeout: Duration,
+    slots: Semaphore,
+    idle: Mutex<Vec<IdleSocket>>,
+    correlation: AtomicU32,
+}
+impl TcpPool {
+    async fn query(&self, ip: IpAddr) -> Result<Decision> {
+        tokio::time::timeout(self.timeout, async {
+            let _slot = self.slots.acquire().await?;
+            let cached = {
+                let mut idle = self
+                    .idle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    match idle.pop() {
+                        Some(entry) if entry.last_used.elapsed() < TCP_IDLE_RETIRE => {
+                            break Some(entry.socket);
+                        }
+                        Some(_) => continue,
+                        None => break None,
+                    }
+                }
+            };
+            let mut socket = if let Some(socket) = cached {
+                socket
+            } else {
+                let mut socket = TcpStream::connect(self.address).await?;
+                socket.set_nodelay(true)?;
+                socket.write_all(b"HGD1").await?;
+                socket
+                    .write_all(&(self.token.len() as u16).to_be_bytes())
+                    .await?;
+                socket.write_all(&self.token).await?;
+                let mut ack = [0; 4];
+                socket.read_exact(&mut ack).await?;
+                ensure!(&ack == b"HGA1", "invalid guard TCP acknowledgement");
+                socket
+            };
+            let correlation = self.correlation.fetch_add(1, Ordering::Relaxed);
+            let mut request = [0u8; 24];
+            request[0] = 1;
+            request[4..8].copy_from_slice(&correlation.to_be_bytes());
+            match ip.to_canonical() {
+                IpAddr::V4(ip) => {
+                    request[1] = 4;
+                    request[8..12].copy_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    request[1] = 6;
+                    request[8..24].copy_from_slice(&ip.octets());
+                }
+            }
+            socket.write_all(&request).await?;
+            let mut frame = [0u8; 24];
+            socket.read_exact(&mut frame).await?;
+            ensure!(
+                frame[0] == 1
+                    && frame[1] <= 1
+                    && frame[2] <= 1
+                    && frame[3] == 0
+                    && frame[20..24] == [0; 4]
+                    && frame[4..8] == correlation.to_be_bytes(),
+                "invalid guard TCP decision frame"
+            );
+            let revision = u64::from_be_bytes(frame[8..16].try_into().unwrap());
+            let ttl_ms = u32::from_be_bytes(frame[16..20].try_into().unwrap()) as u64;
+            ensure!(
+                ttl_ms <= 5000 && !(frame[1] == 1 && frame[2] == 0),
+                "invalid guard TCP decision values"
+            );
+            let decision = Decision {
+                version: 1,
+                revision,
+                action: if frame[1] == 0 {
+                    Action::Allow
+                } else {
+                    Action::Deny
+                },
+                mode: if frame[2] == 0 {
+                    Mode::Observe
+                } else {
+                    Mode::Enforce
+                },
+                reason: None,
+                ttl_ms,
+            };
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.slots.is_closed() {
+                idle.push(IdleSocket {
+                    socket,
+                    last_used: std::time::Instant::now(),
+                });
+            }
+            Ok(decision)
+        })
+        .await
+        .context("guard TCP decision timed out")?
+    }
+}
+
 /// Transport settings contain no credential; token is read from the named environment variable.
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
 pub enum TransportMode {
@@ -219,6 +336,7 @@ struct Cache {
     entries: HashMap<IpAddr, Cached>,
 }
 pub struct Config {
+    pub decision_tcp: Option<SocketAddr>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
     pub timeout_ms: u64,
@@ -239,6 +357,16 @@ impl Config {
             self.cache_ms == 0 || (1000..=5000).contains(&self.cache_ms),
             "guard cache must be zero or 1000..5000 ms"
         );
+        if let Some(address) = self.decision_tcp {
+            ensure!(
+                address.ip().is_loopback() && address.port() > 0,
+                "guard decision TCP requires a literal loopback address and nonzero port"
+            );
+            ensure!(
+                self.transport_mode == TransportMode::Query,
+                "guard decision TCP requires query mode"
+            );
+        }
         let url = reqwest::Url::parse(&self.url).context("invalid guard URL")?;
         ensure!(
             url.username().is_empty()
@@ -292,6 +420,7 @@ impl Config {
 }
 
 pub struct GuardClient {
+    tcp: Option<TcpPool>,
     transport_mode: TransportMode,
     failure_mode: FailureMode,
     cache_ms: u64,
@@ -324,6 +453,12 @@ impl GuardClient {
             !token.is_empty() && token.len() <= 4096 && token.bytes().all(|b| b.is_ascii_graphic()),
             "invalid guard collector token"
         );
+        if config.decision_tcp.is_some() {
+            ensure!(
+                (16..=4096).contains(&token.len()),
+                "guard TCP token must contain 16..4096 bytes"
+            );
+        }
         let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
         authorization.set_sensitive(true);
         let client = reqwest::Client::builder()
@@ -333,6 +468,14 @@ impl GuardClient {
             .build()?;
         let (queue, rx) = mpsc::channel(QUEUE);
         let guard = Arc::new(Self {
+            tcp: config.decision_tcp.map(|address| TcpPool {
+                address,
+                token: token.into_bytes(),
+                timeout: Duration::from_millis(config.timeout_ms),
+                slots: Semaphore::new(TCP_POOL_SIZE),
+                idle: Mutex::new(Vec::with_capacity(TCP_POOL_SIZE)),
+                correlation: AtomicU32::new(1),
+            }),
             transport_mode: config.transport_mode,
             failure_mode: config.failure_mode,
             cache_ms: config.cache_ms,
@@ -348,6 +491,22 @@ impl GuardClient {
             honeypot_paths: config.honeypot_paths.into_iter().collect(),
             scanner_paths: config.scanner_paths.into_iter().collect(),
         });
+        if guard.tcp.is_some() {
+            let weak = Arc::downgrade(&guard);
+            let stop = cancel.clone();
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                if let Some(guard) = weak.upgrade()
+                    && let Some(pool) = &guard.tcp
+                {
+                    pool.slots.close();
+                    pool.idle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                }
+            });
+        }
         if config.transport_mode == TransportMode::Snapshot {
             tokio::spawn(Self::worker(
                 guard.clone(),
@@ -391,6 +550,11 @@ impl GuardClient {
         }
         let query_started = std::time::Instant::now();
         let result: Result<Decision> = async {
+            if kind.is_none()
+                && let Some(pool) = &self.tcp
+            {
+                return pool.query(ip).await;
+            }
             let mut body = serde_json::json!({"source_id": self.source, "ip": ip});
             if let Some(kind) = kind {
                 body["kind"] = serde_json::to_value(kind)?;
@@ -630,6 +794,7 @@ mod tests {
     #[test]
     fn url_boundaries() {
         let mut c = Config {
+            decision_tcp: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
             timeout_ms: 100,
@@ -659,6 +824,7 @@ mod tests {
     fn saturated_export_is_nonblocking() {
         let (queue, mut rx) = mpsc::channel(1);
         let guard = GuardClient {
+            tcp: None,
             transport_mode: TransportMode::Snapshot,
             failure_mode: FailureMode::Deny,
             cache_ms: 0,
@@ -682,6 +848,7 @@ mod tests {
     }
     fn test_config(url: String) -> Config {
         Config {
+            decision_tcp: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
             timeout_ms: 1000,
@@ -719,7 +886,10 @@ mod tests {
                         let output = output.clone();
                         async move {
                             assert_eq!(req.uri().path(), "/v1/decision");
-                            assert_eq!(req.headers()["authorization"], "Bearer test-token");
+                            assert_eq!(
+                                req.headers()["authorization"],
+                                "Bearer test-token-0123456789"
+                            );
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             records
                                 .lock()
@@ -743,7 +913,7 @@ mod tests {
     async fn malformed_snapshot_preserves_last_good_generation() {
         let guard = GuardClient::start_with_token(
             test_config("http://127.0.0.1:1".into()),
-            "test-token".into(),
+            "test-token-0123456789".into(),
             CancellationToken::new(),
         )
         .unwrap();
@@ -775,7 +945,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let guard = GuardClient::start_with_token(
             test_config(url.clone()),
-            "test-token".into(),
+            "test-token-0123456789".into(),
             cancel.clone(),
         )
         .unwrap();
@@ -790,7 +960,8 @@ mod tests {
         let mut config = test_config(url);
         config.cache_ms = 5000;
         let guard =
-            GuardClient::start_with_token(config, "test-token".into(), cancel.clone()).unwrap();
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
         assert!(guard.admit(ip, "/ordinary").await);
         assert!(guard.admit(ip, "/ordinary").await);
         assert_eq!(seen.lock().unwrap().len(), 3);
@@ -812,12 +983,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut config = test_config(url.clone());
         let deny =
-            GuardClient::start_with_token(config, "test-token".into(), cancel.clone()).unwrap();
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
         assert!(!deny.admit("127.0.0.1".parse().unwrap(), "/").await);
         config = test_config(url);
         config.failure_mode = FailureMode::Allow;
         let allow =
-            GuardClient::start_with_token(config, "test-token".into(), cancel.clone()).unwrap();
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
         assert!(allow.admit("127.0.0.1".parse().unwrap(), "/").await);
         // Use an unbound port to exercise connection errors without relying on keepalive shutdown.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -825,7 +998,7 @@ mod tests {
         drop(listener);
         let deny = GuardClient::start_with_token(
             test_config(url.clone()),
-            "test-token".into(),
+            "test-token-0123456789".into(),
             cancel.clone(),
         )
         .unwrap();
@@ -833,7 +1006,8 @@ mod tests {
         let mut config = test_config(url);
         config.failure_mode = FailureMode::Allow;
         let allow =
-            GuardClient::start_with_token(config, "test-token".into(), cancel.clone()).unwrap();
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
         assert!(allow.admit("127.0.0.1".parse().unwrap(), "/").await);
         cancel.cancel();
         task.abort();
@@ -844,9 +1018,12 @@ mod tests {
         use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
         let (url, seen, decision, task) = decision_server().await;
         let cancel = CancellationToken::new();
-        let guard =
-            GuardClient::start_with_token(test_config(url), "test-token".into(), cancel.clone())
-                .unwrap();
+        let guard = GuardClient::start_with_token(
+            test_config(url),
+            "test-token-0123456789".into(),
+            cancel.clone(),
+        )
+        .unwrap();
         let config: crate::config::Config = serde_json::from_value(serde_json::json!({"revision":1,"http":[{"id":"app","hosts":["app.example"],"path_prefix":"/","backends":["http://127.0.0.1:1"],"access_mode":"protected","basic_auth":{"realm":"app","credentials":[crate::basic_auth::hash_credential("alice", "password").unwrap()]}}]})).unwrap();
         let active = Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::config::Snapshot::new(config).unwrap(),
@@ -906,5 +1083,228 @@ mod tests {
         front_task.abort();
         task.abort();
         policy.shutdown().await;
+    }
+    struct TestTcp {
+        address: SocketAddr,
+        connections: Arc<AtomicU64>,
+        requests: Arc<Mutex<Vec<[u8; 24]>>>,
+        response: Arc<Mutex<[u8; 24]>>,
+        delay_ms: Arc<AtomicU64>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    async fn tcp_server() -> TestTcp {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut frame = [0u8; 24];
+        frame[0] = 1;
+        frame[2] = 1;
+        frame[8..16].copy_from_slice(&1u64.to_be_bytes());
+        frame[16..20].copy_from_slice(&1000u32.to_be_bytes());
+        let response = Arc::new(Mutex::new(frame));
+        let delay_ms = Arc::new(AtomicU64::new(0));
+        let count = connections.clone();
+        let records = requests.clone();
+        let output = response.clone();
+        let delay = delay_ms.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                let records = records.clone();
+                let output = output.clone();
+                let delay = delay.clone();
+                tokio::spawn(async move {
+                    let mut header = [0u8; 6];
+                    socket.set_nodelay(true).unwrap();
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    assert_eq!(&header[..4], b"HGD1");
+                    let mut token =
+                        vec![0; u16::from_be_bytes(header[4..6].try_into().unwrap()) as usize];
+                    socket.read_exact(&mut token).await.unwrap();
+                    assert_eq!(token, b"test-token-0123456789");
+                    socket.write_all(b"HGA1").await.unwrap();
+                    loop {
+                        let mut request = [0u8; 24];
+                        if socket.read_exact(&mut request).await.is_err() {
+                            break;
+                        }
+                        assert_eq!(request[0], 1);
+                        assert_eq!(request[2..4], [0; 2]);
+                        records.lock().unwrap().push(request);
+                        let mut response = *output.lock().unwrap();
+                        response[4..8].copy_from_slice(&request[4..8]);
+                        tokio::time::sleep(Duration::from_millis(delay.load(Ordering::Relaxed)))
+                            .await;
+                        if socket.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        TestTcp {
+            address,
+            connections,
+            requests,
+            response,
+            delay_ms,
+            task,
+        }
+    }
+    #[tokio::test]
+    async fn tcp_persistent_pool_reuses_connections_and_keeps_evidence_on_http() {
+        let tcp = tcp_server().await;
+        let (url, http_seen, _, http_task) = decision_server().await;
+        let mut config = test_config(url);
+        config.decision_tcp = Some(tcp.address);
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let ip = "::ffff:192.0.2.8".parse().unwrap();
+        assert!(guard.admit(ip, "/ordinary").await);
+        assert!(guard.admit(ip, "/ordinary").await);
+        assert_eq!(tcp.connections.load(Ordering::Relaxed), 1);
+        assert_eq!(tcp.requests.lock().unwrap().len(), 2);
+        let request = tcp.requests.lock().unwrap()[0];
+        assert_eq!(request[1], 4);
+        assert_eq!(request[8..12], [192, 0, 2, 8]);
+        assert_eq!(request[12..24], [0; 12]);
+        assert!(guard.admit(ip, "/trap").await);
+        assert_eq!(http_seen.lock().unwrap().len(), 1);
+        assert_eq!(tcp.requests.lock().unwrap().len(), 2);
+        tcp.response.lock().unwrap()[1] = 1;
+        assert_eq!(guard.rejection(ip, "/ordinary").await, Some(403));
+        tcp.response.lock().unwrap()[0] = 2;
+        assert_eq!(guard.rejection(ip, "/ordinary").await, Some(503));
+        assert!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().is_empty());
+        tcp.response.lock().unwrap()[0] = 1;
+        assert_eq!(guard.rejection(ip, "/ordinary").await, Some(403));
+        assert_eq!(tcp.connections.load(Ordering::Relaxed), 2);
+        tcp.task.abort();
+        http_task.abort();
+    }
+    #[tokio::test]
+    async fn tcp_pool_is_bounded_and_timeout_discards_socket_without_http_fallback() {
+        let tcp = tcp_server().await;
+        let (url, http_seen, _, http_task) = decision_server().await;
+        let mut config = test_config(url.clone());
+        config.decision_tcp = Some(tcp.address);
+        config.timeout_ms = 25;
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        tcp.delay_ms.store(100, Ordering::Relaxed);
+        assert_eq!(
+            guard.rejection("2001:db8::42".parse().unwrap(), "/").await,
+            Some(503)
+        );
+        assert!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().is_empty());
+        assert!(http_seen.lock().unwrap().is_empty());
+        assert_eq!(
+            guard.tcp.as_ref().unwrap().slots.available_permits(),
+            TCP_POOL_SIZE
+        );
+        let mut config = test_config(url);
+        config.decision_tcp = Some(tcp.address);
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        tcp.delay_ms.store(2, Ordering::Relaxed);
+        let responses = futures_util::future::join_all(
+            (0..100).map(|_| guard.rejection("127.0.0.1".parse().unwrap(), "/")),
+        )
+        .await;
+        assert!(responses.iter().any(Option::is_none));
+        assert!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().len() <= TCP_POOL_SIZE);
+        assert!(tcp.connections.load(Ordering::Relaxed) <= TCP_POOL_SIZE as u64 + 1);
+        tcp.task.abort();
+        http_task.abort();
+    }
+    #[tokio::test]
+    async fn tcp_optional_cache_uses_decision_ttl_and_signal_bypasses_cache() {
+        let tcp = tcp_server().await;
+        let (url, http_seen, _, http_task) = decision_server().await;
+        let mut config = test_config(url);
+        config.decision_tcp = Some(tcp.address);
+        config.cache_ms = 1000;
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        assert!(guard.admit(ip, "/").await);
+        tcp.response.lock().unwrap()[1] = 1;
+        assert!(guard.admit(ip, "/").await);
+        assert_eq!(tcp.requests.lock().unwrap().len(), 1);
+        assert!(guard.admit(ip, "/trap").await);
+        assert_eq!(http_seen.lock().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(1010)).await;
+        assert_eq!(guard.rejection(ip, "/").await, Some(403));
+        tcp.task.abort();
+        http_task.abort();
+    }
+    #[tokio::test]
+    async fn tcp_shutdown_closes_idle_pool_and_wakes_waiters() {
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address);
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        assert!(guard.admit("127.0.0.1".parse().unwrap(), "/").await);
+        assert_eq!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().len(), 1);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !guard.tcp.as_ref().unwrap().slots.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().is_empty());
+        assert_eq!(
+            guard.rejection("127.0.0.1".parse().unwrap(), "/").await,
+            Some(503)
+        );
+        tcp.task.abort();
+    }
+    #[tokio::test]
+    async fn tcp_idle_socket_is_retired_before_server_idle_timeout() {
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address);
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        assert!(guard.admit(ip, "/").await);
+        assert_eq!(tcp.connections.load(Ordering::Relaxed), 1);
+        {
+            let mut idle = guard.tcp.as_ref().unwrap().idle.lock().unwrap();
+            assert_eq!(idle.len(), 1);
+            idle[0].last_used = std::time::Instant::now() - Duration::from_secs(26);
+        }
+        assert!(guard.admit(ip, "/").await);
+        assert_eq!(tcp.connections.load(Ordering::Relaxed), 2);
+        assert_eq!(tcp.requests.lock().unwrap().len(), 2);
+        assert_eq!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().len(), 1);
+        cancel.cancel();
+        tcp.task.abort();
     }
 }

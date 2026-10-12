@@ -60,3 +60,35 @@ queue overflow and failed deliveries increment counters reported through tracing
 Snapshot mode never performs transport in a request worker. Query mode awaits
 one bounded remote request and therefore requires guard availability and capacity
 appropriate for proxy traffic. Disabling `--guard-url` creates no guard tasks.
+
+## Persistent binary decisions for local high-volume traffic
+
+`--guard-decision-tcp 127.0.0.1:9081` opts ordinary query requests into the
+hangang-guard binary decision listener (`--decision-listen` on the service).
+It requires `--guard-url` for explicit evidence submissions, accepts only literal
+loopback addresses, and requires query mode. The collector token must contain
+16–4096 bytes. Evidence-bearing honeypot/scanner requests continue using the
+HTTP decision endpoint so the service receives and evaluates the signal.
+
+The native client maintains up to 64 authenticated persistent sockets, instead
+of serializing all proxy requests through one connection. Each decision uses a
+24-byte request and response. A correlation ID, reserved fields, protocol
+version, action, mode and TTL are checked before returning the socket to the
+pool. IPv4-mapped IPv6 addresses use the IPv4 wire form. Pool admission,
+connection, handshake, write and read share `--guard-timeout-ms`. A timed-out or
+malformed response discards the socket; failures follow the configured failure
+policy without making an additional HTTP request. A socket closed by the server
+also fails that request and is discarded, so a later request can reconnect.
+Sockets idle for 25 seconds are retired before reuse, ahead of the service's
+30-second idle deadline. Idle sockets are also closed on shutdown cancellation.
+
+Caching remains disabled by default and the optional 1–5 second IP cache has the
+same semantics on both decision transports. Persistent transport removes HTTP
+and JSON overhead for ordinary requests; throughput depends on server capacity,
+concurrency and workload and must be measured for the deployed topology.
+
+GeoIP-dependent and dynamic JSON/Lua rules are evaluated by the service in query
+mode, on both HTTP and binary decision transports. The service rejects snapshot
+retrieval while dynamic rules are active because a prefix-only snapshot cannot
+represent those decisions. Use the default query mode for these rules; an older
+snapshot retains its normal expiration behavior and fails open after expiry.
