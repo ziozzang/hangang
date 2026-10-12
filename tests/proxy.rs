@@ -6198,7 +6198,6 @@ async fn conditional_response_transform_preserves_unmatched_streams_and_fences_b
 }
 
 #[tokio::test]
-<<<<<<< HEAD
 async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
     let seen_context = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6262,179 +6261,10 @@ async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
                     .header("x-hopae-gateway-key", "evil")
                     .header("x-hopae-contract", "999")
                     .body(Full::new(Bytes::new()))
-=======
-async fn request_blocks_inspect_all_parameter_sources_before_origin_and_preserve_allowed_uploads() {
-    let (origin, seen, origin_task) = upstream("accepted").await;
-    let profile = |params: serde_json::Value| serde_json::json!({"path":"/control","hosts":["app.example"],"params":params,"max_body_bytes":1048576,"timeout_ms":200});
-    let settings=hangang::config::Settings{request_blocks:Some(serde_json::from_value(serde_json::json!([
-        profile(serde_json::json!([{"name":"action","values":["write"]}])),
-        profile(serde_json::json!([{"name":"rest_route","match":"path_prefix","values":["/wp/v2/users"]}])),
-        profile(serde_json::json!([{"name":"compound","json_field":"api","values":["blocked.api"]}]))
-    ])).unwrap()),..Default::default()};
-    let ((proxy, policy), active) =
-        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
-    let (front, front_task, _) = frontend(proxy).await;
-    let send = |method: &str,
-                path: &str,
-                host: &str,
-                content_type: Option<&str>,
-                body: Bytes,
-                override_method: bool| {
-        let mut request = Request::builder()
-            .method(method)
-            .uri(format!("http://{front}{path}"))
-            .header("host", host);
-        if let Some(content_type) = content_type {
-            request = request.header("content-type", content_type)
-        }
-        if override_method {
-            request = request.header("x-http-method-override", "POST")
-        }
-        let request = request.body(Full::new(body)).unwrap();
-        async move {
-            let reply = client().request(request).await.unwrap();
-            let status = reply.status();
-            reply.into_body().collect().await.unwrap();
-            status
-        }
-    };
-    let multipart = |action: &str| {
-        Bytes::from(format!(
-            "--owned\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n{}\r\n--owned\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\n{action}\r\n--owned--\r\n",
-            "binary-file-payload"
-        ))
-    };
-    for (method,path,content_type,body,status) in [
-        ("GET","/control?action=write",None,Bytes::new(),403),
-        ("HEAD","/control?action=write",None,Bytes::new(),403),
-        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),403),
-        ("GET","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\"}"),403),
-        ("POST","/control",Some("multipart/form-data; boundary=owned"),multipart("write"),403),
-        ("POST","/control?action=read",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),400),
-        ("GET","/control?rest%5Broute=/wp/v2/users",None,Bytes::new(),400),
-        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"rest%5Broute=/wp/v2/users"),400),
-        ("POST","/control",Some("multipart/form-data; boundary=owned"),Bytes::from_static(b"--owned\r\nContent-Disposition: form-data; name=\"rest[route\"\r\n\r\n/wp/v2/users\r\n--owned--\r\n"),400),
-        ("GET","/control?%20action=write",None,Bytes::new(),400),
-        ("GET","/control?action[tail]=write",None,Bytes::new(),400),
-        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\",\"action\":\"read\"}"),400),
-        ("GET","/control?rest_route=wp%2Fv2%2Fusers%2F",None,Bytes::new(),403),
-        ("GET","/control?rest_route=%252fwp%2Fv2%2Fusers",None,Bytes::new(),400),
-        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"allowed.api\",\"params\":{\"compound\":\"[{\\\"api\\\":\\\"blocked.api\\\"}]\"}}]}"),403),
-        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"blocked.api\\u0000suffix\"}]}"),400),
-        ("POST","/control",Some("application/octet-stream"),Bytes::from_static(b"opaque"),415),
-        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from(vec![b'x';1048577]),413),
-        ("GET","/control?rest_route=/wp/v2/users-other",None,Bytes::new(),200),
-    ] {assert_eq!(send(method,path,"app.example",content_type,body,false).await,status,"{path}/{content_type:?}");}
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        1,
-        "blocked requests reached origin"
-    );
-    assert_eq!(
-        send(
-            "POST",
-            "/control",
-            "app.example",
-            Some("application/x-www-form-urlencoded"),
-            Bytes::from_static(
-                b"action=read&billing[address]=a&billing[address]=b&comment=first%0Asecond"
-            ),
-            false
-        )
-        .await,
-        200
-    );
-    let allowed = multipart("read");
-    assert_eq!(
-        send(
-            "POST",
-            "/control",
-            "app.example",
-            Some("multipart/form-data; boundary=owned"),
-            allowed.clone(),
-            false
-        )
-        .await,
-        200
-    );
-    assert_eq!(
-        seen.lock().unwrap().last().unwrap().body,
-        allowed,
-        "allowed upload bytes changed"
-    );
-    assert_eq!(
-        send("GET", "/control", "app.example", None, Bytes::new(), true).await,
-        400
-    );
-    assert_eq!(
-        send(
-            "POST",
-            "/control",
-            "other.example",
-            Some("application/octet-stream"),
-            Bytes::from_static(b"action=write"),
-            false
-        )
-        .await,
-        200
-    );
-    assert_eq!(
-        send(
-            "POST",
-            "/unscoped",
-            "app.example",
-            Some("application/octet-stream"),
-            Bytes::from(vec![0xa5; 1048577]),
-            false
-        )
-        .await,
-        200
-    );
-    assert_eq!(
-        send(
-            "GET",
-            "/contr%6fl?action=write",
-            "app.example",
-            None,
-            Bytes::new(),
-            false
-        )
-        .await,
-        403
-    );
-    let reply = client()
-        .request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("http://{front}/control"))
-                .header("host", "app.example")
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("content-encoding", "gzip")
-                .body(Full::new(Bytes::from_static(b"action=read")))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(reply.status(), 415);
-    reply.into_body().collect().await.unwrap();
-    for nominated in ["content-type", "content-encoding"] {
-        let reply = client()
-            .request(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("http://{front}/control"))
-                    .header("host", "app.example")
-                    .header("content-type", "application/json")
-                    .header("connection", nominated)
-                    .body(Full::new(Bytes::from_static(
-                        b"{\"note\":\"ok&action=write&ignored=value\"}",
-                    )))
->>>>>>> review/release-request-blocks
                     .unwrap(),
             )
             .await
             .unwrap();
-<<<<<<< HEAD
         assert_eq!(response.status(), 200);
         let context = seen_context.lock().unwrap().clone();
         let all = |name: &str| -> Vec<String> {
@@ -6876,7 +6706,280 @@ async fn route_level_strip_request_cookies_works_without_auth() {
             Request::builder()
                 .uri(format!("http://{front}/public"))
                 .header("cookie", "a=1; __Host-hopae=SECRET; __Host-hopae_bind=B")
-=======
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(seen.lock().unwrap()[0].headers["cookie"], "a=1");
+    policy.shutdown().await;
+    front_task.abort();
+    backend_task.abort();
+}
+
+#[tokio::test]
+async fn route_and_auth_strip_lists_are_unioned() {
+    let (auth, upstream) = strip_cookie_roundtrip_with(
+        &["a=1; __Host-hopae=S; __Host-hopae_bind=B; extra=E"],
+        |route| route.strip_request_cookies = vec!["extra".into()],
+    )
+    .await;
+    assert_eq!(auth.len(), 1);
+    assert_eq!(upstream, vec!["a=1".to_owned()]);
+}
+
+#[tokio::test]
+async fn websocket_upgrade_strips_request_cookies() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let recorder = seen.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let recorder = recorder.clone();
+            async move {
+                for value in request.headers().get_all("cookie") {
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(value.to_str().unwrap().to_owned());
+                }
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(101)
+                        .header("connection", "upgrade")
+                        .header("upgrade", "websocket")
+                        .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades()
+            .await;
+    });
+    let mut socket = route(vec![format!("http://{address}")]);
+    socket.auth = None;
+    socket.strip_request_cookies = vec!["__Host-hopae".into()];
+    let (proxy, policy) = proxy(vec![socket]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let mut stream = TcpStream::connect(front).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {front}\r\nCookie: a=1; __Host-hopae=SECRET\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" // gitleaks:allow -- protocol/test fixture
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        headers.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 101"));
+    assert_eq!(*seen.lock().unwrap(), vec!["a=1".to_owned()]);
+    drop(stream);
+    policy.shutdown().await;
+    front_task.abort();
+    upstream_task.abort();
+}
+
+#[test]
+fn cookie_cannot_be_an_authentication_identity_output() {
+    let mut with_auth = route(vec!["http://127.0.0.1:9".into()]);
+    with_auth.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:9/check",
+            "response_headers": ["cookie"],
+        }))
+        .unwrap(),
+    );
+    let config = Config {
+        revision: 1,
+        http: vec![with_auth],
+        ..Config::default()
+    };
+    assert!(config.validate().is_err());
+}
+
+#[tokio::test]
+async fn request_blocks_inspect_all_parameter_sources_before_origin_and_preserve_allowed_uploads() {
+    let (origin, seen, origin_task) = upstream("accepted").await;
+    let profile = |params: serde_json::Value| serde_json::json!({"path":"/control","hosts":["app.example"],"params":params,"max_body_bytes":1048576,"timeout_ms":200});
+    let settings=hangang::config::Settings{request_blocks:Some(serde_json::from_value(serde_json::json!([
+        profile(serde_json::json!([{"name":"action","values":["write"]}])),
+        profile(serde_json::json!([{"name":"rest_route","match":"path_prefix","values":["/wp/v2/users"]}])),
+        profile(serde_json::json!([{"name":"compound","json_field":"api","values":["blocked.api"]}]))
+    ])).unwrap()),..Default::default()};
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy).await;
+    let send = |method: &str,
+                path: &str,
+                host: &str,
+                content_type: Option<&str>,
+                body: Bytes,
+                override_method: bool| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("http://{front}{path}"))
+            .header("host", host);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type)
+        }
+        if override_method {
+            request = request.header("x-http-method-override", "POST")
+        }
+        let request = request.body(Full::new(body)).unwrap();
+        async move {
+            let reply = client().request(request).await.unwrap();
+            let status = reply.status();
+            reply.into_body().collect().await.unwrap();
+            status
+        }
+    };
+    let multipart = |action: &str| {
+        Bytes::from(format!(
+            "--owned\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n{}\r\n--owned\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\n{action}\r\n--owned--\r\n",
+            "binary-file-payload"
+        ))
+    };
+    for (method,path,content_type,body,status) in [
+        ("GET","/control?action=write",None,Bytes::new(),403),
+        ("HEAD","/control?action=write",None,Bytes::new(),403),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),403),
+        ("GET","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\"}"),403),
+        ("POST","/control",Some("multipart/form-data; boundary=owned"),multipart("write"),403),
+        ("POST","/control?action=read",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),400),
+        ("GET","/control?rest%5Broute=/wp/v2/users",None,Bytes::new(),400),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"rest%5Broute=/wp/v2/users"),400),
+        ("POST","/control",Some("multipart/form-data; boundary=owned"),Bytes::from_static(b"--owned\r\nContent-Disposition: form-data; name=\"rest[route\"\r\n\r\n/wp/v2/users\r\n--owned--\r\n"),400),
+        ("GET","/control?%20action=write",None,Bytes::new(),400),
+        ("GET","/control?action[tail]=write",None,Bytes::new(),400),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\",\"action\":\"read\"}"),400),
+        ("GET","/control?rest_route=wp%2Fv2%2Fusers%2F",None,Bytes::new(),403),
+        ("GET","/control?rest_route=%252fwp%2Fv2%2Fusers",None,Bytes::new(),400),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"allowed.api\",\"params\":{\"compound\":\"[{\\\"api\\\":\\\"blocked.api\\\"}]\"}}]}"),403),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"blocked.api\\u0000suffix\"}]}"),400),
+        ("POST","/control",Some("application/octet-stream"),Bytes::from_static(b"opaque"),415),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from(vec![b'x';1048577]),413),
+        ("GET","/control?rest_route=/wp/v2/users-other",None,Bytes::new(),200),
+    ] {assert_eq!(send(method,path,"app.example",content_type,body,false).await,status,"{path}/{content_type:?}");}
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "blocked requests reached origin"
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "app.example",
+            Some("application/x-www-form-urlencoded"),
+            Bytes::from_static(
+                b"action=read&billing[address]=a&billing[address]=b&comment=first%0Asecond"
+            ),
+            false
+        )
+        .await,
+        200
+    );
+    let allowed = multipart("read");
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "app.example",
+            Some("multipart/form-data; boundary=owned"),
+            allowed.clone(),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().body,
+        allowed,
+        "allowed upload bytes changed"
+    );
+    assert_eq!(
+        send("GET", "/control", "app.example", None, Bytes::new(), true).await,
+        400
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "other.example",
+            Some("application/octet-stream"),
+            Bytes::from_static(b"action=write"),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/unscoped",
+            "app.example",
+            Some("application/octet-stream"),
+            Bytes::from(vec![0xa5; 1048577]),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send(
+            "GET",
+            "/contr%6fl?action=write",
+            "app.example",
+            None,
+            Bytes::new(),
+            false
+        )
+        .await,
+        403
+    );
+    let reply = client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-encoding", "gzip")
+                .body(Full::new(Bytes::from_static(b"action=read")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 415);
+    reply.into_body().collect().await.unwrap();
+    for nominated in ["content-type", "content-encoding"] {
+        let reply = client()
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{front}/control"))
+                    .header("host", "app.example")
+                    .header("content-type", "application/json")
+                    .header("connection", nominated)
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"note\":\"ok&action=write&ignored=value\"}",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             reply.status(),
             400,
@@ -7123,14 +7226,20 @@ async fn multipart_spooling_preserves_large_uploads_and_denies_late_controls_bef
     // than silently restore the original cache (which previously returned 200).
     let mut config = active.load().config.clone();
     config.revision += 1;
-    config.http[0].request_transform = Some(serde_json::from_value(serde_json::json!({
-        "mode":"lines", "operations":[{"op":"replace","from":"read","to":"write"}],
-        "max_buffer_bytes":65536, "max_output_bytes":65536
-    })).unwrap());
+    config.http[0].request_transform = Some(
+        serde_json::from_value(serde_json::json!({
+            "mode":"lines", "operations":[{"op":"replace","from":"read","to":"write"}],
+            "max_buffer_bytes":65536, "max_output_bytes":65536
+        }))
+        .unwrap(),
+    );
     active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
     let before = seen.lock().unwrap().len();
-    assert_eq!(send(payload("read")).await, 400,
-        "streaming transform was bypassed using the retained original spool");
+    assert_eq!(
+        send(payload("read")).await,
+        400,
+        "streaming transform was bypassed using the retained original spool"
+    );
     assert_eq!(seen.lock().unwrap().len(), before);
     let mut config = active.load().config.clone();
     config.revision += 1;
@@ -7218,110 +7327,12 @@ async fn multipart_spooling_preserves_large_uploads_and_denies_late_controls_bef
             Request::builder()
                 .uri(format!("http://{front}/control?action=read"))
                 .header("host", "app.example")
->>>>>>> review/release-request-blocks
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-<<<<<<< HEAD
-    assert_eq!(seen.lock().unwrap()[0].headers["cookie"], "a=1");
-    policy.shutdown().await;
-    front_task.abort();
-    backend_task.abort();
-}
-
-#[tokio::test]
-async fn route_and_auth_strip_lists_are_unioned() {
-    let (auth, upstream) = strip_cookie_roundtrip_with(
-        &["a=1; __Host-hopae=S; __Host-hopae_bind=B; extra=E"],
-        |route| route.strip_request_cookies = vec!["extra".into()],
-    )
-    .await;
-    assert_eq!(auth.len(), 1);
-    assert_eq!(upstream, vec!["a=1".to_owned()]);
-}
-
-#[tokio::test]
-async fn websocket_upgrade_strips_request_cookies() {
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let recorder = seen.clone();
-    let upstream_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let service = service_fn(move |request: Request<Incoming>| {
-            let recorder = recorder.clone();
-            async move {
-                for value in request.headers().get_all("cookie") {
-                    recorder
-                        .lock()
-                        .unwrap()
-                        .push(value.to_str().unwrap().to_owned());
-                }
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(101)
-                        .header("connection", "upgrade")
-                        .header("upgrade", "websocket")
-                        .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
-            }
-        });
-        let _ = http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
-            .with_upgrades()
-            .await;
-    });
-    let mut socket = route(vec![format!("http://{address}")]);
-    socket.auth = None;
-    socket.strip_request_cookies = vec!["__Host-hopae".into()];
-    let (proxy, policy) = proxy(vec![socket]);
-    let (front, front_task, _) = frontend(proxy).await;
-    let mut stream = TcpStream::connect(front).await.unwrap();
-    stream
-        .write_all(
-            format!(
-                "GET /socket HTTP/1.1\r\nHost: {front}\r\nCookie: a=1; __Host-hopae=SECRET\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n" // gitleaks:allow -- protocol/test fixture
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut headers = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !headers.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).await.unwrap();
-        headers.push(byte[0]);
-    }
-    assert!(String::from_utf8_lossy(&headers).starts_with("HTTP/1.1 101"));
-    assert_eq!(*seen.lock().unwrap(), vec!["a=1".to_owned()]);
-    drop(stream);
-    policy.shutdown().await;
-    front_task.abort();
-    upstream_task.abort();
-}
-
-#[test]
-fn cookie_cannot_be_an_authentication_identity_output() {
-    let mut with_auth = route(vec!["http://127.0.0.1:9".into()]);
-    with_auth.auth = Some(
-        serde_json::from_value(serde_json::json!({
-            "url": "http://127.0.0.1:9/check",
-            "response_headers": ["cookie"],
-        }))
-        .unwrap(),
-    );
-    let config = Config {
-        revision: 1,
-        http: vec![with_auth],
-        ..Config::default()
-    };
-    assert!(config.validate().is_err());
-=======
     response.into_body().collect().await.unwrap();
     drop(stalled);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -7330,5 +7341,4 @@ fn cookie_cannot_be_an_authentication_identity_output() {
     front_task.abort();
     origin_task.abort();
     policy.shutdown().await;
->>>>>>> review/release-request-blocks
 }
