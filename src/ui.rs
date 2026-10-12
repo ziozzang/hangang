@@ -71,6 +71,10 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "text/css; charset=utf-8",
                 include_bytes!("../web/lua-editor.css"),
             )),
+            "/ui/pumgye.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/pumgye.js"),
+            )),
             "/ui/app.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/app.js"),

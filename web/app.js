@@ -1,3 +1,4 @@
+import { loadPumgye, resetPumgye } from "./pumgye.js";
 import { discoverPlugins, pluginView, loadPlugin, pausePlugins, resetPlugins } from './plugins.js';
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
 import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
@@ -453,6 +454,7 @@ function scrubRenderedData() {
 
 function logout(reason = '') {
   resetPlugins();
+  resetPumgye();
   stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
@@ -590,7 +592,7 @@ async function login(event) {
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
   if (pluginView(name)) return name;
-  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
+  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
 }
 
 async function switchView() {
@@ -633,6 +635,7 @@ async function loadView(name, quiet = false) {
     if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
+    if (name === 'pumgye' && isAdmin()) await loadPumgye({ api });
     if (name === 'config') await loadConfig(false);
     if (name === 'config' && isAdmin()) await loadGeoIpStatus();
     if (name === 'config' || name === 'tcp') {

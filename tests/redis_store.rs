@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config(revision: u64, id: &str) -> Config {
     Config {
+        pumgye: None,
         geoip_database: None,
         settings: Default::default(),
         cache_generation_floor: 0,

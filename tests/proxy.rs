@@ -1530,6 +1530,7 @@ fn proxy_with_settings(
     settings: hangang::config::Settings,
 ) -> ((Proxy, Arc<PolicyPool>), Arc<ArcSwap<Snapshot>>) {
     let config = Config {
+        pumgye: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -2884,6 +2885,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
 
     // A new document without settings restores the process defaults at once.
     let plain = Config {
+        pumgye: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -3022,6 +3024,7 @@ async fn one_streaming_route_cannot_consume_another_routes_capacity() {
     second.max_requests = Some(1);
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config {
+            pumgye: None,
             geoip_database: None,
             certificates: vec![],
             cache: None,
@@ -6307,6 +6310,7 @@ async fn route_without_static_header_variable_fails_closed_and_other_routes_keep
     open.id = "open".into();
     open.path_prefix = Some("/open".into());
     let config = |routes: Vec<HttpRoute>, revision| Config {
+        pumgye: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,

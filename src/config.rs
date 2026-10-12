@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pumgye: Option<pumgye_core::Policy>,
     #[serde(default)]
     pub revision: u64,
     /// Process-wide runtime settings carried in the shared document so a
@@ -863,6 +865,22 @@ impl Config {
         use std::collections::HashSet;
         self.settings.validate()?;
         crate::acme_http01::validate(self)?;
+        if let Some(policy) = &self.pumgye {
+            policy.compile()?;
+        }
+        for route in &self.http {
+            if let Some(gate) = route
+                .resource_policy
+                .as_ref()
+                .and_then(|policy| policy.pumgye.as_ref())
+            {
+                gate.validate(
+                    self.pumgye
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("Pumgye gate requires policy"))?,
+                )?;
+            }
+        }
         ensure!(
             self.settings
                 .path_allowlists
@@ -1871,10 +1889,10 @@ impl Config {
             };
             ensure!(
                 self.http.iter().any(|new| {
-                    new.resource_policy
-                        .as_ref()
-                        .is_some_and(|next| next.resource_id == policy.resource_id)
-                        && resource_hosts_preserved(old, new)
+                    new.resource_policy.as_ref().is_some_and(|next| {
+                        next.resource_id == policy.resource_id
+                            && (policy.pumgye.is_none() || next.pumgye.is_some())
+                    }) && resource_hosts_preserved(old, new)
                         && new.path_prefix == old.path_prefix
                         && new.path_match == old.path_match
                         && new.path_case_insensitive() == old.path_case_insensitive()
@@ -2097,6 +2115,7 @@ struct PublicationRetirements {
 }
 
 pub struct Snapshot {
+    pub pumgye: Option<std::sync::Arc<pumgye_core::CompiledPolicy>>,
     retirements: std::sync::Mutex<Option<PublicationRetirements>>,
     pub retired_members: std::sync::Arc<crate::retired_members::Registry>,
     pub settings: std::sync::Arc<PreparedSettings>,
@@ -2886,7 +2905,13 @@ impl Snapshot {
             };
             public_http_tls.insert(listener.id.clone(), slot);
         }
+        let pumgye = config
+            .pumgye
+            .as_ref()
+            .map(|policy| policy.compile().map(std::sync::Arc::new))
+            .transpose()?;
         let mut next = Self {
+            pumgye,
             retirements: Default::default(),
             retired_members: previous
                 .map(|old| old.retired_members.clone())
