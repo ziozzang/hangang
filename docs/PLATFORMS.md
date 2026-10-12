@@ -54,3 +54,7 @@ python3 tools/prepare_release.py --unsigned \
 Unsigned staging writes the gateway binary, archive, and `SHA256SUMS`; it does not write a signed manifest or public key and cannot be used as a trusted automatic update. The output directory must be empty. On macOS, select the matching `apple-darwin` target; the archive includes the gateway and five portable companion binaries, excluding DSR.
 
 For an authorized release, use `--signing-seed-file` instead of `--unsigned` on a trusted native build host. Keep the private signing seed outside the repository and CI artifacts. The tool checks it against the repository's pinned public key. See [signed updates](UPDATES.md) for asset names, trust provisioning, and Linux installation behavior.
+
+Static Linux x86-64 musl is additionally qualified for the minimal Docker runtime.
+Its artifact uses the distinct `x86_64-unknown-linux-musl` target and `linux-musl`
+archive name; GNU and musl update assets must never be interchanged.

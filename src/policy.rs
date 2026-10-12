@@ -1048,8 +1048,13 @@ fn apply_worker_limits() -> Result<()> {
     set_limit(libc::RLIMIT_CORE, 0).context("failed to set RLIMIT_CORE")
 }
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+type WorkerLimitResource = libc::c_int;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+type WorkerLimitResource = libc::__rlimit_resource_t;
+
 #[cfg(target_os = "linux")]
-fn set_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> Result<()> {
+fn set_limit(resource: WorkerLimitResource, value: libc::rlim_t) -> Result<()> {
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
