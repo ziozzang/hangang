@@ -111,6 +111,10 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/locales/ko-docker.js"),
             )),
+            "/ui/plugins.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/plugins.js"),
+            )),
             "/ui/style.css" => Some((
                 "text/css; charset=utf-8",
                 include_bytes!("../web/style.css"),

@@ -3901,6 +3901,27 @@
           "url"
         ],
         "properties": {
+          "native": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "address"
+            ],
+            "description": "Optional HOP1 native Hopae transport. Requires /_hopae/verify URL and a configured static x-hopae-gateway-key. No HTTP fallback or decision caching.",
+            "properties": {
+              "address": {
+                "type": "string",
+                "maxLength": 128,
+                "description": "Nonzero literal loopback SocketAddr; no DNS or remote plaintext."
+              },
+              "pool_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 256,
+                "default": 32
+              }
+            }
+          },
           "url": {
             "type": "string",
             "format": "uri",

@@ -1,3 +1,4 @@
+import { discoverPlugins, pluginView, loadPlugin, pausePlugins, resetPlugins } from './plugins.js';
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
 import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
 import { loadOperations, pauseObserver, refreshOperationsCopy, resetOperations } from './operations.js';
@@ -438,6 +439,7 @@ function scrubRenderedData() {
 }
 
 function logout(reason = '') {
+  resetPlugins();
   stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
@@ -518,7 +520,8 @@ async function activateSession(token, user, mode) {
   }
   renderStatus(data);
   startStatusPolling();
-  await loadView(state.view, true);
+  if(isAdmin()) { try { await discoverPlugins({api,locale:getLocale}); } catch(error) { if(!(error instanceof StaleSessionError)) showGlobalError(error.message); } }
+  if(pluginView(normalizeView(location.hash))) { await switchView(); } else { await loadView(state.view, true); }
 }
 
 async function login(event) {
@@ -573,6 +576,7 @@ async function login(event) {
 
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split('/')[0];
+  if (pluginView(name)) return name;
   return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 
@@ -582,6 +586,7 @@ async function switchView() {
     name = 'status';
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
+  pausePlugins();
   state.view = name;
   if (name !== 'lua') state.luaPolicySequence++;
   if (name !== 'operations') pauseObserver();
@@ -608,6 +613,7 @@ async function switchView() {
 
 async function loadView(name, quiet = false) {
   try {
+    if (pluginView(name) && isAdmin()) await loadPlugin(name);
     if (name === 'status') await loadStatus();
     if (name === 'lua' && isAdmin()) await loadLuaPolicies();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);

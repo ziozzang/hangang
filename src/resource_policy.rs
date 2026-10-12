@@ -351,6 +351,7 @@ mod tests {
 
     fn auth() -> crate::config::ExternalAuth {
         crate::config::ExternalAuth {
+            native: None,
             url: "http://127.0.0.1/authorize".into(),
             request_headers: vec![],
             response_headers: vec!["X-Auth-Subject".into()],

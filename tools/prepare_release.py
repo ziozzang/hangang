@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TARGET = "x86_64-unknown-linux-gnu"
 COMMON_BINARIES = (
     "hangang",
+    "hangang-console",
     "hangang-acme-issuer",
     "hangang-admin-gateway",
     "hangang-auth-bridge",

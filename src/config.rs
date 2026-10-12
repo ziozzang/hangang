@@ -448,6 +448,9 @@ fn canonical_methods() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct ExternalAuth {
     pub url: String,
+    /// Optional loopback HOP1 transport; provider logic remains in Hopae.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<HopaeNative>,
     #[serde(default)]
     pub request_headers: Vec<String>,
     #[serde(default)]
@@ -476,6 +479,18 @@ pub struct ExternalAuth {
     /// `cookie` header. Names are exact and case-sensitive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strip_request_cookies: Vec<String>,
+}
+
+/// Native Hopae transport. No decision caching or HTTP fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopaeNative {
+    pub address: std::net::SocketAddr,
+    #[serde(default = "hopae_pool_size")]
+    pub pool_size: usize,
+}
+fn hopae_pool_size() -> usize {
+    32
 }
 
 /// A static authorization request header value: a literal or a reference to a
@@ -1567,6 +1582,26 @@ impl Config {
                         "unsafe authorization header"
                     );
                 }
+                if let Some(native) = &auth.native {
+                    ensure!(
+                        native.address.ip().is_loopback() && native.address.port() != 0,
+                        "native Hopae requires a nonzero literal loopback address"
+                    );
+                    ensure!(
+                        (1..=256).contains(&native.pool_size),
+                        "native Hopae pool_size must be 1..256"
+                    );
+                    ensure!(
+                        url.path() == "/_hopae/verify" && url.query().is_none(),
+                        "native Hopae requires the verify URL"
+                    );
+                    ensure!(
+                        auth.static_request_headers
+                            .keys()
+                            .any(|n| n.eq_ignore_ascii_case("x-hopae-gateway-key")),
+                        "native Hopae requires a static caller key"
+                    );
+                }
                 validate_static_request_headers(auth)?;
                 validate_strip_request_cookies(&auth.strip_request_cookies)?;
             }
@@ -2054,6 +2089,7 @@ pub struct HttpRuntime {
     /// Set when a passive path activated this route without its static
     /// header variable; every request to the route is answered with 503.
     pub auth_unavailable: Option<AuthUnavailable>,
+    pub auth_native: Option<std::sync::Arc<crate::hopae_native::Client>>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -2455,10 +2491,36 @@ impl Snapshot {
                 .collect();
         let mut auth_static_headers = std::collections::HashMap::new();
         let mut auth_unavailable = std::collections::HashMap::new();
+        let mut native_clients = std::collections::HashMap::new();
         for route in config.http.iter().filter(|route| route.enabled) {
             if let Some(auth) = &route.auth {
                 match resolve_static_request_headers(auth) {
                     Ok(resolved) => {
+                        if let Some(native) = &auth.native {
+                            let key = resolved
+                                .iter()
+                                .find(|(n, _)| n.as_str() == "x-hopae-gateway-key")
+                                .expect("validated native caller key")
+                                .1
+                                .clone();
+                            let reused = previous
+                                .and_then(|old| {
+                                    old.http.iter().find(|r| {
+                                        r.route.id == route.id
+                                            && r.route.auth.as_ref() == Some(auth)
+                                            && r.auth_static_headers == resolved
+                                    })
+                                })
+                                .and_then(|r| r.auth_native.clone());
+                            let client = reused.unwrap_or_else(|| {
+                                std::sync::Arc::new(crate::hopae_native::Client::new(
+                                    native.address,
+                                    native.pool_size,
+                                    key,
+                                ))
+                            });
+                            native_clients.insert(route.id.clone(), client);
+                        }
                         auth_static_headers.insert(route.id.clone(), resolved);
                     }
                     Err(error) => {
@@ -2526,6 +2588,7 @@ impl Snapshot {
                     auth_reserved,
                     auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
                     auth_unavailable: auth_unavailable.remove(&route.id),
+                    auth_native: native_clients.remove(&route.id),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
@@ -3374,6 +3437,7 @@ mod tests {
             config.http[0].access_mode = mode;
             assert!(config.validate().is_ok());
             config.http[0].auth = Some(ExternalAuth {
+                native: None,
                 url: "http://127.0.0.1:9/check".into(),
                 request_headers: vec![],
                 response_headers: vec![],
@@ -4008,6 +4072,7 @@ mod tests {
         // External-auth identity headers are protected the same way.
         let mut c = route();
         c.http[0].auth = Some(ExternalAuth {
+            native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
             response_headers: vec!["x-user".into()],
@@ -4024,6 +4089,7 @@ mod tests {
         let mut c = route();
         c.http[0].basic_auth = Some(basic.clone());
         c.http[0].auth = Some(ExternalAuth {
+            native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
             response_headers: vec!["X-USER".into()],
@@ -4077,6 +4143,7 @@ mod tests {
             identity_header: None,
         });
         document.http[0].auth = Some(ExternalAuth {
+            native: None,
             url: "http://127.0.0.1:9/check".into(),
             request_headers: vec![],
             response_headers: vec!["x-consumer-id".into()],

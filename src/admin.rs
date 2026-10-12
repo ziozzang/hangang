@@ -850,6 +850,7 @@ struct ViewerResponse;
 
 #[derive(Clone)]
 pub struct Admin {
+    pub plugins: Option<Arc<crate::admin_plugins::Registry>>,
     pub fleet_observer: Option<Arc<crate::fleet_observer::Runtime>>,
     pub fleet_collector: Option<Arc<crate::fleet_collector::Runtime>>,
     pub acme_status: Option<Arc<std::sync::RwLock<crate::acme_runtime::Status>>>,
@@ -887,7 +888,12 @@ impl Admin {
     pub const OBSERVER_REQUEST_LIMIT: usize = 8;
 
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
-        if let Some(response) = public_asset(&req) {
+        if let Some(response) = self
+            .plugins
+            .as_ref()
+            .and_then(|p| p.asset(&req))
+            .or_else(|| public_asset(&req))
+        {
             // Public assets take their own permit and retain it through the
             // body: slow readers are bounded by the public budget alone.
             let Ok(permit) = self.public_requests.clone().try_acquire_owned() else {
@@ -1372,6 +1378,31 @@ impl Admin {
                 ));
             }
             return Ok(empty_response(204, None));
+        }
+        if path == "/v1/plugins" || path.starts_with("/v1/plugins/") {
+            if actor.role() != crate::admin_users::Role::Admin {
+                return Ok(problem(403, "Forbidden", "administrator role required"));
+            }
+            return Ok(match &self.plugins {
+                Some(plugins) => {
+                    plugins
+                        .handle(
+                            req,
+                            crate::admin_plugins::Authority::Local(
+                                self.users.clone(),
+                                actor.mutation_authority(),
+                            ),
+                            actor.user(),
+                        )
+                        .await
+                }
+                None if path == "/v1/plugins" => json_value(
+                    200,
+                    &serde_json::json!({"api_version":1,"plugins":[]}),
+                    None,
+                ),
+                None => problem(404, "Not Found", "console plugins are not configured"),
+            });
         }
         if actor.role() == crate::admin_users::Role::Viewer && !viewer_allowed(&path, req.method())
         {

@@ -156,6 +156,9 @@ struct Args {
     /// Instance-local administrator account database (private SQLite file).
     #[arg(long)]
     admin_users_db: Option<PathBuf>,
+    /// Operator-installed console plugin registry (pinned packages and backend credential references).
+    #[arg(long)]
+    admin_plugins: Option<PathBuf>,
     /// Opt-in inspect-only Unix socket access.
     #[arg(long)]
     docker_socket: Option<PathBuf>,
@@ -845,6 +848,12 @@ async fn run(args: Args) -> Result<()> {
                 .context("Lua validation")?;
         }
     }
+    let admin_plugins = args
+        .admin_plugins
+        .as_deref()
+        .map(hangang::admin_plugins::Registry::load)
+        .transpose()?
+        .map(Arc::new);
     if args.check {
         if let Some(path) = args.fleet_observer_config.clone() {
             let _ =
@@ -1145,6 +1154,7 @@ async fn run(args: Args) -> Result<()> {
     };
     let users = Arc::new(hangang::admin_users::Store::open(users_db_path)?);
     let admin = Admin {
+        plugins: admin_plugins,
         fleet_collector: fleet_collector.clone(),
         fleet_observer: fleet_observer.clone(),
         traffic,
@@ -1553,6 +1563,7 @@ async fn serve(
                     let (io, idle_watch)=hangang::idle::IdleIo::new(io,idle_timeout);
                     let service=service_fn(move |mut request:hyper::Request<hyper::body::Incoming>| {
                         request.extensions_mut().insert(lease.clone());
+                        if let Ok(context)=hangang::admin_plugins::client_context(&request,peer.ip()){request.extensions_mut().insert(context);}
                         request.extensions_mut().insert(hangang::tls::TransportInfo{tls:transport_tls,local_port});
                         let handler=handler.clone();
                         let future:std::pin::Pin<Box<dyn std::future::Future<Output=Result<hyper::Response<hangang::proxy::Body>,std::convert::Infallible>>+Send>>=Box::pin(async move {match handler {Handler::Proxy(p)=>p.handle(request,peer).await,Handler::Admin(a)=>a.handle(request).await,Handler::Acme(store)=>{use http_body_util::BodyExt; let response=store.response(&request).await.unwrap_or_else(||hyper::Response::builder().status(404).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap()); Ok(response.map(|b|b.map_err(|never|match never {}).boxed_unsync()))}}});

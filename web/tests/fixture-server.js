@@ -12,6 +12,7 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === '/ui/' || url.pathname === '/ui/index.html') return file(response, 'index.html');
   if (url.pathname === '/ui/lua-editor.js') return file(response, 'lua-editor.js');
   if (url.pathname === '/ui/lua-editor.css') return file(response, 'lua-editor.css');
+  if (url.pathname === '/ui/plugins.js') return file(response, 'plugins.js');
   if (url.pathname === '/ui/app.js') return file(response, 'app.js');
   if (url.pathname === '/ui/console.js') return file(response, 'console.js');
   if (url.pathname === '/ui/operations.js') return file(response, 'operations.js');

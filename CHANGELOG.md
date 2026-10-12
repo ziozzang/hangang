@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+## 0.3.1 — 2026-10-12
+
+- Add trusted pinned Guard/Hopae console packages and a native console adapter over an existing administrator authority, including role/revocation checks, bounded requests and durable mutation audit.
+- Add authenticated persistent Hopae verification pools with bounded binary framing, cancellation-safe connections, no HTTP fallback and shared native result handling.
+- Keep provider/login/logout decisions in Hopae; native entry routes require no Lua.
+
+
 ## 0.3.0 — 2026-10-12
 
 - Add native integration with the zero-trust decision backbone: Hangang resolves
