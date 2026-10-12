@@ -1357,6 +1357,34 @@ impl Admin {
         actor: AdminActor,
     ) -> Result<Response<Body>, Infallible> {
         let path = req.uri().path().to_owned();
+        if path == "/v1/auth/sso-lease" {
+            if req.uri().query().is_some() {
+                return Ok(problem(400, "Bad Request", "query parameters unsupported"));
+            }
+            if req.method() != hyper::Method::POST {
+                return Ok(problem(405, "Method Not Allowed", "POST required"));
+            }
+            if !matches!(actor, AdminActor::System) {
+                return Ok(problem(403, "Forbidden", "system SSO broker required"));
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Lease {
+                username: String,
+            }
+            let payload: Lease = match read_json(req, 1024).await {
+                Ok(v) => v,
+                Err(r) => return Ok(r),
+            };
+            return Ok(match self.users.sso_lease(payload.username).await {
+                Ok(Some(login)) => auth_json(
+                    200,
+                    &serde_json::json!({"token":login.token,"user":login.user}),
+                ),
+                Ok(None) => problem(403, "Forbidden", "mapped account unavailable"),
+                Err(e) => account_problem(e),
+            });
+        }
         if path == "/v1/auth/me" {
             return Ok(if req.method() == hyper::Method::GET {
                 json_value(200, &serde_json::json!({"user":actor.user()}), None)

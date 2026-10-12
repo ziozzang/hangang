@@ -1,5 +1,7 @@
 //! Serve the current native console and trusted extensions over an existing
 //! Hangang admin authority. The authority still owns accounts/configuration.
+#[path = "../console_sso.rs"]
+mod sso;
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 use clap::Parser;
@@ -33,11 +35,14 @@ struct Args {
     #[arg(long)]
     plugins: PathBuf,
     #[arg(long)]
+    hopae_sso: Option<PathBuf>,
+    #[arg(long)]
     allow_insecure_public: bool,
     #[arg(long)]
     check: bool,
 }
 struct State {
+    sso: Option<sso::Sso>,
     origin: reqwest::Url,
     client: reqwest::Client,
     plugins: Registry,
@@ -112,7 +117,11 @@ async fn handle(
     let public = path == "/" || path.starts_with("/ui/");
     let login = matches!(
         path,
-        "/v1/auth/login" | "/v1/auth/setup" | "/v1/auth/bootstrap"
+        "/v1/auth/login"
+            | "/v1/auth/setup"
+            | "/v1/auth/bootstrap"
+            | "/v1/auth/sso/config"
+            | "/v1/auth/sso/exchange"
     );
     let events = path == "/v1/events";
     match hangang::admin_plugins::client_context(&req, peer.ip()) {
@@ -164,6 +173,93 @@ async fn handle(
         .or_else(|| hangang::ui::serve(&req))
     {
         return Ok(hangang::proxy::retain_request_permit(response, permit));
+    }
+    if req.uri().path() == "/v1/auth/sso-lease" {
+        return Ok(error(StatusCode::NOT_FOUND, "unknown console endpoint"));
+    }
+    if matches!(
+        req.uri().path(),
+        "/v1/auth/sso/config" | "/v1/auth/sso/exchange"
+    ) {
+        if req.uri().query().is_some() {
+            return Ok(error(StatusCode::BAD_REQUEST, "SSO queries unsupported"));
+        }
+        let Some(sso) = &state.sso else {
+            return Ok(error(StatusCode::NOT_FOUND, "SSO unavailable"));
+        };
+        let result = if req.uri().path().ends_with("/config") && req.method() == hyper::Method::GET
+        {
+            Ok(sso.discovery())
+        } else if req.uri().path().ends_with("/exchange") && req.method() == hyper::Method::POST {
+            let headers = req.headers().clone();
+            let context = req
+                .extensions()
+                .get::<hangang::admin_plugins::ClientContext>()
+                .unwrap()
+                .clone();
+            if !sso.exchange_allowed(&headers) {
+                return Ok(error(
+                    StatusCode::FORBIDDEN,
+                    "same-origin SSO exchange required",
+                ));
+            }
+            let bytes = match tokio::time::timeout(
+                Duration::from_secs(2),
+                Limited::new(req.into_body(), 1024).collect(),
+            )
+            .await
+            {
+                Ok(Ok(b)) => b.to_bytes(),
+                _ => return Ok(error(StatusCode::BAD_REQUEST, "invalid SSO body")),
+            };
+            if bytes.as_ref() != b"{}" {
+                return Ok(error(
+                    StatusCode::BAD_REQUEST,
+                    "SSO body must be empty object",
+                ));
+            }
+            sso.exchange(&headers, &context, &state.client, &state.origin)
+                .await
+        } else {
+            return Ok(error(StatusCode::METHOD_NOT_ALLOWED, "invalid SSO method"));
+        };
+        return Ok(match result {
+            Ok(value) => Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(body(value.to_string()))
+                .unwrap(),
+            Err(_) => error(
+                StatusCode::UNAUTHORIZED,
+                "SSO login or account mapping unavailable",
+            ),
+        });
+    }
+    if let Some(token) = bearer(&req).and_then(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|v| v.strip_prefix("Bearer hsso_"))
+            .map(|v| format!("hsso_{v}"))
+    }) {
+        let Some(sso) = &state.sso else {
+            return Ok(error(StatusCode::UNAUTHORIZED, "SSO unavailable"));
+        };
+        let context = req
+            .extensions()
+            .get::<hangang::admin_plugins::ClientContext>()
+            .unwrap();
+        let authorization = match sso
+            .authorization(&token, req.headers(), context, &state.client, &state.origin)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return Ok(error(StatusCode::UNAUTHORIZED, "SSO session rejected")),
+        };
+        if req.uri().path() == "/v1/auth/logout" && req.method() == hyper::Method::POST {
+            sso.logout(&token);
+        }
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, authorization);
     }
     if req.uri().path() == "/v1/plugins" || req.uri().path().starts_with("/v1/plugins/") {
         let Some(authorization) = bearer(&req) else {
@@ -320,11 +416,13 @@ async fn main() -> Result<()> {
         "upstream requires HTTPS or literal loopback HTTP"
     );
     let plugins = Registry::load(&args.plugins)?;
+    let sso = args.hopae_sso.as_deref().map(sso::Sso::load).transpose()?;
     if args.check {
         println!("console plugin configuration is valid");
         return Ok(());
     }
     let state = Arc::new(State {
+        sso,
         origin,
         plugins,
         client: reqwest::Client::builder()

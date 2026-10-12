@@ -126,6 +126,8 @@ struct Binding {
     delegate_actor: bool,
     #[serde(default)]
     delegation_cookie: Option<String>,
+    #[serde(default)]
+    delegation_authority: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +157,7 @@ struct Plugin {
     token: reqwest::header::HeaderValue,
     delegation_key: Option<Vec<u8>>,
     delegation_cookie: Option<String>,
+    delegation_authority: Option<String>,
     assets: BTreeMap<String, Asset>,
 }
 pub struct Registry {
@@ -338,6 +341,15 @@ impl Registry {
                             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))),
                 "delegation_cookie requires actor delegation and a safe cookie name"
             );
+            ensure!(
+                binding
+                    .delegation_authority
+                    .as_ref()
+                    .is_none_or(|v| v == "hangang"
+                        && binding.delegate_actor
+                        && binding.delegation_cookie.is_none()),
+                "Hangang authority requires actor delegation without a native cookie gate"
+            );
             let delegation_key = binding.delegate_actor.then(|| token.as_bytes().to_vec());
             if binding.delegate_actor {
                 ensure!(
@@ -357,6 +369,7 @@ impl Registry {
                             token,
                             delegation_key,
                             delegation_cookie: binding.delegation_cookie,
+                            delegation_authority: binding.delegation_authority,
                             assets
                         }
                     )
@@ -380,7 +393,7 @@ impl Registry {
         })
     }
     pub fn discovery(&self) -> Value {
-        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id)})).collect::<Vec<_>>()})
+        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id),"authentication":p.delegation_authority.as_deref().unwrap_or("native")})).collect::<Vec<_>>()})
     }
     pub fn asset<B>(&self, request: &Request<B>) -> Option<Response<Body>> {
         let path = request.uri().path().strip_prefix("/ui/plugins/")?;
@@ -565,6 +578,7 @@ impl Registry {
             if let Some(key) = &plugin.delegation_key {
                 use crate::console_delegation_wire::{Assertion, digest, sign};
                 let assertion = Assertion {
+                    authority: plugin.delegation_authority.clone(),
                     actor_id: actor.id,
                     actor_name: actor.username.clone(),
                     timestamp: std::time::SystemTime::now()

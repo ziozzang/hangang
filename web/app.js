@@ -350,7 +350,13 @@ function setLoginMode(mode) {
   message($('#login-error'));
 }
 
+async function discoverSso() {
+  try { const {data}=await api("/v1/auth/sso/config"); const button=$("#sso-login");
+    if(data?.provider==="hopae" && data.login_url==="/_hopae/login?return=%2Fui%2F%3Fsso%3Dhopae") {button.href=data.login_url;button.hidden=false;}
+  } catch { $("#sso-login").hidden=true; }
+}
 async function discoverAuth() {
+  await discoverSso();
   let problem = '';
   try {
     const { data } = await api('/v1/auth/setup');
@@ -365,6 +371,13 @@ async function discoverAuth() {
 }
 
 async function restoreAccountSession() {
+  await discoverSso();
+  const params=new URLSearchParams(location.search);
+  if(params.get("sso")==="hopae") {
+    params.delete("sso");history.replaceState(null,"",location.pathname+(params.size?"?"+params.toString():"")+location.hash);
+    try {const {data}=await api("/v1/auth/sso/exchange",{method:"POST",headers:{"X-Hangang-SSO":"1"},json:{}});state.accountAuthAvailable=true;setLoginMode("account");await activateSession(data.token,data.user,"account");return;}
+    catch { await discoverAuth();message($("#login-error"),t("SSO login failed. Your Hopae identity must be linked to an enabled Hangang account."),"error");return;}
+  }
   const token = storedAccountToken();
   if (!token) return discoverAuth();
   try {
