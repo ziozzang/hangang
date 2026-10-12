@@ -52,6 +52,13 @@
   that could still carry a listed cookie is dropped entirely. The authorization
   call is unchanged. `cookie` is rejected as an authentication identity output
   header.
+- Add configurable request parameter deny profiles for query, form, multipart
+  and bounded JSON inputs, including nested JSON fields and normalization.
+- Reject ambiguous protected parameter aliases and duplicates before origin
+  work; retain bounded inspection capacity through forwarded body ownership.
+- Add opt-in bounded anonymous disk inspection and byte-exact replay for
+  large multipart uploads, with private directories, shared quotas and strict framing.
+- Keep application-specific rules in separate configuration examples.
 
 ## 0.2.5 — 2026-10-06
 

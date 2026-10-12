@@ -130,6 +130,8 @@ fn security_denied(status: u16) -> Response<Body> {
 #[derive(Clone)]
 pub struct Proxy {
     guard: Option<Arc<crate::guard::GuardClient>>,
+    request_inspectors: Arc<tokio::sync::Semaphore>,
+    request_spools: Arc<crate::request_block_spool::Pool>,
     acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
     policy: Arc<PolicyPool>,
@@ -499,6 +501,8 @@ impl Proxy {
         Self {
             active,
             guard: None,
+            request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
+            request_spools: Arc::new(crate::request_block_spool::Pool::new()),
             acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
             metrics,
@@ -1585,7 +1589,40 @@ impl Proxy {
             .cloned();
         // Replacing the body preserves request extensions, including OnUpgrade.
         let (parts, body) = request.into_parts();
-        let mut request = Request::from_parts(parts, RequestDataBody { body }.boxed_unsync());
+        let request = Request::from_parts(parts, RequestDataBody { body }.boxed_unsync());
+        let mut request = match crate::request_blocks::check(
+            &snapshot.settings.request_blocks,
+            request,
+            edge.forwarded_host.as_ref().and_then(|h| h.to_str().ok()),
+            &self.request_inspectors,
+            &self.request_spools,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(status) => {
+                crate::security_events::record("request_blocked", edge.client_ip, status, None);
+                return Ok(security_denied(status));
+            }
+        };
+
+        let request_policy_fence = crate::request_blocks::policy_fence(&request);
+        let public_admission = request
+            .extensions()
+            .get::<crate::public_http::Evidence>()
+            .cloned();
+        {
+            let current = self.active.load_full();
+            if request_policy_fence
+                .as_ref()
+                .is_some_and(|f| !f.current(&current.settings.request_blocks))
+                || public_admission
+                    .as_ref()
+                    .is_some_and(|e| !e.current(&current))
+            {
+                return Ok(security_denied(503));
+            }
+        }
 
         let (protected_resource, canonical_resource_path) = match crate::resource_guard::check(
             &snapshot.resource_guards,
@@ -2460,6 +2497,7 @@ impl Proxy {
             None
         };
         if let Some(config) = &runtime.request_transform {
+            crate::request_blocks::invalidate_body_cache(&mut request);
             if !crate::transform_body::identity_encoding(request.headers()) {
                 return Ok(response(
                     415,
@@ -2539,6 +2577,25 @@ impl Proxy {
                     "preconditions are unsupported for transformed representations",
                 ));
             }
+        }
+        if (runtime.request_transform.is_some() || runtime.route.lua.is_some())
+            && !snapshot.settings.request_blocks.is_empty()
+        {
+            request = match crate::request_blocks::check(
+                &snapshot.settings.request_blocks,
+                request,
+                edge.forwarded_host.as_ref().and_then(|h| h.to_str().ok()),
+                &self.request_inspectors,
+                &self.request_spools,
+            )
+            .await
+            {
+                Ok(request) => request,
+                Err(status) => {
+                    crate::security_events::record("request_blocked", edge.client_ip, status, None);
+                    return Ok(security_denied(status));
+                }
+            };
         }
         if runtime.route.response_transform.is_some() {
             request.headers_mut().insert(
@@ -2785,6 +2842,18 @@ impl Proxy {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Docker endpoint changed before request admission",
                 ));
+            }
+            {
+                let current = self.active.load_full();
+                if request_policy_fence
+                    .as_ref()
+                    .is_some_and(|f| !f.current(&current.settings.request_blocks))
+                    || public_admission
+                        .as_ref()
+                        .is_some_and(|e| !e.current(&current))
+                {
+                    return Ok(security_denied(503));
+                }
             }
             let send = async {
                 match &client {

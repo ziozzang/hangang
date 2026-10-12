@@ -49,6 +49,8 @@ fn is_zero(value: &u64) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_blocks: Option<Vec<crate::request_blocks::Rule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_security: Option<Vec<crate::response_security::Rule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_csrf: Option<Vec<crate::path_csrf::Rule>>,
@@ -99,6 +101,9 @@ impl Settings {
         *self == Self::default()
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(rules) = &self.request_blocks {
+            crate::request_blocks::validate(rules)?;
+        }
         if let Some(rules) = &self.response_security {
             crate::response_security::validate(rules)?;
         }
@@ -177,6 +182,7 @@ impl Settings {
 /// `Settings` with names and durations parsed once per snapshot.
 #[derive(Debug, Default)]
 pub struct PreparedSettings {
+    pub request_blocks: Vec<crate::request_blocks::Compiled>,
     pub response_security: Vec<crate::response_security::Compiled>,
     pub path_csrf: Vec<std::sync::Arc<crate::path_csrf::Compiled>>,
     pub path_allowlists: Vec<std::sync::Arc<crate::path_allowlists::Compiled>>,
@@ -198,6 +204,9 @@ impl PreparedSettings {
         use anyhow::Context;
         settings.validate()?;
         Ok(Self {
+            request_blocks: crate::request_blocks::prepare(
+                settings.request_blocks.as_deref().unwrap_or(&[]),
+            )?,
             response_security: crate::response_security::prepare(
                 settings.response_security.as_deref().unwrap_or(&[]),
             )?,

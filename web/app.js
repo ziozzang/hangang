@@ -4488,7 +4488,7 @@ function syncTcpRecordingToDocument() {
   } catch (error) { state.tcpRecordingError = error.message; message($('#tcp-recording-message'), error.message, 'error'); }
 }
 
-const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists', 'path_csrf', 'response_security'];
+const SETTINGS_FIELDS = ['trusted_proxy_cidrs', 'remove_response_headers', 'https_redirect_code', 'upstream_timeout_ms', 'allow_dot_segments', 'health_path', 'path_blocks', 'path_rate_limits', 'path_failure_bans', 'failure_ban_scope', 'security_redis', 'path_allowlists', 'path_csrf', 'response_security', 'request_blocks'];
 /** Response headers no rule or setting may remove (framing and hop-by-hop; the server rejects them too). */
 const PROTECTED_RESPONSE_HEADERS = new Set(['content-length', 'content-encoding', 'transfer-encoding', 'connection', 'keep-alive', 'trailer', 'upgrade', 'te', 'content-range']);
 
@@ -4511,6 +4511,7 @@ function showSettings(settings) {
   $('#settings-state').hidden = !SETTINGS_FIELDS.some(present);
   state.settingsError = null;
   message($('#settings-message'));
+  $('#setting-request_blocks').value = present('request_blocks') ? JSON.stringify(value.request_blocks, null, 2) : '';
   $('#setting-response_security').value = present('response_security') ? JSON.stringify(value.response_security, null, 2) : '';
   renderResponseSecurityRules();
   showHttpRecording(value.http_recording);
@@ -4581,9 +4582,47 @@ function settingsFromForm() {
       settings.security_redis = value;
     } catch { throw invalid('security_redis', t('Redis settings require an environment reference HANGANG_SECURITY_REDIS_* and a safe ASCII namespace, each at most 128 characters. Never paste a URL or password.')); }
   }
+  const requestBlocks = $('#setting-request_blocks').value.trim();
+  if (requestBlocks) { try { settings.request_blocks = requestBlockRules(requestBlocks); } catch (error) { throw invalid('request_blocks', error.message); } }
   const responseSecurity = $('#setting-response_security').value.trim();
   if (responseSecurity) { try { settings.response_security = responseSecurityRules(responseSecurity); } catch (error) { throw invalid('response_security', error.message); } }
   return settings;
+}
+
+function requestBlockRules(raw) {
+  let rules; try { rules = JSON.parse(raw); } catch { throw new Error(t('Request blocks must be a valid JSON array.')); }
+  const fail = () => { throw new Error(t('Request blocks require at most 128 rules, 1–16 unique canonical parameter names per rule, valid matchers and limits, and at most 32 KiB policy text.')); };
+  if (!Array.isArray(rules) || rules.length > 128) fail();
+  const bytes = value => new TextEncoder().encode(value).length; let size = 0;
+  const nameValid = name => typeof name === 'string' && /^[A-Za-z0-9_-]{1,64}$(?![\s\S])/.test(name);
+  for (const rule of rules) {
+    if (!isObject(rule) || Object.keys(rule).some(key => !['path', 'hosts', 'include_subpaths', 'methods', 'params', 'max_body_bytes', 'timeout_ms', 'multipart_spool'].includes(key))) fail();
+    urlDefenseRulesFromJson(JSON.stringify([{ path: rule.path, ...(rule.hosts !== undefined ? { hosts: rule.hosts } : {}) }]), 'path_blocks');
+    if (rule.include_subpaths !== undefined && typeof rule.include_subpaths !== 'boolean') fail();
+    const methods = rule.methods === undefined ? [] : rule.methods; if (!Array.isArray(methods) || methods.length > 8 || new Set(methods).size !== methods.length || methods.some(method => !['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE'].includes(method))) fail();
+    for (const [key, max] of [['max_body_bytes', 16777216], ['timeout_ms', 5000]]) if (rule[key] !== undefined && (!Number.isSafeInteger(rule[key]) || rule[key] < 1 || rule[key] > max)) fail();
+    if (rule.multipart_spool !== undefined && rule.multipart_spool !== null) {
+      const spool = rule.multipart_spool;
+      if (!isObject(spool) || Object.keys(spool).some(key => !['directory', 'max_body_bytes', 'timeout_ms', 'idle_timeout_ms', 'max_field_bytes'].includes(key)) || typeof spool.directory !== 'string' || !spool.directory.startsWith('/') || bytes(spool.directory) > 2048 || spool.directory.includes('\0') || spool.directory.split('/').some(part => part === '.' || part === '..')) fail();
+      size += bytes(spool.directory);
+      if (!Number.isSafeInteger(spool.max_body_bytes) || spool.max_body_bytes < 1 || spool.max_body_bytes > 68719476736) fail();
+      for (const [key, max] of [['timeout_ms', 7200000], ['idle_timeout_ms', 120000], ['max_field_bytes', 65536]]) if (spool[key] !== undefined && (!Number.isSafeInteger(spool[key]) || spool[key] < 1 || spool[key] > max)) fail();
+    }
+    if (!Array.isArray(rule.params) || !rule.params.length || rule.params.length > 16) fail();
+    size += bytes(rule.path) + (rule.hosts || []).reduce((sum, value) => sum + bytes(value), 0) + methods.reduce((sum, value) => sum + bytes(value), 0); const names = new Set();
+    for (const condition of rule.params) {
+      if (!isObject(condition) || Object.keys(condition).some(key => !['name', 'values', 'match', 'case_insensitive', 'negate', 'json_field', 'strip_pattern', 'default_value'].includes(key)) || !nameValid(condition.name) || names.has(condition.name)) fail(); names.add(condition.name); size += bytes(condition.name);
+      for (const key of ['case_insensitive', 'negate']) if (condition[key] !== undefined && typeof condition[key] !== 'boolean') fail();
+      if (condition.json_field !== undefined && condition.json_field !== null) { if (!nameValid(condition.json_field)) fail(); size += bytes(condition.json_field); }
+      if (condition.strip_pattern !== undefined && condition.strip_pattern !== null) { if (typeof condition.strip_pattern !== 'string' || bytes(condition.strip_pattern) > 256) fail(); size += bytes(condition.strip_pattern); }
+      if (condition.match !== undefined && !['exact', 'prefix', 'segment_prefix', 'path_prefix'].includes(condition.match)) fail();
+      const values = condition.values === undefined ? [] : condition.values; if (!Array.isArray(values) || values.length > 128 || new Set(values).size !== values.length || values.some(value => typeof value !== 'string' || bytes(value) > 4096)) fail();
+      if (condition.default_value !== undefined && condition.default_value !== null) { if (typeof condition.default_value !== 'string' || bytes(condition.default_value) > 4096 || !values.length || (condition.json_field !== undefined && condition.json_field !== null)) fail(); size += bytes(condition.default_value); }
+      for (const value of values) { size += bytes(value); if (condition.match === 'path_prefix') { const path = value.startsWith('/') ? value : '/' + value; urlDefenseRulesFromJson(JSON.stringify([{ path }]), 'path_blocks'); } }
+    }
+    if (size > 32768) fail();
+  }
+  return rules;
 }
 
 const RESPONSE_SECURITY_HEADERS = new Set(['strict-transport-security', 'x-content-type-options', 'referrer-policy', 'x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'permissions-policy']);
@@ -4759,7 +4798,7 @@ function renderSettings(settings) {
     health_path: typeof value.health_path === 'string' ? value.health_path : null,
     security_redis: ['redis', 'local'].includes(value.security_state_backend) ? t(value.security_state_backend === 'redis' ? 'Shared Redis' : 'Local state') : null,
     failure_ban_scope: ({ url: t('Configured URLs only'), host: t('Host: all paths, including images'), global: t('Global: all public HTTP hosts and paths') })[value.failure_ban_scope] ?? null,
-    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf', 'response_security'].map(key => [key,
+    ...Object.fromEntries(['path_blocks', 'path_rate_limits', 'path_failure_bans', 'path_allowlists', 'path_csrf', 'response_security', 'request_blocks'].map(key => [key,
       Number.isSafeInteger(value[`${key}_count`]) && value[`${key}_count`] >= 0 ? t('{count} configured rules', { count: value[`${key}_count`] }) : null])),
   };
   for (const key of SETTINGS_FIELDS) {

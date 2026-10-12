@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hangang Management API",
-    "version": "0.2.5",
+    "version": "0.2.6",
     "description": "Authenticated configuration and observation API. Route mutations are atomic and require the quoted current revision in If-Match. Dynamic Docker references use this instance's administrator-managed Docker connection or an initial CLI socket.\n\nManagement accounts are local to each instance. Viewer sessions may read runtime and update status plus health and metrics; configuration and user operations require administrator role. The existing administrator bearer token remains available for break-glass access."
   },
   "servers": [
@@ -4674,7 +4674,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.2.5"
+            "example": "0.2.6"
           },
           "acme": {
             "$ref": "#/components/schemas/AcmeStatus"
@@ -5973,6 +5973,7 @@
             },
             "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
           },
+          "request_blocks": { "type": ["array", "null"], "maxItems": 128, "items": { "$ref": "#/components/schemas/RequestBlockRule" }, "description": "Scoped parameter deny profiles. Conditions AND, matching rules OR, before origins/auth/cache/Lua. At most 32KiB aggregate policy text. Protected query/form/multipart/JSON names reject ambiguous aliases/duplicates. Selected bodies are fully bounded and inspected; no automatic authentication or cookie exemption." },
           "response_security": { "type": ["array", "null"], "maxItems": 128, "items": { "$ref": "#/components/schemas/ResponseSecurityRule" }, "description": "Explicit domain-scoped final response profiles, including redirects and denials. Maximum 32 KiB aggregate host/header text; matching rules apply in order with later headers overriding earlier values; redirect upgrading is enabled if any matching rule enables it. Empty means no changes. HSTS applies only to verified HTTPS." },
           "path_csrf": {
             "type": ["array", "null"],
@@ -7047,6 +7048,9 @@
         },
         "description": "Bounded CSRF origin policy for selected URLs. At least same-origin access or a nonempty allowed-origin list is required. Ordinary image/safe GET requests are unaffected by default; global HTTP security and administrator recovery boundaries remain independent."
       },
+      "RequestBlockCondition": { "type": "object", "additionalProperties": false, "required": ["name"], "properties": { "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" }, "values": { "type": "array", "default": [], "maxItems": 128, "uniqueItems": true, "items": { "type": "string", "maxLength": 4096 }, "description": "Maximum 4096 UTF8bytes per value; empty list matches presence." }, "match": { "type": "string", "enum": ["exact", "prefix", "segment_prefix", "path_prefix"], "default": "exact" }, "case_insensitive": { "type": "boolean", "default": false }, "negate": { "type": "boolean", "default": false, "description": "Missing or any extracted value failing the comparison matches this deny condition." }, "json_field": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{1,64}$", "description": "Extract named scalar fields recursively from parameter JSON object/array/encoded strings: depth16,nodes1024,decoded16KiB; ambiguous JSON rejects." }, "strip_pattern": { "type": ["string", "null"], "maxLength": 256, "description": "Bounded Rust regex, at most256UTF8bytes, removed only for comparison; original forwarding bytes retained." }, "default_value": { "type": ["string", "null"], "maxLength": 4096, "description": "Comparison-only fallback after complete absence is established. Requires nonempty values and no json_field; at most4096UTF8bytes. Never inserts a forwarded parameter." } } },
+      "MultipartInspectionSpool": {"type": "object", "additionalProperties": false, "required": ["directory", "max_body_bytes"], "properties": {"directory": {"type": "string", "maxLength": 2048, "description": "Absolute path at most2048UTF8bytes without traversal; existing0700 writable gatewayUID-owned directory; no symlink components. Server validates pinned descriptors."}, "max_body_bytes": {"type": "integer", "minimum": 1, "maximum": 68719476736}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 7200000, "default": 3600000}, "idle_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000, "default": 60000}, "max_field_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "default": 65536}}, "description": "Two sharedProxy disk inspection slots and128GiB total quota. Anonymous0600 files; resource ownership retained through replay/reference release. Quota/IO503,size413,time408,format400. No unscoped automatic enable."},
+      "RequestBlockRule": {"type": "object", "additionalProperties": false, "required": ["path", "params"], "properties": {"path": {"type": "string", "maxLength": 2048, "description": "Canonical absolute URL path, at most2048UTF8bytes."}, "hosts": {"type": "array", "default": [], "maxItems": 16, "items": {"type": "string", "maxLength": 253}, "description": "Existing host/IP patterns, empty means all hosts."}, "include_subpaths": {"type": "boolean", "default": false}, "methods": {"type": "array", "default": [], "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"]}, "description": "Empty applies to all methods."}, "params": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"$ref": "#/components/schemas/RequestBlockCondition"}, "description": "Unique canonical names; all conditions must match to deny."}, "max_body_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 65536}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 2000}, "multipart_spool": {"anyOf": [{"$ref": "#/components/schemas/MultipartInspectionSpool"}, {"type": "null"}], "description": "Optional explicit private disk inspection for large/unknown-length multipart only; every scoped rule must opt in. JSON/forms retain RAM limits. Entire multipart is inspected before byte-exact demand-driven replay."}}},
       "ResponseSecurityRule": { "type": "object", "additionalProperties": false, "required": ["hosts"], "properties": { "hosts": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "maxLength": 253 }, "description": "Required explicit host/IP patterns; existing label-local * and ? matching. Empty all-host scope is forbidden." }, "upgrade_same_host_redirect": { "type": "boolean", "default": false, "description": "For verified HTTPS only, upgrades absolute http:// same-host default-port redirects to HTTPS. Relative, external-host and nondefault-port redirects are preserved." }, "headers": { "type": "object", "default": {}, "additionalProperties": { "type": "string", "maxLength": 4096 }, "description": "Case-insensitive allowlist: strict-transport-security, x-content-type-options, referrer-policy, x-frame-options, content-security-policy, content-security-policy-report-only, permissions-policy. Values at most 4096 bytes, no controls. Duplicate canonical names rejected. Explicit CSP replaces existing CSP; no automatic policy is supplied." } } },
       "RuntimeSettingsSummary": {
         "type": "object",
@@ -7107,6 +7111,7 @@
             "type": "integer",
             "minimum": 0
           },
+          "request_blocks_count": { "type": "integer", "minimum": 0, "maximum": 128, "description": "Rule count only, without parameter predicates or host/path details." },
           "response_security_count": { "type": "integer", "minimum": 0, "maximum": 128, "description": "Rule count only; viewer summary does not expose host selectors or header policies." },
           "path_csrf_count": {
             "type": "integer", "minimum": 0, "maximum": 128,

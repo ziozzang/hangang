@@ -1,0 +1,103 @@
+{
+  "settings": {
+    "request_blocks": [
+      {
+        "path": "/webapi",
+        "hosts": [
+          "nas.example.test"
+        ],
+        "include_subpaths": true,
+        "params": [
+          {
+            "name": "api",
+            "values": [
+              "SYNO.Auth.ForgotPwd"
+            ],
+            "match": "exact",
+            "case_insensitive": true,
+            "strip_pattern": "[^0-9a-zA-Z_.]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/webapi",
+        "hosts": [
+          "nas.example.test"
+        ],
+        "include_subpaths": true,
+        "params": [
+          {
+            "name": "compound",
+            "json_field": "api",
+            "values": [
+              "SYNO.Auth.ForgotPwd"
+            ],
+            "match": "exact",
+            "case_insensitive": true,
+            "strip_pattern": "[^0-9a-zA-Z_.]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      },
+      {
+        "path": "/webapi",
+        "hosts": [
+          "nas.example.test"
+        ],
+        "include_subpaths": true,
+        "params": [
+          {
+            "name": "params",
+            "json_field": "api",
+            "values": [
+              "SYNO.Auth.ForgotPwd"
+            ],
+            "match": "exact",
+            "case_insensitive": true,
+            "strip_pattern": "[^0-9a-zA-Z_.]"
+          }
+        ],
+        "max_body_bytes": 16777216,
+        "timeout_ms": 5000,
+        "multipart_spool": {
+          "directory": "/data/request-inspection-spool",
+          "max_body_bytes": 68719476736,
+          "timeout_ms": 7200000,
+          "idle_timeout_ms": 60000,
+          "max_field_bytes": 65536
+        }
+      }
+    ],
+    "path_blocks": [
+      {
+        "path": "/webapi/entry.cgi/SYNO.Auth.ForgotPwd",
+        "hosts": [
+          "nas.example.test"
+        ]
+      },
+      {
+        "path": "/webapi/auth.cgi/SYNO.Auth.ForgotPwd",
+        "hosts": [
+          "nas.example.test"
+        ]
+      }
+    ]
+  }
+}

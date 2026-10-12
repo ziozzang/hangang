@@ -6198,6 +6198,7 @@ async fn conditional_response_transform_preserves_unmatched_streams_and_fences_b
 }
 
 #[tokio::test]
+<<<<<<< HEAD
 async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
     let seen_context = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6261,10 +6262,179 @@ async fn authorization_call_carries_static_headers_and_drops_spoofed_copy() {
                     .header("x-hopae-gateway-key", "evil")
                     .header("x-hopae-contract", "999")
                     .body(Full::new(Bytes::new()))
+=======
+async fn request_blocks_inspect_all_parameter_sources_before_origin_and_preserve_allowed_uploads() {
+    let (origin, seen, origin_task) = upstream("accepted").await;
+    let profile = |params: serde_json::Value| serde_json::json!({"path":"/control","hosts":["app.example"],"params":params,"max_body_bytes":1048576,"timeout_ms":200});
+    let settings=hangang::config::Settings{request_blocks:Some(serde_json::from_value(serde_json::json!([
+        profile(serde_json::json!([{"name":"action","values":["write"]}])),
+        profile(serde_json::json!([{"name":"rest_route","match":"path_prefix","values":["/wp/v2/users"]}])),
+        profile(serde_json::json!([{"name":"compound","json_field":"api","values":["blocked.api"]}]))
+    ])).unwrap()),..Default::default()};
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy).await;
+    let send = |method: &str,
+                path: &str,
+                host: &str,
+                content_type: Option<&str>,
+                body: Bytes,
+                override_method: bool| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("http://{front}{path}"))
+            .header("host", host);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type)
+        }
+        if override_method {
+            request = request.header("x-http-method-override", "POST")
+        }
+        let request = request.body(Full::new(body)).unwrap();
+        async move {
+            let reply = client().request(request).await.unwrap();
+            let status = reply.status();
+            reply.into_body().collect().await.unwrap();
+            status
+        }
+    };
+    let multipart = |action: &str| {
+        Bytes::from(format!(
+            "--owned\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sample.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n{}\r\n--owned\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\n{action}\r\n--owned--\r\n",
+            "binary-file-payload"
+        ))
+    };
+    for (method,path,content_type,body,status) in [
+        ("GET","/control?action=write",None,Bytes::new(),403),
+        ("HEAD","/control?action=write",None,Bytes::new(),403),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),403),
+        ("GET","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\"}"),403),
+        ("POST","/control",Some("multipart/form-data; boundary=owned"),multipart("write"),403),
+        ("POST","/control?action=read",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"action=write"),400),
+        ("GET","/control?rest%5Broute=/wp/v2/users",None,Bytes::new(),400),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from_static(b"rest%5Broute=/wp/v2/users"),400),
+        ("POST","/control",Some("multipart/form-data; boundary=owned"),Bytes::from_static(b"--owned\r\nContent-Disposition: form-data; name=\"rest[route\"\r\n\r\n/wp/v2/users\r\n--owned--\r\n"),400),
+        ("GET","/control?%20action=write",None,Bytes::new(),400),
+        ("GET","/control?action[tail]=write",None,Bytes::new(),400),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"action\":\"write\",\"action\":\"read\"}"),400),
+        ("GET","/control?rest_route=wp%2Fv2%2Fusers%2F",None,Bytes::new(),403),
+        ("GET","/control?rest_route=%252fwp%2Fv2%2Fusers",None,Bytes::new(),400),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"allowed.api\",\"params\":{\"compound\":\"[{\\\"api\\\":\\\"blocked.api\\\"}]\"}}]}"),403),
+        ("POST","/control",Some("application/json"),Bytes::from_static(b"{\"compound\":[{\"api\":\"blocked.api\\u0000suffix\"}]}"),400),
+        ("POST","/control",Some("application/octet-stream"),Bytes::from_static(b"opaque"),415),
+        ("POST","/control",Some("application/x-www-form-urlencoded"),Bytes::from(vec![b'x';1048577]),413),
+        ("GET","/control?rest_route=/wp/v2/users-other",None,Bytes::new(),200),
+    ] {assert_eq!(send(method,path,"app.example",content_type,body,false).await,status,"{path}/{content_type:?}");}
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "blocked requests reached origin"
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "app.example",
+            Some("application/x-www-form-urlencoded"),
+            Bytes::from_static(
+                b"action=read&billing[address]=a&billing[address]=b&comment=first%0Asecond"
+            ),
+            false
+        )
+        .await,
+        200
+    );
+    let allowed = multipart("read");
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "app.example",
+            Some("multipart/form-data; boundary=owned"),
+            allowed.clone(),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().body,
+        allowed,
+        "allowed upload bytes changed"
+    );
+    assert_eq!(
+        send("GET", "/control", "app.example", None, Bytes::new(), true).await,
+        400
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "other.example",
+            Some("application/octet-stream"),
+            Bytes::from_static(b"action=write"),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send(
+            "POST",
+            "/unscoped",
+            "app.example",
+            Some("application/octet-stream"),
+            Bytes::from(vec![0xa5; 1048577]),
+            false
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        send(
+            "GET",
+            "/contr%6fl?action=write",
+            "app.example",
+            None,
+            Bytes::new(),
+            false
+        )
+        .await,
+        403
+    );
+    let reply = client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("content-encoding", "gzip")
+                .body(Full::new(Bytes::from_static(b"action=read")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 415);
+    reply.into_body().collect().await.unwrap();
+    for nominated in ["content-type", "content-encoding"] {
+        let reply = client()
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("http://{front}/control"))
+                    .header("host", "app.example")
+                    .header("content-type", "application/json")
+                    .header("connection", nominated)
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"note\":\"ok&action=write&ignored=value\"}",
+                    )))
+>>>>>>> review/release-request-blocks
                     .unwrap(),
             )
             .await
             .unwrap();
+<<<<<<< HEAD
         assert_eq!(response.status(), 200);
         let context = seen_context.lock().unwrap().clone();
         let all = |name: &str| -> Vec<String> {
@@ -6706,12 +6876,356 @@ async fn route_level_strip_request_cookies_works_without_auth() {
             Request::builder()
                 .uri(format!("http://{front}/public"))
                 .header("cookie", "a=1; __Host-hopae=SECRET; __Host-hopae_bind=B")
+=======
+        assert_eq!(
+            reply.status(),
+            400,
+            "representation nomination bypassed filter"
+        );
+        reply.into_body().collect().await.unwrap();
+    }
+    let before = seen.lock().unwrap().len();
+    let mut stalled = TcpStream::connect(front).await.unwrap();
+    stalled.write_all(b"POST /control HTTP/1.1\r\nHost: app.example\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\nConnection: close\r\n\r\naction=re").await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stalled.read_to_end(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reply.starts_with(b"HTTP/1.1 408"),
+        "stalled body inspection did not time out"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "incomplete body reached origin"
+    );
+    let mut early = TcpStream::connect(front).await.unwrap();
+    early.write_all(b"POST /control?action=write HTTP/1.1\r\nHost: app.example\r\nContent-Type: multipart/form-data; boundary=owned\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), early.read_to_end(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reply.starts_with(b"HTTP/1.1 403"),
+        "query-deny waited for large body"
+    );
+    assert_eq!(seen.lock().unwrap().len(), before);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].request_transform = Some(hangang::transform::BodyTransform {
+        operations: vec![hangang::transform::Operation::Replace {
+            from: "action=read".into(),
+            to: "action=write".into(),
+        }],
+        ..Default::default()
+    });
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let before = seen.lock().unwrap().len();
+    assert_eq!(
+        send(
+            "POST",
+            "/control",
+            "app.example",
+            Some("application/x-www-form-urlencoded"),
+            Bytes::from_static(b"action=read"),
+            false
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "request transformation introduced blocked origin action"
+    );
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].request_transform = None;
+    config.http[0].lua =
+        Some("hangang.set_header('content-type', 'application/x-www-form-urlencoded')".into());
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let native_pool = Arc::new(PolicyPool::new(
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_hangang")),
+        1,
+    ));
+    let native = Proxy::new(
+        active.clone(),
+        native_pool.clone(),
+        Arc::new(Metrics::default()),
+    );
+    let (lua_front, lua_task, _) = frontend(native).await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{lua_front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from_static(
+                    b"{\"note\":\"ok&action=write&ignored=value\"}",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.status(),
+        403,
+        "Lua changed decoder and bypassed final parameter protection"
+    );
+    reply.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), before);
+    lua_task.abort();
+    native_pool.shutdown().await;
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].lua = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.path_failure_bans=Some(vec![serde_json::from_value(serde_json::json!({"path":"/control","failures":1,"window_seconds":60,"ban_seconds":60})).unwrap()]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    assert_eq!(
+        send(
+            "GET",
+            "/control?action=write",
+            "app.example",
+            None,
+            Bytes::new(),
+            false
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        send(
+            "GET",
+            "/control?action=read",
+            "app.example",
+            None,
+            Bytes::new(),
+            false
+        )
+        .await,
+        429
+    );
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn multipart_spooling_preserves_large_uploads_and_denies_late_controls_before_origin() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (origin, seen, origin_task) = upstream("accepted").await;
+    let settings=hangang::config::Settings{request_blocks:Some(vec![serde_json::from_value(serde_json::json!({"path":"/control","hosts":["app.example"],"params":[{"name":"action","values":["write"]}],"max_body_bytes":65536,"timeout_ms":200,"multipart_spool":{"directory":directory.path().to_str().unwrap(),"max_body_bytes":33554432,"timeout_ms":30000,"idle_timeout_ms":5000}})).unwrap()]),..Default::default()};
+    let ((proxy, policy), active) =
+        proxy_with_settings(vec![route(vec![format!("http://{origin}")])], settings);
+    let (front, front_task, _) = frontend(proxy).await;
+    let payload = |action: &str| {
+        let mut data=b"--owned-large\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"sample.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        data.resize(data.len() + 20 * 1024 * 1024, 0xa5);
+        data.extend_from_slice(format!("\r\n--owned-large\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\n{action}\r\n--owned-large--\r\n").as_bytes());
+        Bytes::from(data)
+    };
+    let send = |body: Bytes| {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{front}/control"))
+            .header("host", "app.example")
+            .header("content-type", "multipart/form-data; boundary=owned-large")
+            .body(Full::new(body))
+            .unwrap();
+        async move {
+            let reply = client().request(request).await.unwrap();
+            let status = reply.status();
+            reply.into_body().collect().await.unwrap();
+            status
+        }
+    };
+    assert_eq!(send(payload("write")).await, 403);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "file bytes reached origin before late control denial"
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let allowed = payload("read");
+    assert_eq!(send(allowed.clone()).await, 200);
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().body,
+        allowed,
+        "large allowed multipart changed during disk replay"
+    );
+    // An unrelated trusted request-body rewrite forces the final filter pass;
+    // the >20MiB file still replays once from its cached parsed controls.
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].lua = Some("hangang.set_header('x-checked', 'yes')".into());
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let native_pool = Arc::new(PolicyPool::new(
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_hangang")),
+        1,
+    ));
+    let native = Proxy::new(
+        active.clone(),
+        native_pool.clone(),
+        Arc::new(Metrics::default()),
+    );
+    let (lua_front, lua_task, _) = frontend(native).await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{lua_front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "multipart/form-data; boundary=owned-large")
+                .body(Full::new(allowed.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    reply.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().last().unwrap().body, allowed);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].lua =
+        Some("hangang.set_header('content-type', 'application/x-www-form-urlencoded')".into());
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let before = seen.lock().unwrap().len();
+    let reply = client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{lua_front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "multipart/form-data; boundary=owned-large")
+                .body(Full::new(allowed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 403);
+    reply.into_body().collect().await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), before);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].lua = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    // A streaming transform retains the old spool while producing a new
+    // representation. The final inspector must poll that representation rather
+    // than silently restore the original cache (which previously returned 200).
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].request_transform = Some(serde_json::from_value(serde_json::json!({
+        "mode":"lines", "operations":[{"op":"replace","from":"read","to":"write"}],
+        "max_buffer_bytes":65536, "max_output_bytes":65536
+    })).unwrap());
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let before = seen.lock().unwrap().len();
+    assert_eq!(send(payload("read")).await, 400,
+        "streaming transform was bypassed using the retained original spool");
+    assert_eq!(seen.lock().unwrap().len(), before);
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.http[0].request_transform = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    // A body admitted before reload must use the same effective security profile
+    // at dispatch, while unrelated host-profile edits leave its upload intact.
+    for relevant in [false, true] {
+        let body = payload("read");
+        let mut socket = TcpStream::connect(front).await.unwrap();
+        socket.write_all(format!("POST /control HTTP/1.1\r\nHost: app.example\r\nContent-Type: multipart/form-data; boundary=owned-large\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+        socket.write_all(&body[..1024]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = seen.lock().unwrap().len();
+        let mut config = active.load().config.clone();
+        config.revision += 1;
+        let rules = config.settings.request_blocks.as_mut().unwrap();
+        if relevant {
+            rules[0].params[0].values.push("new-denial".into());
+        } else {
+            let mut unrelated = rules[0].clone();
+            unrelated.hosts = vec!["unrelated.example".into()];
+            rules.push(unrelated);
+        }
+        active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+        socket.write_all(&body[1024..]).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        if relevant {
+            assert!(reply.starts_with(b"HTTP/1.1 503"));
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                before,
+                "retired policy upload reached origin"
+            );
+        } else {
+            assert!(reply.starts_with(b"HTTP/1.1 200"));
+            assert_eq!(seen.lock().unwrap().last().unwrap().body, body);
+        }
+    }
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let mut socket = TcpStream::connect(front).await.unwrap();
+        socket.write_all(b"POST /control HTTP/1.1\r\nHost: app.example\r\nContent-Type: multipart/form-data; boundary=owned-large\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n--owned-large\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pending.bin\"\r\n\r\npending").await.unwrap();
+        stalled.push(socket);
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut third = TcpStream::connect(front).await.unwrap();
+    third.write_all(b"POST /control HTTP/1.1\r\nHost: app.example\r\nContent-Type: multipart/form-data; boundary=owned-large\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut rejected = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), third.read_to_end(&mut rejected))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rejected.starts_with(b"HTTP/1.1 503"),
+        "two stalled spools did not own separate capacity"
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        client().request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{front}/control"))
+                .header("host", "app.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Full::new(Bytes::from_static(b"action=read")))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "stalled spools exhausted small control inspectors"
+    );
+    response.into_body().collect().await.unwrap();
+    let response = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/control?action=read"))
+                .header("host", "app.example")
+>>>>>>> review/release-request-blocks
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+<<<<<<< HEAD
     assert_eq!(seen.lock().unwrap()[0].headers["cookie"], "a=1");
     policy.shutdown().await;
     front_task.abort();
@@ -6807,4 +7321,14 @@ fn cookie_cannot_be_an_authentication_identity_output() {
         ..Config::default()
     };
     assert!(config.validate().is_err());
+=======
+    response.into_body().collect().await.unwrap();
+    drop(stalled);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    lua_task.abort();
+    native_pool.shutdown().await;
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+>>>>>>> review/release-request-blocks
 }
