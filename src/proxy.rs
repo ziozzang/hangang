@@ -68,7 +68,7 @@ enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
     /// The second value carries `Set-Cookie` fields from the authorization
     /// response (session refresh) to append to the final client response when
-    /// `forward_response` is enabled. The final flag identifies a validated native service credential.
+    /// `forward_response` is enabled. The final value binds a native service identity to its authenticated service.
     Allow(HeaderMap, Vec<HeaderValue>, Option<String>),
     /// Fail closed with this status and a generic message.
     Deny(u16),
@@ -738,12 +738,14 @@ impl Proxy {
                 && (parts.headers.contains_key("x-hopae-principal-kind")
                     || parts
                         .headers
-                        .get("x-hopae-aal")
-                        .is_some_and(|v| v.as_bytes() == b"0")
+                        .get_all("x-hopae-aal")
+                        .iter()
+                        .any(|v| v.as_bytes() == b"0")
                     || parts
                         .headers
-                        .get("x-forwarded-user")
-                        .is_some_and(|v| v.as_bytes().starts_with(b"s_")))
+                        .get_all("x-forwarded-user")
+                        .iter()
+                        .any(|v| v.as_bytes().starts_with(b"s_")))
             {
                 crate::pumgye::identity(&parts.headers).ok_or(503u16)?.1 == 0
             } else {
