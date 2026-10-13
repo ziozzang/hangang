@@ -76,36 +76,13 @@ impl Client {
         );
         let mut client = Self::new(settings.address, settings.pool_size, key);
         if let Some(tls) = &settings.tls {
-            anyhow::ensure!(
-                [&tls.ca, &tls.certificate, &tls.key]
-                    .iter()
-                    .all(|p| p.is_absolute()),
-                "native Hopae TLS paths must be absolute"
-            );
-            let ca = crate::tls::read_bounded(&tls.ca)?;
-            let cert = crate::tls::read_bounded(&tls.certificate)?;
-            let key = crate::tls::read_bounded(&tls.key)?;
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
-                roots.add(cert?)?;
-            }
-            anyhow::ensure!(!roots.is_empty(), "native Hopae server CA is empty");
-            let certs =
-                rustls_pemfile::certs(&mut cert.as_slice()).collect::<io::Result<Vec<_>>>()?;
-            let key = rustls_pemfile::private_key(&mut key.as_slice())?
-                .ok_or_else(|| anyhow::anyhow!("native Hopae client key missing"))?;
-            let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_client_auth_cert(certs, key)?;
-            config.alpn_protocols = vec![b"hop1".to_vec()];
-            config.enable_early_data = false;
-            client.tls = Some((
-                tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
-                rustls::pki_types::ServerName::try_from(tls.server_name.clone())?,
-            ));
+            client.tls = Some(crate::tls::mutual_client(
+                &tls.ca,
+                &tls.certificate,
+                &tls.key,
+                &tls.server_name,
+                b"hop1",
+            )?);
         }
         Ok(client)
     }

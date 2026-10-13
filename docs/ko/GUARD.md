@@ -44,3 +44,22 @@ Snapshot은2초마다 bounded 배치/정책을 받아 로컬 index로 판단합�
 다릅니다. 동적 Lua/국가/ASN RuleSet은 snapshot v1에서 지원하지 않으므로
 query를 사용하세요. 기존 기본 health probe는 guard admission 밖에 있습니다.
 일반 proxy admission에 들어온 ACME 요청은 guard 판단을 받습니다.
+
+## 원격 네이티브 mTLS
+
+`--guard-decision-tcp`와 함께 `--guard-decision-server-name`·
+`--guard-decision-ca`·`--guard-decision-cert`·`--guard-decision-key`를 설정합니다.
+PEM 경로는 절대 경로여야 하며 literal 루프백 밖에서는 이 설정이 필수입니다.
+네이티브 목적지는 고정된 0이 아닌 포트의 unicast 소켓 주소입니다. Hangang은
+명시한 CA·서버 이름을 검증하고 클라이언트 인증서를 제시하며 ALPN `hgd1`을
+요구하고 TLS early data를 끕니다. 암호화된 연결 안에서도 collector 키 인증은 필수입니다.
+
+기존 제한된 연결 풀과 전체 판단 기한에 TCP 연결·TLS 핸드셰이크·요청/응답을
+포함합니다. Idle 연결은 25초 후 종료하고 서버의 300초 제한보다 짧은 240초의
+연결 수명도 적용합니다. 취소·잘못된 응답·TLS 실패·타임아웃은 연결을 폐기하며
+네이티브 실패 시 HTTP 또는 평문으로 전환하지 않습니다.
+
+HTTP origin은 여전히 신호/근거 제출과 snapshot export를 처리하고 네이티브 CA
+설정은 HGD1에만 적용합니다. 같은 권한 서버의 기존 인증된 HTTPS ingress 또는
+로컬 broker를 HTTP origin으로 설정합니다. 이 설정이 분산 discovery·영속 revision
+watermark나 전체 스택 100k QPS를 구현·검증한 것은 아닙니다.

@@ -92,3 +92,25 @@ mode, on both HTTP and binary decision transports. The service rejects snapshot
 retrieval while dynamic rules are active because a prefix-only snapshot cannot
 represent those decisions. Use the default query mode for these rules; an older
 snapshot retains its normal expiration behavior and fails open after expiry.
+
+## Remote native mTLS
+
+With `--guard-decision-tcp`, configure `--guard-decision-server-name`,
+`--guard-decision-ca`, `--guard-decision-cert` and `--guard-decision-key`
+together. PEM paths must be absolute. Outside literal loopback these settings
+are required; the native destination remains a fixed, nonzero unicast socket
+address. Hangang validates the explicit CA and expected server name, presents
+its client certificate, requires ALPN `hgd1` and disables TLS early data.
+Collector-key authentication remains mandatory inside the encrypted connection.
+
+The existing bounded pool and total decision timeout include TCP connection,
+TLS handshake and request/reply. Idle connections retire after 25 seconds;
+connections also retire after 240 seconds, before the server's 300-second
+limit. Cancellation, malformed responses, TLS failure and timeout discard the
+connection. Native failure never triggers HTTP or plaintext fallback.
+
+The HTTP origin still handles signals/evidence and snapshot export; the native
+CA configuration applies only to HGD1. Configure the HTTP origin for the same
+authority through its existing authenticated HTTPS ingress or local broker.
+These settings do not implement fleet discovery, persisted revision watermarks
+or measured full-stack 100k QPS.

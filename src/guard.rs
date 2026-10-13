@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::{Semaphore, mpsc},
 };
@@ -188,12 +188,19 @@ impl Policy {
 
 const TCP_POOL_SIZE: usize = 64;
 const TCP_IDLE_RETIRE: Duration = Duration::from_secs(25);
+trait NativeIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> NativeIo for T {}
 struct IdleSocket {
-    socket: TcpStream,
+    socket: Box<dyn NativeIo>,
+    created: std::time::Instant,
     last_used: std::time::Instant,
 }
 struct TcpPool {
     address: SocketAddr,
+    tls: Option<(
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )>,
     token: Vec<u8>,
     timeout: Duration,
     slots: Semaphore,
@@ -211,19 +218,32 @@ impl TcpPool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 loop {
                     match idle.pop() {
-                        Some(entry) if entry.last_used.elapsed() < TCP_IDLE_RETIRE => {
-                            break Some(entry.socket);
+                        Some(entry)
+                            if entry.last_used.elapsed() < TCP_IDLE_RETIRE
+                                && entry.created.elapsed() < Duration::from_secs(240) =>
+                        {
+                            break Some((entry.socket, entry.created));
                         }
                         Some(_) => continue,
                         None => break None,
                     }
                 }
             };
-            let mut socket = if let Some(socket) = cached {
-                socket
+            let (mut socket, created) = if let Some(cached) = cached {
+                cached
             } else {
-                let mut socket = TcpStream::connect(self.address).await?;
+                let socket = TcpStream::connect(self.address).await?;
                 socket.set_nodelay(true)?;
+                let mut socket: Box<dyn NativeIo> = if let Some((connector, name)) = &self.tls {
+                    let stream = connector.connect(name.clone(), socket).await?;
+                    ensure!(
+                        stream.get_ref().1.alpn_protocol() == Some(b"hgd1".as_slice()),
+                        "invalid guard native TLS protocol"
+                    );
+                    Box::new(stream)
+                } else {
+                    Box::new(socket)
+                };
                 socket.write_all(b"HGD1").await?;
                 socket
                     .write_all(&(self.token.len() as u16).to_be_bytes())
@@ -232,7 +252,7 @@ impl TcpPool {
                 let mut ack = [0; 4];
                 socket.read_exact(&mut ack).await?;
                 ensure!(&ack == b"HGA1", "invalid guard TCP acknowledgement");
-                socket
+                (socket, std::time::Instant::now())
             };
             let correlation = self.correlation.fetch_add(1, Ordering::Relaxed);
             let mut request = [0u8; 24];
@@ -289,6 +309,7 @@ impl TcpPool {
             if !self.slots.is_closed() {
                 idle.push(IdleSocket {
                     socket,
+                    created,
                     last_used: std::time::Instant::now(),
                 });
             }
@@ -335,8 +356,16 @@ struct Cache {
     revision: Option<u64>,
     entries: HashMap<IpAddr, Cached>,
 }
+#[derive(Clone, Debug)]
+pub struct NativeTls {
+    pub server_name: String,
+    pub ca: std::path::PathBuf,
+    pub certificate: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+}
 pub struct Config {
     pub decision_tcp: Option<SocketAddr>,
+    pub decision_tls: Option<NativeTls>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
     pub timeout_ms: u64,
@@ -357,10 +386,29 @@ impl Config {
             self.cache_ms == 0 || (1000..=5000).contains(&self.cache_ms),
             "guard cache must be zero or 1000..5000 ms"
         );
+        if let Some(tls) = &self.decision_tls {
+            ensure!(
+                self.decision_tcp.is_some(),
+                "guard native TLS requires a decision TCP address"
+            );
+            ensure!(
+                rustls::pki_types::ServerName::try_from(tls.server_name.clone()).is_ok(),
+                "invalid guard native TLS server name"
+            );
+            ensure!(
+                [&tls.ca, &tls.certificate, &tls.key]
+                    .iter()
+                    .all(|p| p.is_absolute()),
+                "guard native TLS paths must be absolute"
+            );
+        }
         if let Some(address) = self.decision_tcp {
             ensure!(
-                address.ip().is_loopback() && address.port() > 0,
-                "guard decision TCP requires a literal loopback address and nonzero port"
+                (address.ip().is_loopback() || self.decision_tls.is_some())
+                    && address.port() > 0
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast(),
+                "remote guard decision TCP requires mTLS and a nonzero unicast address"
             );
             ensure!(
                 self.transport_mode == TransportMode::Query,
@@ -466,10 +514,24 @@ impl GuardClient {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()?;
+        let native_tls = config
+            .decision_tls
+            .as_ref()
+            .map(|tls| {
+                crate::tls::mutual_client(
+                    &tls.ca,
+                    &tls.certificate,
+                    &tls.key,
+                    &tls.server_name,
+                    b"hgd1",
+                )
+            })
+            .transpose()?;
         let (queue, rx) = mpsc::channel(QUEUE);
         let guard = Arc::new(Self {
             tcp: config.decision_tcp.map(|address| TcpPool {
                 address,
+                tls: native_tls,
                 token: token.into_bytes(),
                 timeout: Duration::from_millis(config.timeout_ms),
                 slots: Semaphore::new(TCP_POOL_SIZE),
@@ -840,6 +902,7 @@ mod tests {
     fn url_boundaries() {
         let mut c = Config {
             decision_tcp: None,
+            decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
             timeout_ms: 100,
@@ -894,6 +957,7 @@ mod tests {
     fn test_config(url: String) -> Config {
         Config {
             decision_tcp: None,
+            decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
             timeout_ms: 1000,
@@ -1138,6 +1202,100 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
     async fn tcp_server() -> TestTcp {
+        tcp_server_with_tls(None).await
+    }
+    #[tokio::test]
+    async fn native_mtls_name_ca_and_collector_are_verified_without_http_fallback() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+            KeyPair,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["sumunjang.example.test".into()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_cert = params.signed_by(&server_key, &ca).unwrap();
+        let client_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = params.signed_by(&client_key, &ca).unwrap();
+        std::fs::write(temp.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(temp.path().join("client.pem"), client_cert.pem()).unwrap();
+        std::fs::write(temp.path().join("client.key"), client_key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let mut server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .unwrap();
+        server.alpn_protocols = vec![b"hgd1".to_vec()];
+        let tcp =
+            tcp_server_with_tls(Some(tokio_rustls::TlsAcceptor::from(Arc::new(server)))).await;
+        let (url, http_seen, _, http_task) = decision_server().await;
+        let settings = NativeTls {
+            server_name: "sumunjang.example.test".into(),
+            ca: temp.path().join("ca.pem"),
+            certificate: temp.path().join("client.pem"),
+            key: temp.path().join("client.key"),
+        };
+        let mut config = test_config(url.clone());
+        config.decision_tcp = Some(tcp.address);
+        config.decision_tls = Some(settings.clone());
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        assert!(guard.admit(ip, "/ordinary").await);
+        assert!(guard.admit(ip, "/ordinary").await);
+        assert_eq!(tcp.connections.load(Ordering::Relaxed), 1);
+        tcp.response.lock().unwrap()[1] = 1;
+        assert_eq!(guard.rejection(ip, "/ordinary").await, Some(403));
+        let mut config = test_config(url.clone());
+        config.decision_tcp = Some(tcp.address);
+        config.decision_tls = Some(NativeTls {
+            server_name: "wrong.example.test".into(),
+            ..settings.clone()
+        });
+        let wrong =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        assert_eq!(wrong.rejection(ip, "/ordinary").await, Some(503));
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let other = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        std::fs::write(temp.path().join("other.pem"), other.pem()).unwrap();
+        let mut config = test_config(url);
+        config.decision_tcp = Some(tcp.address);
+        config.decision_tls = Some(NativeTls {
+            ca: temp.path().join("other.pem"),
+            ..settings
+        });
+        let wrong =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        assert_eq!(wrong.rejection(ip, "/ordinary").await, Some(503));
+        assert!(http_seen.lock().unwrap().is_empty());
+        cancel.cancel();
+        tcp.task.abort();
+        http_task.abort();
+    }
+    async fn tcp_server_with_tls(tls: Option<tokio_rustls::TlsAcceptor>) -> TestTcp {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU64::new(0));
@@ -1154,14 +1312,23 @@ mod tests {
         let output = response.clone();
         let delay = delay_ms.clone();
         let task = tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
+            while let Ok((socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::Relaxed);
                 let records = records.clone();
                 let output = output.clone();
                 let delay = delay.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
                     let mut header = [0u8; 6];
                     socket.set_nodelay(true).unwrap();
+                    let mut socket: Box<dyn NativeIo> = if let Some(tls) = tls {
+                        let Ok(stream) = tls.accept(socket).await else {
+                            return;
+                        };
+                        Box::new(stream)
+                    } else {
+                        Box::new(socket)
+                    };
                     if socket.read_exact(&mut header).await.is_err() {
                         return;
                     }
