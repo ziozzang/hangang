@@ -58,3 +58,25 @@
 라이브러리·기존 관리자/설정/리소스 테스트·OpenAPI 참조·브라우저 소유권/CAS/로그아웃과
 실제 Hangang/품계 mTLS 프로세스를 소유한 HOP1/HGD1 peer로 검증합니다. 실제 호패/
 수문장 원격 전송·혼합 인증·큰 정책 규모·전체 스택 100k HTTP QPS는 별도 통과 조건입니다.
+
+## 서비스 신원
+
+네이티브 호패 서비스 인증은 단일 `x-hopae-principal-kind: service`·
+`x-hopae-aal: 0`·`s_`와 소문자 16진수 48자로 된 subject를 사용합니다. 인증된 `x-hopae-service-id`는 품계 게이트의 서비스 ID와 정확히 맞아야 합니다. 기존 사람
+근거는 AAL 1–3을 유지하고 서비스 namespace는 사람 assurance로 바뀌지 않습니다.
+미등록/중복/모순된 typed metadata는 거부합니다. 이 bridge는 아직 workload/network
+신원 변형을 활성화하지 않습니다.
+
+라우트가 호패에 `authorization`을 보내고 `x-forwarded-user`·`x-hopae-aal`·
+`x-hopae-principal-kind`를 받도록 설정합니다. 인증된 서비스에는 강제되는 품계
+게이트·명시적인 서비스별 subject 역할·일치하는 메서드/정보등급/network 권한이
+필요합니다. 역할이 `minimum_aal: 0`을 명시적으로 허용해야 하며 사람/MFA 요구는
+만족하지 못합니다. API credential만으로 resource gate가 없는 기존 라우트까지
+허용되지 않습니다. 서비스 인증의 terminal-response 모드로 권한 판단을 우회할
+수 없습니다.
+
+들어온 API Authorization credential은 네이티브 검증 후 소비하고 정책/변환 처리
+전에 제거하며 upstream 전송 직전에 다시 제거합니다. application 자격 정보로
+사용하지 않습니다. 서비스에 묶인 별도 변환과 스트리밍 credential 회수는 후속
+작업입니다. 현재 회귀 검증은 소유한 네이티브 호패 프로토콜 peer와 실제 Hangang/품계
+정책 평가를 사용합니다. 실제 여러 프로세스의 API 키 배포는 별도 검증 단계입니다.

@@ -687,6 +687,12 @@ async fn concurrent_subjects_cannot_share_resource_permission() {
 }
 
 async fn pumgye_identity() -> (SocketAddr, Arc<Mutex<String>>, JoinHandle<()>) {
+    pumgye_identity_with(None, b"2").await
+}
+async fn pumgye_identity_with(
+    kind: Option<&'static str>,
+    aal: &'static [u8],
+) -> (SocketAddr, Arc<Mutex<String>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let subject = Arc::new(Mutex::new("u_reader".to_owned()));
@@ -714,12 +720,17 @@ async fn pumgye_identity() -> (SocketAddr, Arc<Mutex<String>>, JoinHandle<()>) {
                     let mut body = vec![0; n];
                     stream.read_exact(&mut body).await.unwrap();
                     let subject = selected.lock().unwrap().clone();
+                    let mut identity = vec![
+                        ("x-forwarded-user".into(), subject.into_bytes()),
+                        ("x-hopae-aal".into(), aal.to_vec()),
+                    ];
+                    if let Some(kind) = kind {
+                        identity.push(("x-hopae-principal-kind".into(), kind.as_bytes().to_vec()));
+                        identity.push(("x-hopae-service-id".into(), b"orders".to_vec()));
+                    }
                     let reply = hangang::hopae_wire::Reply {
                         status: 200,
-                        headers: vec![
-                            ("x-forwarded-user".into(), subject.into_bytes()),
-                            ("x-hopae-aal".into(), b"2".to_vec()),
-                        ],
+                        headers: identity,
                         body: vec![],
                     };
                     let data = hangang::hopae_wire::encode_reply(&reply).unwrap();
@@ -809,4 +820,91 @@ fn pumgye_scope_cannot_be_silently_downgraded() {
     let mut missing = old.clone();
     missing.pumgye = None;
     assert!(missing.validate().is_err());
+}
+
+#[tokio::test]
+async fn service_principal_requires_explicit_matrix_and_never_exports_api_credential() {
+    let (origin, seen, origin_task) = capture_origin().await;
+    let (native, subject, native_task) = pumgye_identity_with(Some("service"), b"0").await;
+    let service = format!("s_{}", "a".repeat(48));
+    *subject.lock().unwrap() = service.clone();
+    let mut document = pumgye_document(origin, native, false);
+    document["http"][0]["auth"]["request_headers"] = json!(["authorization"]);
+    document["http"][0]["auth"]["response_headers"] =
+        json!(["x-forwarded-user", "x-hopae-aal", "x-hopae-principal-kind"]);
+    document["pumgye"]["services"]["orders"]["users"] = json!({service.clone():["reader"]});
+    document["pumgye"]["services"]["orders"]["roles"]["reader"]["minimum_aal"] = json!(0);
+    document["http"][0]["request_transform"] =
+        json!({"set_headers":{"authorization":"Bearer late-transform-credential"}});
+    let (front, policy, task) = gateway_document(document.clone()).await;
+    let credential = [("authorization", "Bearer consumed-service-credential")];
+    assert_eq!(
+        request(front, "GET", "/secure", None, &credential, None).await,
+        200
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].get("authorization").is_none());
+        assert_eq!(seen[0]["x-forwarded-user"], service);
+        assert_eq!(seen[0]["x-hopae-aal"], "0");
+    }
+    assert_eq!(
+        request(front, "POST", "/secure", None, &credential, None).await,
+        403
+    );
+    *subject.lock().unwrap() = format!("s_{}", "b".repeat(48));
+    assert_eq!(
+        request(front, "GET", "/secure", None, &credential, None).await,
+        403
+    );
+    *subject.lock().unwrap() = service;
+    let mut unguarded = document.clone();
+    unguarded["http"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("access_mode");
+    unguarded["http"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("resource_policy");
+    let (open, p2, t2) = gateway_document(unguarded).await;
+    assert_eq!(
+        request(open, "GET", "/secure", None, &credential, None).await,
+        403
+    );
+    for condition in ["assurance", "network", "class", "service"] {
+        let mut denied = document.clone();
+        match condition {
+            "assurance" => {
+                denied["pumgye"]["services"]["orders"]["roles"]["reader"]["minimum_aal"] = json!(1)
+            }
+            "network" => denied["pumgye"]["services"]["orders"]["networks"] = json!([]),
+            "service" => {
+                denied["pumgye"]["services"]["other"] =
+                    denied["pumgye"]["services"]["orders"].clone();
+                denied["http"][0]["resource_policy"]["pumgye"]["service_id"] = json!("other");
+            }
+            _ => {
+                denied["pumgye"]["information_classes"] = json!(["internal", "restricted"]);
+                denied["http"][0]["resource_policy"]["pumgye"]["information_class"] =
+                    json!("restricted");
+            }
+        }
+        let (front, p, t) = gateway_document(denied).await;
+        assert_eq!(
+            request(front, "GET", "/secure", None, &credential, None).await,
+            403,
+            "{condition} must independently deny service access"
+        );
+        t.abort();
+        p.shutdown().await;
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    task.abort();
+    t2.abort();
+    native_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+    p2.shutdown().await;
 }

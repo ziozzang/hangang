@@ -50,14 +50,32 @@ impl Gate {
 pub fn identity(headers: &hyper::HeaderMap) -> Option<(&str, u8)> {
     let mut subjects = headers.get_all("x-forwarded-user").iter();
     let subject = subjects.next()?.to_str().ok()?;
-    if subjects.next().is_some() || subject.is_empty() {
+    if subjects.next().is_some()
+        || subject.is_empty()
+        || subject.len() > 128
+        || subject.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut kinds = headers.get_all("x-hopae-principal-kind").iter();
+    let kind = kinds.next().map(|v| v.as_bytes());
+    if kinds.next().is_some() {
         return None;
     }
     let mut assurances = headers.get_all("x-hopae-aal").iter();
     let assurance = match assurances.next()?.as_bytes() {
-        b"1" => 1,
-        b"2" => 2,
-        b"3" => 3,
+        b"0" if kind == Some(b"service")
+            && subject.len() == 50
+            && subject.starts_with("s_")
+            && subject.as_bytes()[2..]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) =>
+        {
+            0
+        }
+        b"1" if (kind.is_none() || kind == Some(b"human")) && !subject.starts_with("s_") => 1,
+        b"2" if (kind.is_none() || kind == Some(b"human")) && !subject.starts_with("s_") => 2,
+        b"3" if (kind.is_none() || kind == Some(b"human")) && !subject.starts_with("s_") => 3,
         _ => return None,
     };
     if assurances.next().is_some() {
@@ -69,6 +87,28 @@ pub fn identity(headers: &hyper::HeaderMap) -> Option<(&str, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn service_identity_cannot_claim_human_assurance_or_reuse_human_subjects() {
+        let mut headers = hyper::HeaderMap::new();
+        let subject = format!("s_{}", "a".repeat(48));
+        headers.insert("x-forwarded-user", subject.parse().unwrap());
+        headers.insert("x-hopae-aal", "0".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.insert("x-hopae-principal-kind", "service".parse().unwrap());
+        assert_eq!(identity(&headers), Some((subject.as_str(), 0)));
+        headers.insert("x-hopae-aal", "2".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.insert("x-hopae-aal", "0".parse().unwrap());
+        headers.insert("x-forwarded-user", "u_operator".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.insert("x-forwarded-user", subject.parse().unwrap());
+        headers.append("x-hopae-principal-kind", "service".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.remove("x-hopae-principal-kind");
+        headers.insert("x-forwarded-user", "u_operator".parse().unwrap());
+        headers.insert("x-hopae-aal", "2".parse().unwrap());
+        assert_eq!(identity(&headers), Some(("u_operator", 2)));
+    }
     #[test]
     fn remote_authority_rejects_plaintext_and_scope_downgrades() {
         let mut authority:AuthorityConfig=serde_json::from_value(serde_json::json!({"decision_address":"127.0.0.1:9085","management_address":"127.0.0.1:9084","decision_token_env":"PUMGYE_DECISION_TOKEN","admin_token_env":"PUMGYE_ADMIN_TOKEN"})).unwrap();
