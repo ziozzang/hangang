@@ -68,8 +68,8 @@ enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
     /// The second value carries `Set-Cookie` fields from the authorization
     /// response (session refresh) to append to the final client response when
-    /// `forward_response` is enabled.
-    Allow(HeaderMap, Vec<HeaderValue>),
+    /// `forward_response` is enabled. The final flag identifies a validated native service credential.
+    Allow(HeaderMap, Vec<HeaderValue>, Option<String>),
     /// Fail closed with this status and a generic message.
     Deny(u16),
     /// Forward this response (SSO redirect/challenge) to the client verbatim.
@@ -733,6 +733,41 @@ impl Proxy {
             // configured identity headers or forwarding an SSO response.
             strip_hop_by_hop(&mut parts.headers);
             let status = parts.status;
+            let service_identity = if native.is_some()
+                && status.is_success()
+                && (parts.headers.contains_key("x-hopae-principal-kind")
+                    || parts
+                        .headers
+                        .get("x-hopae-aal")
+                        .is_some_and(|v| v.as_bytes() == b"0")
+                    || parts
+                        .headers
+                        .get("x-forwarded-user")
+                        .is_some_and(|v| v.as_bytes().starts_with(b"s_")))
+            {
+                crate::pumgye::identity(&parts.headers).ok_or(503u16)?.1 == 0
+            } else {
+                false
+            };
+            let service_scope = if service_identity {
+                let mut values = parts.headers.get_all("x-hopae-service-id").iter();
+                let scope = values.next().and_then(|v| v.to_str().ok()).ok_or(503u16)?;
+                if values.next().is_some()
+                    || scope.is_empty()
+                    || scope.len() > 128
+                    || !scope
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                {
+                    return Err(503);
+                }
+                Some(scope.to_owned())
+            } else {
+                None
+            };
+            if service_identity && auth.terminal_response {
+                return Err(503);
+            }
             let mut headers = HeaderMap::new();
             let mut size = 0;
             for name in &auth.response_headers {
@@ -803,7 +838,7 @@ impl Proxy {
                         cookies.push(value.clone());
                     }
                 }
-                return Ok(AuthOutcome::Allow(headers, cookies));
+                return Ok(AuthOutcome::Allow(headers, cookies, service_scope));
             }
             // SSO passthrough: forward a redirect/challenge to the client so the
             // authorization service can drive login/ban redirects and cookies.
@@ -2036,6 +2071,7 @@ impl Proxy {
         let auth_reserved = runtime.auth_reserved.as_slice();
         // Session cookies issued by the authorization service on a 2xx.
         let mut auth_cookies: Vec<HeaderValue> = Vec::new();
+        let mut consumed_service_credential = false;
         // A policy-selected backend is an authorization/routing decision. A
         // later connection retry must not replace it with a balancer-selected
         // backend the policy never approved.
@@ -2294,7 +2330,22 @@ impl Proxy {
                 return Ok(denied);
             }
             match authorization {
-                AuthOutcome::Allow(headers, cookies) => {
+                AuthOutcome::Allow(headers, cookies, service_scope) => {
+                    if let Some(service_scope) = service_scope {
+                        if resource_policy.is_none_or(|policy| {
+                            policy
+                                .pumgye
+                                .as_ref()
+                                .is_none_or(|gate| gate.service_id != service_scope)
+                        }) {
+                            return Ok(response(
+                                403,
+                                "service identity requires an enforced Pumgye permission gate",
+                            ));
+                        }
+                        consumed_service_credential = true;
+                        request.headers_mut().remove(header::AUTHORIZATION);
+                    }
                     if let Some(policy) = resource_policy
                         && matches!(
                             policy.principal,
@@ -2792,6 +2843,11 @@ impl Proxy {
         let strip_cookies = runtime.route.effective_strip_cookies();
         if !strip_cookies.is_empty() {
             strip_request_cookies(request.headers_mut(), &strip_cookies);
+        }
+        if consumed_service_credential {
+            // The API credential was consumed by the trusted native authenticator.
+            // Strip it after all transforms so it cannot become an upstream credential.
+            request.headers_mut().remove(header::AUTHORIZATION);
         }
         *request.version_mut() = Version::HTTP_11;
         // Regenerate HTTP/1 framing for an unknown-length body now that the

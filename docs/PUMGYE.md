@@ -72,3 +72,29 @@ OpenAPI references, browser owner/CAS/logout fences and actual Hangang/Pumgye mT
 processes with owned HOP1/HGD1 peers. Real Hopae/Sumunjang remote transports, mixed
 authentication, realistic-cardinality traffic and whole-stack 100k HTTP QPS remain
 separate acceptance work.
+
+## Service principals
+
+Native Hopae service authentication uses one `x-hopae-principal-kind: service`,
+`x-hopae-aal: 0` and a canonical `s_` plus 48 lowercase hexadecimal subject.
+The authenticated `x-hopae-service-id` must match the Pumgye gate exactly.
+Legacy human evidence retains AAL 1–3; service namespaces cannot become human
+assurance, and unknown/duplicate/contradictory typed metadata fails closed.
+Workload/network principal variants are not enabled by this bridge.
+
+Configure the route to forward `authorization` to Hopae and to receive
+`x-forwarded-user`, `x-hopae-aal` and `x-hopae-principal-kind`. The authenticated
+service must have an enforced Pumgye gate, an explicit service-scoped subject
+role and matching method, information class and network rights. Its role must
+explicitly permit `minimum_aal: 0`; a human/MFA requirement remains unsatisfied.
+An API credential alone never grants application access, including legacy routes
+without a resource gate. Service authentication cannot use terminal-response
+mode to bypass the permission decision.
+
+The incoming API Authorization credential is consumed after native verification
+and removed before policy/transform processing and again immediately before
+upstream dispatch. It does not become the application's credential. Dedicated
+service-bound translation and streaming credential revocation remain follow-up
+work. The current regression uses an owned native Hopae protocol peer and real
+Hangang/Pumgye policy evaluation; actual multi-process API-key deployment is
+still a separate qualification step.
