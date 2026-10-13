@@ -11,6 +11,45 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn mutual_client(
+    ca: &Path,
+    certificate: &Path,
+    key: &Path,
+    server_name: &str,
+    alpn: &[u8],
+) -> Result<(
+    tokio_rustls::TlsConnector,
+    rustls::pki_types::ServerName<'static>,
+)> {
+    ensure!(
+        [ca, certificate, key].iter().all(|p| p.is_absolute()),
+        "native TLS paths must be absolute"
+    );
+    let ca = read_bounded(ca)?;
+    let certificate = read_bounded(certificate)?;
+    let key = read_bounded(key)?;
+    let mut roots = RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut ca.as_slice()) {
+        roots.add(certificate?)?;
+    }
+    ensure!(!roots.is_empty(), "native server CA is empty");
+    let certificates =
+        rustls_pemfile::certs(&mut certificate.as_slice()).collect::<std::io::Result<Vec<_>>>()?;
+    let key =
+        rustls_pemfile::private_key(&mut key.as_slice())?.context("native client key missing")?;
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, key)?;
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config.enable_early_data = false;
+    Ok((
+        tokio_rustls::TlsConnector::from(Arc::new(config)),
+        rustls::pki_types::ServerName::try_from(server_name.to_owned())?,
+    ))
+}
+
 pub struct ReloadingTls {
     pub current: ArcSwap<ServerConfig>,
     files: Option<(PathBuf, PathBuf)>,
