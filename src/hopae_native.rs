@@ -11,17 +11,24 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::Semaphore,
     time::Instant,
 };
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 struct Connection {
-    socket: TcpStream,
+    socket: Box<dyn Io>,
+    created: Instant,
     used: Instant,
 }
 pub struct Client {
     address: SocketAddr,
+    tls: Option<(
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )>,
     key: hyper::header::HeaderValue,
     idle: Mutex<Vec<Connection>>,
     slots: Semaphore,
@@ -30,7 +37,7 @@ pub struct Client {
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid Hopae native exchange")
 }
-async fn read(socket: &mut TcpStream) -> io::Result<(u64, Vec<u8>)> {
+async fn read<S: AsyncRead + Unpin + ?Sized>(socket: &mut S) -> io::Result<(u64, Vec<u8>)> {
     let mut h = [0; 16];
     socket.read_exact(&mut h).await?;
     let (id, n) = wire::parse_header(h)?;
@@ -38,16 +45,74 @@ async fn read(socket: &mut TcpStream) -> io::Result<(u64, Vec<u8>)> {
     socket.read_exact(&mut data).await?;
     Ok((id, data))
 }
-async fn write(socket: &mut TcpStream, id: u64, data: &[u8]) -> io::Result<()> {
+async fn write<S: AsyncWrite + Unpin + ?Sized>(
+    socket: &mut S,
+    id: u64,
+    data: &[u8],
+) -> io::Result<()> {
     let mut bytes = Vec::with_capacity(16 + data.len());
     bytes.extend_from_slice(&wire::frame_header(id, data.len())?);
     bytes.extend_from_slice(data);
     socket.write_all(&bytes).await
 }
 impl Client {
+    pub fn from_config(
+        settings: &crate::config::HopaeNative,
+        key: hyper::header::HeaderValue,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=256).contains(&settings.pool_size),
+            "invalid native Hopae pool size"
+        );
+        anyhow::ensure!(
+            settings.address.ip().is_loopback() || settings.tls.is_some(),
+            "remote native Hopae requires mTLS"
+        );
+        anyhow::ensure!(
+            settings.address.port() != 0
+                && !settings.address.ip().is_unspecified()
+                && !settings.address.ip().is_multicast(),
+            "invalid native Hopae address"
+        );
+        let mut client = Self::new(settings.address, settings.pool_size, key);
+        if let Some(tls) = &settings.tls {
+            anyhow::ensure!(
+                [&tls.ca, &tls.certificate, &tls.key]
+                    .iter()
+                    .all(|p| p.is_absolute()),
+                "native Hopae TLS paths must be absolute"
+            );
+            let ca = crate::tls::read_bounded(&tls.ca)?;
+            let cert = crate::tls::read_bounded(&tls.certificate)?;
+            let key = crate::tls::read_bounded(&tls.key)?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
+                roots.add(cert?)?;
+            }
+            anyhow::ensure!(!roots.is_empty(), "native Hopae server CA is empty");
+            let certs =
+                rustls_pemfile::certs(&mut cert.as_slice()).collect::<io::Result<Vec<_>>>()?;
+            let key = rustls_pemfile::private_key(&mut key.as_slice())?
+                .ok_or_else(|| anyhow::anyhow!("native Hopae client key missing"))?;
+            let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key)?;
+            config.alpn_protocols = vec![b"hop1".to_vec()];
+            config.enable_early_data = false;
+            client.tls = Some((
+                tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
+                rustls::pki_types::ServerName::try_from(tls.server_name.clone())?,
+            ));
+        }
+        Ok(client)
+    }
     pub fn new(address: SocketAddr, pool_size: usize, key: hyper::header::HeaderValue) -> Self {
         Self {
             address,
+            tls: None,
             key,
             idle: Mutex::new(Vec::with_capacity(pool_size)),
             slots: Semaphore::new(pool_size),
@@ -63,10 +128,25 @@ impl Client {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop()
-            .filter(|c| c.used.elapsed() < Duration::from_secs(25));
+            .filter(|c| {
+                c.used.elapsed() < Duration::from_secs(25)
+                    && c.created.elapsed() < Duration::from_secs(240)
+            });
         if connection.is_none() {
-            let mut socket = TcpStream::connect(self.address).await?;
+            if self.tls.is_none() && !self.address.ip().is_loopback() {
+                return Err(invalid());
+            }
+            let socket = TcpStream::connect(self.address).await?;
             socket.set_nodelay(true)?;
+            let mut socket: Box<dyn Io> = if let Some((connector, name)) = &self.tls {
+                let stream = connector.connect(name.clone(), socket).await?;
+                if stream.get_ref().1.alpn_protocol() != Some(b"hop1".as_slice()) {
+                    return Err(invalid());
+                }
+                Box::new(stream)
+            } else {
+                Box::new(socket)
+            };
             write(&mut socket, 0, self.key.as_bytes()).await?;
             let (id, ack) = read(&mut socket).await?;
             if id != 0 || ack != [1] {
@@ -74,6 +154,7 @@ impl Client {
             }
             connection = Some(Connection {
                 socket,
+                created: Instant::now(),
                 used: Instant::now(),
             });
         }
@@ -121,6 +202,99 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("cookie", "a=1".parse().unwrap());
         h
+    }
+    #[tokio::test]
+    async fn mtls_verifies_server_name_ca_and_reuses_authenticated_pool() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+            KeyPair,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+        let mut server_params = CertificateParams::new(vec!["hopae.example.test".into()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+        let mut client_params = CertificateParams::new(vec![]).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca).unwrap();
+        std::fs::write(temp.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(temp.path().join("client.pem"), client_cert.pem()).unwrap();
+        std::fs::write(temp.path().join("client.key"), client_key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let mut server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .unwrap();
+        server.alpn_protocols = vec![b"hop1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let Ok(mut socket) = acceptor.accept(socket).await else {
+                    continue;
+                };
+                let (id, key) = read(&mut socket).await.unwrap();
+                assert_eq!((id, key), (0, b"fixture-key".to_vec()));
+                write(&mut socket, 0, &[1]).await.unwrap();
+                for _ in 0..2 {
+                    let (id, _) = read(&mut socket).await.unwrap();
+                    let reply = wire::Reply {
+                        status: 403,
+                        headers: vec![],
+                        body: vec![],
+                    };
+                    write(&mut socket, id, &wire::encode_reply(&reply).unwrap())
+                        .await
+                        .unwrap();
+                }
+                break;
+            }
+        });
+        let mut settings = crate::config::HopaeNative {
+            address,
+            pool_size: 1,
+            tls: Some(crate::config::HopaeNativeTls {
+                server_name: "wrong.example.test".into(),
+                ca: temp.path().join("ca.pem"),
+                certificate: temp.path().join("client.pem"),
+                key: temp.path().join("client.key"),
+            }),
+        };
+        let bad = Client::from_config(&settings, "fixture-key".parse().unwrap()).unwrap();
+        assert!(bad.verify(&headers()).await.is_err());
+        settings.tls.as_mut().unwrap().server_name = "hopae.example.test".into();
+        let mut other = CertificateParams::new(vec![]).unwrap();
+        other.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let other = CertifiedIssuer::self_signed(other, KeyPair::generate().unwrap()).unwrap();
+        std::fs::write(temp.path().join("other-ca.pem"), other.pem()).unwrap();
+        settings.tls.as_mut().unwrap().ca = temp.path().join("other-ca.pem");
+        let untrusted = Client::from_config(&settings, "fixture-key".parse().unwrap()).unwrap();
+        assert!(untrusted.verify(&headers()).await.is_err());
+        settings.tls.as_mut().unwrap().ca = temp.path().join("ca.pem");
+        let good = Client::from_config(&settings, "fixture-key".parse().unwrap()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(good.verify(&headers()).await.unwrap().status(), 403);
+        }
+        task.await.unwrap();
     }
     #[tokio::test]
     async fn reuses_authenticated_connection_and_preserves_multiple_cookies() {

@@ -21,6 +21,8 @@ use tokio::time::Instant;
 struct Config {
     public_url: String,
     native_address: SocketAddr,
+    #[serde(default)]
+    native_tls: Option<hangang::config::HopaeNativeTls>,
     gateway_key_env: String,
     upstream_token_env: String,
     #[serde(default = "cookie_name")]
@@ -95,8 +97,9 @@ impl Sso {
             "SSO public_url must be an origin"
         );
         ensure!(
-            config.native_address.ip().is_loopback() && config.native_address.port() != 0,
-            "SSO native peer must be literal loopback"
+            (config.native_address.ip().is_loopback() || config.native_tls.is_some())
+                && config.native_address.port() != 0,
+            "remote SSO native peer requires mTLS"
         );
         ensure!(
             config.cookie.len() <= 64
@@ -123,7 +126,14 @@ impl Sso {
         let token = std::env::var(&config.upstream_token_env)
             .context("SSO upstream credential unavailable")?;
         let system = secret(format!("Bearer {token}"))?;
-        let native = Client::new(config.native_address, 8, key);
+        let native = Client::from_config(
+            &hangang::config::HopaeNative {
+                address: config.native_address,
+                pool_size: 8,
+                tls: config.native_tls.clone(),
+            },
+            key,
+        )?;
         let origin = url.origin().ascii_serialization();
         Ok(Self {
             config,
@@ -393,6 +403,7 @@ mod tests {
         let config = Config {
             public_url: "https://console.example.test/".into(),
             native_address: address,
+            native_tls: None,
             gateway_key_env: "FIXTURE".into(),
             upstream_token_env: "FIXTURE".into(),
             cookie: cookie_name(),
