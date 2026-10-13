@@ -4533,13 +4533,41 @@
               "address": {
                 "type": "string",
                 "maxLength": 128,
-                "description": "Nonzero literal loopback SocketAddr; no DNS or remote plaintext."
+                "description": "Nonzero literal unicast SocketAddr; remote connections require mTLS. No DNS destination lookup or plaintext fallback."
               },
               "pool_size": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 256,
                 "default": 32
+              },
+              "tls": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "server_name",
+                  "ca",
+                  "certificate",
+                  "key"
+                ],
+                "properties": {
+                  "server_name": {
+                    "type": "string",
+                    "description": "Expected TLS server identity; socket destination remains the fixed native address."
+                  },
+                  "ca": {
+                    "type": "string",
+                    "description": "Absolute path to explicit PEM server trust roots."
+                  },
+                  "certificate": {
+                    "type": "string",
+                    "description": "Absolute path to client certificate PEM."
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Absolute path to client private key PEM; contents never serialized."
+                  }
+                }
               }
             }
           },

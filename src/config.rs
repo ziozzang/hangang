@@ -452,7 +452,7 @@ fn canonical_methods() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct ExternalAuth {
     pub url: String,
-    /// Optional loopback HOP1 transport; provider logic remains in Hopae.
+    /// Optional authenticated HOP1 transport; remote connections require mTLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<HopaeNative>,
     #[serde(default)]
@@ -492,6 +492,16 @@ pub struct HopaeNative {
     pub address: std::net::SocketAddr,
     #[serde(default = "hopae_pool_size")]
     pub pool_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<HopaeNativeTls>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopaeNativeTls {
+    pub server_name: String,
+    pub ca: std::path::PathBuf,
+    pub certificate: std::path::PathBuf,
+    pub key: std::path::PathBuf,
 }
 fn hopae_pool_size() -> usize {
     32
@@ -1613,9 +1623,25 @@ impl Config {
                 }
                 if let Some(native) = &auth.native {
                     ensure!(
-                        native.address.ip().is_loopback() && native.address.port() != 0,
-                        "native Hopae requires a nonzero literal loopback address"
+                        (native.address.ip().is_loopback() || native.tls.is_some())
+                            && native.address.port() != 0
+                            && !native.address.ip().is_unspecified()
+                            && !native.address.ip().is_multicast(),
+                        "native Hopae requires a nonzero unicast address; remote connections require mTLS"
                     );
+                    if let Some(tls) = &native.tls {
+                        ensure!(
+                            rustls::pki_types::ServerName::try_from(tls.server_name.clone())
+                                .is_ok(),
+                            "invalid native Hopae TLS server name"
+                        );
+                        ensure!(
+                            [&tls.ca, &tls.certificate, &tls.key]
+                                .iter()
+                                .all(|p| p.is_absolute()),
+                            "native Hopae TLS paths must be absolute"
+                        );
+                    }
                     ensure!(
                         (1..=256).contains(&native.pool_size),
                         "native Hopae pool_size must be 1..256"
@@ -2543,13 +2569,12 @@ impl Snapshot {
                                     })
                                 })
                                 .and_then(|r| r.auth_native.clone());
-                            let client = reused.unwrap_or_else(|| {
-                                std::sync::Arc::new(crate::hopae_native::Client::new(
-                                    native.address,
-                                    native.pool_size,
-                                    key,
-                                ))
-                            });
+                            let client = match reused {
+                                Some(client) => client,
+                                None => std::sync::Arc::new(
+                                    crate::hopae_native::Client::from_config(native, key)?,
+                                ),
+                            };
                             native_clients.insert(route.id.clone(), client);
                         }
                         auth_static_headers.insert(route.id.clone(), resolved);

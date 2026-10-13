@@ -7435,6 +7435,7 @@ async fn native_hopae_transport_uses_normal_identity_cookie_and_terminal_handlin
         native: Some(hangang::config::HopaeNative {
             address: native,
             pool_size: 2,
+            tls: None,
         }),
         url: "http://127.0.0.1:1/_hopae/verify".into(),
         request_headers: vec!["cookie".into()],

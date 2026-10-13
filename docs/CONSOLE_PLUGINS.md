@@ -83,7 +83,7 @@ An existing route's external auth can add:
 
 The auth URL must identify `/_hopae/verify`; configure a static
 `x-hopae-gateway-key` and enable Hopae `listen.native_gateway` at that address.
-HOP1 is a bounded authenticated persistent loopback transport. No session decision
+HOP1 is a bounded authenticated persistent transport; remote connections require mTLS. No session decision
 is cached, no provider is embedded, and native failures fail closed with no HTTP
 fallback/replay. Both transports share the same forwarding and result handling.
 Idle sockets retire before the server deadline; cancellation discards a socket.
@@ -141,3 +141,18 @@ Configuration discovery reveals only the provider name and fixed entry URL.
 Validation: native per-request revocation, same-origin exchange, explicit account
 mapping, opaque-bearer isolation, local account disable/expiry, browser callback,
 and Hangang-authority Hopae reads/mutations/replay/audit are covered by tests.
+
+For remote HOP1, add `native.tls` with `server_name`, `ca`, `certificate` and
+`key` (absolute PEM paths), and enable Hopae `listen.native_gateway_tls`.
+Hangang dials only the fixed `native.address`, validates the explicit CA and
+server identity, supplies its client certificate and requires ALPN `hop1`.
+TLS errors never fall back to plaintext or HTTP. Connections retire after
+240 seconds, before Hopae's 300-second server limit. TLS files are read only
+when preparing a changed configuration; CA/key rotation requires publication
+of changed `native.tls` settings (for example, new versioned PEM paths).
+
+The optional console SSO configuration accepts `native_tls` with the same
+`server_name`, `ca`, `certificate` and `key` fields. It uses the shared native
+client and fixed `native_address`, preserving explicit Hopae-to-Hangang
+account mappings and existing session/lease checks. Remote SSO peers require
+mTLS; loopback plaintext remains available during migration.

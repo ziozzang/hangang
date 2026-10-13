@@ -67,3 +67,15 @@ Hangang lease를 사용합니다(최대 1초 재사용). Hangang 계정·역할�
 
 요청별 세션 회수, 같은 origin 교환, 명시적 계정 연결, bearer 직접 우회 차단,
 계정 비활성화·만료, 브라우저 복귀, 통합 Hopae 조회·변경·재전송·감사를 검증합니다.
+
+원격 HOP1에는 `native.tls`의 `server_name`·`ca`·`certificate`·`key`(절대 PEM 경로)를
+설정하고 Hopae `listen.native_gateway_tls`를 활성화합니다. Hangang은 고정된
+`native.address`에만 연결하고 명시한 CA·서버 신원·클라이언트 인증서와 ALPN
+`hop1`을 검증합니다. TLS 오류 시 평문 또는 HTTP로 전환하지 않습니다. 연결은
+Hopae의 300초 제한 전에 240초 후 교체합니다. TLS 파일은 변경된 설정을 준비할 때
+읽으므로 CA/key 회전에는 변경된 `native.tls` 설정(예: 버전을 가진 새로운 PEM 경로)의 게시가 필요합니다.
+
+선택적인 콘솔 SSO 설정도 같은 `server_name`·`ca`·`certificate`·`key` 필드를 가진
+`native_tls`를 받습니다. 공통 네이티브 client와 고정 `native_address`를 사용하고
+명시적인 호패→Hangang 계정 매핑과 기존 세션/lease 검사를 유지합니다.
+원격 SSO peer에는 mTLS가 필수이며 전환 중에는 루프백 평문을 유지할 수 있습니다.
