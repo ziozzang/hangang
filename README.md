@@ -179,3 +179,5 @@ Some integration targets need Docker or additional dependencies. See [developmen
 Trusted Guard/Hopae menus and native Hopae transport: [console integration](docs/CONSOLE_PLUGINS.md).
 
 [Pumgye native authorization and matrix](docs/PUMGYE.md) · [한국어](docs/ko/PUMGYE.md)
+
+[Independent Pumgye authority](docs/PUMGYE.md) documents native decision transport and delegated policy administration.

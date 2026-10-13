@@ -4221,6 +4221,7 @@ mod tests {
         ));
         let different = Config {
             pumgye: None,
+            pumgye_authority: None,
             geoip_database: None,
             revision: 6,
             certificates: vec![],

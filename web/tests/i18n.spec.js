@@ -110,7 +110,7 @@ test('switching a dirty route dialog translates controls without altering values
   await expect(page.locator('#route-json')).toHaveValue(draft);
   await expect(page.locator('#revision-badge')).toHaveText(revision);
   await page.locator('#locale-select-route').selectOption('ko');
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   await page.locator('#route-json').fill('{');
   await page.locator('#save-route').click();
   await expect(page.locator('#route-message')).toContainText(/[가-힣]/);

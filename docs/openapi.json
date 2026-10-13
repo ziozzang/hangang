@@ -16,6 +16,223 @@
     }
   ],
   "paths": {
+    "/v1/pumgye/policy": {
+      "get": {
+        "summary": "Read independent Pumgye policy through Hangang",
+        "description": "Administrator-only fixed owning-domain operation. No client URL, credential, cookie or header forwarding. 503 if authority or local management credential is unavailable.",
+        "responses": {
+          "200": {
+            "description": "Owning Pumgye result; no-store, live administrator authority rechecked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PumgyePolicyDocument"
+                }
+              }
+            },
+            "headers": {
+              "X-Hangang-Config-Revision": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Quoted Hangang authority configuration revision; bind publication to this scope."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      },
+      "put": {
+        "summary": "Publish independent Pumgye policy with owning CAS and Hangang scope fence",
+        "description": "Does not rewrite Hangang configuration. Admission is fenced by live administrator role; admitted external publication may complete after cancellation. Re-read policy after an unconfirmed outcome. Requires both quoted revisions; owning Pumgye increments policy revision and audits its verified transport caller.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Quoted owning Pumgye policy revision."
+          },
+          {
+            "name": "X-Hangang-Config-Revision",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Quoted current Hangang authority connection configuration revision."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PumgyePolicyDocument"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Owning Pumgye result; no-store, live administrator authority rechecked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PumgyePolicyDocument"
+                }
+              }
+            },
+            "headers": {
+              "X-Hangang-Config-Revision": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Quoted Hangang authority configuration revision; bind publication to this scope."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "428": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/status": {
+      "get": {
+        "summary": "Read independent Pumgye status through Hangang",
+        "description": "Administrator-only fixed owning-domain operation. No client URL, credential, cookie or header forwarding. 503 if authority or local management credential is unavailable.",
+        "responses": {
+          "200": {
+            "description": "Owning Pumgye result; no-store, live administrator authority rechecked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PumgyeStatus"
+                }
+              }
+            },
+            "headers": {
+              "X-Hangang-Config-Revision": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Quoted Hangang authority configuration revision; bind publication to this scope."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/audit": {
+      "get": {
+        "summary": "Read independent Pumgye audit through Hangang",
+        "description": "Administrator-only fixed owning-domain operation. No client URL, credential, cookie or header forwarding. 503 if authority or local management credential is unavailable.",
+        "responses": {
+          "200": {
+            "description": "Owning Pumgye result; no-store, live administrator authority rechecked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "items": {
+                    "$ref": "#/components/schemas/PumgyeAudit"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "after_revision",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Sole optional numeric cursor; at most 100 records."
+          }
+        ]
+      }
+    },
     "/v1/fleet/observations": {"get":{"summary":"Read local collector observations (administrator only)","description":"Returns a copied local, partial snapshot without waiting on peers. Available means the inventory is valid; fresh_nodes counts fresh responses regardless of peer readiness. Stale or failed samples never imply current readiness. Requires live administrator authority. Cache-Control: no-store.","responses":{"200":{"description":"Bounded local collector snapshot","content":{"application/json":{"schema":{"$ref":"#/components/schemas/FleetObservations"}}}},"400":{"$ref":"#/components/responses/Problem"},"401":{"$ref":"#/components/responses/Problem"},"403":{"$ref":"#/components/responses/Problem"},"405":{"$ref":"#/components/responses/Problem"}}}},
     "/v1/fleet/observation": {"get":{"summary":"Read one local node observation with its dedicated observer bearer token","description":"Uses only the private observer credential, never an administrator session. No peer polling. Duplicate Authorization headers and query strings are rejected. Cache-Control: no-store.","security":[{"observerAuth":[]}],"responses":{"200":{"description":"Fixed redacted local observation","content":{"application/json":{"schema":{"$ref":"#/components/schemas/FleetObservation"}}}},"400":{"$ref":"#/components/responses/Problem"},"401":{"$ref":"#/components/responses/Problem"},"405":{"$ref":"#/components/responses/Problem"},"503":{"$ref":"#/components/responses/Problem"}}}},
     "/v1/fleet/observer-status": {"get":{"summary":"Read local observer credential readiness (administrator only)","description":"Requires live administrator authority. Disabled mode reports configured=false, available=false, node_id=null, generation=null. Cache-Control: no-store.","responses":{"200":{"description":"Local observer status","content":{"application/json":{"schema":{"$ref":"#/components/schemas/FleetObserverStatus"}}}},"400":{"$ref":"#/components/responses/Problem"},"401":{"$ref":"#/components/responses/Problem"},"403":{"$ref":"#/components/responses/Problem"},"405":{"$ref":"#/components/responses/Problem"},"503":{"$ref":"#/components/responses/Problem"}}}},
@@ -2111,6 +2328,408 @@
       }
     },
     "schemas": {
+      "PumgyeGate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service_id",
+          "information_class",
+          "permissions"
+        ],
+        "properties": {
+          "service_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          },
+          "information_class": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          },
+          "permissions": {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 16,
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "pattern": "^[A-Z]+$"
+            },
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+              },
+              "maxItems": 64,
+              "uniqueItems": true,
+              "minItems": 1
+            }
+          }
+        }
+      },
+      "PumgyeRole": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "permissions",
+          "information_classes"
+        ],
+        "properties": {
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "maxItems": 64,
+            "uniqueItems": true
+          },
+          "information_classes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "maxItems": 64,
+            "uniqueItems": true
+          },
+          "inherits": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "maxItems": 8,
+            "uniqueItems": true
+          },
+          "minimum_aal": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3,
+            "default": 0
+          }
+        }
+      },
+      "PumgyeNetwork": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cidr",
+          "roles"
+        ],
+        "properties": {
+          "cidr": {
+            "type": "string",
+            "maxLength": 43,
+            "description": "Canonical IPv4/IPv6 CIDR. Host bits and duplicate prefixes are rejected by runtime validation."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true
+          }
+        }
+      },
+      "PumgyeService": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "permissions",
+          "roles",
+          "users",
+          "networks"
+        ],
+        "properties": {
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "maxItems": 64,
+            "uniqueItems": true,
+            "minItems": 1
+          },
+          "roles": {
+            "type": "object",
+            "maxProperties": 64,
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PumgyeRole"
+            }
+          },
+          "users": {
+            "type": "object",
+            "maxProperties": 65536,
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+              },
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true
+            }
+          },
+          "networks": {
+            "type": "array",
+            "maxItems": 65536,
+            "items": {
+              "$ref": "#/components/schemas/PumgyeNetwork"
+            }
+          },
+          "require_guard": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "description": "User/network rights intersect. Guest is reserved, inheritance/assignment references are validated, and aggregate users/prefixes are bounded across services."
+      },
+      "PumgyePolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "information_classes",
+          "services"
+        ],
+        "properties": {
+          "version": {
+            "const": 1
+          },
+          "information_classes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "maxItems": 64,
+            "uniqueItems": true,
+            "minItems": 1
+          },
+          "services": {
+            "type": "object",
+            "maxProperties": 128,
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PumgyeService"
+            }
+          }
+        }
+      },
+      "PumgyePolicyDocument": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "policy"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PumgyePolicy"
+          }
+        }
+      },
+      "PumgyeAuthorityTls": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "server_name",
+          "ca",
+          "certificate",
+          "key"
+        ],
+        "properties": {
+          "server_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "ca": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Local PEM file reference; no private material in JSON."
+          },
+          "certificate": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Local PEM file reference; no private material in JSON."
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Local PEM file reference; no private material in JSON."
+          }
+        }
+      },
+      "PumgyeAuthority": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "decision_address",
+          "management_address",
+          "decision_token_env",
+          "admin_token_env"
+        ],
+        "properties": {
+          "decision_address": {
+            "type": "string",
+            "description": "Fixed SocketAddr for persistent PPG1."
+          },
+          "management_address": {
+            "type": "string",
+            "description": "Fixed SocketAddr for owning-domain administration."
+          },
+          "decision_token_env": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          },
+          "admin_token_env": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          },
+          "tls": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PumgyeAuthorityTls"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pool_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024,
+            "default": 64
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100
+          },
+          "minimum_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          }
+        },
+        "description": "Outside loopback mTLS is required. Credential references are distinct. Data-plane nodes may omit the local admin secret; management then fails closed. Independent policy belongs to Pumgye, not Hangang configuration."
+      },
+      "PumgyeStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "policy_revision",
+          "healthy",
+          "decision_queries",
+          "cache_ttl_ms"
+        ],
+        "properties": {
+          "version": {
+            "const": 1
+          },
+          "policy_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "healthy": {
+            "type": "boolean"
+          },
+          "decision_queries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cache_ttl_ms": {
+            "const": 0
+          }
+        }
+      },
+      "PumgyeAudit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "at_unix",
+          "actor",
+          "sha256"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "at_unix": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "actor": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
       "FleetObservations": {"type":"object","additionalProperties":false,"required":["observer_instance_id","configured","available","generation","expected_nodes","fresh_nodes","stale_after_seconds","nodes"],"properties":{"observer_instance_id":{"type":"string","pattern":"^[0-9a-f]{16}(?![\\s\\S])","description":"Process-local collector identity; pair with generation when interpreting freshness across restarts or load-balanced admin endpoints."},"configured":{"type":"boolean"},"available":{"type":"boolean"},"generation":{"type":["string","null"],"pattern":"^(0|[1-9][0-9]{0,19})(?![\\s\\S])","maxLength":20},"expected_nodes":{"type":["integer","null"],"minimum":0,"maximum":64},"fresh_nodes":{"type":["integer","null"],"minimum":0,"maximum":64,"description":"Number of peers with a current fresh observation, including those reporting ready=false; not a count of healthy nodes."},"stale_after_seconds":{"type":"integer","const":60},"nodes":{"type":"array","maxItems":64,"items":{"$ref":"#/components/schemas/FleetCollectedNode"}}},"allOf":[{"if":{"properties":{"configured":{"const":false}},"required":["configured"]},"then":{"properties":{"available":{"const":false},"generation":{"type":"null"},"expected_nodes":{"const":0},"fresh_nodes":{"const":0},"nodes":{"maxItems":0}}}},{"if":{"properties":{"configured":{"const":true}},"required":["configured"]},"then":{"properties":{"generation":{"type":"string"}}}},{"if":{"properties":{"configured":{"const":true},"available":{"const":false}},"required":["configured","available"]},"then":{"properties":{"expected_nodes":{"type":"null"},"fresh_nodes":{"type":"null"},"nodes":{"maxItems":0}}}},{"if":{"properties":{"available":{"const":true}},"required":["available"]},"then":{"properties":{"expected_nodes":{"type":"integer"},"fresh_nodes":{"type":"integer"}}}}]},
       "FleetCollectedNode": {"type":"object","additionalProperties":false,"required":["node_id","endpoint","group_id","role","condition","last_error","age_seconds","observation"],"properties":{"node_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}(?![\\s\\S])"},"endpoint":{"type":"string","maxLength":2048,"pattern":"^https://[^/?#@]+(?![\\s\\S])","description":"Validated HTTPS origin without path, query, fragment or userinfo; inventory only."},"group_id":{"type":["string","null"],"pattern":"^[A-Za-z0-9._-]{1,64}(?![\\s\\S])","description":"Unverified operator inventory label; null when omitted. No group or role authority is inferred."},"role":{"type":["string","null"],"pattern":"^[A-Za-z0-9._-]{1,64}(?![\\s\\S])","description":"Unverified operator inventory label; null when omitted. No group or role authority is inferred."},"condition":{"type":"string","enum":["unknown","fresh","stale","unavailable","identity_mismatch"],"description":"Stale applies only after a previously fresh observation ages past 60 seconds; failures and identity mismatches remain explicit even when older."},"last_error":{"type":["string","null"],"enum":[null,"transport","http_status","body_too_large","invalid_observation","identity_mismatch"]},"age_seconds":{"type":["integer","null"],"minimum":0},"observation":{"description":"Historical last successful observation may remain visible during stale or unavailable conditions; only condition=fresh represents current freshness.","anyOf":[{"$ref":"#/components/schemas/FleetCollectedObservation"},{"type":"null"}]}},"allOf":[{"if":{"properties":{"condition":{"const":"unknown"}},"required":["condition"]},"then":{"properties":{"observation":{"type":"null"},"age_seconds":{"type":"null"},"last_error":{"type":"null"}}}},{"if":{"properties":{"condition":{"const":"fresh"}},"required":["condition"]},"then":{"properties":{"observation":{"$ref":"#/components/schemas/FleetCollectedObservation"},"age_seconds":{"type":"integer","minimum":0,"maximum":59},"last_error":{"type":"null"}}}},{"if":{"properties":{"condition":{"const":"stale"}},"required":["condition"]},"then":{"properties":{"observation":{"$ref":"#/components/schemas/FleetCollectedObservation"},"age_seconds":{"type":"integer","minimum":60},"last_error":{"type":"null"}}}},{"if":{"properties":{"condition":{"const":"unavailable"}},"required":["condition"]},"then":{"properties":{"last_error":{"type":"string","enum":["transport","http_status","body_too_large","invalid_observation"]}}}},{"if":{"properties":{"condition":{"const":"identity_mismatch"}},"required":["condition"]},"then":{"properties":{"last_error":{"const":"identity_mismatch"}}}},{"if":{"properties":{"observation":{"type":"null"}},"required":["observation"]},"then":{"properties":{"age_seconds":{"type":"null"}}}},{"if":{"properties":{"observation":{"type":"object"}},"required":["observation"]},"then":{"properties":{"age_seconds":{"type":"integer"}}}}]},
       "FleetCollectedObservation": {"allOf":[{"$ref":"#/components/schemas/FleetObservation"},{"type":"object","properties":{"store_epoch":{"anyOf":[{"type":"null"},{"type":"string","pattern":"^[!-~]{1,128}(?![\\s\\S])"}]}}}],"description":"Collector-validated local observation; store_epoch is null or 1..128 printable ASCII characters."},
@@ -3309,6 +3928,8 @@
           "tcp"
         ],
         "properties": {
+          "pumgye": {"anyOf":[{"$ref":"#/components/schemas/PumgyePolicy"},{"type":"null"}],"description":"Earlier embedded migration baseline; mutually exclusive with pumgye_authority."},
+          "pumgye_authority": {"anyOf":[{"$ref":"#/components/schemas/PumgyeAuthority"},{"type":"null"}]},
           "geoip_database": {"anyOf":[{"$ref":"#/components/schemas/GeoIpSource"},{"type":"null"}]},
           "revision": {
             "type": "integer",
@@ -5040,6 +5661,7 @@
         "additionalProperties": false,
         "required": ["resource_id", "principal", "allow"],
         "properties": {
+          "pumgye": {"anyOf":[{"$ref":"#/components/schemas/PumgyeGate"},{"type":"null"}],"description":"Requires native Hopae subject/AAL, empty legacy allow array and embedded policy or remote authority. Cache bypass and bounded stream revocation apply."},
           "resource_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$", "description": "Opaque ASCII namespace ID. Same ID across routes requires the same policy and authenticator." },
           "enforce": { "type": "boolean", "default": true, "description": "False keeps the policy configured but disables namespace and subject enforcement. Gateway authentication still runs, and all schema/authenticator checks still apply." },
           "principal": { "$ref": "#/components/schemas/ResourcePrincipal" },

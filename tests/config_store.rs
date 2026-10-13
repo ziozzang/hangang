@@ -38,6 +38,7 @@ fn sequenced_stamp(expected: u64, sequence: u64, candidate: &Config) -> Sequence
 fn config(revision: u64, id: &str) -> Config {
     Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         settings: Default::default(),
         cache_generation_floor: 0,

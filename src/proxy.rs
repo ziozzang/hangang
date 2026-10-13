@@ -324,6 +324,7 @@ impl JwtRouteLease {
 #[derive(Clone, Default)]
 struct AuthRouteLease {
     pumgye: Option<(Arc<ArcSwap<Snapshot>>, u64)>,
+    pumgye_remote: Option<(Arc<crate::pumgye::AuthorityRuntime>, u64)>,
     workload: Option<WorkloadRouteLease>,
     jwt: Option<JwtRouteLease>,
 }
@@ -360,7 +361,11 @@ impl AuthRouteLease {
             pumgye: self
                 .pumgye
                 .as_ref()
-                .is_some_and(|(active, revision)| active.load().config.revision != *revision),
+                .is_some_and(|(active, revision)| active.load().config.revision != *revision)
+                || self
+                    .pumgye_remote
+                    .as_ref()
+                    .is_some_and(|(runtime, revision)| !runtime.lease_current(*revision)),
             workload: self.workload.as_ref().is_some_and(|lease| !lease.current()),
             jwt: self.jwt.as_ref().is_some_and(|lease| !lease.current()),
         }
@@ -1809,6 +1814,7 @@ impl Proxy {
             workload: Some(workload),
             jwt: None,
             pumgye: None,
+            pumgye_remote: None,
         });
         if runtime
             .route
@@ -2301,25 +2307,63 @@ impl Proxy {
                                 Some(guard) => guard.authorization_evidence(edge.client_ip).await,
                                 None => pumgye_core::GuardEvidence::Unavailable,
                             };
-                            match (
-                                snapshot.pumgye.as_ref(),
-                                identity,
-                                gate.permissions.get(request.method().as_str()),
-                            ) {
-                                (Some(compiled), Some((subject, aal)), Some(permissions)) => {
-                                    permissions.iter().all(|permission| {
-                                        compiled.evaluate(
-                                            &gate.service_id,
+                            if snapshot.config.pumgye_authority.is_some() {
+                                match (snapshot.pumgye_remote.as_ref(), identity) {
+                                    (Some(remote), Some((subject, aal))) => match remote
+                                        .authorize(
+                                            gate,
+                                            request.method().as_str(),
                                             subject,
                                             edge.client_ip,
-                                            permission,
-                                            &gate.information_class,
                                             aal,
                                             evidence,
-                                        ) == pumgye_core::Decision::Allow
-                                    })
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some(revision)) => {
+                                            if policy.enforce {
+                                                auth_route_lease
+                                                    .get_or_insert_with(Default::default)
+                                                    .pumgye_remote =
+                                                    Some((remote.clone(), revision));
+                                            }
+                                            true
+                                        }
+                                        Ok(None) => false,
+                                        Err(_) if policy.enforce => {
+                                            return Ok(response(
+                                                503,
+                                                "Pumgye authority unavailable",
+                                            ));
+                                        }
+                                        Err(_) => false,
+                                    },
+                                    (None, _) if policy.enforce => {
+                                        return Ok(response(503, "Pumgye authority unavailable"));
+                                    }
+                                    _ => false,
                                 }
-                                _ => false,
+                            } else {
+                                match (
+                                    snapshot.pumgye.as_ref(),
+                                    identity,
+                                    gate.permissions.get(request.method().as_str()),
+                                ) {
+                                    (Some(compiled), Some((subject, aal)), Some(permissions)) => {
+                                        permissions.iter().all(|permission| {
+                                            compiled.evaluate(
+                                                &gate.service_id,
+                                                subject,
+                                                edge.client_ip,
+                                                permission,
+                                                &gate.information_class,
+                                                aal,
+                                                evidence,
+                                            ) == pumgye_core::Decision::Allow
+                                        })
+                                    }
+                                    _ => false,
+                                }
                             }
                         } else {
                             policy.allows(

@@ -1,0 +1,31 @@
+name: Independent Pumgye integration
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.96.0 fmt --all --check
+      - run: cargo +1.96.0 clippy --locked --lib -- -D warnings
+      - run: cargo +1.96.0 test --locked --lib --test admin_api --test resource_policy --test config_store --test openapi_schema
+      - run: cargo +1.96.0 build --locked --bin hangang
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ziozzang/pumgye
+          ref: 8f0b819e774c4001f381f073af9a33531caee5be
+          path: qualification-pumgye
+          persist-credentials: false
+      - name: Build independent authority
+        run: cargo +1.96.0 build --locked --manifest-path qualification-pumgye/Cargo.toml -p pumgye-server
+      - name: Owned mTLS delegation, scope and stream revocation
+        run: python3 qualification-pumgye/tools/remote_hangang_smoke.py --gateway-binary target/debug/hangang --pumgye-binary qualification-pumgye/target/debug/pumgye

@@ -1,4 +1,8 @@
 export default {
+  "Pumgye authority status": "품계 서버 상태",
+  "Policy publication audit": "정책 게시 감사",
+  "Reload before publishing.": "게시 전에 다시 불러오세요.",
+
   'Public listener: {id}': '공개 리스너: {id}',
   'Workload mTLS listener: {id}': '워크로드 mTLS 리스너: {id}',
   'Listener unknown': '리스너 알 수 없음',

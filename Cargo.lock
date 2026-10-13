@@ -960,7 +960,9 @@ dependencies = [
  "memchr",
  "mlua",
  "p256",
+ "pumgye-client",
  "pumgye-core",
+ "pumgye-protocol",
  "quick-xml",
  "rand 0.8.8",
  "rcgen",
@@ -2043,14 +2045,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "pumgye-client"
+version = "0.1.0"
+source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
+dependencies = [
+ "anyhow",
+ "pumgye-protocol",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "pumgye-core"
 version = "0.1.0"
-source = "git+https://github.com/ziozzang/pumgye?rev=412a5641dffe93b8ae990b46e89fa331febc42e2#412a5641dffe93b8ae990b46e89fa331febc42e2"
+source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
 dependencies = [
  "anyhow",
  "guard-core",
  "ipnet",
  "serde",
+]
+
+[[package]]
+name = "pumgye-protocol"
+version = "0.1.0"
+source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
+dependencies = [
+ "anyhow",
+ "pumgye-core",
 ]
 
 [[package]]
