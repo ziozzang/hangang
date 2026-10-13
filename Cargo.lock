@@ -906,7 +906,7 @@ dependencies = [
 [[package]]
 name = "guard-core"
 version = "0.3.1"
-source = "git+https://github.com/ziozzang/hangang-guard?rev=ee34be662cb04fb4c199e977127338e0ea8247ec#ee34be662cb04fb4c199e977127338e0ea8247ec"
+source = "git+https://github.com/ziozzang/sumunjang?rev=ee34be662cb04fb4c199e977127338e0ea8247ec#ee34be662cb04fb4c199e977127338e0ea8247ec"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -2045,7 +2045,7 @@ dependencies = [
 [[package]]
 name = "pumgye-core"
 version = "0.1.0"
-source = "git+https://github.com/ziozzang/pumgye?rev=3c1ec20cf42709d72187ab7d4cbeff01ee6125c3#3c1ec20cf42709d72187ab7d4cbeff01ee6125c3"
+source = "git+https://github.com/ziozzang/pumgye?rev=412a5641dffe93b8ae990b46e89fa331febc42e2#412a5641dffe93b8ae990b46e89fa331febc42e2"
 dependencies = [
  "anyhow",
  "guard-core",
