@@ -84,6 +84,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     // every route plus one separating comma per additional route.
     let base_bytes = serialized_len(&Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -187,6 +188,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     routes.extend(defaults);
     let config = Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,

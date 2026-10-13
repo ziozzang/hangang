@@ -122,7 +122,7 @@ impl ReloadingTls {
         }
     }
 }
-fn read_bounded(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     // Inspect the opened descriptor, rather than checking a path and then
     // opening it: replacement by a FIFO must not pin startup or the watcher.
     crate::certificates::read_bounded(path, "command-line", "material")

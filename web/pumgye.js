@@ -5,6 +5,8 @@ let document = null;
 let etag = null;
 let draft = null;
 let dirty = false;
+let independent = false;
+let authorityRevision = null;
 const $ = (id) => window.document.getElementById(id);
 const text = (value) => window.document.createTextNode(value);
 function message(value) { $('pumgye-message').textContent = value; }
@@ -31,12 +33,20 @@ function renderMatrix() {
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { generation++; context = null; document = null; etag = null; draft = null; dirty = false; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; }
+export function resetPumgye() { generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; for (const id of ['pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
 export async function loadPumgye(host) {
   context = host; const own = ++generation;
   const result = await host.api('/v1/config'); if (own !== generation) return;
-  document = result.data; etag = result.etag || `"${document.revision}"`;
-  draft = structuredClone(document.pumgye || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; render(); message(t('Unassigned users are guests with no permissions. User and network rights must both allow access.'));
+  independent = Boolean(result.data.pumgye_authority);
+  $('pumgye-authority-panel').hidden = !independent;
+  if (independent) {
+    const [policy, status, audit] = await Promise.all([host.api('/v1/pumgye/policy'),host.api('/v1/pumgye/status'),host.api('/v1/pumgye/audit')]);
+    if (own !== generation) return;
+    document=policy.data;etag=policy.etag || `"${document.revision}"`;authorityRevision=policy.response.headers.get('x-hangang-config-revision');
+    $('pumgye-authority-status').textContent=JSON.stringify(status.data,null,2);
+    $('pumgye-audit').textContent=JSON.stringify(audit.data,null,2);
+  } else { document = result.data; etag = result.etag || `"${document.revision}"`; authorityRevision=null; }
+  draft = structuredClone((independent?document.policy:document.pumgye) || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; render(); message(t('Unassigned users are guests with no permissions. User and network rights must both allow access.'));
 }
 $('pumgye-service').addEventListener('change', renderMatrix);
 $('pumgye-document').addEventListener('change', () => { try { edit(); message(t('Draft updated. Publish to apply.')); } catch (e) { dirty=true; message(e.message); } });
@@ -58,9 +68,10 @@ $('pumgye-publish').addEventListener('click', async () => {
   if (!context || !document) return; const own=generation; const button=$('pumgye-publish');button.disabled=true;
   try {
     const policy=JSON.parse($('pumgye-document').value);
-    const next=structuredClone(document);next.pumgye=policy;
-    const result=await context.api('/v1/config',{method:'PUT',headers:{'If-Match':etag},json:next});
-    if (own!==generation) return;document=result.data;etag=result.etag || `"${document.revision}"`;draft=structuredClone(document.pumgye);dirty=false;render();message(t('Authorization policy published.'));
+    const next=independent?{revision:document.revision,policy}:structuredClone(document);if (!independent) next.pumgye=policy;
+    const headers={'If-Match':etag};if (independent) {if (!authorityRevision) throw new Error(t('Reload before publishing.'));headers['x-hangang-config-revision']=authorityRevision;}
+    const result=await context.api(independent?'/v1/pumgye/policy':'/v1/config',{method:'PUT',headers,json:next});
+    if (own!==generation) return;document=result.data;if (independent) authorityRevision=result.response.headers.get('x-hangang-config-revision');etag=result.etag || `"${document.revision}"`;draft=structuredClone(independent?document.policy:document.pumgye);dirty=false;render();message(t('Authorization policy published.'));
   } catch (e) { if (own===generation) message(e.status===409?t('Configuration changed. Reload before publishing.'):e.message); }
   finally {button.disabled=false;}
 });

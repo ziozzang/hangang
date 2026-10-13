@@ -174,3 +174,5 @@ make check-docs  # Staged documentation and publication checks
 Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUGINS.md).
 
 [품계 네이티브 권한·매트릭스](docs/ko/PUMGYE.md) · [English](docs/PUMGYE.md)
+
+[독립 품계 서버](docs/ko/PUMGYE.md)에 네이티브 판단 전송과 정책 관리 위임을 기록했습니다.

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pumgye: Option<pumgye_core::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pumgye_authority: Option<crate::pumgye::AuthorityConfig>,
     #[serde(default)]
     pub revision: u64,
     /// Process-wide runtime settings carried in the shared document so a
@@ -865,6 +867,13 @@ impl Config {
         use std::collections::HashSet;
         self.settings.validate()?;
         crate::acme_http01::validate(self)?;
+        ensure!(
+            self.pumgye.is_none() || self.pumgye_authority.is_none(),
+            "Pumgye policy belongs to either embedded or independent authority"
+        );
+        if let Some(authority) = &self.pumgye_authority {
+            authority.validate()?;
+        }
         if let Some(policy) = &self.pumgye {
             policy.compile()?;
         }
@@ -874,11 +883,13 @@ impl Config {
                 .as_ref()
                 .and_then(|policy| policy.pumgye.as_ref())
             {
-                gate.validate(
-                    self.pumgye
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("Pumgye gate requires policy"))?,
-                )?;
+                if self.pumgye_authority.is_some() {
+                    gate.validate_remote()?;
+                } else {
+                    gate.validate(self.pumgye.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Pumgye gate requires policy or authority")
+                    })?)?;
+                }
             }
         }
         ensure!(
@@ -2116,6 +2127,7 @@ struct PublicationRetirements {
 
 pub struct Snapshot {
     pub pumgye: Option<std::sync::Arc<pumgye_core::CompiledPolicy>>,
+    pub pumgye_remote: Option<std::sync::Arc<crate::pumgye::AuthorityRuntime>>,
     retirements: std::sync::Mutex<Option<PublicationRetirements>>,
     pub retired_members: std::sync::Arc<crate::retired_members::Registry>,
     pub settings: std::sync::Arc<PreparedSettings>,
@@ -2910,8 +2922,32 @@ impl Snapshot {
             .as_ref()
             .map(|policy| policy.compile().map(std::sync::Arc::new))
             .transpose()?;
+        let pumgye_remote = if let Some(authority) = &config.pumgye_authority {
+            if let Some(old) = previous
+                .and_then(|snapshot| snapshot.pumgye_remote.as_ref())
+                .filter(|old| &old.config == authority)
+            {
+                Some(old.clone())
+            } else {
+                match crate::pumgye::AuthorityRuntime::prepare(authority) {
+                    Ok(runtime) => {
+                        if let Some(old) =
+                            previous.and_then(|snapshot| snapshot.pumgye_remote.as_ref())
+                        {
+                            runtime.require_revision(old.revision());
+                        }
+                        Some(runtime)
+                    }
+                    Err(error) if policy == EnvPolicy::Strict => return Err(error),
+                    Err(_) => None,
+                }
+            }
+        } else {
+            None
+        };
         let mut next = Self {
             pumgye,
+            pumgye_remote,
             retirements: Default::default(),
             retired_members: previous
                 .map(|old| old.retired_members.clone())

@@ -1,0 +1,80 @@
+import { test, expect } from '@playwright/test';
+
+async function setup(page, { scope = '"3"', delayed = false } = {}) {
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let document = { revision: 7, policy: { version: 1, information_classes: ['internal'], services: {
+    orders: { permissions: ['read'], roles: { reader: { permissions: ['read'], information_classes: ['internal'] } },
+      users: { 'fixture-user': ['reader'] }, networks: [{ cidr: '192.0.2.0/24', roles: ['reader'] }], require_guard: true },
+  } } };
+  await page.route('**/*', async route => {
+    const request = route.request(); const path = new URL(request.url()).pathname;
+    if (path.startsWith('/ui/')) return route.continue();
+    calls.push({ path, method: request.method(), headers: request.headers(), body: request.postDataJSON?.() });
+    if (path === '/v1/auth/setup') return route.fulfill({ status: 404, body: '' });
+    if (path === '/v1/auth/logout') return route.fulfill({ status: 204, body: '' });
+    if (path === '/v1/status') return route.fulfill({ json: { revision: 3, http_routes: 0, tcp_routes: 0, uptime_seconds: 1, metrics: {} } });
+    if (path === '/v1/config') return route.fulfill({ json: { revision: 3, http: [], tcp: [], pumgye_authority: {
+      decision_address: '127.0.0.1:9085', management_address: '127.0.0.1:9084',
+      decision_token_env: 'PUMGYE_DECISION_TOKEN', admin_token_env: 'PUMGYE_ADMIN_TOKEN',
+    } } });
+    if (path === '/v1/pumgye/policy') {
+      if (request.method() === 'GET' && delayed) await gate;
+      if (request.method() === 'PUT') document = { ...request.postDataJSON(), revision: document.revision + 1 };
+      const headers = { etag: `"${document.revision}"` }; if (scope) headers['x-hangang-config-revision'] = scope;
+      return route.fulfill({ json: document, headers });
+    }
+    if (path === '/v1/pumgye/status') return route.fulfill({ json: { healthy: true, policy_revision: document.revision, decision_queries: 42 } });
+    if (path === '/v1/pumgye/audit') return route.fulfill({ json: [{ revision: document.revision, actor: 'mtls:fixture-node', sha256: 'a'.repeat(64) }] });
+    return route.fulfill({ status: 404, body: '' });
+  });
+  await page.goto('/ui/');
+  await page.getByLabel('Administrator token').fill('fixture-admin-token');
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(page.locator('#login-dialog')).toBeHidden();
+  await page.locator('.sidebar a[data-view="pumgye"]').click();
+  return { calls, release };
+}
+
+test('independent policy publication targets owning authority and binds both revisions', async ({ page }) => {
+  const { calls } = await setup(page);
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await expect(page.locator('#pumgye-authority-panel')).toBeVisible();
+  await expect(page.locator('#pumgye-authority-status')).toContainText('"policy_revision": 7');
+  await page.locator('#pumgye-subject').fill('new-guest');
+  await page.locator('#pumgye-assignment-form button').click();
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(3);
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toContainText('Authorization policy published.');
+  const write = calls.find(call => call.path === '/v1/pumgye/policy' && call.method === 'PUT');
+  expect(write.headers['if-match']).toBe('"7"');
+  expect(write.headers['x-hangang-config-revision']).toBe('"3"');
+  expect(write.body.policy.services.orders.users['new-guest']).toEqual(['guest']);
+  expect(write.body.revision).toBe(7);
+  expect(write.body.http).toBeUndefined();
+  expect(calls.some(call => call.path === '/v1/config' && call.method === 'PUT')).toBe(false);
+  await page.locator('#logout-button').click();
+  await expect(page.locator('#pumgye-document')).toHaveValue('');
+  await expect(page.locator('#pumgye-authority-status')).toHaveText('');
+  await expect(page.locator('#pumgye-audit')).toHaveText('');
+});
+
+test('missing owning authority scope prevents publication', async ({ page }) => {
+  const { calls } = await setup(page, { scope: null });
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toContainText('Reload before publishing.');
+  expect(calls.some(call => call.method === 'PUT')).toBe(false);
+});
+
+test('late authority result cannot restore policy or audit after logout', async ({ page }) => {
+  const { release } = await setup(page, { delayed: true });
+  await page.locator('#logout-button').click();
+  release();
+  await page.waitForTimeout(150);
+  await expect(page.locator('#pumgye-document')).toHaveValue('');
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(0);
+  await expect(page.locator('#pumgye-authority-status')).toHaveText('');
+  await expect(page.locator('#pumgye-audit')).toHaveText('');
+});

@@ -1,60 +1,74 @@
-# Pumgye service authorization
+# Independent Pumgye authority
 
-Pumgye's immutable Rust core is embedded in Hangang. Hopae supplies authenticated
-identity through HOP1; Sumunjang (Guard) supplies fresh network admission evidence.
-Pumgye owns service-scoped permissions, roles, explicit information classes and
-user/network assignments. A successful login alone grants no service access.
+[한국어](ko/PUMGYE.md)
 
-## Administration
+Pumgye owns policy storage, compilation, CAS publication, revision and audit.
+Hangang owns route service/method/class bindings and request enforcement, and
+hosts administrator controls through a fixed owning-domain delegation.
 
-The native **Pumgye authorization** menu uses Hangang administrator authority.
-Add a service, assign stable Hopae user IDs and CIDRs to existing roles, then
-publish. Unassigned users are guest. A more specific guest network overrides a
-broader allow. New services require enforced Sumunjang evidence by default.
-The JSON editor configures role inheritance, exact class sets and minimum AAL.
-Classes are explicit sets: their names do not imply an automatic hierarchy.
-
-Policy is stored at `pumgye` in the authoritative configuration. GET/PUT
-`/v1/config` provides administrator authorization, bounded parsing, If-Match CAS,
-validation, durable publication and the existing audit path. Publication preserves
-all other configuration fields; a stale revision cannot overwrite concurrent work.
-This uses the existing Hangang configuration store, without sharing Hopae's user DB.
-
-## Protected route binding
-
-A protected HTTP route has its existing `resource_policy` plus a `pumgye` gate:
+Configure `pumgye_authority` at the configuration root. It is mutually exclusive
+with the earlier embedded `pumgye` policy. Remote endpoints require mTLS; local
+plaintext may only use loopback. Example references use synthetic names and do
+not contain credentials:
 
 ```json
 {
-  "resource_id": "orders",
-  "principal": {"source": "external", "subject_header": "x-forwarded-user"},
-  "allow": [],
-  "pumgye": {
-    "service_id": "orders",
-    "information_class": "internal",
-    "permissions": {"GET": ["read"], "POST": ["write"]}
-  }
+  "decision_address": "192.0.2.10:9085",
+  "management_address": "192.0.2.10:9084",
+  "decision_token_env": "PUMGYE_DECISION_TOKEN",
+  "admin_token_env": "PUMGYE_ADMIN_TOKEN",
+  "tls": {
+    "server_name": "pumgye.example.test",
+    "ca": "/private/pumgye/ca.pem",
+    "certificate": "/private/pumgye/gateway.pem",
+    "key": "/private/pumgye/gateway.key"
+  },
+  "pool_size": 64,
+  "timeout_ms": 100,
+  "minimum_revision": 1
 }
 ```
 
-The route must configure native Hopae verification and response headers
-`x-forwarded-user` and `x-hopae-aal`. Only the authenticated verification response
-provides those fields; client copies are stripped. Missing, duplicate or malformed
-identity/assurance denies access. Undeclared methods deny. Every requested right
-and class must exist in both user and trusted source-IP assignments.
+The native client verifies the fixed endpoint's name/CA, presents its client
+certificate, authenticates a decision credential and reuses bounded persistent
+PPG1 connections. Common single-permission decisions avoid batch allocations;
+multiple required permissions use at most 64 correlated requests. Unknown service,
+guest, unavailable/fail-open/observe network evidence and rights/class/AAL mismatch
+cannot grant. This path uses verified native Hopae headers and fresh Guard evidence,
+not caller claims. Protection bypasses response/auth caches.
 
-A required Sumunjang decision accepts only an enforced allow. Observe, unavailable
-transport and fail-open behavior cannot grant rights. This query bypasses optional
-1–5 second decision caching. An explicit network deny dominates even if the
-service deliberately makes the enforcement evidence optional.
+The native policy probe runs every 500 ms, preserving the observed monotonic
+revision and a 1-second authority freshness bound. Protected streams retire on
+revision change, authority loss/expiry or Hangang configuration retirement, including
+publications made directly at Pumgye. This does not yet implement distributed
+membership, persisted observed revision watermarks, authority-incarnation pinning
+or Hopae/session/Guard stream revocation across the complete fleet.
 
-Protected routes bypass response caches. Existing namespace/canonical-path guards
-still apply. Active Pumgye streams retain a publication lease: any configuration
-revision change retires the lease, checked per frame and at most every 250ms while
-waiting. This conservative behavior also retires streams on unrelated publications.
-It does not claim provider-session revocation continuously during a long stream.
-Removing a live gate requires first publishing `enforce:false` at its original scope.
+The native Pumgye console reads and writes its owning policy rather than replacing
+Hangang's configuration. These Hangang APIs require a live administrator; Viewer
+and anonymous access is denied:
 
-Existing authentication-only routes are not implicitly assigned rights or switched
-to Pumgye protection. Operators explicitly bind protected routes and assignments.
-No production identity or network grant is generated by deploying the feature.
+- `GET /v1/pumgye/policy`, `/v1/pumgye/status`, `/v1/pumgye/audit`.
+- `PUT /v1/pumgye/policy`: JSON `{revision, policy}`, quoted Pumgye revision in
+  `If-Match` and quoted Hangang authority configuration revision in
+  `X-Hangang-Config-Revision` (returned by reads).
+
+Both scope fences are required. Admission is serialized with account revocation;
+admitted external publication continues if the browser disconnects. Re-read after
+an unconfirmed operation rather than assuming rollback. Live role and selected
+authority are rechecked before disclosure. Paths, methods, response sizes, body
+sizes, concurrency and redirects are restricted; no client URL, credential or
+arbitrary header is relayed. Data-plane nodes may omit the local administrator
+secret; policy enforcement works while management fails closed. Owning Pumgye
+records its verified transport caller; individual delegated user audit remains
+subsequent work.
+
+The earlier embedded policy is a migration baseline, not the new policy owner.
+There is no automatic assignment/grant or automatic schema/DB transfer. Validate
+and publish any migration into the owning Pumgye authority before enabling routes.
+
+Qualification includes library and existing administrator/config/resource tests,
+OpenAPI references, browser owner/CAS/logout fences and actual Hangang/Pumgye mTLS
+processes with owned HOP1/HGD1 peers. Real Hopae/Sumunjang remote transports, mixed
+authentication, realistic-cardinality traffic and whole-stack 100k HTTP QPS remain
+separate acceptance work.

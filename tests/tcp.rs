@@ -46,6 +46,7 @@ fn route(id: &str, listen: SocketAddr, backend: SocketAddr) -> TcpRoute {
 fn config(routes: Vec<TcpRoute>) -> Config {
     Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         cache: None,
         certificates: Vec::new(),

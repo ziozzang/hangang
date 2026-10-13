@@ -1531,6 +1531,7 @@ fn proxy_with_settings(
 ) -> ((Proxy, Arc<PolicyPool>), Arc<ArcSwap<Snapshot>>) {
     let config = Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -2886,6 +2887,7 @@ async fn document_settings_override_process_defaults_and_apply_on_reload() {
     // A new document without settings restores the process defaults at once.
     let plain = Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -3025,6 +3027,7 @@ async fn one_streaming_route_cannot_consume_another_routes_capacity() {
     let active = Arc::new(ArcSwap::from_pointee(
         Snapshot::new(Config {
             pumgye: None,
+            pumgye_authority: None,
             geoip_database: None,
             certificates: vec![],
             cache: None,
@@ -6311,6 +6314,7 @@ async fn route_without_static_header_variable_fails_closed_and_other_routes_keep
     open.path_prefix = Some("/open".into());
     let config = |routes: Vec<HttpRoute>, revision| Config {
         pumgye: None,
+        pumgye_authority: None,
         geoip_database: None,
         certificates: vec![],
         cache: None,

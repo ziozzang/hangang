@@ -1436,6 +1436,9 @@ impl Admin {
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
         }
+        if path.starts_with("/v1/pumgye/") {
+            return Ok(self.handle_pumgye(req, actor).await);
+        }
         if path == "/v1/security/bans" {
             if req.method() != hyper::Method::GET {
                 return Ok(problem(405, "Method Not Allowed", "GET required"));
@@ -3332,6 +3335,13 @@ fn user_audit_query(query: Option<&str>) -> Option<(i64, usize)> {
 }
 
 fn account_problem(error: anyhow::Error) -> Response<Body> {
+    if error.is::<crate::pumgye::AuthorityScopeChanged>() {
+        return problem(
+            409,
+            "Authority Changed",
+            "Pumgye authority configuration changed; reload before publishing",
+        );
+    }
     if error.is::<crate::admin_users::ConfigOperationConflict>() {
         return problem(
             409,
@@ -3466,6 +3476,223 @@ impl Admin {
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
             Err(error) => account_problem(error),
         }
+    }
+
+    async fn handle_pumgye(&self, req: Request<Incoming>, actor: AdminActor) -> Response<Body> {
+        if actor.role() != crate::admin_users::Role::Admin {
+            return problem(403, "Forbidden", "administrator role required");
+        }
+        let path = match req.uri().path() {
+            "/v1/pumgye/policy" => "v1/policy",
+            "/v1/pumgye/status" => "v1/status",
+            "/v1/pumgye/audit" => "v1/audit",
+            _ => return problem(404, "Not Found", "unknown Pumgye operation"),
+        };
+        let method = req.method().clone();
+        let write = method == hyper::Method::PUT && path == "v1/policy";
+        if !write && method != hyper::Method::GET {
+            return problem(405, "Method Not Allowed", "GET or policy PUT required");
+        }
+        let after = match req.uri().query() {
+            None => None,
+            Some(query) if path == "v1/audit" => {
+                let Some(value) = query
+                    .strip_prefix("after_revision=")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v <= i64::MAX as u64)
+                else {
+                    return problem(400, "Bad Request", "invalid audit cursor");
+                };
+                Some(value)
+            }
+            Some(_) => return problem(400, "Bad Request", "query parameters unsupported"),
+        };
+        let snapshot = self.manager.active.load_full();
+        let parent_revision = snapshot.config.revision;
+        let Some(remote) = snapshot.pumgye_remote.clone() else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "independent Pumgye authority is not available",
+            );
+        };
+        if write {
+            let mut values = req.headers().get_all("x-hangang-config-revision").iter();
+            let expected = values
+                .next()
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_revision);
+            if expected.is_none() || values.next().is_some() {
+                return problem(
+                    428,
+                    "Precondition Required",
+                    "quoted Hangang authority configuration revision required",
+                );
+            }
+            if expected != Some(parent_revision) {
+                return problem(
+                    409,
+                    "Authority Changed",
+                    "Hangang authority configuration changed; reload before publishing",
+                );
+            }
+        }
+        let expected = if write {
+            let mut values = req.headers().get_all(hyper::header::IF_MATCH).iter();
+            let revision = values
+                .next()
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_revision);
+            if values.next().is_some() || revision.is_none() {
+                return problem(
+                    428,
+                    "Precondition Required",
+                    "quoted Pumgye revision required",
+                );
+            }
+            revision
+        } else {
+            None
+        };
+        let body = if write {
+            let payload: serde_json::Value = match read_json(req, 1024 * 1024).await {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            if payload.get("revision").and_then(|v| v.as_u64()) != expected {
+                return problem(
+                    400,
+                    "Bad Request",
+                    "policy revision must agree with If-Match",
+                );
+            }
+            match serde_json::to_vec(&payload) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return problem(400, "Bad Request", "invalid policy document"),
+            }
+        } else {
+            None
+        };
+        static OPERATIONS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let Ok(permit) = OPERATIONS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+            .clone()
+            .try_acquire_owned()
+        else {
+            return problem(
+                503,
+                "Authority Busy",
+                "Pumgye management capacity exhausted",
+            );
+        };
+        let users = self.users.clone();
+        let authority = actor.mutation_authority();
+        let admission = authority.clone();
+        let active = self.manager.active.clone();
+        let target = remote.clone();
+        let handle = tokio::runtime::Handle::current();
+        // Account revocation fences admission; admitted external publication may complete
+        // after browser cancellation. Never hold the account transaction across network I/O.
+        let admitted = tokio::task::spawn_blocking(move || {
+            users.authorized_action(&admission, || {
+                if active.load().config.revision != parent_revision
+                    || !active
+                        .load()
+                        .pumgye_remote
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &target))
+                {
+                    return Err(crate::pumgye::AuthorityScopeChanged.into());
+                }
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                handle.spawn(async move {
+                    let _permit = permit;
+                    let outcome = target
+                        .management(method, path, body, expected, after)
+                        .await
+                        .map_err(|_| ());
+                    if let Ok((200, bytes)) = &outcome
+                        && path == "v1/policy"
+                        && let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes)
+                        && let Some(revision) = document
+                            .get("revision")
+                            .and_then(|v| v.as_u64())
+                            .filter(|v| *v > 0 && *v <= i64::MAX as u64)
+                    {
+                        target.require_revision(revision);
+                    }
+                    let _ = sender.send(outcome);
+                });
+                Ok(receiver)
+            })
+        })
+        .await;
+        let receiver = match admitted {
+            Ok(Ok(receiver)) => receiver,
+            Ok(Err(error)) => return account_problem(error),
+            Err(_) => {
+                return problem(
+                    503,
+                    "Authority Unavailable",
+                    "Pumgye operation admission failed",
+                );
+            }
+        };
+        let outcome = match receiver.await {
+            Ok(Ok(result)) => result,
+            _ => {
+                return problem(
+                    503,
+                    "Authority Unavailable",
+                    "Pumgye operation unconfirmed; reload authoritative state",
+                );
+            }
+        };
+        // Revoked accounts may not disclose a remote read/publication result.
+        if let Err(error) = self.users.authorize_admin(authority).await {
+            return account_problem(error);
+        }
+        if !self
+            .manager
+            .active
+            .load()
+            .pumgye_remote
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &remote))
+        {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "Pumgye authority retired during operation",
+            );
+        }
+        let (status, bytes) = outcome;
+        if !matches!(status, 200 | 400 | 409 | 422 | 428 | 503) {
+            return problem(503, "Authority Unavailable", "Pumgye response unavailable");
+        }
+        if status != 200 {
+            return problem(
+                status,
+                "Pumgye Operation Rejected",
+                "owning authority rejected the operation; reload before retrying",
+            );
+        }
+        let document: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(doc) => doc,
+            Err(_) => return problem(503, "Authority Unavailable", "invalid Pumgye response"),
+        };
+        let revision = if path == "v1/policy" {
+            document.get("revision").and_then(|v| v.as_u64())
+        } else {
+            None
+        };
+        let mut result = json_value(200, &document, revision);
+        result.headers_mut().insert(
+            "x-hangang-config-revision",
+            format!("\"{parent_revision}\"").parse().unwrap(),
+        );
+        result
     }
 
     async fn handle_config_commit_receipts_v2(
