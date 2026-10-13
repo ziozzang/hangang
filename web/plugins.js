@@ -8,7 +8,6 @@ export async function discoverPlugins(context) {
   if (data?.api_version !== 1 || !Array.isArray(data.plugins)) throw Error('Unsupported console plugin contract');
   const navigation=document.querySelector('.sidebar nav');
   const anchor=navigation.querySelector('[data-i18n="MANAGE"]');
-  if(data.plugins.length){const group=document.createElement('p');group.className='nav-group-label';group.textContent='ZERO TRUST';group.dataset.consolePlugin='group';group.dataset.adminOnly='';navigation.insertBefore(group,anchor);}
   for (const p of data.plugins) {
     if (!/^[a-z0-9-]{1,32}$/.test(p.id) || typeof p.name !== 'string' || !p.entry?.startsWith(`/ui/plugins/${p.id}/`) || p.api_base !== `/v1/plugins/${p.id}`) throw Error('Invalid console plugin discovery');
     const name='plugin-'+p.id;

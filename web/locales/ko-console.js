@@ -1,4 +1,5 @@
 export default {
+  "ZERO TRUST": "제로 트러스트",
   "Pumgye authority status": "품계 서버 상태",
   "Policy publication audit": "정책 게시 감사",
   "Reload before publishing.": "게시 전에 다시 불러오세요.",
