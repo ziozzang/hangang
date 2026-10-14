@@ -37,6 +37,7 @@ def main():
         management,native,grpc_port=port(),port(),port()
         env=dict(os.environ,PUMGYE_ADMIN_TOKEN=secrets.token_hex(24),PUMGYE_DECISION_TOKEN=secrets.token_hex(24))
         initial={'version':1,'information_classes':['public'],'services':{'orders':{'permissions':['read'],'require_guard':True,'roles':{'reader':{'permissions':['read'],'information_classes':['public'],'minimum_aal':1}},'users':{'fixture':['reader']},'networks':[{'cidr':'192.0.2.0/24','roles':['reader']}]}}}
+        initial['resources']={'db:orders':{'service':'orders','information_class':'public','actions':{'select':'read'},'minimum_aal':2}}
         policy=root/'policy.json';policy.write_text(json.dumps({'revision':1,'policy':initial}))
         config=root/'client.json';config.write_text(json.dumps({'transport':'grpc','decision_address':f'localhost:{grpc_port}','management_address':f'127.0.0.1:{management}','decision_token_env':'PUMGYE_DECISION_TOKEN','admin_token_env':'PUMGYE_ADMIN_TOKEN','timeout_ms':1000,'tls':{'server_name':'pumgye.example.test','ca':str(root/'ca.pem'),'certificate':str(root/'client.pem'),'key':str(root/'client.key')}}))
         argv=[str(args.server.resolve()),'--listen',f'127.0.0.1:{management}','--decision-listen',f'127.0.0.1:{native}','--grpc-listen',f'0.0.0.0:{grpc_port}','--database',str(root/'policy.sqlite3'),'--policy',str(policy),'--tls-cert',str(root/'server.pem'),'--tls-key',str(root/'server.key'),'--client-ca',str(root/'ca.pem')]

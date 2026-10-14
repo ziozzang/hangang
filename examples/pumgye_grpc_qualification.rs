@@ -44,6 +44,39 @@ async fn main() -> Result<()> {
         wrong_server.decide(&query).await.is_err(),
         "server name mismatch must fail closed"
     );
+    let resources = hangang::pumgye_grpc_client::Client::new(
+        &config,
+        &std::env::var(&config.decision_token_env)?,
+    )?;
+    let mut resource_query = hangang::pumgye_grpc_client::ResourceQuery {
+        minimum_revision: 0,
+        ip,
+        aal: 2,
+        guard: pumgye_core::GuardEvidence::EnforcedAllow,
+        resource: "db:orders",
+        action: "select",
+        subject: "fixture",
+    };
+    ensure!(
+        wrong_role.decide_resource(&resource_query).await.is_err(),
+        "resource admin role refusal"
+    );
+    ensure!(
+        wrong_server.decide_resource(&resource_query).await.is_err(),
+        "resource server name refusal"
+    );
+    ensure!(
+        resources.decide_resource(&resource_query).await?.decision
+            == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow),
+        "native resource allow"
+    );
+    resource_query.aal = 1;
+    ensure!(
+        resources.decide_resource(&resource_query).await?.decision
+            == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::AssuranceDenied),
+        "owner assurance refusal"
+    );
+    resource_query.aal = 2;
     let allow = runtime
         .authorize(
             &gate,
@@ -118,6 +151,17 @@ async fn main() -> Result<()> {
         "immediate revocation on reusable channel"
     );
     ensure!(runtime.revision() == 2, "revision advancement");
+    let retired = resources.decide_resource(&resource_query).await?;
+    ensure!(
+        retired.revision == 2 && retired.decision == pumgye_core::ResourceDecision::UnknownResource,
+        "catalog removal must apply on the same channel"
+    );
+    resources.require_revision(999);
+    ensure!(
+        resources.decide_resource(&resource_query).await.is_err(),
+        "resource unavailable revision refusal"
+    );
+
     runtime.require_revision(999);
     ensure!(
         runtime
@@ -134,7 +178,7 @@ async fn main() -> Result<()> {
         "unavailable revision must fail closed"
     );
     println!(
-        "PASS: Hangang gRPC authority integration, guest/all-permission denial, same-channel policy revocation and revision fencing"
+        "PASS: Hangang gRPC service/resource clients, assurance and role denial, same-channel policy/catalog revocation and revision fencing"
     );
     Ok(())
 }

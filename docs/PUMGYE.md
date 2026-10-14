@@ -209,3 +209,12 @@ when publishing service/user/network changes through the existing CAS endpoint.
 Edit the policy JSON to change catalog entries; source-managed policies remain
 read-only. This does not yet connect resource RPC decisions to gateway dispatch
 or create signed permits. Existing service gates continue their current behavior.
+
+The reusable gRPC client also exposes `decide_resource`, taking native
+resource/action/subject and verified IP/AAL/guard evidence. It shares the existing
+channel, admission, deadline, correlation sequence and monotonic revision fence.
+Only exact recognized verdict/reason pairs with zero TTL are accepted; unavailable,
+stale, conflicting and unknown replies fail closed. The owned two-process fixture
+qualifies resource Allow, minimum-AAL denial, administrator/server-name refusal,
+CAS catalog removal on the same channel and unavailable revision floors alongside
+legacy service decisions. Gateway route selection and dispatch adoption remain open.
