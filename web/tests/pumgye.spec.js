@@ -7,7 +7,7 @@ async function setup(page, { scope = '"3"', delayed = false, source = 'native', 
   let document = { revision: 7, policy: { version: 1, information_classes: ['internal'], services: {
     orders: { permissions: ['read'], roles: { reader: { permissions: ['read'], information_classes: ['internal'] } },
       users: { 'fixture-user': ['reader'] }, networks: [{ cidr: '192.0.2.0/24', roles: ['reader'] }], require_guard: true },
-  } } };
+  }, resources: { "db:orders": { service: "orders", information_class: "internal", actions: { select: "read" }, minimum_aal: 2 } } } };
   await page.route('**/*', async route => {
     const request = route.request(); const path = new URL(request.url()).pathname;
     if (path.startsWith('/ui/')) return route.continue();
@@ -52,6 +52,9 @@ test('independent policy publication targets owning authority and binds both rev
   expect(write.headers['if-match']).toBe('"7"');
   expect(write.headers['x-hangang-config-revision']).toBe('"3"');
   expect(write.body.policy.services.orders.users['new-guest']).toEqual(['guest']);
+  expect(write.body.policy.resources['db:orders'].minimum_aal).toBe(2);
+  await expect(page.locator('#pumgye-resources tr')).toHaveCount(1);
+  await expect(page.locator('#pumgye-resources')).toContainText('select → read');
   expect(write.body.revision).toBe(7);
   expect(write.body.http).toBeUndefined();
   expect(calls.some(call => call.path === '/v1/config' && call.method === 'PUT')).toBe(false);
@@ -59,6 +62,7 @@ test('independent policy publication targets owning authority and binds both rev
   await expect(page.locator('#pumgye-document')).toHaveValue('');
   await expect(page.locator('#pumgye-authority-status')).toHaveText('');
   await expect(page.locator('#pumgye-audit')).toHaveText('');
+  await expect(page.locator('#pumgye-resources tr')).toHaveCount(0);
   await expect(page.locator('#pumgye-guard-requirement')).toHaveText('');
 });
 
@@ -134,4 +138,24 @@ test('service guard requirement follows policy drafts and language changes', asy
   await expect(page.locator('#pumgye-guard-requirement')).toContainText('필수가 아닙니다');
   await page.locator('#locale-select').selectOption('en');
   await expect(page.locator('#pumgye-guard-requirement')).toContainText('explicit network denial refuses access.');
+});
+
+test('catalog draft changes publish to the owner and source-managed catalogs stay read-only', async ({ page }) => {
+  const { calls } = await setup(page);
+  await expect(page.locator('#pumgye-resources')).toContainText('db:orders');
+  const policy = JSON.parse(await page.locator('#pumgye-document').inputValue());
+  policy.resources['db:orders'].minimum_aal = 3;
+  policy.resources['db:orders'].actions = { inspect: 'read' };
+  await page.locator('#pumgye-document').fill(JSON.stringify(policy));
+  await page.locator('#pumgye-document').dispatchEvent('change');
+  await expect(page.locator('#pumgye-resources')).toContainText('inspect → read');
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toContainText('Authorization policy published.');
+  const write = calls.find(call => call.path === '/v1/pumgye/policy' && call.method === 'PUT');
+  expect(write.body.policy.resources['db:orders']).toEqual(policy.resources['db:orders']);
+  await page.route('**/v1/pumgye/status', route => route.fulfill({ json: { healthy: true, policy_source: 'kubernetes', source_state: 'fresh', policy_revision: 8 } }));
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-document')).toHaveAttribute('readonly', '');
+  await expect(page.locator('#pumgye-resources')).toContainText('inspect → read');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
 });

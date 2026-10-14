@@ -41,6 +41,15 @@ function render() {
   for (const id of Object.keys(draft.services || {})) { const option = window.document.createElement('option'); option.value = id; option.textContent = id; select.append(option); }
   if (draft.services?.[selected]) select.value = selected;
   renderMatrix();
+  const catalog = $('pumgye-resources'); catalog.replaceChildren();
+  for (const [id, resource] of Object.entries(draft.resources || {})) {
+    const tr = window.document.createElement('tr');
+    for (const value of [id, resource.service, resource.information_class,
+      Object.entries(resource.actions || {}).map(([action, permission]) => `${action} → ${permission}`).join(', '), resource.minimum_aal ?? 0]) {
+      const td = window.document.createElement('td'); td.textContent = String(value); tr.append(td);
+    }
+    catalog.append(tr);
+  }
 }
 function renderMatrix() {
   const table = $('pumgye-matrix'); table.replaceChildren();
@@ -60,7 +69,7 @@ function renderMatrix() {
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
+export function resetPumgye() { sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
 export async function loadPumgye(host) {
   context = host; const own = ++generation; sourceManaged = true; sourceControls();
   $('pumgye-source-summary').textContent = t('Checking authority');

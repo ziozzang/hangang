@@ -198,3 +198,14 @@ python3 tools/pumgye_grpc_smoke.py --server /path/to/pumgye --client target/debu
 
 This mutates only a disposable fixture database. Actual Hangang request-chain,
 Kubernetes gRPC and production rollout remain separate qualification gates.
+
+## Native resource catalog (unreleased)
+
+The pinned Pumgye core and contract crates support owner-managed `resources`:
+service, information class, action-to-permission mappings and minimum AAL.
+Typed configuration round trips retain the catalog and reject invalid relationships
+when compiling policy. The Pumgye console displays the catalog and preserves it
+when publishing service/user/network changes through the existing CAS endpoint.
+Edit the policy JSON to change catalog entries; source-managed policies remain
+read-only. This does not yet connect resource RPC decisions to gateway dispatch
+or create signed permits. Existing service gates continue their current behavior.

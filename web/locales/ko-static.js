@@ -270,4 +270,10 @@ export default {
   '↑ ↓ to navigate · Enter to open · Esc to close': '↑ ↓ 탐색 · Enter 열기 · Esc 닫기',
   "Sign in with SSO": "SSO 로그인",
   "SSO login failed. Your Hopae identity must be linked to an enabled Hangang account.": "SSO 로그인에 실패했습니다. Hopae 사용자가 활성화된 Hangang 계정에 연결되어 있어야 합니다.",
+  'Resource catalog': '자원 카탈로그',
+  'Resource classification and action mappings belong to Pumgye. Edit the policy JSON and publish to update them.': '자원 등급과 행위 매핑은 품계가 관리합니다. 정책 JSON을 편집하고 게시해 변경합니다.',
+  'Resource': '자원',
+  'Information class': '정보등급',
+  'Action to permission': '행위와 권한 매핑',
+  'Minimum assurance level': '최소 인증 수준',
 };

@@ -174,6 +174,53 @@ mod tests {
         assert!(authority.validate().is_err());
     }
     #[test]
+    fn owner_resource_catalog_survives_typed_roundtrip_and_enforces_assurance() {
+        let value = serde_json::json!({
+            "version":1,"information_classes":["internal"],
+            "services":{"orders":{
+                "permissions":["read"],"require_guard":true,
+                "roles":{"reader":{"permissions":["read"],"information_classes":["internal"],"minimum_aal":1}},
+                "users":{"fixture":["reader"]},
+                "networks":[{"cidr":"192.0.2.0/24","roles":["reader"]}]
+            }},
+            "resources":{"db:orders":{"service":"orders","information_class":"internal","actions":{"select":"read"},"minimum_aal":2}}
+        });
+        let policy: pumgye_core::Policy = serde_json::from_value(value.clone()).unwrap();
+        let serialized = serde_json::to_value(&policy).unwrap();
+        assert_eq!(serialized["resources"], value["resources"]);
+        let restored: pumgye_core::Policy = serde_json::from_value(serialized).unwrap();
+        let compiled = restored.compile().unwrap();
+        let ip = "192.0.2.10".parse().unwrap();
+        for (aal, expected) in [
+            (1, pumgye_core::Decision::AssuranceDenied),
+            (2, pumgye_core::Decision::Allow),
+        ] {
+            assert_eq!(
+                compiled.evaluate_resource(
+                    "db:orders",
+                    "select",
+                    "fixture",
+                    ip,
+                    aal,
+                    pumgye_core::GuardEvidence::EnforcedAllow
+                ),
+                pumgye_core::ResourceDecision::Decided(expected)
+            );
+        }
+        assert_eq!(
+            compiled.evaluate_resource(
+                "db:orders",
+                "drop",
+                "fixture",
+                ip,
+                2,
+                pumgye_core::GuardEvidence::EnforcedAllow
+            ),
+            pumgye_core::ResourceDecision::UnknownAction
+        );
+    }
+
+    #[test]
     fn route_scope_rejects_undefined_rights_and_empty_methods() {
         let policy: pumgye_core::Policy = serde_json::from_value(serde_json::json!({
             "version":1,"information_classes":["internal"],"services":{"orders":{
