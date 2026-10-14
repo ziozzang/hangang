@@ -14,7 +14,7 @@ pub(super) struct Client {
     slots: tokio::sync::Semaphore,
     next: AtomicU64,
     receipt_revision: AtomicU64,
-    receipt_wall_ms: u64,
+    receipt_wall: Duration,
     receipt_started: std::time::Instant,
 }
 impl Client {
@@ -42,18 +42,16 @@ impl Client {
         let mut key =
             format!("Bearer {}", key.to_str()?).parse::<tonic::metadata::MetadataValue<_>>()?;
         key.set_sensitive(true);
+        let receipt_started = std::time::Instant::now();
+        let receipt_wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
         Ok(Self {
             channel: endpoint.connect_lazy(),
             key,
             slots: tokio::sync::Semaphore::new(settings.pool_size),
             next: AtomicU64::new(1),
             receipt_revision: AtomicU64::new(0),
-            receipt_wall_ms: u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis(),
-            )?,
-            receipt_started: std::time::Instant::now(),
+            receipt_wall,
+            receipt_started,
         })
     }
     pub(super) async fn issue_service_receipt(
@@ -104,13 +102,7 @@ impl Client {
                 .await
                 .map_err(|_| invalid())?
                 .into_inner();
-            let now = self
-                .receipt_wall_ms
-                .checked_add(
-                    u64::try_from(self.receipt_started.elapsed().as_millis())
-                        .map_err(|_| invalid())?,
-                )
-                .ok_or_else(invalid)?;
+            let now = receipt_now(self.receipt_wall, self.receipt_started.elapsed())?;
             let checked = pin
                 .verify_service_reply(request_id, scope, reply, now)
                 .map_err(|_| invalid())?;
@@ -184,5 +176,22 @@ impl Client {
         tokio::time::timeout(Duration::from_secs(1), operation)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Hopae gRPC deadline"))?
+    }
+}
+
+fn receipt_now(wall: Duration, elapsed: Duration) -> io::Result<u64> {
+    let now = wall.checked_add(elapsed).ok_or_else(invalid)?;
+    u64::try_from(now.as_millis()).map_err(|_| invalid())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn receipt_clock_keeps_fractional_wall_time_until_final_rounding() {
+        assert_eq!(
+            receipt_now(Duration::from_micros(100_999), Duration::from_micros(200)).unwrap(),
+            101
+        );
+        assert!(receipt_now(Duration::MAX, Duration::from_secs(1)).is_err());
     }
 }

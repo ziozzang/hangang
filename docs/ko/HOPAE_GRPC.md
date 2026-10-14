@@ -62,3 +62,15 @@ HANGANG_HOPAE_GRPC_CLIENT=/absolute/path/to/hangang/target/debug/examples/hopae_
 범위/서명/만료와 기존 native client 검사·엄격한 Clippy가 통과했습니다. 실제
 receipt 서버와의 클라이언트 검증·경로 설정 선택·권한/자격 전달 연결은 아직
 남아 있습니다. 키 회전·소유자 신선도·재사용 방지는 별도 필수 경계입니다.
+
+실제 저장소 간 검증도 통과했습니다. 한강에서
+`cargo build --example hopae_receipt_qualification` 후 호패에서
+`HANGANG_RECEIPT_CLIENT=/path/to/hangang/target/debug/examples/hopae_receipt_qualification cargo test --lib actual_gateway_captures_native_service_proof_only_in_internal_extensions`를
+실행합니다. 격리 실행 파일은 환경 참조로 자격을 받고 최종 origin-form 요청
+digest를 계산하며 한 클라이언트로 성공/거부/복구를 검사합니다. 실제 mTLS
+3회 연속 검사가 통과했습니다.
+
+이 검사로 수신 시계의 반올림 오류를 발견했습니다. 시작 시각과 경과 시간을 각각
+밀리초로 자르면 새 발행 시각보다 뒤처질 수 있어, 합산 후에만 밀리초로 변환하도록
+수정했습니다. 소수 밀리초 경계·초과 검사도 통과했으며 만료 허용 시간을 늘리지
+않았습니다. 전체 프록시 전달·권한·자격 변환은 아직 별도 검증이 필요합니다.

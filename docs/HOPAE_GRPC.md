@@ -74,3 +74,16 @@ Clippy. This client has not yet been qualified against the actual receipt server
 selected by route configuration or wired into permission/credential dispatch.
 Current signing/key rotation, owner freshness and replay admission requirements
 remain separate and mandatory.
+
+Actual cross-repository qualification now passes using
+`cargo build --example hopae_receipt_qualification` and, in Hopae,
+`HANGANG_RECEIPT_CLIENT=/path/to/hangang/target/debug/examples/hopae_receipt_qualification cargo test --lib actual_gateway_captures_native_service_proof_only_in_internal_extensions`.
+The owned executable receives credential references through environment variables,
+computes the final origin-form request digest and retains one client across
+success/refusal/restoration. Three consecutive actual mTLS runs passed.
+
+This exposed a receiver-clock rounding bug: separately truncating startup wall
+time and elapsed time could put the receiver behind a freshly issued millisecond.
+The client now preserves fractional wall time until their final sum is rounded;
+the sub-millisecond boundary and overflow regression passes. No expiry window was
+relaxed. Complete proxy dispatch, permissions and projection remain unqualified.
