@@ -103,6 +103,20 @@ impl Client {
             next: AtomicU64::new(1),
         }
     }
+    /// Separate native receipt phase. Unsupported transports refuse without fallback.
+    pub async fn issue_service_receipt(
+        &self,
+        headers: &HeaderMap,
+        scope: &crate::projection_receipt::ServiceScope<'_>,
+        pin: &crate::projection_receipt::IssuerPin,
+    ) -> io::Result<crate::projection_receipt::CheckedServiceReceipt> {
+        self.grpc
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "receipt requires gRPC"))?
+            .issue_service_receipt(headers, scope, pin)
+            .await
+    }
+
     pub async fn verify(&self, headers: &HeaderMap) -> io::Result<Response<crate::proxy::Body>> {
         if let Some(client) = &self.grpc {
             return client.verify(headers).await;

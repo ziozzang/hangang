@@ -1181,7 +1181,7 @@ dependencies = [
 [[package]]
 name = "hopae-grpc"
 version = "0.0.3"
-source = "git+https://github.com/ziozzang/hopae?rev=0225145d7da1962edbdde019b8b38463021db07d#0225145d7da1962edbdde019b8b38463021db07d"
+source = "git+https://github.com/ziozzang/hopae?rev=0d8d6860780ed0236635f9e92488b5fdea08ddc6#0d8d6860780ed0236635f9e92488b5fdea08ddc6"
 dependencies = [
  "ed25519-dalek",
  "prost",

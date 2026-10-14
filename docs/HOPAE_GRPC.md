@@ -53,3 +53,24 @@ state, enforce clock monotonicity and consume replay state at the owning authori
 Passing a stale or caller-invented context is not made safe by this helper. The
 helper is not wired into request dispatch or receipt RPC. Tests cover every-byte
 tampering, context/generation/key epoch changes and expiry with a real signature.
+
+## Native service receipt client (unreleased)
+
+The Hopae contract pin advances to 0d8d6860.
+`hopae_native::Client::issue_service_receipt` uses the existing authenticated
+mTLS gRPC channel and shared admission slots, with a one-second deadline and
+2 KiB reply bound. Verification-only transports refuse receipt requests without
+HTTP/HOP1 fallback. Caller authorization metadata remains sensitive.
+
+The receiver compares native request correlation/service/audience/digest, requires
+Service/AAL0 and verifies the receipt against its native issuer pin. The checked
+nonserializable result preserves the signed context, chain hash and expiry for
+the permission phase. Profile revisions cannot regress below the observed client
+watermark. Receipt time uses startup wall time plus monotonic elapsed time, avoiding
+acceptance extension on local wall-clock rollback. No receipt result cache is added.
+
+Scope/signature/expiry tests and existing native client tests pass with strict
+Clippy. This client has not yet been qualified against the actual receipt server,
+selected by route configuration or wired into permission/credential dispatch.
+Current signing/key rotation, owner freshness and replay admission requirements
+remain separate and mandatory.

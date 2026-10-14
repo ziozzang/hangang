@@ -45,3 +45,20 @@ HANGANG_HOPAE_GRPC_CLIENT=/absolute/path/to/hangang/target/debug/examples/hopae_
 처리해야 합니다. 오래되거나 호출자가 만든 문맥을 넣는 것은 안전해지지 않습니다.
 아직 요청 전달·receipt RPC에 연결하지 않았습니다. 실제 서명으로 전체 바이트
 변조·문맥/신원 세대/키 세대 변경·만료를 검증했습니다.
+
+## 네이티브 서비스 receipt 클라이언트 (미릴리스)
+
+호패 계약을 0d8d6860으로 고정합니다.
+`hopae_native::Client::issue_service_receipt`는 기존 인증된 mTLS gRPC 채널과
+공용 처리 용량을 사용하고 1초 기한·응답 2 KiB 제한을 적용합니다. 검증 전용
+전송에서는 receipt 요청을 거부하며 HTTP/HOP1 대체 경로를 사용하지 않습니다.
+호출자 인증 metadata는 sensitive로 유지합니다.
+
+네이티브 요청 ID/서비스/대상/digest를 대조하고 Service/AAL0·고정 발행자 키의
+서명을 검증합니다. 직렬화하지 않는 결과는 서명 문맥·체인 해시·만료를 권한 단계에
+전달합니다. 관측한 profile 리비전 이하로 후퇴하지 않으며 시작 시각+단조 경과
+시간으로 로컬 벽시계 후퇴가 수락 시간을 연장하지 않게 합니다. 결과 캐시는 없습니다.
+
+범위/서명/만료와 기존 native client 검사·엄격한 Clippy가 통과했습니다. 실제
+receipt 서버와의 클라이언트 검증·경로 설정 선택·권한/자격 전달 연결은 아직
+남아 있습니다. 키 회전·소유자 신선도·재사용 방지는 별도 필수 경계입니다.
