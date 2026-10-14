@@ -7441,6 +7441,7 @@ async fn native_hopae_transport_uses_normal_identity_cookie_and_terminal_handlin
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
         native: Some(hangang::config::HopaeNative {
+            transport: hangang::config::HopaeTransport::Native,
             address: native.into(),
             pool_size: 2,
             tls: None,

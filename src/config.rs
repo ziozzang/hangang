@@ -488,10 +488,20 @@ pub struct ExternalAuth {
     pub strip_request_cookies: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopaeTransport {
+    #[default]
+    Native,
+    Grpc,
+}
+
 /// Native Hopae transport. No decision caching or HTTP fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HopaeNative {
+    #[serde(default)]
+    pub transport: HopaeTransport,
     pub address: pumgye_client::Endpoint,
     #[serde(default = "hopae_pool_size")]
     pub pool_size: usize,
@@ -1636,6 +1646,10 @@ impl Config {
                     ensure!(
                         (native.address.is_loopback() || native.tls.is_some()),
                         "native Hopae requires a nonzero unicast address; remote connections require mTLS"
+                    );
+                    ensure!(
+                        native.transport != HopaeTransport::Grpc || native.tls.is_some(),
+                        "Hopae gRPC requires mTLS"
                     );
                     if let Some(tls) = &native.tls {
                         ensure!(

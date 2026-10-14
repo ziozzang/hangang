@@ -1008,6 +1008,7 @@ dependencies = [
  "guard-grpc",
  "hickory-resolver",
  "hmac 0.12.1",
+ "hopae-grpc",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -1175,6 +1176,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "hopae-grpc"
+version = "0.0.3"
+source = "git+https://github.com/ziozzang/hopae?rev=7b5a8b8782cfb6bedd57992bcb74800e2394fa38#7b5a8b8782cfb6bedd57992bcb74800e2394fa38"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 //! Provider-independent, authenticated, bounded native Hopae client.
+mod grpc;
 use crate::hopae_wire as wire;
 use hyper::{HeaderMap, Response};
 use std::{
@@ -23,6 +24,7 @@ struct Connection {
     used: Instant,
 }
 pub struct Client {
+    grpc: Option<grpc::Client>,
     address: pumgye_client::Endpoint,
     tls: Option<(
         tokio_rustls::TlsConnector,
@@ -68,6 +70,12 @@ impl Client {
             "remote native Hopae requires mTLS"
         );
         settings.address.validate()?;
+        if settings.transport == crate::config::HopaeTransport::Grpc {
+            let grpc = grpc::Client::new(settings, &key)?;
+            let mut client = Self::new(settings.address.clone(), settings.pool_size, key);
+            client.grpc = Some(grpc);
+            return Ok(client);
+        }
         let mut client = Self::new(settings.address.clone(), settings.pool_size, key);
         if let Some(tls) = &settings.tls {
             client.tls = Some(crate::tls::mutual_client(
@@ -86,6 +94,7 @@ impl Client {
         key: hyper::header::HeaderValue,
     ) -> Self {
         Self {
+            grpc: None,
             address: address.into(),
             tls: None,
             key,
@@ -95,6 +104,9 @@ impl Client {
         }
     }
     pub async fn verify(&self, headers: &HeaderMap) -> io::Result<Response<crate::proxy::Body>> {
+        if let Some(client) = &self.grpc {
+            return client.verify(headers).await;
+        }
         let _permit = self.slots.try_acquire().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "Hopae native capacity reached")
         })?;
@@ -150,23 +162,27 @@ impl Client {
             return Err(invalid());
         }
         let reply = wire::decode_reply(&payload)?;
-        let mut response = Response::builder()
-            .status(reply.status)
-            .body(crate::proxy::full_body(bytes::Bytes::from(reply.body)))
-            .map_err(|_| invalid())?;
-        for (name, value) in reply.headers {
-            response.headers_mut().append(
-                hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?,
-                hyper::header::HeaderValue::from_bytes(&value).map_err(|_| invalid())?,
-            );
-        }
         connection.used = Instant::now();
         self.idle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(connection);
-        Ok(response)
+        response(reply)
     }
+}
+
+fn response(reply: wire::Reply) -> io::Result<Response<crate::proxy::Body>> {
+    let mut response = Response::builder()
+        .status(reply.status)
+        .body(crate::proxy::full_body(bytes::Bytes::from(reply.body)))
+        .map_err(|_| invalid())?;
+    for (name, value) in reply.headers {
+        response.headers_mut().append(
+            hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?,
+            hyper::header::HeaderValue::from_bytes(&value).map_err(|_| invalid())?,
+        );
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -177,6 +193,22 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("cookie", "a=1".parse().unwrap());
         h
+    }
+    #[test]
+    fn grpc_requires_mtls_even_on_loopback() {
+        let settings = crate::config::HopaeNative {
+            transport: crate::config::HopaeTransport::Grpc,
+            address: "127.0.0.1:8703".parse().unwrap(),
+            pool_size: 1,
+            tls: None,
+        };
+        assert!(
+            Client::from_config(
+                &settings,
+                hyper::header::HeaderValue::from_static("fixture-gateway-key")
+            )
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn mtls_verifies_server_name_ca_and_reuses_authenticated_pool() {
@@ -245,6 +277,7 @@ mod tests {
             }
         });
         let mut settings = crate::config::HopaeNative {
+            transport: crate::config::HopaeTransport::Native,
             address: format!("localhost:{}", address.port()).parse().unwrap(),
             pool_size: 1,
             tls: Some(crate::config::HopaeNativeTls {

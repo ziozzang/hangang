@@ -128,6 +128,7 @@ impl Sso {
         config.native_address.validate()?;
         let native = Client::from_config(
             &hangang::config::HopaeNative {
+                transport: hangang::config::HopaeTransport::Native,
                 address: config.native_address.clone(),
                 pool_size: 8,
                 tls: config.native_tls.clone(),
