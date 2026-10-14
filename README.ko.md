@@ -185,15 +185,15 @@ Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUG
 
 ```mermaid
 flowchart LR
-  N0["기존 인증"]
-  N1["변환 및 backend URI 합성"]
-  N2["전체 본문 바인딩"]
-  N3["호패 증명"]
-  N4["품계의 실제 신원·네트워크 결합 판정"]
-  N5["최종 설정·로컬 리비전 검사"]
+  N0["Existing authentication"]
+  N1["Transform and compose backend URI"]
+  N2["Bound complete entity"]
+  N3["Hopae receipt"]
+  N4["Pumgye live identity and network decision"]
+  N5["Final configuration and local revision fences"]
   N6["HTTP upstream"]
   N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6
-  N4 --> S["수문장 네트워크 판정"]
+  N4 --> S["Sumunjang network owner"]
   S --> N4
-  N4 -. "발급자 검증" .-> N3
+  N4 -. "issuer validation" .-> N3
 ```

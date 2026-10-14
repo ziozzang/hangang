@@ -421,3 +421,17 @@ explicit ignores; strict all-target Clippy and 922 local documentation links pas
 The first full run hit an existing delayed-worker Lua saturation deadline. Its
 unchanged isolated test and the complete rerun pass; the original failed log is
 retained privately. This does not establish a timing-test fix or throughput.
+
+## Static 0.3.5 / 0.1.6 candidates
+
+Hangang 0.3.5 pins all four Pumgye libraries to the same 0.1.6 source
+609e552604d693fc3ac5410a4ef593463200b25b, with no unrelated lockfile updates.
+Full 1,282-test/58-ignore regression, strict Clippy and five release boundary
+tests pass. All eight musl executables are static and match their archive.
+Existing pinned-key OpenSSL signatures, exact payloads and asset hashes verify
+for Hangang/Pumgye and the published Hopae 0.0.7/Sumunjang 0.3.5 artifacts.
+That exact four-static-binary combination passes native final dispatch, trust/
+budget refusal without upstream effects, network/permission/class/AAL/service
+checks, restoration and durable authority-restart withdrawal. These are prepared
+local candidates, not new published releases or operating replacements. Remote
+Kubernetes and deployment/rollback qualification remain required.
