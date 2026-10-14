@@ -117,6 +117,19 @@ impl Client {
             .await
     }
 
+    /// Re-query the native issuer for the exact checked proof. An observation,
+    /// not a permission, lease or guarantee about a future dispatch.
+    pub async fn validate_service_receipt(
+        &self,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+    ) -> io::Result<()> {
+        self.grpc
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "receipt requires gRPC"))?
+            .validate_service_receipt(receipt)
+            .await
+    }
+
     pub async fn verify(&self, headers: &HeaderMap) -> io::Result<Response<crate::proxy::Body>> {
         if let Some(client) = &self.grpc {
             return client.verify(headers).await;

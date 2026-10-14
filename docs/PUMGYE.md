@@ -306,3 +306,15 @@ method and changed-digest refusal. It returns an observation only: it does not
 start or refresh the older authorization lease health watcher. Final request
 transformation, receipt-owner/route freshness and upstream dispatch integration
 remain required before activating this path in routes.
+
+`hopae_native::Client::validate_service_receipt` re-queries the native Hopae
+issuer on the existing mTLS channel using only a checked service receipt. Caller
+authentication and admission are shared with issuance. Encoding/decoding is
+bounded to 2 KiB/64 bytes; the deadline is capped at one second and original
+receipt expiry. Exact request correlation and unchanged original expiry are
+required, with local wall/monotonic time and observed profile-revision fences.
+The result is a fresh issuer observation, not an authorization lease or permit.
+The actual three-authority fixture additionally verifies this Hangang client
+accepts current proofs and rejects still-unexpired withdrawn/outage proofs.
+Before querying Pumgye afterward, it asserts the cached proof is still valid,
+so expiration cannot substitute for the remote lifecycle refusal.

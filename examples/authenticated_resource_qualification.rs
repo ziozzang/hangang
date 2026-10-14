@@ -132,6 +132,14 @@ async fn main() -> Result<()> {
                 old.authentication().valid_at(now()),
                 "cached receipt expired before lifecycle query"
             );
+            ensure!(
+                client.validate_service_receipt(old).await.is_err(),
+                "retired or unavailable issuer proof accepted"
+            );
+            ensure!(
+                old.authentication().valid_at(now()),
+                "cached receipt expired before Pumgye lifecycle query"
+            );
             let result = pumgye
                 .observe_authenticated_resource(&gate, "GET", ip, digest, old)
                 .await;
@@ -153,6 +161,7 @@ async fn main() -> Result<()> {
                 .await
             {
                 Ok(Some(reply)) if reply.allow => {
+                    client.validate_service_receipt(&checked).await?;
                     let mut wrong_service = gate.clone();
                     wrong_service.service_id = "billing".into();
                     ensure!(

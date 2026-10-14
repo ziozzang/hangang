@@ -120,6 +120,86 @@ impl Client {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Hopae receipt deadline"))?
     }
 
+    pub(super) async fn validate_service_receipt(
+        &self,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+    ) -> io::Result<()> {
+        let _permit = self
+            .slots
+            .try_acquire()
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "Hopae gRPC capacity"))?;
+        let before = current_wall_ms()?;
+        if !receipt.authentication().valid_at(before)
+            || receipt.revision() < self.receipt_revision.load(Ordering::Acquire)
+        {
+            return Err(invalid());
+        }
+        let begun = std::time::Instant::now();
+        let request_id = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                (value < 9_007_199_254_740_991).then(|| value + 1)
+            })
+            .map_err(|_| invalid())?;
+        let context = receipt.context();
+        let mut request = tonic::Request::new(hopae_grpc::v1::ServiceReceiptValidationRequest {
+            request_id,
+            context: Some(hopae_grpc::v1::AuthenticationReceiptContext {
+                issuer_ref: context.issuer_ref.into(),
+                key_epoch: context.key_epoch,
+                identity_authority_epoch: context.identity_authority_epoch.into(),
+                identity: Some(hopae_grpc::v1::ReceiptIdentity {
+                    subject_ref: context.identity.subject_ref.into(),
+                    kind: 2,
+                    aal: 0,
+                    revision: context.identity.revision,
+                    credential_generation: context.identity.credential_generation,
+                }),
+                service: context.service.into(),
+                audience: context.audience.into(),
+                request_sha256: context.request_sha256.to_vec(),
+            }),
+            receipt: receipt.authentication().receipt_bytes().to_vec(),
+            request_sha256: context.request_sha256.to_vec(),
+        });
+        let timeout = Duration::from_millis(
+            receipt
+                .authentication()
+                .expires_ms()
+                .saturating_sub(before)
+                .min(1000),
+        );
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.key.clone());
+        let mut client =
+            hopae_grpc::v1::authentication_receipts_client::AuthenticationReceiptsClient::new(
+                self.channel.clone(),
+            )
+            .max_encoding_message_size(2048)
+            .max_decoding_message_size(64);
+        let reply = tokio::time::timeout(timeout, client.validate_service(request))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Hopae receipt deadline"))?
+            .map_err(|_| invalid())?
+            .into_inner();
+        let after = current_wall_ms()?;
+        let final_ms = after
+            .max(before.saturating_add(
+                u64::try_from(begun.elapsed().as_millis()).map_err(|_| invalid())?,
+            ));
+        if after < before
+            || !receipt.authentication().valid_at(final_ms)
+            || receipt.revision() < self.receipt_revision.load(Ordering::Acquire)
+            || reply.request_id != request_id
+            || reply.expires_ms != receipt.authentication().expires_ms()
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub(super) async fn verify(
         &self,
         headers: &HeaderMap,
@@ -177,6 +257,13 @@ impl Client {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Hopae gRPC deadline"))?
     }
+}
+
+fn current_wall_ms() -> io::Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| invalid())?;
+    u64::try_from(now.as_millis()).map_err(|_| invalid())
 }
 
 fn receipt_now(wall: Duration, elapsed: Duration) -> io::Result<u64> {
