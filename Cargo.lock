@@ -1181,9 +1181,10 @@ dependencies = [
 [[package]]
 name = "hopae-grpc"
 version = "0.0.3"
-source = "git+https://github.com/ziozzang/hopae?rev=7b5a8b8782cfb6bedd57992bcb74800e2394fa38#7b5a8b8782cfb6bedd57992bcb74800e2394fa38"
+source = "git+https://github.com/ziozzang/hopae?rev=3121f993574d16733363653f1562ef8b7cd8c6ba#3121f993574d16733363653f1562ef8b7cd8c6ba"
 dependencies = [
  "prost",
+ "sha2 0.10.9",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

@@ -28,3 +28,14 @@ HANGANG_HOPAE_GRPC_CLIENT=/absolute/path/to/hangang/target/debug/examples/hopae_
 
 Actual complete gateway request-chain, Kubernetes deployment and production rollout
 remain separate gates. Building the shared schema requires `protoc`.
+
+## Shared projection request binding (unreleased)
+
+The pinned provider-independent Hopae contract is now 3121f993. Hangang
+`projection_binding::digest` uses its exact request-binding implementation and
+accepts an origin-form `Request<Bytes>` plus native service/audience scope. It
+hashes the complete final entity; header claims are not scope inputs. Callers
+must run it after route/body rewriting and must not substitute empty bytes for
+unknown streaming entities. Fixed owner-vector, changed entity/query/scope and
+ambiguous target refusal tests pass. This helper is not yet invoked by credential
+projection dispatch and does not enable receipt RPC or credential delivery.

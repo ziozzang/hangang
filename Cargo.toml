@@ -9,7 +9,7 @@ description = "A dynamically configured asynchronous L4/L7 reverse proxy"
 repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
-hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "7b5a8b8782cfb6bedd57992bcb74800e2394fa38" }
+hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "3121f993574d16733363653f1562ef8b7cd8c6ba" }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 pumgye-grpc = { git = "https://github.com/ziozzang/pumgye", rev = "878bd2a2b109f91b4563a34677d22dedf371f469" }
