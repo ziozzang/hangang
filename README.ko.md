@@ -178,3 +178,22 @@ Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUG
 [품계 네이티브 권한·매트릭스](docs/ko/PUMGYE.md) · [English](docs/PUMGYE.md)
 
 [독립 품계 서버](docs/ko/PUMGYE.md)에 네이티브 판단 전송과 정책 관리 위임을 기록했습니다.
+
+## 네이티브 서비스 요청 집행
+
+미릴리스 auth.native_resource 옵션은 최종 upstream 경로·본문을 실제 호패/품계/수문장의 mTLS gRPC 판정에 바인딩합니다. 전용 네 프로세스·origin 검사로 전달/거부를 확인했으며 릴리즈·Kubernetes·운영 반영은 남아 있습니다.
+
+```mermaid
+flowchart LR
+  N0["기존 인증"]
+  N1["변환 및 backend URI 합성"]
+  N2["전체 본문 바인딩"]
+  N3["호패 증명"]
+  N4["품계의 실제 신원·네트워크 결합 판정"]
+  N5["최종 설정·로컬 리비전 검사"]
+  N6["HTTP upstream"]
+  N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6
+  N4 --> S["수문장 네트워크 판정"]
+  S --> N4
+  N4 -. "발급자 검증" .-> N3
+```

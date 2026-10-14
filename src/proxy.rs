@@ -311,6 +311,7 @@ fn security_denied(status: u16) -> Response<Body> {
 pub struct Proxy {
     guard: Option<Arc<crate::guard::GuardClient>>,
     request_inspectors: Arc<tokio::sync::Semaphore>,
+    native_bodies: Arc<tokio::sync::Semaphore>,
     request_spools: Arc<crate::request_block_spool::Pool>,
     acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
@@ -703,6 +704,7 @@ impl Proxy {
             active,
             guard: None,
             request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
+            native_bodies: Arc::new(tokio::sync::Semaphore::new(128)),
             request_spools: Arc::new(crate::request_block_spool::Pool::new()),
             acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
@@ -871,32 +873,7 @@ impl Proxy {
                 .uri(&auth.url)
                 .body(full_body(Bytes::new()))
                 .map_err(|_| 503u16)?;
-            for name in &auth.request_headers {
-                for value in original.headers().get_all(name) {
-                    request.headers_mut().append(
-                        HeaderName::from_bytes(name.as_bytes()).map_err(|_| 503u16)?,
-                        value.clone(),
-                    );
-                }
-            }
-            // Generated request context always wins over anything a client
-            // sent under the same name (the copy above used `append`; these
-            // use `insert`). Values come from the trusted-proxy resolution,
-            // so behind a trusted load balancer the service sees the real
-            // client, scheme and host. `x-original-*` names are kept for
-            // existing deployments; `x-forwarded-*`, `x-real-ip` and
-            // `x-original-url` are the set most authorization services expect.
-            for (name, value) in forward_auth_context(original, edge) {
-                request.headers_mut().insert(
-                    HeaderName::from_static(name),
-                    HeaderValue::from_str(&value).map_err(|_| 503u16)?,
-                );
-            }
-            // Configured static headers are applied last with `insert`, so a
-            // client copy of the same name can never reach the service.
-            for (name, value) in static_headers {
-                request.headers_mut().insert(name.clone(), value.clone());
-            }
+            *request.headers_mut() = auth_request_headers(auth, static_headers, original, edge)?;
             let renewal_context = auth
                 .renew_native_evidence
                 .then(|| request.headers().clone());
@@ -2522,6 +2499,7 @@ impl Proxy {
                 AuthResponseBody::new(body, lease.clone(), self.metrics.clone()).boxed_unsync();
         }
 
+        let mut native_auth_context = None;
         if let Some(auth) = &runtime.route.auth {
             if auth
                 .request_headers
@@ -2536,6 +2514,16 @@ impl Proxy {
             // A client must never supply identity headers reserved for the auth service.
             for name in &auth.response_headers {
                 request.headers_mut().remove(name);
+            }
+            if runtime.native_resource.is_some() {
+                native_auth_context =
+                    match auth_request_headers(auth, &runtime.auth_static_headers, &request, &edge)
+                    {
+                        Ok(headers) => Some(headers),
+                        Err(_) => {
+                            return Ok(response(503, "native authentication context unavailable"));
+                        }
+                    };
             }
             let authorization = tokio::select! {
                 biased;
@@ -3281,6 +3269,56 @@ impl Proxy {
                     request
                 }
             };
+            let mut native_observation = None;
+            if let Some(binding) = &runtime.native_resource {
+                let (Some(hopae), Some(authority), Some(context)) = (
+                    runtime.auth_native.as_ref(),
+                    snapshot.pumgye_remote.as_ref(),
+                    native_auth_context.as_ref(),
+                ) else {
+                    return Ok(response(503, "native resource authority unavailable"));
+                };
+                let mut context = context.clone();
+                for (name, value) in forward_auth_context(&outgoing, &edge) {
+                    let Ok(value) = HeaderValue::from_str(&value) else {
+                        return Ok(response(400, "native request context refused"));
+                    };
+                    context.insert(HeaderName::from_static(name), value);
+                }
+                for (name, value) in &runtime.auth_static_headers {
+                    context.insert(name.clone(), value.clone());
+                }
+                let prepared = tokio::select! {
+                    biased;
+                    retired = auth_retired(auth_route_lease.as_ref()) => {
+                        retired.record(&self.metrics);
+                        return Ok(response(503, "route authorization retired"));
+                    }
+                    result = binding.prepare(outgoing, self.native_bodies.clone()) => match result {
+                        Ok(prepared) => prepared,
+                        Err(crate::projection_entity::Refused::TooLarge) => return Ok(response(413, "native entity too large")),
+                        Err(crate::projection_entity::Refused::Length | crate::projection_entity::Refused::Trailers | crate::projection_entity::Refused::Target) => return Ok(response(400, "native entity refused")),
+                        Err(_) => return Ok(response(503, "native entity unavailable")),
+                    }
+                };
+                let observation = tokio::select! {
+                    biased;
+                    retired = auth_retired(auth_route_lease.as_ref()) => {
+                        retired.record(&self.metrics);
+                        return Ok(response(503, "route authorization retired"));
+                    }
+                    result = binding.observe(&prepared, &context, hopae, authority, edge.client_ip) => match result {
+                        Ok(observation) => observation,
+                        Err(_) => return Ok(response(503, "native resource authority unavailable")),
+                    }
+                };
+                if !observation.allowed() {
+                    return Ok(response(403, "native resource permission denied"));
+                }
+                outgoing = prepared.into_dispatch();
+                outgoing.headers_mut().remove(header::AUTHORIZATION);
+                native_observation = Some((observation, authority.clone()));
+            }
             // Raw request bodies already carry the guard installed before
             // external auth/Lua/transform buffering. A transformed body is a
             // new stream and needs its own final output guard.
@@ -3315,6 +3353,12 @@ impl Proxy {
                 {
                     return Ok(security_denied(503));
                 }
+            }
+            if native_observation
+                .as_ref()
+                .is_some_and(|(observation, authority)| !observation.local_fences_hold(authority))
+            {
+                return Ok(response(503, "native resource observation retired"));
             }
             let send = async {
                 match &client {
@@ -4230,6 +4274,42 @@ fn set_forwarding_headers(
 /// Request context sent to an external authorization service, in the order
 /// the headers are inserted. `x-original-uri`/`x-forwarded-uri` are always
 /// origin-form (path and query), independent of the client's HTTP version.
+fn auth_request_headers(
+    auth: &crate::config::ExternalAuth,
+    static_headers: &[(HeaderName, HeaderValue)],
+    original: &Request<Body>,
+    edge: &EdgeContext,
+) -> Result<HeaderMap, u16> {
+    let mut headers = HeaderMap::new();
+    for name in &auth.request_headers {
+        for value in original.headers().get_all(name) {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| 503u16)?,
+                value.clone(),
+            );
+        }
+    }
+    // Generated request context always wins over anything a client
+    // sent under the same name (the copy above used `append`; these
+    // use `insert`). Values come from the trusted-proxy resolution,
+    // so behind a trusted load balancer the service sees the real
+    // client, scheme and host. `x-original-*` names are kept for
+    // existing deployments; `x-forwarded-*`, `x-real-ip` and
+    // `x-original-url` are the set most authorization services expect.
+    for (name, value) in forward_auth_context(original, edge) {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(&value).map_err(|_| 503u16)?,
+        );
+    }
+    // Configured static headers are applied last with `insert`, so a
+    // client copy of the same name can never reach the service.
+    for (name, value) in static_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+    Ok(headers)
+}
+
 fn forward_auth_context(
     original: &Request<Body>,
     edge: &EdgeContext,

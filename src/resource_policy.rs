@@ -390,6 +390,7 @@ mod tests {
     fn auth() -> crate::config::ExternalAuth {
         crate::config::ExternalAuth {
             renew_native_evidence: false,
+            native_resource: None,
             native: None,
             url: "http://127.0.0.1/authorize".into(),
             request_headers: vec![],

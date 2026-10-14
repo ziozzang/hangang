@@ -183,3 +183,22 @@ Trusted Guard/Hopae menus and native Hopae transport: [console integration](docs
 [Pumgye native authorization and matrix](docs/PUMGYE.md) · [한국어](docs/ko/PUMGYE.md)
 
 [Independent Pumgye authority](docs/PUMGYE.md) documents native decision transport and delegated policy administration.
+
+## Native service request enforcement
+
+The unreleased `auth.native_resource` option binds the final upstream target and entity to actual Hopae/Pumgye/Sumunjang decisions over mTLS gRPC. The owned four-process origin fixture qualifies dispatch/refusal; release, Kubernetes and operating adoption remain pending.
+
+```mermaid
+flowchart LR
+  N0["Existing authentication"]
+  N1["Transform and compose backend URI"]
+  N2["Bound complete entity"]
+  N3["Hopae receipt"]
+  N4["Pumgye live identity and network decision"]
+  N5["Final configuration and local revision fences"]
+  N6["HTTP upstream"]
+  N0 --> N1 --> N2 --> N3 --> N4 --> N5 --> N6
+  N4 --> S["Sumunjang network owner"]
+  S --> N4
+  N4 -. "issuer validation" .-> N3
+```

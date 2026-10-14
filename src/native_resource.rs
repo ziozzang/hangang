@@ -65,6 +65,18 @@ impl Observation {
     pub fn allowed(&self) -> bool {
         self.reply.allow
     }
+    /// Local observed floors/expiry only; no remote freshness or stream lease.
+    pub fn local_fences_hold(&self, authority: &pumgye::AuthorityRuntime) -> bool {
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return false;
+        };
+        self.reply.allow
+            && self
+                .receipt
+                .authentication()
+                .valid_at(now.as_millis().min(u64::MAX as u128) as u64)
+            && authority.authenticated_observation_current(&self.reply)
+    }
     pub fn receipt(&self) -> &projection_receipt::CheckedServiceReceipt {
         &self.receipt
     }

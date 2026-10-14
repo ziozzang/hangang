@@ -2467,6 +2467,7 @@ async fn external_authorization_is_bounded_fail_closed_and_replaces_spoofed_iden
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["authorization".into()],
@@ -2568,6 +2569,7 @@ async fn authorization_service_receives_edge_resolved_forward_auth_context() {
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/check"),
         // Generated names cannot be configured as inputs (validation rejects
@@ -2742,6 +2744,7 @@ async fn sso_identity_under_forwarded_prefix_reaches_the_upstream_unspoofed() {
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec![],
@@ -3428,6 +3431,7 @@ async fn client_connection_token_cannot_erase_auth_injected_header() {
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["authorization".into()],
@@ -4540,6 +4544,7 @@ async fn terminal_auth_2xx_never_contacts_upstream_or_leaks_marker() {
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/authorize"),
         request_headers: vec![],
@@ -4808,6 +4813,7 @@ async fn external_auth_forward_response_drives_sso_redirect_and_cookie() {
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth_address}/check"),
         request_headers: vec!["cookie".into()],
@@ -5233,6 +5239,7 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
         country_policy: None,
         auth_reserved: Vec::new(),
         auth_static_headers: Vec::new(),
+        native_resource: None,
         auth_native: None,
         auth_unavailable: None,
         jwt_auth: None,
@@ -5549,6 +5556,7 @@ async fn http2_cookie_join_precedes_route_matching_and_external_auth() {
         .insert("cookie".into(), "a=1; session=ok".into());
     configured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: None,
         url: format!("http://{auth}/check"),
         request_headers: vec!["cookie".into()],
@@ -7440,6 +7448,7 @@ async fn native_hopae_transport_uses_normal_identity_cookie_and_terminal_handlin
     let mut secured = route(vec![format!("http://{backend}")]);
     secured.auth = Some(hangang::config::ExternalAuth {
         renew_native_evidence: false,
+        native_resource: None,
         native: Some(hangang::config::HopaeNative {
             transport: hangang::config::HopaeTransport::Native,
             address: native.into(),

@@ -382,6 +382,42 @@ comes from its owning caller. Unknown fields, including signing seeds, refuse;
 weak/malformed public keys, unsafe epochs and invalid budgets refuse compilation.
 `Binding::prepare` applies the compiled budget using caller-supplied shared
 admission. Two compiler/budget tests and the actual fragmented three-authority
-lifecycle fixture pass. This standalone compiler is not an accepted `HttpRoute`
-activation option yet; full route/configuration validation and dispatch wiring
-remain required before operating adoption.
+lifecycle fixture pass. At this compiler increment, route activation was still
+open; the subsequent dispatch qualification below connects it.
+
+## Final native service dispatch (unreleased candidate)
+
+Set `auth.native_resource` to the public configuration above on an explicitly
+protected route with enforced `resource_policy.pumgye_resource`. Both native
+Hopae and independent Pumgye transports must use gRPC with mTLS. Invalid pins,
+embedded/unencrypted/native-only authority combinations and disabled permission
+gates refuse configuration validation. Ordinary configurations omit the field.
+
+The gateway captures the trusted native authentication input before consuming
+the service credential. After request transforms and actual backend URI
+composition, each upstream attempt prepares the complete entity using shared
+128-request admission, issues its bound receipt, queries Pumgye's combined live
+authorities and revalidates Hopae. It checks local policy/network floors and the
+existing configuration/permission retirement fences immediately before sending.
+The outgoing body retains admission and exact bytes, regenerates framing and
+removes Authorization. Protected routes retain their existing cache bypass.
+Existing authorization leases continue guarding request/response work; the new
+zero-TTL observation does not create or refresh a stream lease.
+
+Hopae's `tools/service_stack_smoke.py --grpc --resource-catalog --native-resource
+--durable-restart` passes with the actual four debug binaries and HTTP origin.
+The origin receives the composed `/api/secure` target and nonempty entity with
+no service credential. Wrong public pin/issuer/audience and a reduced entity cap
+refuse without origin calls, then restoration allows. Resource/class/AAL/service
+changes, guest/credential refusal, durable permission/authentication withdrawal,
+network block/removal and authority outages also pass. The existing resource
+fixture without this option passes. A focused configuration matrix rejects
+unsafe transport/enforcement/pin combinations. Static release, remote Kubernetes,
+production adoption, streaming application protocol coverage, signed permission/
+projection/replay and throughput qualification remain separate gates.
+
+Full all-target regression after dispatch wiring passes 1,282 tests with 58
+explicit ignores; strict all-target Clippy and 922 local documentation links pass.
+The first full run hit an existing delayed-worker Lua saturation deadline. Its
+unchanged isolated test and the complete rerun pass; the original failed log is
+retained privately. This does not establish a timing-test fix or throughput.

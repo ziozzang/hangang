@@ -455,6 +455,9 @@ pub struct ExternalAuth {
     /// Renew bounded native machine evidence for long-lived requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub renew_native_evidence: bool,
+    /// Request-bound native service authentication and resource decision before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_resource: Option<crate::native_resource::Configuration>,
     /// Optional authenticated HOP1 transport; remote connections require mTLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<HopaeNative>,
@@ -939,6 +942,46 @@ impl Config {
                         anyhow::anyhow!("resource gate requires policy or authority")
                     })?)?;
                 }
+            }
+        }
+        for route in &self.http {
+            if let Some(native) = route
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.native_resource.as_ref())
+            {
+                ensure!(
+                    route.access_mode == AccessMode::Protected,
+                    "native resource requires protected access"
+                );
+                ensure!(
+                    route
+                        .auth
+                        .as_ref()
+                        .and_then(|auth| auth.native.as_ref())
+                        .is_some_and(|transport| transport.transport == HopaeTransport::Grpc
+                            && transport.tls.is_some()),
+                    "native resource requires Hopae gRPC mTLS"
+                );
+                ensure!(
+                    self.pumgye_authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.transport
+                            == crate::pumgye::DecisionTransport::Grpc
+                            && authority.tls.is_some()),
+                    "native resource requires independent Pumgye gRPC mTLS"
+                );
+                let policy = route
+                    .resource_policy
+                    .as_ref()
+                    .filter(|policy| policy.enforce)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("native resource requires enforced resource policy")
+                    })?;
+                let gate = policy.pumgye_resource.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("native resource requires owner resource/action gate")
+                })?;
+                native.compile(gate.clone())?;
             }
         }
         ensure!(
@@ -2186,6 +2229,7 @@ pub struct HttpRuntime {
     /// header variable; every request to the route is answered with 503.
     pub auth_unavailable: Option<AuthUnavailable>,
     pub auth_native: Option<std::sync::Arc<crate::hopae_native::Client>>,
+    pub native_resource: Option<std::sync::Arc<crate::native_resource::Binding>>,
 }
 struct PublicationRetirements {
     reservation: crate::retired_members::Reservation,
@@ -2686,6 +2730,26 @@ impl Snapshot {
                     auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
                     auth_unavailable: auth_unavailable.remove(&route.id),
                     auth_native: native_clients.remove(&route.id),
+                    native_resource: route
+                        .auth
+                        .as_ref()
+                        .and_then(|auth| auth.native_resource.as_ref())
+                        .map(|native| {
+                            std::sync::Arc::new(
+                                native
+                                    .compile(
+                                        route
+                                            .resource_policy
+                                            .as_ref()
+                                            .unwrap()
+                                            .pumgye_resource
+                                            .as_ref()
+                                            .unwrap()
+                                            .clone(),
+                                    )
+                                    .expect("validated native resource configuration"),
+                            )
+                        }),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
@@ -3238,6 +3302,60 @@ mod tests {
     }
 
     #[test]
+    fn native_resource_requires_protected_enforced_remote_grpc_and_public_pin() {
+        use base64::Engine;
+        let public = base64::engine::general_purpose::STANDARD.encode(
+            ed25519_dalek::SigningKey::from_bytes(&[9; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let tls = serde_json::json!({"server_name":"owned.example.test", "ca":"/owned/ca.pem", "certificate":"/owned/client.pem", "key":"/owned/client.key"});
+        let document = serde_json::json!({"http":[{
+            "id":"orders", "host":"orders.example.test", "path_prefix":"/private",
+            "access_mode":"protected", "backends":["http://127.0.0.1:9090"],
+            "auth":{"url":"https://owned.example.test/_hopae/verify",
+                "native":{"transport":"grpc", "address":"127.0.0.1:9001", "tls":tls},
+                "native_resource":{"audience":"orders-api", "issuer_ref":"owned", "key_epoch":1, "public_key":public},
+                "request_headers":["authorization"], "response_headers":["x-forwarded-user","x-hopae-aal","x-hopae-principal-kind"],
+                "static_request_headers":{"x-hopae-gateway-key":"owned-caller-key-not-a-secret","x-hopae-contract":"1"}},
+            "resource_policy":{"resource_id":"orders", "principal":{"source":"external","subject_header":"x-forwarded-user"}, "allow":[],
+                "pumgye_resource":{"service_id":"orders", "resource":"db:orders", "actions":{"GET":"select"}}}
+        }], "pumgye_authority":{"transport":"grpc", "decision_address":"127.0.0.1:9002", "management_address":"127.0.0.1:9003",
+            "tls":tls, "decision_token_env":"PUMGYE_DECISION_TOKEN", "admin_token_env":"PUMGYE_ADMIN_TOKEN"}});
+        let valid: Config = serde_json::from_value(document.clone()).unwrap();
+        valid.validate().unwrap();
+        for (path, replacement) in [
+            ("/http/0/access_mode", serde_json::json!("public")),
+            ("/http/0/resource_policy/enforce", serde_json::json!(false)),
+            ("/http/0/auth/native/transport", serde_json::json!("native")),
+            ("/http/0/auth/native/tls", serde_json::Value::Null),
+            ("/pumgye_authority/transport", serde_json::json!("native")),
+            ("/pumgye_authority/tls", serde_json::Value::Null),
+            ("/pumgye_authority", serde_json::Value::Null),
+            (
+                "/http/0/resource_policy/pumgye_resource",
+                serde_json::Value::Null,
+            ),
+            (
+                "/http/0/auth/native_resource/public_key",
+                serde_json::json!("invalid"),
+            ),
+        ] {
+            let mut bad = document.clone();
+            if path.ends_with("/enforce") {
+                bad["http"][0]["resource_policy"]["enforce"] = replacement;
+            } else {
+                *bad.pointer_mut(path).unwrap() = replacement;
+            }
+            let bad: Config = serde_json::from_value(bad).unwrap();
+            assert!(
+                bad.validate().is_err(),
+                "accepted unsafe native configuration: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn geoip_source_is_optional_validated_without_file_io_and_reuses_only_exact_policy() {
         let mut config = Config::default();
         assert!(
@@ -3565,6 +3683,7 @@ mod tests {
             assert!(config.validate().is_ok());
             config.http[0].auth = Some(ExternalAuth {
                 renew_native_evidence: false,
+                native_resource: None,
                 native: None,
                 url: "http://127.0.0.1:9/check".into(),
                 request_headers: vec![],
@@ -4201,6 +4320,7 @@ mod tests {
         let mut c = route();
         c.http[0].auth = Some(ExternalAuth {
             renew_native_evidence: false,
+            native_resource: None,
             native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
@@ -4219,6 +4339,7 @@ mod tests {
         c.http[0].basic_auth = Some(basic.clone());
         c.http[0].auth = Some(ExternalAuth {
             renew_native_evidence: false,
+            native_resource: None,
             native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
@@ -4274,6 +4395,7 @@ mod tests {
         });
         document.http[0].auth = Some(ExternalAuth {
             renew_native_evidence: false,
+            native_resource: None,
             native: None,
             url: "http://127.0.0.1:9/check".into(),
             request_headers: vec![],
