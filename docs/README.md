@@ -2,6 +2,8 @@
 
 [한국어 목차](README.ko.md)
 
+[Ingress usage, scenarios and live qualification](KUBERNETES_SCENARIOS.md).
+
 English is the reference language. Available Korean pages are full translations of their English sources; both versions must preserve the same behavior, examples, and limitations. Guides without a Korean translation link to English references. The [repository README](../README.md) has the local quick start. The [example configuration guide](../examples/README.md) explains the starting JSON field by field, and [OpenAPI](openapi.json) defines the management API and configuration objects.
 
 ## Start here

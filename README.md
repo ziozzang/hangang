@@ -2,6 +2,8 @@
 
 [Documentation](docs/README.md) · [Quick start](#quick-start) · [Release notes](CHANGELOG.md) · [한국어](README.ko.md)
 
+[Ingress usage, scenarios and live qualification](docs/KUBERNETES_SCENARIOS.md).
+
 **An HTTP, TCP, and UDP gateway with enterprise-class lifecycle controls, isolated Lua policies, and a built-in management console.**
 
 Hangang brings reverse proxying, load balancing, TLS certificate management, access policies, and traffic visibility into one Rust binary. Configure routes in the browser or through the API, inspect live traffic, and extend request handling with Lua—without deploying a separate console service. The console supports English and Korean; this README and the English guides are the reference documentation.
