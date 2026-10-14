@@ -105,7 +105,7 @@ A live k3d v5.9.0 / k3s v1.37.1+k3s1 cluster on one Linux amd64 physical server 
 
 Native qualification of the RC passed 687 library/proxy/CLI/Host regression tests, with 13 existing ignored cases. GNU and musl Linux amd64 gateway smoke suites each passed ten checks. The Host regression covers exact, wildcard and default-backend routes including Host ports. See the [release notes](../CHANGELOG.md) and release description for final stable build verification.
 
-The live exercise did not establish WebSocket, SSE, gRPC, physical-node failover or prolonged API-outage behavior. GitHub Actions was disabled; qualification was run locally. The documentation checker has ten known failures also reproduced on the unmodified v0.3.1 baseline. These are recorded limits, not successful checks. Additional architectures have no assets in this maintenance release.
+The live exercise did not establish WebSocket, SSE, gRPC, physical-node failover or prolonged API-outage behavior. The RC qualification ran locally while GitHub Actions was disabled. Stable qualification is also performed locally; workflow availability may change independently. The documentation checker has ten known failures also reproduced on the unmodified v0.3.1 baseline. These are recorded limits, not successful checks. Additional architectures have no assets in this maintenance release.
 
 ## Troubleshooting and cleanup
 
