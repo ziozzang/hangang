@@ -7,7 +7,7 @@ use hangang::{
     hopae_native::Client,
     projection_receipt::{IssuerPin, ServiceScope},
 };
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::{
     HeaderMap, Request,
     header::{HeaderName, HeaderValue},
@@ -83,13 +83,34 @@ async fn main() -> Result<()> {
     );
     let (mut parts, bytes) = request.into_parts();
     parts.uri = format!("https://orders.example.test{}", parts.uri).parse()?;
+    let fragment_mode = std::env::var("OWNED_RECEIPT_FRAGMENTED_ENTITY").ok();
+    ensure!(
+        fragment_mode
+            .as_deref()
+            .is_none_or(|mode| matches!(mode, "0" | "1")),
+        "invalid owned frame mode"
+    );
+    let fragmented = fragment_mode.as_deref() == Some("1");
+    let entity_frames = if fragmented {
+        2
+    } else {
+        usize::from(!bytes.is_empty())
+    };
+    let body: hangang::proxy::Body = if fragmented {
+        ensure!(bytes.len() > 1, "owned fragmented entity required");
+        let midpoint = bytes.len().div_ceil(2);
+        let frames: [Result<hyper::body::Frame<Bytes>, hangang::proxy::BodyError>; 2] = [
+            Ok(hyper::body::Frame::data(bytes.slice(..midpoint))),
+            Ok(hyper::body::Frame::data(bytes.slice(midpoint..))),
+        ];
+        StreamBody::new(futures_util::stream::iter(frames)).boxed_unsync()
+    } else {
+        Full::new(bytes)
+            .map_err(|never| match never {})
+            .boxed_unsync()
+    };
     let prepared = hangang::projection_entity::prepare(
-        Request::from_parts(
-            parts,
-            Full::new(bytes)
-                .map_err(|never| match never {})
-                .boxed_unsync(),
-        ),
+        Request::from_parts(parts, body),
         &config.service,
         &config.audience,
         std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -230,7 +251,7 @@ async fn main() -> Result<()> {
         match (command.as_str(), outcome) {
             ("allow", Ok(revision)) => println!(
                 "{}",
-                serde_json::json!({"allowed":true,"revision":revision})
+                serde_json::json!({"allowed":true,"revision":revision,"entity_frames":entity_frames})
             ),
             ("deny" | "deny-network", Err(_)) => {
                 println!("{}", serde_json::json!({"allowed":false}))

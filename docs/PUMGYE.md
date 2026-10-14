@@ -333,16 +333,27 @@ receipt or activate dispatch.
 owner-supplied global admission, byte cap (1 byte–16 MiB) and deadline (up to five
 seconds). Admission remains with the prepared request and its dispatch body.
 Single-frame bodies retain their original `Bytes` allocation; fragmented bodies
-reserve at most the configured cap once, beyond source frame buffers. The read
+grow in power-of-two capacity buckets capped at the configured maximum, beyond
+source frame buffers; allocation failure refuses. The read
 loop yields every 64 frames so continuously ready empty frames cannot starve
 deadline/cancellation. Capacity, length ambiguity/mismatch, excess bytes, body
 errors, unsupported trailers and invalid final targets refuse. Dispatch framing
 is regenerated from the preserved bytes. This phase grants no permission.
 
-Eight entity tests cover byte preservation, admission lifetime/cancellation,
+Nine entity tests cover byte preservation, admission lifetime/cancellation,
 allocation reuse and adversarial inputs. The actual Hangang three-authority
 fixture now derives its receipt digest from this prepared final request. Both
 empty and `--nonempty-entity` runs pass Allow, network/identity lifecycle, outage
 and trust refusals. The nonempty run also passes with Pumgye's own client. These
 are local preparation/authority tests, not actual gateway transformation or
 upstream dispatch, static release, Kubernetes or production adoption.
+
+Reservation tests verify that a 13-byte fragmented entity needs 16 bytes of
+vector capacity with a 16 MiB limit, logarithmic growth under non-power-of-two
+limits, and size/overflow refusal without further allocation. The owned fixture's
+`--nonempty-entity --fragmented-entity` mode feeds two real data frames through
+Hangang preparation before issuance; the actual three-authority Allow/lifecycle/
+outage/trust fixture passes. It requires the selected client to report two
+prepared frames, and refuses a nonparticipating client. Default empty-body and
+Pumgye's single-entity compatibility modes also pass. These are local functional
+and capacity checks, not complete gateway throughput qualification.

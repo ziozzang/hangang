@@ -1,6 +1,6 @@
 //! Bounded final entity preparation, before native request receipt issuance.
 //! Neither the digest nor this buffer grants authentication or dispatch rights.
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, header};
 use std::{sync::Arc, time::Duration};
@@ -10,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub enum Refused {
     Limits,
     Capacity,
+    Allocation,
     Length,
     TooLarge,
     Deadline,
@@ -79,6 +80,23 @@ impl hyper::body::Body for AdmittedBody {
     }
 }
 
+fn reserve_entity(buffer: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), Refused> {
+    let needed = buffer
+        .len()
+        .checked_add(additional)
+        .ok_or(Refused::TooLarge)?;
+    if needed > limit {
+        return Err(Refused::TooLarge);
+    }
+    if needed > buffer.capacity() {
+        let capacity = needed.next_power_of_two().min(limit);
+        buffer
+            .try_reserve_exact(capacity - buffer.len())
+            .map_err(|_| Refused::Allocation)?;
+    }
+    Ok(())
+}
+
 /// The owner supplies global admission and a per-request budget. This phase
 /// reads the complete transformed entity before any upstream effects. Inputs
 /// with trailers require a separate binding contract and refuse here.
@@ -126,7 +144,7 @@ pub async fn prepare(
     let bytes = tokio::time::timeout(deadline, async {
         let mut body = Limited::new(body, maximum_bytes);
         let mut first = Bytes::new();
-        let mut merged: Option<BytesMut> = None;
+        let mut merged: Option<Vec<u8>> = None;
         let mut frames = 0;
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|error| {
@@ -142,13 +160,22 @@ pub async fn prepare(
             let data = frame.into_data().map_err(|_| Refused::Body)?;
             if !data.is_empty() {
                 if let Some(bytes) = &mut merged {
+                    reserve_entity(bytes, data.len(), maximum_bytes)?;
                     bytes.extend_from_slice(&data);
                 } else if first.is_empty() {
                     first = data;
                 } else {
-                    // One-frame bodies retain their Bytes allocation. Fragmented
-                    // bodies reserve a bounded buffer once, not per frame.
-                    let mut bytes = BytesMut::with_capacity(maximum_bytes);
+                    // Retain single-frame allocations; grow fragmented entities
+                    // geometrically without reserving the whole configured cap.
+                    let mut bytes = Vec::new();
+                    reserve_entity(
+                        &mut bytes,
+                        first
+                            .len()
+                            .checked_add(data.len())
+                            .ok_or(Refused::TooLarge)?,
+                        maximum_bytes,
+                    )?;
                     bytes.extend_from_slice(&first);
                     bytes.extend_from_slice(&data);
                     first = Bytes::new();
@@ -163,7 +190,7 @@ pub async fn prepare(
                 tokio::task::yield_now().await;
             }
         }
-        Ok(merged.map_or(first, BytesMut::freeze))
+        Ok(merged.map_or(first, Bytes::from))
     })
     .await
     .map_err(|_| Refused::Deadline)??;
@@ -439,5 +466,39 @@ mod tests {
             Err(Refused::Target)
         ));
         assert_eq!(admission.available_permits(), 1);
+    }
+    #[test]
+    fn fragment_reservation_stays_small_and_bounded_with_logarithmic_growth() {
+        let mut buffer = Vec::new();
+        reserve_entity(&mut buffer, 13, 16 * 1024 * 1024).unwrap();
+        assert_eq!(buffer.capacity(), 16);
+        for limit in [1, 3, 7, 31, 1025, 4096] {
+            let mut buffer = Vec::new();
+            let mut changes = 0;
+            for index in 0..limit {
+                let before = buffer.capacity();
+                reserve_entity(&mut buffer, 1, limit).unwrap();
+                changes += usize::from(buffer.capacity() != before);
+                buffer.push((index % 251) as u8);
+                assert!(buffer.capacity() <= limit);
+            }
+            assert!(changes <= (usize::BITS - limit.leading_zeros()) as usize + 1);
+            assert!(
+                buffer
+                    .iter()
+                    .enumerate()
+                    .all(|(index, value)| *value == (index % 251) as u8)
+            );
+            let before = buffer.capacity();
+            assert_eq!(
+                reserve_entity(&mut buffer, 1, limit),
+                Err(Refused::TooLarge)
+            );
+            assert_eq!(buffer.capacity(), before);
+            assert_eq!(
+                reserve_entity(&mut buffer, usize::MAX, limit),
+                Err(Refused::TooLarge)
+            );
+        }
     }
 }
