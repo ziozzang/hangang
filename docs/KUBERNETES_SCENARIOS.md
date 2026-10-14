@@ -45,6 +45,14 @@ Generate the token as described in the reference, keep it private, and never com
 
 ## Configure an existing edge gateway
 
+For the k3d bridge scenario, expose the controller Service on the shared NodePort (choose an available port permitted by your cluster):
+
+```sh
+kubectl -n demo patch service hangang --type merge -p '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":"http","protocol":"TCP","nodePort":30090}]}}'
+```
+
+Limit reachability to the edge gateway with your host/network controls. App Services stay ClusterIP.
+
 For each hostname, register an edge HTTP route to the same internal entry, with TLS required and the original Host preserved. This is a route object for the existing configuration/API, not a complete standalone config:
 
 ```json
