@@ -240,4 +240,14 @@ Successful remote decisions join the existing authority revision/health lease;
 route retirement, backend dispatch and response streaming retain their fences.
 No decision cache or transport fallback is introduced.
 
-Local four-process mTLS gRPC qualification passed for the resource gate and the legacy service gate. The resource variant checks owner class changes, catalog deletion/restoration, method and service isolation, network blocks/outage, unchanged backend counts on refusal and durable Hopae/Pumgye revocation after restart. Seven resource-policy, seven Pumgye and 36 configuration tests plus strict all-target Clippy passed. This source change is not yet a signed release, Kubernetes qualification or production rollout.
+Local four-process mTLS gRPC qualification passed for the resource gate and the legacy service gate. The resource variant checks owner class changes, catalog deletion/restoration, method and service isolation, network blocks/outage, unchanged backend counts on refusal and durable Hopae/Pumgye revocation after restart. Seven resource-policy, seven Pumgye and 36 configuration tests plus strict all-target Clippy passed. Signed release and production rollout remain open; selected Kubernetes qualification is described below.
+
+The same static candidate was qualified in the remote Kubernetes package with
+actual Chromium: resource catalog display, owner class/AAL/service reassignment,
+catalog removal/restoration, backend non-dispatch on refusal, owner CAS and
+persistent authentication/authorization revocation across Pod replacement passed.
+The first run timed out reading the diagnostic backend counter after a response.
+Only that idempotent read now permits bounded transport retries; the passing run
+needed none. Protected calls are never replayed. Existing nodes/DNS/Ingress and
+backup copies were preserved; the owned namespace was removed. This is candidate
+functional qualification, not production rollout or performance evidence.

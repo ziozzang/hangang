@@ -39,6 +39,11 @@ try {
   await page.locator('.sidebar a[data-view="pumgye"]').click();
   await expect(page.locator('#pumgye-authority-panel')).toBeVisible();
   await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  if (config.resourceCatalog) {
+    await expect(page.locator('#pumgye-resources tr')).toHaveCount(1);
+    await expect(page.locator('#pumgye-resources')).toContainText('db:orders');
+    await expect(page.locator('#pumgye-resources')).toContainText('select → read');
+  }
   await page.locator('#pumgye-subject').fill('browser-guest');
   await page.locator('#pumgye-assignment-roles').fill('guest');
   await page.locator('#pumgye-assignment-form button').click();
