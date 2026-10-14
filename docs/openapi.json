@@ -2328,6 +2328,8 @@
       }
     },
     "schemas": {
+      "PumgyeResourceGate": {"type": "object", "additionalProperties": false, "required": ["service_id", "resource", "actions"], "properties": {"service_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "resource": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "actions": {"type": "object", "minProperties": 1, "maxProperties": 16, "propertyNames": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Z]+$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}}}, "description": "Native route scope. Mutually exclusive with pumgye. Independent authority requires mTLS gRPC. Class and permissions belong to the catalog."},
+      "PumgyeResource": {"type": "object", "additionalProperties": false, "required": ["service", "information_class", "actions"], "properties": {"service": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "information_class": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "minimum_aal": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}, "actions": {"type": "object", "minProperties": 1, "maxProperties": 64, "propertyNames": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}}}},
       "PumgyeGate": {
         "type": "object",
         "additionalProperties": false,
@@ -2530,6 +2532,7 @@
           "services"
         ],
         "properties": {
+          "resources": {"type":"object","maxProperties":65536,"propertyNames":{"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},"additionalProperties":{"$ref":"#/components/schemas/PumgyeResource"}},
           "version": {
             "const": 1
           },
@@ -5691,9 +5694,11 @@
       },
       "ResourcePolicy": {
         "type": "object",
+        "not": {"required":["pumgye","pumgye_resource"],"properties":{"pumgye":{"type":"object"},"pumgye_resource":{"type":"object"}}},
         "additionalProperties": false,
         "required": ["resource_id", "principal", "allow"],
         "properties": {
+          "pumgye_resource": {"anyOf":[{"$ref":"#/components/schemas/PumgyeResourceGate"},{"type":"null"}]},
           "pumgye": {"anyOf":[{"$ref":"#/components/schemas/PumgyeGate"},{"type":"null"}],"description":"Requires native Hopae subject/AAL, empty legacy allow array and embedded policy or remote authority. Cache bypass and bounded stream revocation apply."},
           "resource_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]{1,128}$", "description": "Opaque ASCII namespace ID. Same ID across routes requires the same policy and authenticator." },
           "enforce": { "type": "boolean", "default": true, "description": "False keeps the policy configured but disables namespace and subject enforcement. Gateway authentication still runs, and all schema/authenticator checks still apply." },

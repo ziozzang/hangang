@@ -922,6 +922,25 @@ impl Config {
                 }
             }
         }
+        for route in &self.http {
+            if let Some(gate) = route
+                .resource_policy
+                .as_ref()
+                .and_then(|p| p.pumgye_resource.as_ref())
+            {
+                if let Some(authority) = &self.pumgye_authority {
+                    ensure!(
+                        authority.transport == crate::pumgye::DecisionTransport::Grpc,
+                        "resource authority requires gRPC transport"
+                    );
+                    gate.validate_remote()?;
+                } else {
+                    gate.validate(self.pumgye.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("resource gate requires policy or authority")
+                    })?)?;
+                }
+            }
+        }
         ensure!(
             self.settings
                 .path_allowlists
@@ -1950,7 +1969,7 @@ impl Config {
                 self.http.iter().any(|new| {
                     new.resource_policy.as_ref().is_some_and(|next| {
                         next.resource_id == policy.resource_id
-                            && (policy.pumgye.is_none() || next.pumgye.is_some())
+                            && (!policy.has_pumgye() || next.has_pumgye())
                     }) && resource_hosts_preserved(old, new)
                         && new.path_prefix == old.path_prefix
                         && new.path_match == old.path_match

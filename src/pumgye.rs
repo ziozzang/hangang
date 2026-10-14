@@ -4,6 +4,59 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResourceGate {
+    pub service_id: String,
+    pub resource: String,
+    pub actions: BTreeMap<String, String>,
+}
+impl ResourceGate {
+    pub fn validate_remote(&self) -> Result<()> {
+        let id = |v: &str| {
+            !v.is_empty()
+                && v.len() <= 128
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        };
+        ensure!(
+            id(&self.service_id) && id(&self.resource),
+            "invalid resource gate scope"
+        );
+        ensure!(
+            !self.actions.is_empty() && self.actions.len() <= 16,
+            "invalid resource method count"
+        );
+        for (method, action) in &self.actions {
+            ensure!(
+                !method.is_empty()
+                    && method.len() <= 32
+                    && method.bytes().all(|b| b.is_ascii_uppercase())
+                    && id(action),
+                "invalid resource method/action"
+            );
+        }
+        Ok(())
+    }
+    pub fn validate(&self, policy: &pumgye_core::Policy) -> Result<()> {
+        self.validate_remote()?;
+        let resource = policy
+            .resources
+            .get(&self.resource)
+            .ok_or_else(|| anyhow::anyhow!("unknown Pumgye resource"))?;
+        ensure!(
+            resource.service == self.service_id,
+            "resource belongs to another service"
+        );
+        ensure!(
+            self.actions
+                .values()
+                .all(|action| resource.actions.contains_key(action)),
+            "unknown resource action"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gate {
     pub service_id: String,
     pub information_class: String,
@@ -173,6 +226,34 @@ mod tests {
         authority.tls.as_mut().unwrap().server_name = "other.world.svc".into();
         assert!(authority.validate().is_err());
     }
+    #[test]
+    fn resource_gate_validates_owner_service_actions_and_method_bounds() {
+        let mut policy: pumgye_core::Policy = serde_json::from_value(serde_json::json!({
+            "version":1,"information_classes":["internal"],
+            "services":{"orders":{"permissions":["read"],"roles":{},"users":{},"networks":[]}},
+            "resources":{"db:orders":{"service":"orders","information_class":"internal","actions":{"select":"read"}}}
+        })).unwrap();
+        let mut gate = ResourceGate {
+            service_id: "orders".into(),
+            resource: "db:orders".into(),
+            actions: [("GET".into(), "select".into())].into(),
+        };
+        assert!(gate.validate(&policy).is_ok());
+        gate.service_id = "billing".into();
+        assert!(gate.validate(&policy).is_err());
+        gate.service_id = "orders".into();
+        gate.actions.insert("POST".into(), "drop".into());
+        assert!(gate.validate(&policy).is_err());
+        gate.actions.remove("POST");
+        gate.actions.insert("get".into(), "select".into());
+        assert!(gate.validate_remote().is_err());
+        gate.actions.remove("get");
+        policy.resources.clear();
+        assert!(gate.validate(&policy).is_err());
+        gate.actions.clear();
+        assert!(gate.validate_remote().is_err());
+    }
+
     #[test]
     fn owner_resource_catalog_survives_typed_roundtrip_and_enforces_assurance() {
         let value = serde_json::json!({
@@ -641,6 +722,43 @@ impl AuthorityRuntime {
             .iter()
             .all(|r| r.decision == Some(pumgye_core::Decision::Allow))
             .then(|| replies[0].revision))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_resource(
+        self: &std::sync::Arc<Self>,
+        gate: &ResourceGate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+    ) -> Result<Option<u64>> {
+        let Some(action) = gate.actions.get(method) else {
+            return Ok(None);
+        };
+        let DecisionClient::Grpc(client) = &self.native else {
+            anyhow::bail!("resource authority requires gRPC");
+        };
+        self.start_watch();
+        let reply = client
+            .decide_resource(&crate::pumgye_grpc_client::ResourceQuery {
+                service_id: &gate.service_id,
+                resource: &gate.resource,
+                action,
+                subject,
+                ip,
+                aal,
+                guard,
+                minimum_revision: 0,
+            })
+            .await?;
+        self.success();
+        Ok(
+            (reply.decision
+                == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow))
+            .then_some(reply.revision),
+        )
     }
 
     /// Fixed owning-domain paths only; never forwards client URLs or credentials.

@@ -25,6 +25,8 @@ const MAX_POLICY_TEXT: usize = 32 * 1024;
 pub struct ResourcePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pumgye: Option<crate::pumgye::Gate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pumgye_resource: Option<crate::pumgye::ResourceGate>,
     /// Opaque audit/policy identifier; route host and path predicates define its URL namespace.
     pub resource_id: String,
     /// Explicit first step for removing a protected namespace. A disabled
@@ -93,6 +95,16 @@ pub enum PrincipalEvidence<'a> {
 }
 
 impl ResourcePolicy {
+    pub fn has_pumgye(&self) -> bool {
+        self.pumgye.is_some() || self.pumgye_resource.is_some()
+    }
+    pub fn pumgye_service(&self) -> Option<&str> {
+        self.pumgye
+            .as_ref()
+            .map(|g| g.service_id.as_str())
+            .or_else(|| self.pumgye_resource.as_ref().map(|g| g.service_id.as_str()))
+    }
+
     /// Validate the wire document and the route's authenticated principal source.
     /// The caller also validates the route's `access_mode == protected` contract.
     pub fn validate_binding(
@@ -130,7 +142,11 @@ impl ResourcePolicy {
             external_auth.is_none_or(|auth| !auth.terminal_response),
             "resource policy cannot use external auth terminal_response"
         );
-        if self.pumgye.is_some() {
+        ensure!(
+            self.pumgye.is_none() || self.pumgye_resource.is_none(),
+            "choose one Pumgye gate"
+        );
+        if self.has_pumgye() {
             ensure!(
                 external_auth.is_some_and(|auth| auth.native.is_some()
                     && auth
@@ -358,6 +374,7 @@ mod tests {
     fn policy() -> ResourcePolicy {
         ResourcePolicy {
             pumgye: None,
+            pumgye_resource: None,
             resource_id: "billing.read".into(),
             enforce: true,
             principal: PrincipalSource::External {

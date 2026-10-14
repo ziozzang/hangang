@@ -220,3 +220,24 @@ CAS catalog removal on the same channel and unavailable revision floors alongsid
 legacy service decisions. Gateway route selection and dispatch adoption remain open.
 
 Resource queries also carry the trusted native `service_id`; catalog membership must match it before rights are evaluated. The actual owning-server fixture includes cross-service denial even for an otherwise allowed identity.
+
+## Resource gates (unreleased)
+
+A protected route may use `resource_policy.pumgye_resource` instead of `pumgye`:
+
+```json
+{"service_id":"orders","resource":"db:orders","actions":{"GET":"select","POST":"update"}}
+```
+
+Choose exactly one gate and keep legacy `allow` empty. Native Hopae subject/AAL
+is mandatory. Machine identities must match the gate's native service scope, and
+the owner also checks resource membership. The gate supplies no information class
+or permission; those come from the catalog. Unmapped methods and unknown resources
+refuse access. An independent authority currently requires mandatory-mTLS gRPC;
+PPG1 is rejected during configuration validation for this new gate. Embedded
+Pumgye uses the same scoped core evaluation and validates catalog actions at load.
+Successful remote decisions join the existing authority revision/health lease;
+route retirement, backend dispatch and response streaming retain their fences.
+No decision cache or transport fallback is introduced.
+
+Local four-process mTLS gRPC qualification passed for the resource gate and the legacy service gate. The resource variant checks owner class changes, catalog deletion/restoration, method and service isolation, network blocks/outage, unchanged backend counts on refusal and durable Hopae/Pumgye revocation after restart. Seven resource-policy, seven Pumgye and 36 configuration tests plus strict all-target Clippy passed. This source change is not yet a signed release, Kubernetes qualification or production rollout.

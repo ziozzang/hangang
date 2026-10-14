@@ -2074,7 +2074,7 @@ impl Proxy {
             .route
             .resource_policy
             .as_ref()
-            .is_some_and(|policy| policy.enforce && policy.pumgye.is_some())
+            .is_some_and(|policy| policy.enforce && policy.has_pumgye())
         {
             auth_route_lease.get_or_insert_with(Default::default).pumgye =
                 Some((self.active.clone(), snapshot.config.revision));
@@ -2566,10 +2566,7 @@ impl Proxy {
                     }
                     if let Some(service_scope) = service_scope {
                         if resource_policy.is_none_or(|policy| {
-                            policy
-                                .pumgye
-                                .as_ref()
-                                .is_none_or(|gate| gate.service_id != service_scope)
+                            policy.pumgye_service() != Some(service_scope.as_str())
                         }) {
                             return Ok(response(
                                 403,
@@ -2585,7 +2582,73 @@ impl Proxy {
                             crate::resource_policy::PrincipalSource::External { .. }
                         )
                     {
-                        resource_allowed = if let Some(gate) = &policy.pumgye {
+                        resource_allowed = if let Some(gate) = &policy.pumgye_resource {
+                            let identity = crate::pumgye::identity(&headers);
+                            let evidence = match &self.guard {
+                                Some(guard) => match guard_evidence
+                                    .take()
+                                    .and_then(|proof| proof.current(guard, edge.client_ip))
+                                {
+                                    Some(evidence) => evidence,
+                                    None => guard.authorization_evidence(edge.client_ip).await,
+                                },
+                                None => pumgye_core::GuardEvidence::Unavailable,
+                            };
+                            if snapshot.config.pumgye_authority.is_some() {
+                                match (snapshot.pumgye_remote.as_ref(), identity) {
+                                    (Some(remote), Some((subject, aal))) => match remote
+                                        .authorize_resource(
+                                            gate,
+                                            request.method().as_str(),
+                                            subject,
+                                            edge.client_ip,
+                                            aal,
+                                            evidence,
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some(revision)) => {
+                                            auth_route_lease
+                                                .get_or_insert_with(Default::default)
+                                                .pumgye_remote = Some((remote.clone(), revision));
+                                            true
+                                        }
+                                        Err(_) if policy.enforce => {
+                                            return Ok(response(
+                                                503,
+                                                "Pumgye authority unavailable",
+                                            ));
+                                        }
+                                        _ => false,
+                                    },
+                                    (None, _) if policy.enforce => {
+                                        return Ok(response(503, "Pumgye authority unavailable"));
+                                    }
+                                    _ => false,
+                                }
+                            } else {
+                                match (
+                                    snapshot.pumgye.as_ref(),
+                                    identity,
+                                    gate.actions.get(request.method().as_str()),
+                                ) {
+                                    (Some(compiled), Some((subject, aal)), Some(action)) => {
+                                        compiled.evaluate_scoped_resource(
+                                            &gate.service_id,
+                                            &gate.resource,
+                                            action,
+                                            subject,
+                                            edge.client_ip,
+                                            aal,
+                                            evidence,
+                                        ) == pumgye_core::ResourceDecision::Decided(
+                                            pumgye_core::Decision::Allow,
+                                        )
+                                    }
+                                    _ => false,
+                                }
+                            }
+                        } else if let Some(gate) = &policy.pumgye {
                             let identity = crate::pumgye::identity(&headers);
                             let evidence = match &self.guard {
                                 Some(guard) => match guard_evidence
