@@ -121,6 +121,8 @@ struct Binding {
     directory: PathBuf,
     manifest_sha256: String,
     backend: String,
+    #[serde(default)]
+    tls: Option<BackendTls>,
     token_env: String,
     #[serde(default)]
     delegate_actor: bool,
@@ -128,6 +130,14 @@ struct Binding {
     delegation_cookie: Option<String>,
     #[serde(default)]
     delegation_authority: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendTls {
+    server_name: String,
+    ca: PathBuf,
+    certificate: PathBuf,
+    key: PathBuf,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +162,7 @@ struct Asset {
     mime: &'static str,
 }
 struct Plugin {
+    client: reqwest::Client,
     manifest: Manifest,
     backend: reqwest::Url,
     token: reqwest::header::HeaderValue,
@@ -162,7 +173,6 @@ struct Plugin {
 }
 pub struct Registry {
     plugins: BTreeMap<String, Plugin>,
-    client: reqwest::Client,
     slots: tokio::sync::Semaphore,
     audit: PathBuf,
 }
@@ -298,7 +308,7 @@ impl Registry {
                     "invalid/duplicate plugin route"
                 );
             }
-            let backend = reqwest::Url::parse(&binding.backend)?;
+            let mut backend = reqwest::Url::parse(&binding.backend)?;
             ensure!(
                 backend.username().is_empty()
                     && backend.password().is_none()
@@ -315,6 +325,55 @@ impl Registry {
                 backend.scheme() == "https" || (backend.scheme() == "http" && loopback),
                 "plugin backend requires HTTPS or literal loopback HTTP"
             );
+            let mut client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(3));
+            if let Some(tls) = &binding.tls {
+                ensure!(backend.scheme() == "https", "plugin mTLS requires HTTPS");
+                ensure!(
+                    matches!(
+                        rustls::pki_types::ServerName::try_from(tls.server_name.clone())?,
+                        rustls::pki_types::ServerName::DnsName(_)
+                    ),
+                    "plugin TLS server name must be DNS"
+                );
+                ensure!(
+                    [&tls.ca, &tls.certificate, &tls.key]
+                        .iter()
+                        .all(|p| p.is_absolute()),
+                    "plugin TLS paths must be absolute"
+                );
+                let host = backend
+                    .host_str()
+                    .context("plugin host required")?
+                    .to_owned();
+                if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+                    let port = backend
+                        .port_or_known_default()
+                        .context("plugin port required")?;
+                    backend.set_host(Some(&tls.server_name))?;
+                    client = client.resolve(&tls.server_name, std::net::SocketAddr::new(ip, port));
+                } else {
+                    ensure!(
+                        host.eq_ignore_ascii_case(&tls.server_name),
+                        "plugin Service DNS must match TLS server name"
+                    );
+                }
+                let roots =
+                    reqwest::Certificate::from_pem_bundle(&crate::tls::read_bounded(&tls.ca)?)?;
+                ensure!(!roots.is_empty(), "plugin CA must not be empty");
+                client = client.tls_built_in_root_certs(false);
+                for root in roots {
+                    client = client.add_root_certificate(root);
+                }
+                let mut identity = crate::tls::read_bounded(&tls.certificate)?;
+                identity.push(b'\n');
+                identity.extend(crate::tls::read_bounded(&tls.key)?);
+                client = client.identity(reqwest::Identity::from_pem(&identity)?);
+            }
+            let client = client.build()?;
             ensure!(
                 binding.token_env.len() <= 128
                     && binding
@@ -364,6 +423,7 @@ impl Registry {
                     .insert(
                         binding.id,
                         Plugin {
+                            client,
                             manifest,
                             backend,
                             token,
@@ -384,12 +444,6 @@ impl Registry {
             plugins,
             audit,
             slots: tokio::sync::Semaphore::new(8),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .connect_timeout(Duration::from_secs(3))
-                .build()?,
         })
     }
     pub fn discovery(&self) -> Value {
@@ -574,7 +628,7 @@ impl Registry {
         }
         let result = async {
             let url = plugin.backend.join(&format!("v1/{endpoint}"))?;
-            let mut request = self.client.request(method.clone(), url.clone());
+            let mut request = plugin.client.request(method.clone(), url.clone());
             if let Some(key) = &plugin.delegation_key {
                 use crate::console_delegation_wire::{Assertion, digest, sign};
                 let assertion = Assertion {
@@ -786,6 +840,21 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+    #[test]
+    fn mutual_tls_requires_https_matching_dns_and_absolute_paths() {
+        let (_dir, path) = package();
+        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["plugins"][0]["tls"] = json!({"server_name":"sumunjang.example.test","ca":"/missing/ca.pem","certificate":"/missing/client.pem","key":"/missing/client.key"});
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(Registry::load(&path).is_err());
+        config["plugins"][0]["backend"] = json!("https://other.example.test:9080");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(Registry::load(&path).is_err());
+        config["plugins"][0]["backend"] = json!("https://sumunjang.example.test:9080");
+        config["plugins"][0]["tls"]["ca"] = json!("relative.pem");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(Registry::load(&path).is_err());
     }
     #[test]
     fn tampered_manifest_and_assets_fail_closed() {

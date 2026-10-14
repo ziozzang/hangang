@@ -156,3 +156,19 @@ The optional console SSO configuration accepts `native_tls` with the same
 client and fixed `native_address`, preserving explicit Hopae-to-Hangang
 account mappings and existing session/lease checks. Remote SSO peers require
 mTLS; loopback plaintext remains available during migration.
+
+## Backend mTLS
+
+A binding may include `tls` with `server_name`, `ca`, `certificate` and `key`.
+All file paths must be absolute; TLS material is bounded. The backend must use
+HTTPS and the server name must be DNS. For a Service DNS backend its host must
+match that name. A literal IP backend is connected at the configured IP while
+using the specified DNS name for TLS verification. Private CA roots replace
+built-in roots for that binding. Each plugin has its own client identity/pool;
+credentials and TLS paths are absent from browser discovery. There is no plaintext
+fallback on TLS or role failure. Existing bindings without this object retain
+their HTTPS or literal-loopback HTTP behavior.
+
+Sumunjang `--management-tls` enables the corresponding native management server.
+Owned process qualification proves pinned plugin policy reads and mutations over
+mTLS; full browser/Kubernetes console adoption remains a separate gate.

@@ -136,3 +136,17 @@ fallback하지 않습니다. 연결은 Hopae 300초보다 빠른 240초에 회�
 선택적 콘솔 SSO 설정의 native_tls도 같은 server_name·ca·certificate·key를 지원합니다.
 공유 native client·고정 native_address를 사용하고 명시적 Hopae→Hangang 계정 매핑과
 세션/lease 검사를 유지합니다. 원격은 mTLS이며 이전 과정의 loopback 평문은 지원합니다.
+
+## 백엔드 mTLS
+
+바인딩의 tls에 server_name·ca·certificate·key를 설정할 수 있습니다. 파일 경로는
+절대 경로이며 읽기 크기를 제한합니다. HTTPS와 DNS 서버 이름이 필수입니다.
+Service DNS 백엔드는 호스트와 서버 이름이 일치해야 합니다. 리터럴 IP는 설정한
+IP로 연결하면서 지정한 DNS 이름으로 인증서를 검증합니다. 바인딩의 사설 CA는
+기본 루트 대신 사용하며 플러그인마다 클라이언트 신원과 연결 풀을 분리합니다.
+자격·TLS 경로는 브라우저 발견 응답에 포함하지 않고 TLS/역할 실패에 평문으로
+우회하지 않습니다. 이 설정이 없는 기존 HTTPS/리터럴 루프백 HTTP 동작은 유지합니다.
+
+수문장 --management-tls가 대응하는 네이티브 관리 서버를 활성화합니다. 격리된
+실제 프로세스에서 고정한 플러그인의 정책 조회·변경을 mTLS로 검증했습니다.
+전체 브라우저/K8s 콘솔 적용은 별도 검증 대상입니다.
