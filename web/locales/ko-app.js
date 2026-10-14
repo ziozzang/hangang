@@ -1233,6 +1233,8 @@ export default {
   "Assign roles": "역할 배정",
   "Authorization policy JSON": "권한 정책 JSON",
   "Publish authorization policy": "권한 정책 게시",
+  "Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.": "수문장의 강제 허용 근거가 필수입니다. 관찰 모드 또는 근거를 사용할 수 없으면 접근을 거부합니다.",
+  "Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.": "수문장의 강제 허용 근거는 필수가 아닙니다. 사용자·네트워크 권한은 계속 적용하며 명시적인 네트워크 거부는 접근을 차단합니다.",
   "Unassigned users are guests with no permissions. User and network rights must both allow access.": "미배정 사용자는 권한 없는 guest입니다. 사용자와 네트워크 권한 모두 접근을 허용해야 합니다.",
   "Publishing validates the policy and requires the current configuration revision.": "게시 시 정책을 검증하고 현재 설정 리비전을 확인합니다.",
   "Draft updated. Publish to apply.": "초안을 갱신했습니다. 게시하면 적용됩니다.",

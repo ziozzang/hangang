@@ -41,6 +41,7 @@ test('independent policy publication targets owning authority and binds both rev
   const { calls } = await setup(page);
   await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
   await expect(page.locator('#pumgye-authority-panel')).toBeVisible();
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('Observe mode or unavailable evidence refuses access.');
   await expect(page.locator('#pumgye-authority-status')).toContainText('"policy_revision": 7');
   await page.locator('#pumgye-subject').fill('new-guest');
   await page.locator('#pumgye-assignment-form button').click();
@@ -58,6 +59,7 @@ test('independent policy publication targets owning authority and binds both rev
   await expect(page.locator('#pumgye-document')).toHaveValue('');
   await expect(page.locator('#pumgye-authority-status')).toHaveText('');
   await expect(page.locator('#pumgye-audit')).toHaveText('');
+  await expect(page.locator('#pumgye-guard-requirement')).toHaveText('');
 });
 
 test('missing owning authority scope prevents publication', async ({ page }) => {
@@ -117,4 +119,19 @@ test('unreported policy ownership never enables database edits', async ({ page }
   await expect(page.locator('#pumgye-publish')).toBeDisabled();
   await page.locator('#pumgye-publish').dispatchEvent('click');
   expect(calls.some(call => call.method === 'PUT')).toBe(false);
+});
+
+
+test('service guard requirement follows policy drafts and language changes', async ({ page }) => {
+  await setup(page);
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('Observe mode');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('관찰 모드');
+  const policy = JSON.parse(await page.locator('#pumgye-document').inputValue());
+  policy.services.orders.require_guard = false;
+  await page.locator('#pumgye-document').fill(JSON.stringify(policy));
+  await page.locator('#pumgye-document').dispatchEvent('change');
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('필수가 아닙니다');
+  await page.locator('#locale-select').selectOption('en');
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('explicit network denial refuses access.');
 });

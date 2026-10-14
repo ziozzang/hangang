@@ -45,6 +45,10 @@ function render() {
 function renderMatrix() {
   const table = $('pumgye-matrix'); table.replaceChildren();
   const service = draft?.services?.[$('pumgye-service').value];
+  const requirement = service ? (service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
+  $('pumgye-guard-requirement').textContent = requirement ? t(requirement) : '';
+  if (requirement) $('pumgye-guard-requirement').dataset.i18n = requirement;
+  else delete $('pumgye-guard-requirement').dataset.i18n;
   if (!service) return;
   for (const [kind, rows] of [['User', Object.entries(service.users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
     for (const [id, roles] of rows) {
@@ -56,7 +60,7 @@ function renderMatrix() {
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
+export function resetPumgye() { sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
 export async function loadPumgye(host) {
   context = host; const own = ++generation; sourceManaged = true; sourceControls();
   $('pumgye-source-summary').textContent = t('Checking authority');
