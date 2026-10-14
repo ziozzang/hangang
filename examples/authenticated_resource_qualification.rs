@@ -64,18 +64,23 @@ async fn main() -> Result<()> {
     authority.validate()?;
     let pumgye = hangang::pumgye::AuthorityRuntime::prepare(&authority)?;
     let public: [u8; 32] = STANDARD
-        .decode(config.public_key)?
+        .decode(&config.public_key)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid public pin"))?;
-    let pin = IssuerPin::new(config.issuer_ref.clone(), config.key_epoch, public)
-        .map_err(|_| anyhow::anyhow!("invalid native issuer pin"))?;
     let gate = hangang::pumgye::ResourceGate {
         service_id: config.service.clone(),
         resource: "db:orders".into(),
         actions: std::collections::BTreeMap::from([("GET".into(), "select".into())]),
     };
-    let binding =
-        hangang::native_resource::Binding::new(gate.clone(), config.audience.clone(), pin)?;
+    let native_configuration = hangang::native_resource::Configuration {
+        audience: config.audience.clone(),
+        issuer_ref: config.issuer_ref.clone(),
+        key_epoch: config.key_epoch,
+        public_key: config.public_key.clone(),
+        maximum_body_bytes: 1024 * 1024,
+        body_timeout_ms: 1000,
+    };
+    let binding = native_configuration.compile(gate.clone())?;
     let request = Request::builder()
         .method(config.method.as_str())
         .uri(&config.target)
@@ -112,15 +117,13 @@ async fn main() -> Result<()> {
             .map_err(|never| match never {})
             .boxed_unsync()
     };
-    let prepared = hangang::projection_entity::prepare_scoped(
-        Request::from_parts(parts, body),
-        binding.scope(),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        1024 * 1024,
-        std::time::Duration::from_secs(1),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("final entity preparation refused"))?;
+    let prepared = binding
+        .prepare(
+            Request::from_parts(parts, body),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("final entity preparation refused"))?;
     let digest = prepared.digest();
     let mut headers = HeaderMap::new();
     for (name, value) in config.headers {

@@ -373,3 +373,15 @@ entity lifecycle/trust tests pass. Ten entity tests and four gRPC response/floor
 tests pass. Local floors do not prove remote freshness after return. The result
 remains an observation; selected gateway config/route fences, upstream effects,
 signed permits/projection, release and operating adoption remain open.
+
+`native_resource::Configuration` is the public-only compiler input for this
+library phase: `audience`, `issuer_ref`, `key_epoch`, canonical Base64 Ed25519
+`public_key`, `maximum_body_bytes` (default 1 MiB, 1 byte–16 MiB) and
+`body_timeout_ms` (default 1000, range 1–5000). The resource/service/action gate
+comes from its owning caller. Unknown fields, including signing seeds, refuse;
+weak/malformed public keys, unsafe epochs and invalid budgets refuse compilation.
+`Binding::prepare` applies the compiled budget using caller-supplied shared
+admission. Two compiler/budget tests and the actual fragmented three-authority
+lifecycle fixture pass. This standalone compiler is not an accepted `HttpRoute`
+activation option yet; full route/configuration validation and dispatch wiring
+remain required before operating adoption.
