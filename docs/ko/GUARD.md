@@ -1,6 +1,6 @@
 # 네이티브 hangang-guard 연계
 
-[문서](README.md) · [English](../GUARD.md)
+[문서](../README.ko.md) · [English](../GUARD.md)
 
 Hangang은 선택적 native hangang-guard admission을 지원합니다. 기본은 trusted-proxy
 설정으로 client IP를 정한 뒤 라우트 security/auth 전에 인증된 POST /v1/decision을

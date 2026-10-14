@@ -1,6 +1,6 @@
 # 독립 품계 서버
 
-[문서](README.md) · [English](../PUMGYE.md)
+[문서](../README.ko.md) · [English](../PUMGYE.md)
 
 품계가 정책 저장·컴파일·CAS 게시·리비전·감사를 소유합니다. Hangang은 라우트의
 서비스/메서드/등급 연결과 요청 집행을 맡고 고정된 도메인 위임으로 관리 화면을 제공합니다.

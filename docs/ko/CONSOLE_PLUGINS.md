@@ -1,6 +1,6 @@
 # 신뢰 콘솔 패키지와 호패 네이티브 전송
 
-[문서](README.md) · [English](../CONSOLE_PLUGINS.md)
+[문서](../README.ko.md) · [English](../CONSOLE_PLUGINS.md)
 
 네이티브 콘솔은 운영자가 설치한 패키지를 ZERO TRUST 사이드바에 불러옵니다.
 Guard·Hopae는 각 관리 API와 데이터를 소유하고 Hangang은 콘솔 인증을 소유합니다.
