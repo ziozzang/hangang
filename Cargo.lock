@@ -2279,7 +2279,7 @@ dependencies = [
 [[package]]
 name = "pumgye-client"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/pumgye?rev=08d9dbe1dc66cbceeaf1f396a9a038007943f0a3#08d9dbe1dc66cbceeaf1f396a9a038007943f0a3"
+source = "git+https://github.com/ziozzang/pumgye?rev=2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34#2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34"
 dependencies = [
  "anyhow",
  "pumgye-protocol",
@@ -2293,7 +2293,7 @@ dependencies = [
 [[package]]
 name = "pumgye-core"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/pumgye?rev=08d9dbe1dc66cbceeaf1f396a9a038007943f0a3#08d9dbe1dc66cbceeaf1f396a9a038007943f0a3"
+source = "git+https://github.com/ziozzang/pumgye?rev=2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34#2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34"
 dependencies = [
  "anyhow",
  "guard-core",
@@ -2304,7 +2304,7 @@ dependencies = [
 [[package]]
 name = "pumgye-grpc"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/pumgye?rev=08d9dbe1dc66cbceeaf1f396a9a038007943f0a3#08d9dbe1dc66cbceeaf1f396a9a038007943f0a3"
+source = "git+https://github.com/ziozzang/pumgye?rev=2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34#2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34"
 dependencies = [
  "prost",
  "tonic",
@@ -2315,7 +2315,7 @@ dependencies = [
 [[package]]
 name = "pumgye-protocol"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/pumgye?rev=08d9dbe1dc66cbceeaf1f396a9a038007943f0a3#08d9dbe1dc66cbceeaf1f396a9a038007943f0a3"
+source = "git+https://github.com/ziozzang/pumgye?rev=2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34#2f6101cb296d3532bf4ea439bbe8f6ac1bf54d34"
 dependencies = [
  "anyhow",
  "pumgye-core",

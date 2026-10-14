@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         &std::env::var(&config.decision_token_env)?,
     )?;
     let mut resource_query = hangang::pumgye_grpc_client::ResourceQuery {
+        service_id: "orders",
         minimum_revision: 0,
         ip,
         aal: 2,
@@ -70,6 +71,13 @@ async fn main() -> Result<()> {
             == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow),
         "native resource allow"
     );
+    resource_query.service_id = "billing";
+    ensure!(
+        resources.decide_resource(&resource_query).await?.decision
+            == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::UnknownService),
+        "cross-service resource refusal"
+    );
+    resource_query.service_id = "orders";
     resource_query.aal = 1;
     ensure!(
         resources.decide_resource(&resource_query).await?.decision

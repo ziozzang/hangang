@@ -13,6 +13,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 /// Native resource/action scope; classification remains owned by Pumgye.
 pub struct ResourceQuery<'a> {
+    pub service_id: &'a str,
     pub minimum_revision: u64,
     pub ip: std::net::IpAddr,
     pub aal: u8,
@@ -75,12 +76,17 @@ impl Client {
     pub async fn decide_resource(&self, query: &ResourceQuery<'_>) -> Result<ResourceReply> {
         ensure!(
             query.aal <= 3
-                && [query.resource, query.action, query.subject]
-                    .iter()
-                    .all(|v| !v.is_empty()
-                        && v.len() <= 128
-                        && v.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))),
+                && [
+                    query.service_id,
+                    query.resource,
+                    query.action,
+                    query.subject
+                ]
+                .iter()
+                .all(|v| !v.is_empty()
+                    && v.len() <= 128
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))),
             "invalid resource decision scope"
         );
         let _permit = self
@@ -94,6 +100,7 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("gRPC request sequence exhausted"))?;
         let floor = self.revision().max(query.minimum_revision);
         let input = pumgye_grpc::v1::ResourceDecisionRequest {
+            service_id: query.service_id.into(),
             request_id,
             minimum_revision: floor,
             ip: match query.ip {

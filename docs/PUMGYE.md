@@ -218,3 +218,5 @@ stale, conflicting and unknown replies fail closed. The owned two-process fixtur
 qualifies resource Allow, minimum-AAL denial, administrator/server-name refusal,
 CAS catalog removal on the same channel and unavailable revision floors alongside
 legacy service decisions. Gateway route selection and dispatch adoption remain open.
+
+Resource queries also carry the trusted native `service_id`; catalog membership must match it before rights are evaluated. The actual owning-server fixture includes cross-service denial even for an otherwise allowed identity.
