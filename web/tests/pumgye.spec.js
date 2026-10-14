@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-async function setup(page, { scope = '"3"', delayed = false } = {}) {
+async function setup(page, { scope = '"3"', delayed = false, source = 'native' } = {}) {
   const calls = [];
   let release;
   const gate = new Promise(resolve => { release = resolve; });
@@ -25,7 +25,7 @@ async function setup(page, { scope = '"3"', delayed = false } = {}) {
       const headers = { etag: `"${document.revision}"` }; if (scope) headers['x-hangang-config-revision'] = scope;
       return route.fulfill({ json: document, headers });
     }
-    if (path === '/v1/pumgye/status') return route.fulfill({ json: { healthy: true, policy_revision: document.revision, decision_queries: 42 } });
+    if (path === '/v1/pumgye/status') return route.fulfill({ json: { healthy: true, policy_source: source, policy_revision: document.revision, decision_queries: 42 } });
     if (path === '/v1/pumgye/audit') return route.fulfill({ json: [{ revision: document.revision, actor: 'mtls:fixture-node', sha256: 'a'.repeat(64) }] });
     return route.fulfill({ status: 404, body: '' });
   });
@@ -77,4 +77,18 @@ test('late authority result cannot restore policy or audit after logout', async 
   await expect(page.locator('#pumgye-matrix tr')).toHaveCount(0);
   await expect(page.locator('#pumgye-authority-status')).toHaveText('');
   await expect(page.locator('#pumgye-audit')).toHaveText('');
+});
+
+
+test('Kubernetes source policy remains inspectable but cannot be edited or published', async ({ page }) => {
+  const { calls } = await setup(page, { source: 'kubernetes' });
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await expect(page.locator('#pumgye-message')).toContainText('Kubernetes owns this policy.');
+  await expect(page.locator('#pumgye-document')).toHaveAttribute('readonly', '');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  await expect(page.locator('#pumgye-subject')).toBeDisabled();
+  await expect(page.locator('#pumgye-new-service')).toBeDisabled();
+  for (const button of await page.locator('#pumgye-matrix button').all()) await expect(button).toBeDisabled();
+  await page.locator('#pumgye-publish').dispatchEvent('click');
+  expect(calls.some(call => call.method === 'PUT')).toBe(false);
 });

@@ -1,4 +1,5 @@
 export default {
+  "Kubernetes owns this policy. Change the source RBAC or its mapping, then refresh.": "Kubernetes 원천 정책입니다. 원천 RBAC나 매핑을 변경한 뒤 새로고침하세요.",
   "ZERO TRUST": "제로 트러스트",
   "Pumgye authority status": "품계 서버 상태",
   "Policy publication audit": "정책 게시 감사",
