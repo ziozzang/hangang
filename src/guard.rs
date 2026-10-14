@@ -1,5 +1,6 @@
 //! Opt-in native hangang-guard transport and local, expiring admission cache.
 //! Query mode awaits bounded remote decisions; snapshot exports never wait for queue capacity.
+mod grpc;
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwapOption;
 use ipnet::IpNet;
@@ -391,6 +392,7 @@ pub struct NativeTls {
 }
 pub struct Config {
     pub decision_tcp: Option<pumgye_client::Endpoint>,
+    pub decision_grpc: bool,
     pub decision_tls: Option<NativeTls>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
@@ -411,6 +413,10 @@ impl Config {
         ensure!(
             self.cache_ms == 0 || (1000..=5000).contains(&self.cache_ms),
             "guard cache must be zero or 1000..5000 ms"
+        );
+        ensure!(
+            !self.decision_grpc || (self.decision_tcp.is_some() && self.decision_tls.is_some()),
+            "guard gRPC requires an endpoint and mTLS"
         );
         if let Some(tls) = &self.decision_tls {
             ensure!(
@@ -492,6 +498,7 @@ impl Config {
 }
 
 pub struct GuardClient {
+    grpc: Option<grpc::Client>,
     tcp: Option<TcpPool>,
     transport_mode: TransportMode,
     failure_mode: FailureMode,
@@ -551,17 +558,25 @@ impl GuardClient {
                 )
             })
             .transpose()?;
+        let grpc = config
+            .decision_grpc
+            .then(|| grpc::Client::new(&config, &token, cancel.clone()))
+            .transpose()?;
         let (queue, rx) = mpsc::channel(QUEUE);
         let guard = Arc::new(Self {
-            tcp: config.decision_tcp.map(|address| TcpPool {
-                address,
-                tls: native_tls,
-                token: token.into_bytes(),
-                timeout: Duration::from_millis(config.timeout_ms),
-                slots: Semaphore::new(TCP_POOL_SIZE),
-                idle: Mutex::new(Vec::with_capacity(TCP_POOL_SIZE)),
-                correlation: AtomicU32::new(1),
-            }),
+            grpc,
+            tcp: config
+                .decision_tcp
+                .filter(|_| !config.decision_grpc)
+                .map(|address| TcpPool {
+                    address,
+                    tls: native_tls,
+                    token: token.into_bytes(),
+                    timeout: Duration::from_millis(config.timeout_ms),
+                    slots: Semaphore::new(TCP_POOL_SIZE),
+                    idle: Mutex::new(Vec::with_capacity(TCP_POOL_SIZE)),
+                    correlation: AtomicU32::new(1),
+                }),
             transport_mode: config.transport_mode,
             failure_mode: config.failure_mode,
             cache_ms: config.cache_ms,
@@ -617,6 +632,9 @@ impl GuardClient {
             return GuardEvidence::Unavailable;
         }
         let result: Result<Decision> = async {
+            if let Some(client) = &self.grpc {
+                return client.query(ip.to_canonical()).await;
+            }
             if let Some(pool) = &self.tcp {
                 return pool.query(ip.to_canonical()).await;
             }
@@ -636,6 +654,23 @@ impl GuardClient {
             Ok(decision)
         }
         .await;
+        let result = result.and_then(|decision| {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ensure!(
+                cache
+                    .revision
+                    .is_none_or(|revision| decision.revision >= revision),
+                "guard revision rollback"
+            );
+            if cache.revision != Some(decision.revision) {
+                cache.entries.clear();
+                cache.revision = Some(decision.revision);
+            }
+            Ok(decision)
+        });
         match result {
             Ok(Decision {
                 mode: Mode::Enforce,
@@ -689,6 +724,11 @@ impl GuardClient {
         let query_started = std::time::Instant::now();
         let result: Result<Decision> = async {
             if kind.is_none()
+                && let Some(client) = &self.grpc
+            {
+                return client.query(ip).await;
+            }
+            if kind.is_none()
                 && let Some(pool) = &self.tcp
             {
                 return pool.query(ip).await;
@@ -732,6 +772,15 @@ impl GuardClient {
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cache
+                    .revision
+                    .is_some_and(|revision| decision.revision < revision)
+                {
+                    return (
+                        (self.failure_mode == FailureMode::Deny).then_some(503),
+                        None,
+                    );
+                }
                 if cache.revision != Some(decision.revision) {
                     cache.entries.clear();
                     cache.revision = Some(decision.revision);
@@ -953,6 +1002,7 @@ mod tests {
     fn url_boundaries() {
         let mut c = Config {
             decision_tcp: None,
+            decision_grpc: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
@@ -965,6 +1015,12 @@ mod tests {
             scanner_paths: vec![],
         };
         assert!(c.validate().is_ok());
+        c.decision_grpc = true;
+        assert!(c.validate().is_err());
+        c.decision_tcp = Some("127.0.0.1:9083".parse().unwrap());
+        assert!(c.validate().is_err());
+        c.decision_grpc = false;
+        c.decision_tcp = None;
         c.cache_ms = 999;
         assert!(c.validate().is_err());
         c.cache_ms = 5001;
@@ -998,6 +1054,7 @@ mod tests {
     fn saturated_export_is_nonblocking() {
         let (queue, mut rx) = mpsc::channel(1);
         let guard = GuardClient {
+            grpc: None,
             tcp: None,
             transport_mode: TransportMode::Snapshot,
             failure_mode: FailureMode::Deny,
@@ -1023,6 +1080,7 @@ mod tests {
     fn test_config(url: String) -> Config {
         Config {
             decision_tcp: None,
+            decision_grpc: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
@@ -1148,6 +1206,35 @@ mod tests {
         assert!(!guard.admit("192.0.2.9".parse().unwrap(), "/ordinary").await);
         assert!(!guard.admit(ip, "/ordinary").await);
         assert_eq!(seen.lock().unwrap().len(), 7);
+        cancel.cancel();
+        task.abort();
+    }
+    #[tokio::test]
+    async fn known_revision_never_rolls_back_across_admission_and_authorization() {
+        let (url, _, decision, task) = decision_server().await;
+        let cancel = CancellationToken::new();
+        let guard = GuardClient::start_with_token(
+            test_config(url),
+            "test-token-0123456789".into(),
+            cancel.clone(),
+        )
+        .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        *decision.lock().unwrap() = serde_json::json!({"version":1,"revision":2,"action":"deny","mode":"enforce","reason":"blocked","ttl_ms":1000});
+        assert!(!guard.admit(ip, "/ordinary").await);
+        *decision.lock().unwrap() = serde_json::json!({"version":1,"revision":1,"action":"allow","mode":"enforce","reason":null,"ttl_ms":1000});
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            pumgye_core::GuardEvidence::Unavailable
+        );
+        assert_eq!(guard.rejection(ip, "/ordinary").await, Some(503));
+        assert_eq!(guard.cache.lock().unwrap().revision, Some(2));
+        *decision.lock().unwrap() = serde_json::json!({"version":1,"revision":3,"action":"allow","mode":"enforce","reason":null,"ttl_ms":1000});
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            pumgye_core::GuardEvidence::EnforcedAllow
+        );
+        assert!(guard.admit(ip, "/ordinary").await);
         cancel.cancel();
         task.abort();
     }

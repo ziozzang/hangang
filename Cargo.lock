@@ -963,6 +963,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "guard-grpc"
+version = "0.3.4"
+source = "git+https://github.com/ziozzang/sumunjang?rev=65856ab40223138ab1d40e168e6f2a259a47b132#65856ab40223138ab1d40e168e6f2a259a47b132"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,6 +1005,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures-util",
+ "guard-grpc",
  "hickory-resolver",
  "hmac 0.12.1",
  "http-body-util",

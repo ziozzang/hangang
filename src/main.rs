@@ -34,6 +34,9 @@ struct Args {
     /// Opt-in persistent binary decision pool; remote connections require mTLS.
     #[arg(long, requires = "guard_url")]
     guard_decision_tcp: Option<pumgye_client::Endpoint>,
+    /// Use gRPC at the decision endpoint; mandatory mTLS.
+    #[arg(long, requires_all = ["guard_decision_tcp", "guard_decision_server_name"])]
+    guard_decision_grpc: bool,
     #[arg(long, requires_all = ["guard_decision_tcp","guard_decision_ca","guard_decision_cert","guard_decision_key"])]
     guard_decision_server_name: Option<String>,
     #[arg(long, requires = "guard_decision_server_name")]
@@ -1064,6 +1067,7 @@ async fn run(args: Args) -> Result<()> {
             hangang::guard::GuardClient::start(
                 hangang::guard::Config {
                     decision_tcp: args.guard_decision_tcp,
+                    decision_grpc: args.guard_decision_grpc,
                     decision_tls: args.guard_decision_server_name.as_ref().map(|name| {
                         hangang::guard::NativeTls {
                             server_name: name.clone(),

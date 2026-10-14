@@ -122,3 +122,30 @@ or literal IPv4/IPv6 address. Every DNS endpoint requires mTLS, including localh
 New pooled connections resolve under the existing request deadline; TLS verifies
 the separately configured server name and CA. No plaintext HTTP fallback is added
 when native DNS or TLS fails. Keep an HTTPS origin for remote evidence exports.
+
+## Optional gRPC query transport
+
+Add `--guard-decision-grpc` to use `--guard-decision-tcp` as the Sumunjang gRPC
+endpoint. `--guard-decision-server-name`, CA, certificate and key are mandatory,
+including on loopback. This remains query mode, with the collector role only.
+The listener must be the server's `--grpc-listen`, not its HGD1 port.
+
+A reusable HTTP/2 channel admits at most 64 concurrent decisions, with bounded
+metadata/message sizes and one configured timeout covering connection and RPC.
+It rejects unspecified/unavailable responses, malformed modes/TTLs, mismatched
+request IDs and revision rollback. Observe allow is not enforced admission.
+Cancellation aborts an outstanding query. There is no additional HTTP/native
+request on a gRPC failure; optional guard admission follows the configured failure
+policy, while mandatory Pumgye evidence remains unavailable and fails closed.
+Evidence-bearing honeypot/scanner calls still use the explicit HTTP signal endpoint.
+Credential/channel rotation, actual Kubernetes rollout and complete gateway chain
+qualification remain separate gates. Native HGD1 is still the default.
+
+Owned client/server qualification:
+
+```sh
+cargo build --example guard_grpc_qualification
+python /path/to/sumunjang/tools/grpc_smoke.py --binary /path/to/sumunjang --hangang-client target/debug/examples/guard_grpc_qualification
+```
+
+Admission and fresh authorization evidence share a monotonically increasing observed revision. An older reply cannot replace newer cached policy evidence, including when HTTP signals and gRPC/native queries are mixed.

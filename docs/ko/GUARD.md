@@ -93,3 +93,26 @@ IPv4/IPv6 주소를 받습니다. localhost도 DNS이면 mTLS가 필수입니다
 연결은 기존 요청 기한 안에서 조회하며 별도 설정한 서버 이름·CA를 검증합니다.
 DNS·TLS 실패 시 평문 HTTP fallback하지 않습니다. 원격 근거 내보내기의
 origin은 HTTPS를 유지합니다.
+
+## 선택 gRPC 질의 전송
+
+`--guard-decision-grpc`를 추가하면 `--guard-decision-tcp` 주소를 수문장 gRPC
+엔드포인트로 사용합니다. 루프백에서도 서버 이름·CA·인증서·키가 필수입니다.
+서버의 HGD1 포트 대신 `--grpc-listen` 포트를 지정하며 질의 모드·collector 자격을 사용합니다.
+
+HTTP/2 채널을 재사용하고 동시 판정 64개, 메시지 크기, 연결·RPC를 포함한 전체
+시간을 제한합니다. 기본값·사용 불가·잘못된 모드/TTL·요청 ID 불일치·리비전 후퇴는
+거부합니다. 관찰 허용은 집행 근거가 아닙니다. 취소는 진행 중 질의를 중단합니다.
+gRPC 실패에 HTTP/네이티브로 우회하지 않습니다. 선택적 네트워크 입장은 설정한
+장애 정책을 따르지만 품계에 필요한 강제 네트워크 근거는 사용 불가로 닫힙니다.
+허니팟·스캐너 근거 제출은 기존 HTTP 신호 경로를 사용합니다. 기본 전송은 HGD1입니다.
+자격/채널 교체·실제 K8s 배포·전체 한강 요청 체인 검증은 후속 작업입니다.
+
+격리된 서버·클라이언트 검증:
+
+```sh
+cargo build --example guard_grpc_qualification
+python /path/to/sumunjang/tools/grpc_smoke.py --binary /path/to/sumunjang --hangang-client target/debug/examples/guard_grpc_qualification
+```
+
+입장 판정과 새 권한 근거는 이미 확인한 리비전을 공유하며 단조 증가합니다. HTTP 신호와 gRPC/네이티브 질의가 섞여도 오래된 응답이 최신 근거를 덮어쓰지 못합니다.
