@@ -142,3 +142,27 @@ Guard 인스턴스·canonical IP·관찰 정책 revision·원래 질의 시작 �
 새 요청마다 정상 Guard 입구 검사를 거치고 공유 판단 캐시는 추가하지 않습니다.
 진행 중 요청은 유효한 발급 네트워크 근거를 사용할 수 있으며 원격 정책 변경의
 즉시 통지나 서명 permit receipt를 의미하지 않습니다.
+
+## 선택 gRPC 판정 전송
+
+`pumgye_authority.transport`를 `grpc`로 설정하고 `decision_address`를 품계의 gRPC
+리스너로 지정합니다. 기본값은 `native`(PPG1)입니다. gRPC는 루프백에서도 설정된
+mTLS 신원이 필수이며 관리는 별도 관리자 자격의 HTTPS를 계속 사용합니다.
+고정한 품계 스키마 크레이트의 빌드에 protoc가 필요합니다.
+
+HTTP/2 채널을 재사용하고 pool_size로 동시 처리를 제한하며 timeout_ms를 전체
+판정 묶음에 적용합니다. 기본값·모순된 응답·캐시 힌트·오래된 리비전은 거부합니다.
+리비전 하한은 단조 증가하고 묶음에 서로 다른 리비전이 있으면 거부합니다.
+모든 권한이 허용돼야 통과합니다. 전송 실패·사용 불가·처리량 초과에 네이티브나
+HTTP로 우회하지 않습니다. 리비전 감시도 선택된 전송을 사용합니다.
+현재 묶음은 하나의 시간 제한 아래 개별 RPC를 전송합니다. 자격·인증서 교체와
+채널 수명 검증은 운영 도입 전 별도로 필요합니다.
+
+다음 명령으로 임시 DB의 실제 서버·클라이언트 연결을 검증합니다.
+
+```sh
+cargo build --example pumgye_grpc_qualification
+python3 tools/pumgye_grpc_smoke.py --server /path/to/pumgye --client target/debug/examples/pumgye_grpc_qualification
+```
+
+전체 한강 요청 체인·K8s gRPC·운영 반영은 별도 검증 대상입니다.

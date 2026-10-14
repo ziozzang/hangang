@@ -76,7 +76,7 @@ Comparison sources reviewed on **2026-09-22**. Product editions and configuratio
 
 ## Quick start
 
-This local example demonstrates a working proxy, a Lua rejection rule, and the management console. You need Git, Rust 1.96 or newer, a C compiler, Python 3, OpenSSL, and curl. Node.js is only needed when developing the console; its built assets are already included.
+This local example demonstrates a working proxy, a Lua rejection rule, and the management console. You need Git, Rust 1.96 or newer, a C compiler, `protoc` (protobuf compiler), Python 3, OpenSSL, and curl. Node.js is only needed when developing the console; its built assets are already included.
 
 Linux amd64 binaries and `SHA256SUMS` are available in the
 [v0.2.1 release](https://github.com/ziozzang/hangang/releases/tag/v0.2.1).

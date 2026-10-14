@@ -116,3 +116,5 @@ pub mod hopae_wire;
 pub mod console_delegation_wire;
 
 pub mod pumgye;
+
+pub mod pumgye_grpc_client;

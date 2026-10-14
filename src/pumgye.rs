@@ -135,6 +135,9 @@ mod tests {
     fn remote_authority_rejects_plaintext_and_scope_downgrades() {
         let mut authority:AuthorityConfig=serde_json::from_value(serde_json::json!({"decision_address":"127.0.0.1:9085","management_address":"127.0.0.1:9084","decision_token_env":"PUMGYE_DECISION_TOKEN","admin_token_env":"PUMGYE_ADMIN_TOKEN"})).unwrap();
         assert!(authority.validate().is_ok());
+        authority.transport = DecisionTransport::Grpc;
+        assert!(authority.validate().is_err());
+        authority.transport = DecisionTransport::Native;
         authority.decision_address = "192.0.2.1:9085".parse().unwrap();
         assert!(authority.validate().is_err());
         authority.decision_address = "127.0.0.1:9085".parse().unwrap();
@@ -195,10 +198,20 @@ mod tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionTransport {
+    #[default]
+    Native,
+    Grpc,
+}
+
 /// Credentials remain in local service environment, never in configuration JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityConfig {
+    #[serde(default)]
+    pub transport: DecisionTransport,
     pub decision_address: pumgye_client::Endpoint,
     pub management_address: pumgye_client::Endpoint,
     pub decision_token_env: String,
@@ -231,6 +244,10 @@ pub struct AuthorityTls {
 }
 impl AuthorityConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.transport != DecisionTransport::Grpc || self.tls.is_some(),
+            "gRPC Pumgye requires mTLS"
+        );
         self.decision_address.validate()?;
         self.management_address.validate()?;
         ensure!(
@@ -318,10 +335,43 @@ impl Gate {
         Ok(())
     }
 }
+enum DecisionClient {
+    Native(std::sync::Arc<pumgye_client::Client>),
+    Grpc(crate::pumgye_grpc_client::Client),
+}
+impl DecisionClient {
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Native(c) => c.revision(),
+            Self::Grpc(c) => c.revision(),
+        }
+    }
+    fn require_revision(&self, revision: u64) {
+        match self {
+            Self::Native(c) => c.require_revision(revision),
+            Self::Grpc(c) => c.require_revision(revision),
+        }
+    }
+    async fn decide(&self, q: &pumgye_protocol::Query<'_>) -> Result<pumgye_protocol::Reply> {
+        match self {
+            Self::Native(c) => c.decide(q).await,
+            Self::Grpc(c) => c.decide(q).await,
+        }
+    }
+    async fn decide_batch(
+        &self,
+        q: &[pumgye_protocol::Query<'_>],
+    ) -> Result<Vec<pumgye_protocol::Reply>> {
+        match self {
+            Self::Native(c) => c.decide_batch(q).await,
+            Self::Grpc(c) => c.decide_batch(q).await,
+        }
+    }
+}
 /// One domain authority runtime; policy and publication remain in the remote server.
 pub struct AuthorityRuntime {
     pub config: AuthorityConfig,
-    native: std::sync::Arc<pumgye_client::Client>,
+    native: DecisionClient,
     management: reqwest::Client,
     base_url: reqwest::Url,
     admin: Option<hyper::header::HeaderValue>,
@@ -401,14 +451,21 @@ impl AuthorityRuntime {
                 reqwest::Url::parse(&format!("http://{}/", config.management_address))?,
             )
         };
-        let native = std::sync::Arc::new(pumgye_client::Client::new(
-            config.decision_address.clone(),
-            tls,
-            decision,
-            config.pool_size,
-            std::time::Duration::from_millis(config.timeout_ms),
-            config.minimum_revision,
-        )?);
+        let native = match config.transport {
+            DecisionTransport::Native => {
+                DecisionClient::Native(std::sync::Arc::new(pumgye_client::Client::new(
+                    config.decision_address.clone(),
+                    tls,
+                    decision,
+                    config.pool_size,
+                    std::time::Duration::from_millis(config.timeout_ms),
+                    config.minimum_revision,
+                )?))
+            }
+            DecisionTransport::Grpc => {
+                DecisionClient::Grpc(crate::pumgye_grpc_client::Client::new(config, &decision)?)
+            }
+        };
         let admin = admin
             .map(|value| {
                 let mut header = hyper::header::HeaderValue::from_str(&format!("Bearer {value}"))?;

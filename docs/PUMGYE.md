@@ -169,3 +169,32 @@ reusable proof. This removes a redundant RPC within one request; every new reque
 still follows normal Guard admission and no shared decision cache is introduced.
 The in-flight request can use its still-valid issued network proof; it does not
 claim instantaneous remote policy-change notification or a signed permit receipt.
+
+## Optional gRPC decision transport
+
+Set `pumgye_authority.transport` to `grpc` and point `decision_address` at the
+Pumgye gRPC listener. The default remains `native` (PPG1). gRPC always requires the
+configured mTLS identity, including on loopback. Management remains HTTPS with
+its separate administrator credential. Building requires `protoc` through the
+pinned Pumgye schema crate.
+
+The client reuses an HTTP/2 channel, bounds concurrent admission by `pool_size`,
+applies `timeout_ms` to the entire decision batch and sends an RPC deadline.
+It bounds protobuf input/output, rejects unspecified/inconsistent replies and
+nonzero cache hints, advances its revision floor monotonically and refuses a
+batch containing different revisions. Every permission must allow. Unavailable
+responses, stale revisions, transport failure and capacity exhaustion fail closed;
+there is no native or HTTP fallback. The revision watcher uses the selected transport.
+A batch currently sends individual RPCs under one deadline; it is not a server-side
+batch method. Credential/material rotation and channel retirement need separate
+qualification before production adoption.
+
+Owned-process qualification:
+
+```sh
+cargo build --example pumgye_grpc_qualification
+python3 tools/pumgye_grpc_smoke.py --server /path/to/pumgye --client target/debug/examples/pumgye_grpc_qualification
+```
+
+This mutates only a disposable fixture database. Actual Hangang request-chain,
+Kubernetes gRPC and production rollout remain separate qualification gates.

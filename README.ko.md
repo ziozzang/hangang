@@ -75,7 +75,7 @@ Hangang은 **대화형 게이트웨이 관리, HTTP/TCP 트래픽 처리, 사용
 
 ## 빠른 시작
 
-이 로컬 예제는 작동하는 프록시, Lua 거부 규칙, 관리 콘솔을 보여 줍니다. Git, Rust 1.96 이상, C 컴파일러, Python 3, OpenSSL, curl이 필요합니다. Node.js는 콘솔을 개발할 때만 필요하며 빌드된 자산은 이미 포함되어 있습니다.
+이 로컬 예제는 작동하는 프록시, Lua 거부 규칙, 관리 콘솔을 보여 줍니다. Git, Rust 1.96 이상, C 컴파일러, `protoc`(protobuf 컴파일러), Python 3, OpenSSL, curl이 필요합니다. Node.js는 콘솔을 개발할 때만 필요하며 빌드된 자산은 이미 포함되어 있습니다.
 
 Linux amd64 바이너리와 `SHA256SUMS`는 [v0.2.1 릴리스](https://github.com/ziozzang/hangang/releases/tag/v0.2.1)에서 받을 수 있습니다. 압축 파일에는 Hangang과 보조 도구가 들어 있습니다. 압축을 풀기 전에 `sha256sum -c SHA256SUMS`로 검증하세요. 아래 절차는 소스에서 빌드합니다.
 
