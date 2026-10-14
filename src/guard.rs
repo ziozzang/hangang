@@ -331,6 +331,32 @@ pub enum FailureMode {
     Allow,
     Deny,
 }
+/// Request-local authenticated network evidence, never a cross-request cache.
+pub(crate) struct RequestEvidence {
+    authority: usize,
+    ip: IpAddr,
+    revision: u64,
+    expires: std::time::Instant,
+    value: pumgye_core::GuardEvidence,
+}
+impl RequestEvidence {
+    pub(crate) fn current(
+        &self,
+        guard: &GuardClient,
+        ip: IpAddr,
+    ) -> Option<pumgye_core::GuardEvidence> {
+        (self.authority == guard as *const GuardClient as usize
+            && self.ip == ip.to_canonical()
+            && std::time::Instant::now() < self.expires
+            && guard
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .revision
+                == Some(self.revision))
+        .then_some(self.value)
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Decision {
@@ -633,13 +659,20 @@ impl GuardClient {
     }
     /// Explicit denials are 403; unavailable query authority fails closed with 503.
     pub async fn rejection(&self, ip: IpAddr, path: &str) -> Option<u16> {
+        self.admission(ip, path).await.0
+    }
+    pub(crate) async fn admission(
+        &self,
+        ip: IpAddr,
+        path: &str,
+    ) -> (Option<u16>, Option<RequestEvidence>) {
         let ip = ip.to_canonical();
         if self.transport_mode == TransportMode::Snapshot {
             if self.denied(ip) {
-                return Some(403);
+                return (Some(403), None);
             }
             self.observe_path(ip, path);
-            return None;
+            return (None, None);
         }
         let kind = self.path_kind(path);
         if kind.is_none() && self.cache_ms > 0 {
@@ -652,7 +685,7 @@ impl GuardClient {
                 .get(&ip)
                 .filter(|entry| entry.expires > std::time::Instant::now())
             {
-                return entry.denied.then_some(403);
+                return (entry.denied.then_some(403), None);
             }
         }
         let query_started = std::time::Instant::now();
@@ -722,7 +755,23 @@ impl GuardClient {
                         );
                     }
                 }
-                denied.then_some(403)
+                let proof = if !denied && decision.ttl_ms > 0 {
+                    let value = if decision.mode == Mode::Enforce {
+                        pumgye_core::GuardEvidence::EnforcedAllow
+                    } else {
+                        pumgye_core::GuardEvidence::Observe
+                    };
+                    Some(RequestEvidence {
+                        authority: self as *const GuardClient as usize,
+                        ip,
+                        revision: decision.revision,
+                        expires: query_started + Duration::from_millis(decision.ttl_ms.min(1000)),
+                        value,
+                    })
+                } else {
+                    None
+                };
+                (denied.then_some(403), proof)
             }
             Err(_) => {
                 let failures = self
@@ -732,7 +781,10 @@ impl GuardClient {
                 if failures.is_power_of_two() {
                     tracing::warn!(query_failures = failures, "guard decision query failed");
                 }
-                (self.failure_mode == FailureMode::Deny).then_some(503)
+                (
+                    (self.failure_mode == FailureMode::Deny).then_some(503),
+                    None,
+                )
             }
         }
     }
@@ -1516,6 +1568,51 @@ mod tests {
         assert_eq!(tcp.connections.load(Ordering::Relaxed), 2);
         assert_eq!(tcp.requests.lock().unwrap().len(), 2);
         assert_eq!(guard.tcp.as_ref().unwrap().idle.lock().unwrap().len(), 1);
+        cancel.cancel();
+        tcp.task.abort();
+    }
+    #[tokio::test]
+    async fn request_evidence_is_bound_to_authority_ip_revision_and_deadline() {
+        use pumgye_core::GuardEvidence;
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address);
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        let mut other_config = test_config("http://127.0.0.1:1".into());
+        other_config.decision_tcp = Some(tcp.address);
+        let other = GuardClient::start_with_token(
+            other_config,
+            "test-token-0123456789".into(),
+            cancel.clone(),
+        )
+        .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        let (denied, proof) = guard.admission(ip, "/").await;
+        assert!(denied.is_none());
+        let mut proof = proof.unwrap();
+        assert_eq!(
+            proof.current(&guard, ip),
+            Some(GuardEvidence::EnforcedAllow)
+        );
+        assert_eq!(
+            tcp.requests.lock().unwrap().len(),
+            1,
+            "request evidence reuse must not issue another query"
+        );
+        assert!(
+            proof
+                .current(&guard, "192.0.2.9".parse().unwrap())
+                .is_none()
+        );
+        assert!(proof.current(&other, ip).is_none());
+        guard.cache.lock().unwrap().revision = Some(proof.revision + 1);
+        assert!(proof.current(&guard, ip).is_none());
+        guard.cache.lock().unwrap().revision = Some(proof.revision);
+        proof.expires = std::time::Instant::now();
+        assert!(proof.current(&guard, ip).is_none());
         cancel.cancel();
         tcp.task.abort();
     }

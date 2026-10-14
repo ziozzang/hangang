@@ -156,3 +156,16 @@ The remaining-lifetime minimum also applies to renewal replies; short TTL tests
 keep the authenticated identity unchanged so identity rejection cannot mask this
 check. Retained header values are marked sensitive for debug formatting. These are
 owned transport/lifecycle tests, not a fleet saturation throughput measurement.
+
+
+## Request-local network evidence
+
+The authenticated Guard decision taken during admission can satisfy the same
+request's Pumgye check while it remains current. It binds the Guard instance,
+canonical client IP, observed policy revision and deadline capped at one second
+from the original query start. An expired proof or changed binding triggers a
+fresh mandatory query. Snapshot, fail-open and optional cache hits never produce
+reusable proof. This removes a redundant RPC within one request; every new request
+still follows normal Guard admission and no shared decision cache is introduced.
+The in-flight request can use its still-valid issued network proof; it does not
+claim instantaneous remote policy-change notification or a signed permit receipt.

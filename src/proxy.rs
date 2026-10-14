@@ -1664,10 +1664,13 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.client_ip = edge.client_ip;
         }
-        if let Some(guard) = &self.guard
-            && let Some(status) = guard.rejection(edge.client_ip, request.uri().path()).await
-        {
-            return Ok(security_denied(status));
+        let mut guard_evidence = None;
+        if let Some(guard) = &self.guard {
+            let (rejected, evidence) = guard.admission(edge.client_ip, request.uri().path()).await;
+            if let Some(status) = rejected {
+                return Ok(security_denied(status));
+            }
+            guard_evidence = evidence;
         }
         let peer = SocketAddr::new(edge.client_ip, peer.port());
         if let Some(capture) = request.extensions().get::<FailureCapture>().cloned() {
@@ -2585,7 +2588,13 @@ impl Proxy {
                         resource_allowed = if let Some(gate) = &policy.pumgye {
                             let identity = crate::pumgye::identity(&headers);
                             let evidence = match &self.guard {
-                                Some(guard) => guard.authorization_evidence(edge.client_ip).await,
+                                Some(guard) => match guard_evidence
+                                    .take()
+                                    .and_then(|proof| proof.current(guard, edge.client_ip))
+                                {
+                                    Some(evidence) => evidence,
+                                    None => guard.authorization_evidence(edge.client_ip).await,
+                                },
                                 None => pumgye_core::GuardEvidence::Unavailable,
                             };
                             if snapshot.config.pumgye_authority.is_some() {
