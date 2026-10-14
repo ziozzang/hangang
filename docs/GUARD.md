@@ -1,5 +1,7 @@
 # Native hangang-guard integration
 
+[Documentation](README.md) · [한국어](ko/GUARD.md)
+
 Hangang supports hangang-guard as an opt-in native request admission service.
 By default each request sends an authenticated `POST /v1/decision` after Hangang
 resolves the client IP using its trusted-proxy configuration, before route

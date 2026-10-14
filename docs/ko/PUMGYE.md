@@ -1,8 +1,10 @@
 # 독립 품계 서버
 
+[문서](README.md) · [English](../PUMGYE.md)
+
 품계가 정책 저장·컴파일·CAS 게시·리비전·감사를 소유합니다. Hangang은 라우트의
 서비스/메서드/등급 연결과 요청 집행을 맡고 고정된 도메인 위임으로 관리 화면을 제공합니다.
-[English](../PUMGYE.md).
+
 
 설정 최상위의 `pumgye_authority`를 사용하며 기존 내장 `pumgye` 정책과 동시에 둘 수
 없습니다. 원격은 mTLS가 필수이고 로컬 평문은 loopback만 허용합니다. 예제는 합성 값이며
@@ -61,11 +63,13 @@
 
 ## 서비스 신원
 
-네이티브 호패 서비스 인증은 단일 `x-hopae-principal-kind: service`·
+네이티브 호패 비인간 인증은 단일 `x-hopae-principal-kind: service` 또는
+`x-hopae-principal-kind: workload`와
 `x-hopae-aal: 0`·`s_`와 소문자 16진수 48자로 된 subject를 사용합니다. 인증된 `x-hopae-service-id`는 품계 게이트의 서비스 ID와 정확히 맞아야 합니다. 기존 사람
 근거는 AAL 1–3을 유지하고 서비스 namespace는 사람 assurance로 바뀌지 않습니다.
-미등록/중복/모순된 typed metadata는 거부합니다. 이 bridge는 아직 workload/network
-신원 변형을 활성화하지 않습니다.
+미등록/중복/모순된 typed metadata는 거부합니다. 정규 workload AAL 0은 지원하고
+network 단독 신원은 아직 지원하지 않습니다. 호패가 원천·게시/회수를 검증해야
+하며 헤더는 인증된 네이티브 호패 응답에서만 받아들입니다.
 
 라우트가 호패에 `authorization`을 보내고 `x-forwarded-user`·`x-hopae-aal`·
 `x-hopae-principal-kind`를 받도록 설정합니다. 인증된 서비스에는 강제되는 품계

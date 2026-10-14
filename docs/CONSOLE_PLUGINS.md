@@ -1,6 +1,6 @@
 # Trusted console packages and Hopae native transport
 
-[한국어](ko/CONSOLE_PLUGINS.md)
+[Documentation](README.md) · [한국어](ko/CONSOLE_PLUGINS.md)
 
 The native console imports operator-installed packages as sidebar entries under
 ZERO TRUST. Guard and Hopae own their management APIs and data; Hangang owns

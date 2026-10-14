@@ -1,65 +1,89 @@
-# 네이티브 hangang-guard 연동
+# 네이티브 hangang-guard 연계
 
-[English](../GUARD.md) · [문서](README.md)
+[문서](README.md) · [English](../GUARD.md)
 
-Hangang은 신뢰 프록시 설정으로 클라이언트 IP를 판별한 뒤, 경로 인증 전에
-zero-trust 판단 서비스 hangang-guard에 요청별로 질의합니다. Guard 허용은
-기존 인증을 우회하지 않습니다. hopae는 사용자·주체 관리, guard는 IP·네트워크
-제어와 위험 판단을 담당합니다. 보호 범위는 향후 확대할 수 있습니다.
+Hangang은 선택적 native hangang-guard admission을 지원합니다. 기본은 trusted-proxy
+설정으로 client IP를 정한 뒤 라우트 security/auth 전에 인증된 POST /v1/decision을
+요청합니다. allow 뒤에도 기존 모든 검사를 통과해야 합니다. deny는 403이며 통신 오류·
+timeout·잘못된 판정은 기본 503입니다. --guard-failure-mode allow로 명시적 변경할 수
+있습니다. 기존 unauthenticated health probe는 admission 밖이며 일반 proxy 경로의
+ACME는 Guard 판정을 적용합니다.
 
 ```sh
-hangang --config config.json --guard-url http://127.0.0.1:9080 \
-  --guard-honeypot-path /trap --guard-scanner-path /.git/config
+# Provide the collector credential through your service environment or secret manager.
+hangang --config config.json --guard-url http://127.0.0.1:8090 \
+  --guard-honeypot-path /deliberate-trap --guard-scanner-path /configured-scanner
 ```
 
-Collector 토큰은 HANGANG_GUARD_COLLECTOR_TOKEN 환경 변수로 제공합니다.
---guard-token-env로 환경 변수 이름을 바꿀 수 있습니다. HTTP는 literal
-loopback 주소만 허용하며 원격은 HTTPS를 사용합니다. 리다이렉트를 거부합니다.
+토큰은 HANGANG_GUARD_COLLECTOR_TOKEN에서 읽고 --guard-token-env로 이름을
+바꿉니다. 명령 인자·URL에 토큰을 넣지 않습니다. 평문 HTTP는 literal loopback IP만,
+원격은 HTTPS입니다. 리다이렉트를 거절해 자격이 다른 endpoint로 이동하지 않습니다.
 
-| 옵션 | 기본 | 의미 |
+| Flag | Default | 의미 |
 | --- | --- | --- |
-| --guard-url | 없음 | 네이티브 연동 활성화 |
-| --guard-mode | query | 요청별 질의; snapshot은 제한된 로컬 정책 모드 |
-| --guard-source-id | hangang | Collector 이름 |
-| --guard-timeout-ms | 100 | 풀 대기·연결·인증·질의 전체 deadline |
-| --guard-failure-mode | deny | 장애 시503; allow는 기존 정책으로 계속 처리 |
-| --guard-cache-ms | 0 | 캐시 없음; 활성화 시1000~5000ms |
-| --guard-decision-tcp | 없음 | 선택적 loopback 바이너리 decision 주소 |
-| --guard-honeypot-path | 없음 | 명시적 허니팟 경로, 반복 지정 |
-| --guard-scanner-path | 없음 | 명시적 스캐너 경로, 반복 지정 |
+| `--guard-url` | absent | origin URL로 native Guard 활성화 |
+| `--guard-source-id` | `hangang` | collector ID, 최대 ASCII 64자 |
+| `--guard-mode` | `query` | query는 요청별, snapshot은 로컬 admission |
+| `--guard-timeout-ms` | `100` | 전송 기한 1–5000ms |
+| `--guard-failure-mode` | `deny` | query 실패 시 deny 또는 allow |
+| `--guard-cache-ms` | `0` | 0 비활성, 1000–5000ms 활성 |
+| `--guard-honeypot-path` | empty | 반복 가능한 exact honeypot 경로 |
+| `--guard-scanner-path` | empty | 반복 가능한 exact scanner 경로 |
 
-명시적 차단은403입니다. 캐시는 요청 시작부터 server TTL과 설정값 중 짧은
-기간만 유효하며 최대1만 IP를 보관합니다. 탐지 신호가 있는 요청은 캐시를
-사용하지 않습니다. Query 기본은 캐시 없이 항상 판단 서비스에 질의합니다.
-Guard 자체 차단은 공격 증거를 갱신하지 않으며 일반403을 증거로 세지 않습니다.
+요청은 source_id·ip·선택적 kind만 전달하며 원문 path/query/host/header/자격/body를
+내보내지 않습니다. 설정된 경로는 typed signal을 전달합니다. 서비스는 근거를 세기 전에
+기존 block을 확인해 자체 거절로 근거가 강화되지 않도록 합니다. 일반 403은 자동 근거가 아닙니다.
 
-TCP는 최대64개 인증된 연결을 재사용하고24바이트 프레임을 검증합니다. Idle
-연결은25초 뒤 폐기해 server30초 deadline 전에 새로 인증합니다. 실패/잘못된
-프레임/timeout이면 연결을 폐기하며 HTTP로 조용히 fallback하지 않습니다.
-증거를 포함한 요청은 HTTP decision API로 보냅니다. 종료 시 풀을 닫습니다.
+기본 캐시는 꺼져 있습니다. 활성화 시 canonical IP 최대 10,000개를 설정 기간·응답 TTL
+중 짧은 기간 캐시하며 네트워크 지연을 더하지 않도록 query 시작부터 측정합니다. TTL은
+block 만료에도 제한됩니다. signal은 항상 서비스에 질의합니다. 새 정책 revision을 관찰하면
+캐시를 비우지만 cached request 자체는 새 revision을 볼 수 없으므로 최대 5초 stale일 수
+있습니다. 매 요청 현재 판정이 필요하면 기본 0 캐시를 사용합니다.
 
-Snapshot은2초마다 bounded 배치/정책을 받아 로컬 index로 판단합니다.4MiB,
-10만 prefix/목록,버전·만료·canonical CIDR을 검증하고 정상 정책만 원자적으로
-반영합니다.4096 event queue/256 batch,만료 뒤 fail-open이며 query 장애 의미와
-다릅니다. 동적 Lua/국가/ASN RuleSet은 snapshot v1에서 지원하지 않으므로
-query를 사용하세요. 기존 기본 health probe는 guard admission 밖에 있습니다.
-일반 proxy admission에 들어온 ACME 요청은 guard 판단을 받습니다.
+snapshot 모드는 명시적으로 비동기 batch와 2초 정책 polling을 선택합니다. 불변 prefix
+인덱스가 allow/block별 IPv4 최대 33·IPv6 129 조회를 하고 mapped IPv6를 정규화하며
+allowlist가 block보다 우선합니다. 게시 전 전체 version·정규 고유 network·집합당 100,000개·
+4 MiB·시간/이유 길이를 검사합니다. 실패한 poll은 유효한 캐시를 유지하며 snapshot 만료는
+query failure mode와 독립적으로 fail-open합니다. 만료 block과 observe snapshot은
+차단하지 않습니다. evidence queue는 4096개, batch는 최대 256개이며 overflow/전송 실패는
+tracing counter에 기록합니다.
 
-## 원격 네이티브 mTLS
+snapshot은 요청 worker에서 전송하지 않습니다. query는 제한된 원격 요청을 기다리므로
+proxy 트래픽에 맞는 가용성과 용량이 필요합니다. --guard-url이 없으면 task를 만들지 않습니다.
 
-`--guard-decision-tcp`와 함께 `--guard-decision-server-name`·
-`--guard-decision-ca`·`--guard-decision-cert`·`--guard-decision-key`를 설정합니다.
-PEM 경로는 절대 경로여야 하며 literal 루프백 밖에서는 이 설정이 필수입니다.
-네이티브 목적지는 고정된 0이 아닌 포트의 unicast 소켓 주소입니다. Hangang은
-명시한 CA·서버 이름을 검증하고 클라이언트 인증서를 제시하며 ALPN `hgd1`을
-요구하고 TLS early data를 끕니다. 암호화된 연결 안에서도 collector 키 인증은 필수입니다.
+## 로컬 대량 트래픽의 지속 바이너리 판정
 
-기존 제한된 연결 풀과 전체 판단 기한에 TCP 연결·TLS 핸드셰이크·요청/응답을
-포함합니다. Idle 연결은 25초 후 종료하고 서버의 300초 제한보다 짧은 240초의
-연결 수명도 적용합니다. 취소·잘못된 응답·TLS 실패·타임아웃은 연결을 폐기하며
-네이티브 실패 시 HTTP 또는 평문으로 전환하지 않습니다.
+--guard-decision-tcp 127.0.0.1:9081은 일반 query를 서비스 --decision-listen 바이너리
+listener로 보냅니다. evidence 제출용 --guard-url과 query mode가 필요하며 loopback literal
+주소를 받습니다. collector token은 16–4096 bytes입니다. honeypot/scanner 신호는 HTTP
+판정으로 계속 보내 service가 근거와 판정을 처리하도록 합니다.
 
-HTTP origin은 여전히 신호/근거 제출과 snapshot export를 처리하고 네이티브 CA
-설정은 HGD1에만 적용합니다. 같은 권한 서버의 기존 인증된 HTTPS ingress 또는
-로컬 broker를 HTTP origin으로 설정합니다. 이 설정이 분산 discovery·영속 revision
-watermark나 전체 스택 100k QPS를 구현·검증한 것은 아닙니다.
+최대 64개 인증 지속 socket을 풀로 사용하며 요청/응답은 각각 24 bytes입니다. correlation
+ID·reserved fields·protocol version·action/mode/TTL을 검증한 뒤 반납합니다. mapped IPv6는
+IPv4 wire 형태입니다. pool admission·connect·handshake·write·read에 전체 timeout을
+공유합니다. timeout/잘못된 응답은 socket을 폐기하고 추가 HTTP 없이 failure policy를
+따릅니다. 서버가 닫은 socket도 해당 요청은 실패하고 폐기하며 이후 다시 연결합니다.
+idle 25초에 회수해 서비스 30초 기한보다 먼저 정리하고 shutdown cancellation에도 닫습니다.
+
+기본 캐시 비활성과 선택적 1–5초 캐시는 두 전송에서 같은 의미입니다. 지속 전송은 일반
+요청의 HTTP/JSON 비용을 없애지만 실제 성능은 서버·동시성·workload·토폴로지별로 측정합니다.
+
+GeoIP와 동적 JSON/Lua는 query 모드의 HTTP/바이너리 모두 서비스에서 평가합니다.
+prefix snapshot으로 표현할 수 없으므로 동적 규칙 활성 시 snapshot 조회를 거절합니다.
+기본 query를 사용하며 기존 snapshot은 정상 만료 후 fail-open합니다.
+
+## 원격 native mTLS
+
+--guard-decision-tcp와 함께 --guard-decision-server-name·--guard-decision-ca·
+--guard-decision-cert·--guard-decision-key를 모두 설정합니다. PEM은 절대 경로이며
+loopback 밖에서 필수입니다. 목적지는 고정된 nonzero unicast socket입니다. 명시적 CA·
+서버명을 검증하고 client 인증서·ALPN hgd1을 사용하며 TLS early data를 끕니다. 암호화
+안에서도 collector key 인증은 필수입니다.
+
+기존 제한된 풀과 전체 timeout은 TCP·TLS·요청/응답을 포함합니다. idle 25초와 연결
+240초에 회수하며 서버 300초 한도보다 짧습니다. 취소·잘못된 응답·TLS 실패·timeout은
+연결을 폐기합니다. native 실패 시 HTTP/평문으로 fallback하지 않습니다.
+
+HTTP origin은 신호/evidence·snapshot을 계속 처리합니다. native CA는 HGD1에만 적용하므로
+같은 권위의 HTTP origin을 인증된 HTTPS ingress 또는 로컬 broker로 구성합니다. 이 설정은
+fleet discovery·영속 revision watermark·전체 경로 100k QPS를 구현한 것이 아닙니다.

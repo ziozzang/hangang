@@ -64,7 +64,7 @@ pub fn identity(headers: &hyper::HeaderMap) -> Option<(&str, u8)> {
     }
     let mut assurances = headers.get_all("x-hopae-aal").iter();
     let assurance = match assurances.next()?.as_bytes() {
-        b"0" if kind == Some(b"service")
+        b"0" if (kind == Some(b"service") || kind == Some(b"workload"))
             && subject.len() == 50
             && subject.starts_with("s_")
             && subject.as_bytes()[2..]
@@ -108,6 +108,28 @@ mod tests {
         headers.insert("x-forwarded-user", "u_operator".parse().unwrap());
         headers.insert("x-hopae-aal", "2".parse().unwrap());
         assert_eq!(identity(&headers), Some(("u_operator", 2)));
+    }
+    #[test]
+    fn workload_identity_requires_canonical_nonhuman_subject_and_zero_assurance() {
+        let mut headers = hyper::HeaderMap::new();
+        let subject = format!("s_{}", "b".repeat(48));
+        headers.insert("x-forwarded-user", subject.parse().unwrap());
+        headers.insert("x-hopae-principal-kind", "workload".parse().unwrap());
+        headers.insert("x-hopae-aal", "0".parse().unwrap());
+        assert_eq!(identity(&headers), Some((subject.as_str(), 0)));
+        for assurance in ["1", "2", "3"] {
+            headers.insert("x-hopae-aal", assurance.parse().unwrap());
+            assert!(identity(&headers).is_none());
+        }
+        headers.insert("x-hopae-aal", "0".parse().unwrap());
+        headers.insert("x-forwarded-user", "u_operator".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.insert("x-forwarded-user", subject.parse().unwrap());
+        headers.insert("x-hopae-principal-kind", "network".parse().unwrap());
+        assert!(identity(&headers).is_none());
+        headers.insert("x-hopae-principal-kind", "workload".parse().unwrap());
+        headers.append("x-hopae-aal", "0".parse().unwrap());
+        assert!(identity(&headers).is_none());
     }
     #[test]
     fn remote_authority_rejects_plaintext_and_scope_downgrades() {

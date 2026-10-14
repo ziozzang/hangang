@@ -1,6 +1,6 @@
 # Independent Pumgye authority
 
-[한국어](ko/PUMGYE.md)
+[Documentation](README.md) · [한국어](ko/PUMGYE.md)
 
 Pumgye owns policy storage, compilation, CAS publication, revision and audit.
 Hangang owns route service/method/class bindings and request enforcement, and
@@ -75,12 +75,15 @@ separate acceptance work.
 
 ## Service principals
 
-Native Hopae service authentication uses one `x-hopae-principal-kind: service`,
+Native Hopae nonhuman authentication uses one `x-hopae-principal-kind: service`
+or `x-hopae-principal-kind: workload`,
 `x-hopae-aal: 0` and a canonical `s_` plus 48 lowercase hexadecimal subject.
 The authenticated `x-hopae-service-id` must match the Pumgye gate exactly.
-Legacy human evidence retains AAL 1–3; service namespaces cannot become human
+Legacy human evidence retains AAL 1–3; service/workload namespaces cannot become human
 assurance, and unknown/duplicate/contradictory typed metadata fails closed.
-Workload/network principal variants are not enabled by this bridge.
+Canonical workload AAL 0 is supported; network-only principals remain unsupported.
+Hopae must verify the workload source and its own publication/revocation fences;
+these headers are accepted only from the authenticated native Hopae response.
 
 Configure the route to forward `authorization` to Hopae and to receive
 `x-forwarded-user`, `x-hopae-aal` and `x-hopae-principal-kind`. The authenticated

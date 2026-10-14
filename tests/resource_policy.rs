@@ -824,8 +824,15 @@ fn pumgye_scope_cannot_be_silently_downgraded() {
 
 #[tokio::test]
 async fn service_principal_requires_explicit_matrix_and_never_exports_api_credential() {
+    qualify_nonhuman_principal("service").await;
+}
+#[tokio::test]
+async fn workload_principal_requires_explicit_matrix_and_never_exports_client_credential() {
+    qualify_nonhuman_principal("workload").await;
+}
+async fn qualify_nonhuman_principal(kind: &'static str) {
     let (origin, seen, origin_task) = capture_origin().await;
-    let (native, subject, native_task) = pumgye_identity_with(Some("service"), b"0").await;
+    let (native, subject, native_task) = pumgye_identity_with(Some(kind), b"0").await;
     let service = format!("s_{}", "a".repeat(48));
     *subject.lock().unwrap() = service.clone();
     let mut document = pumgye_document(origin, native, false);

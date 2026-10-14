@@ -1,81 +1,138 @@
-# 콘솔 패키지와 Hopae 네이티브 전송
+# 신뢰 콘솔 패키지와 호패 네이티브 전송
 
-[English](../CONSOLE_PLUGINS.md)
+[문서](README.md) · [English](../CONSOLE_PLUGINS.md)
 
-Hangang의 ZERO TRUST 메뉴에 Guard·Hopae 관리 패키지를 불러옵니다.
-동일 출처의 신뢰된 JavaScript이므로 패키지를 검토하고 해시를 고정해야 합니다.
-각 서비스의 데이터/변경 권한은 유지하고 콘솔 계정은 Hangang에 위임합니다.
+네이티브 콘솔은 운영자가 설치한 패키지를 ZERO TRUST 사이드바에 불러옵니다.
+Guard·Hopae는 각 관리 API와 데이터를 소유하고 Hangang은 콘솔 인증을 소유합니다.
+패키지는 동일 출처의 신뢰 JavaScript이며 sandbox가 아닙니다. 검토하지 않은 코드를
+설치하지 않습니다. 별도 콘솔 계정 DB를 생성하지 않습니다.
 
-`--admin-plugins`로 설정하거나 `hangang-console` 어댑터를 기존 관리자 API 앞에 배치합니다.
-공개 평문 리스닝은 `--allow-insecure-public`이 필요하며 TLS 게이트웨이와 직접 접근 제한을
-적용합니다. 생성된 전달 헤더는 로컬 relay에서만 신뢰합니다. 설정 예제는 영어 원문을 참고하세요.
-각 서비스의 `tools/build_console_plugin.py`로 패키지를 만들고 manifest SHA-256을 고정합니다.
-파일은 그룹/전체 쓰기가 불가능해야 하며 시작 때 크기·해시를 검증해 불변 메모리로 적재합니다.
+## 패키지 불러오기
 
-백엔드 주소/키는 discovery나 mount 객체로 노출하지 않습니다. 활성 관리자만 등록된 API를
-사용하고 viewer는 거부합니다. 화면을 숨기면 polling을 중단하고 로그아웃 시 늦은 응답까지
-폐기합니다. 요청 종류별 admission, 본문/응답 한도와 기한을 적용합니다.
-변경 전 영속 감사 의도와 작업자·본문 해시를 기록하고 결과를 남깁니다. 감사 수락 실패 시
-전달하지 않으며, 불확실한 변경은 자동 재시도하지 않습니다. 이미 수락된 백엔드 변경의 회수를
-서로 다른 서비스 간 원자적으로 보장하지는 않습니다.
+Hangang의 --admin-plugins /private/console-plugins.json 또는 기존 네이티브 관리자
+앞의 hangang-console --listen 127.0.0.1:19080 --upstream http://127.0.0.1:49000
+--plugins /private/console-plugins.json을 사용합니다. 어댑터는 현재 네이티브 UI를 제공하고
+설정·계정은 해당 권위에 위임합니다. 공개 평문은 명시적 --allow-insecure-public이
+필요합니다. 인증된 TLS 게이트웨이와 직접 접근 제한으로 보호하고 생성된 forwarding
+context는 로컬 relay만 제공하도록 합니다.
 
-Hopae 관리 위임은 전용 키로 작업자·시각·nonce·메서드/경로·본문 해시와 handle/클라이언트
-근거를 서명합니다. 기본 native 모드에서는 기존 Hopae handle·grant·역할·인증 강도·freshness·CSRF·변경 fence를
-유지합니다. Hangang 관리자 역할만으로 Hopae grant를 만들지 않습니다.
-브라우저 방식은 두 권한을 모두 요구합니다. Hopae 관리자 origin을 콘솔 origin에 맞추고
-`/_hopae/`를 forward-auth로 연결합니다. 로그인/로그아웃은 네이티브 엔트리를 사용하며
-Lua가 필요하지 않습니다. 로그아웃 확인/CSRF를 유지하고 앱 upstream에는 Hopae 쿠키를 제거합니다.
+설정 예제의 pin은 실제 검토한 manifest digest로 교체합니다.
 
-외부 인증 설정에 `native:{address:"127.0.0.1:8703",pool_size:32}`를 추가하면 HOP1 지속 연결을
-사용합니다. URL은 `/_hopae/verify`, static caller key와 Hopae native listener가 필요합니다.
-풀은 1–256, loopback만 허용합니다. 판단 캐시·HTTP 자동 fallback은 없으며 실패는 fail-closed입니다.
-취소된 연결은 폐기하고 포화 시 즉시 거부합니다. 프로바이더 코드는 Hopae에 유지합니다.
+```json
+{
+  "audit_database": "/private/console-audit.sqlite3",
+  "plugins": [
+    {"id":"guard","directory":"/opt/console/guard",
+     "manifest_sha256":"<reviewed SHA-256>","backend":"http://127.0.0.1:19082",
+     "token_env":"CONSOLE_GUARD_TOKEN"},
+    {"id":"hopae","directory":"/opt/console/hopae",
+     "manifest_sha256":"<reviewed SHA-256>","backend":"http://127.0.0.1:8702",
+     "token_env":"CONSOLE_HOPAE_DELEGATION_KEY","delegate_actor":true,
+     "delegation_cookie":"__Host-hopae"}
+  ]
+}
+```
 
-코덱·쿠키 중복·잘못된/재사용 ID·키 거부·취소·재연결·포화·실제 세션 및 엔트리 parity·
-grant 회수·위임 감사·콘솔 수명주기를 검증합니다. Hopae 전체 처리량은 별도 환경 부하 검증이
-필요하며 Guard transport 수치를 그대로 가져오지 않습니다.
+각 컴포넌트의 tools/build_console_plugin.py로 패키지를 만들고 manifest.json 해시를
+고정합니다. 파일은 group/world 쓰기를 허용하지 않습니다. 제한된 manifest·assets를
+해시 검증 후 불변 startup registry에 복사합니다. 수정은 새 pin으로 검증된 reload/restart
+후 적용합니다. --check는 콘솔 시작 없이 검사합니다. registry·감사 저장소는 비공개입니다.
 
-Hopae 진입 라우트는 콘솔 / 라우트보다 높은 priority를 주거나 같은 priority에서 먼저 배치합니다.
-Hangang은 가장 긴 prefix 자동 정렬 대신 priority와 설정 순서를 사용합니다.
+GET /v1/plugins는 이름·entry만 공개하며 backend origin·자격을 공개하지 않습니다.
+GET /ui/plugins/<id>/<asset>는 pin한 목록만 제공합니다. 활성 관리자만 manifest의
+명시적 /v1/plugins/<id>/<operation> allowlist를 호출하고 viewer는 거절합니다. 브라우저
+자격은 mount에 전달하지 않으며 host API가 현재 권위를 붙입니다. 숨기면 pause하고
+로그아웃 시 늦은 async 응답을 포함해 dispose합니다.
 
-## Hangang 통합 권한과 SSO
+공개·로그인·일반·SSE에는 독립 admission·본문 제한·기한이 있습니다. plugin 호출은
+별도 한도와 제한된 JSON 응답을 사용합니다. dispatch와 응답 공개 전에 parent 신원을
+재검증합니다. 변경 의도/결과·actor·본문 digest를 제한된 비공개 SQLite 감사에 기록하고
+원문·비밀값은 제외합니다. 감사 admission 실패 시 dispatch하지 않습니다. 불명확한
+결과를 자동 재시도하지 않습니다. backend가 이미 수락한 작업의 회수를 서로 다른
+권위 사이에서 원자적으로 보장하지 않습니다.
 
-Hangang 로그인·역할을 따르는 통합 콘솔은 Hopae 플러그인 binding에
-`delegation_authority: "hangang"`을 설정하고 `delegation_cookie`를 제거합니다.
-Hopae의 `admin.hangang_delegation.authority`도 `"hangang"`으로 설정하며 전용 키를
-맞춥니다. 명시적 통합 모드에서는 기존 제한된 API 목록에 대해 Hangang 관리자의
-서명 요청만 허용합니다. 권한 모드·요청을 서명에 묶고, 일회성 요청을 5초 이내로
-제한하며 변경 트랜잭션에서도 다시 검증합니다. 기본 `native` 모드와 독립 Hopae
-관리자 인증은 기존 grant·세션·freshness·assurance 검사를 유지합니다.
-통합 메뉴는 별도 Hopae 로그인·로그아웃 링크를 숨깁니다. 콘솔 권한은 Hangang,
-프로바이더 자격 증명·사용자·세션 데이터는 Hopae가 소유합니다.
+## 호패 관리와 로그인
 
-어댑터에 `--hopae-sso /private/console-sso.json`을 지정하면 ID/PW 로그인 아래에
-**SSO 로그인** 버튼이 표시됩니다. 영어 문서의 JSON 예시처럼 private 일반 파일
-(0600)에 공개 origin, 루프백 native 주소, caller/system 키의 환경변수 이름,
-쿠키 이름, `accounts` 매핑을 설정합니다. Hopae의 불변 사용자 ID를 기존 Hangang
-계정명에 명시적으로 연결합니다. 이메일/표시명으로 자동 연결하거나 사용자·권한을
-생성하지 않으며 기존 활성 Hangang 계정의 현재 역할을 적용합니다.
+기본 native 위임은 Hopae handle 인증·grant/role·assurance·신선도·CSRF·트랜잭션 변경
+fence를 유지합니다. Hopae의 HANGANG_NATIVE.md를 참고합니다. 별도 위임 키가
+actor ID/name·timestamp·nonce·method/path·본문 digest·handle/client 근거를 서명합니다.
+일반 검증 caller key와 다릅니다. provider/session 비밀은 Hopae에 남습니다. 브라우저
+모드에는 Hangang admin과 유효한 Hopae admin handle/grant 모두 필요합니다.
+Hangang admin 역할만으로 Hopae grant를 생성하지 않습니다.
 
-프로바이더 인증은 Hopae 네이티브 `/_hopae/login`에서 처리합니다. 쿠키와 함께
-`/ui/?sso=hopae`로 돌아와 같은 origin의 POST로 불투명 콘솔 bearer를 발급합니다.
-시스템 키·프로바이더 토큰·upstream lease는 브라우저에 전달하지 않습니다.
-SSO 요청마다 Hopae 쿠키·클라이언트 IP/UA·현재 세션을 확인하고 5초짜리 private
-Hangang lease를 사용합니다(최대 1초 재사용). Hangang 계정·역할도 재검증합니다.
-로그아웃은 해당 콘솔 세션과 현재 lease를 회수하며 다른 Hopae 앱을 전역 로그아웃하지
-않습니다. 어댑터 재시작 후에는 남은 Hopae 세션으로 다시 로그인합니다.
+브라우저 모드에서 Hopae admin origin을 콘솔 origin으로 설정합니다. /_hopae/ 예약
+경로를 forward_response:true·terminal_response:true와 요청 cookie/navigation 및
+고정 caller-key/contract 헤더로 Hopae에 forward-auth합니다. /_hopae/login·/_hopae/logout
+네이티브 handler를 사용하며 Lua로 구현하지 않습니다. 로그아웃 확인·CSRF를 유지하고
+Hopae cookie는 앱 upstream 요청에서 제거합니다. 콘솔 API 자격/cookie를 다른 앱에
+전달하지 않습니다.
 
-요청별 세션 회수, 같은 origin 교환, 명시적 계정 연결, bearer 직접 우회 차단,
-계정 비활성화·만료, 브라우저 복귀, 통합 Hopae 조회·변경·재전송·감사를 검증합니다.
+## 네이티브 검증 풀
 
-원격 HOP1에는 `native.tls`의 `server_name`·`ca`·`certificate`·`key`(절대 PEM 경로)를
-설정하고 Hopae `listen.native_gateway_tls`를 활성화합니다. Hangang은 고정된
-`native.address`에만 연결하고 명시한 CA·서버 신원·클라이언트 인증서와 ALPN
-`hop1`을 검증합니다. TLS 오류 시 평문 또는 HTTP로 전환하지 않습니다. 연결은
-Hopae의 300초 제한 전에 240초 후 교체합니다. TLS 파일은 변경된 설정을 준비할 때
-읽으므로 CA/key 회전에는 변경된 `native.tls` 설정(예: 버전을 가진 새로운 PEM 경로)의 게시가 필요합니다.
+기존 라우트 external auth에 다음을 추가합니다.
 
-선택적인 콘솔 SSO 설정도 같은 `server_name`·`ca`·`certificate`·`key` 필드를 가진
-`native_tls`를 받습니다. 공통 네이티브 client와 고정 `native_address`를 사용하고
-명시적인 호패→Hangang 계정 매핑과 기존 세션/lease 검사를 유지합니다.
-원격 SSO peer에는 mTLS가 필수이며 전환 중에는 루프백 평문을 유지할 수 있습니다.
+```json
+"native": {"address":"127.0.0.1:8703","pool_size":32}
+```
+
+auth URL은 /_hopae/verify를 지정해야 합니다. 고정 x-hopae-gateway-key를 설정하고
+해당 주소의 Hopae listen.native_gateway를 켭니다. HOP1은 제한된 인증 지속 연결이며
+원격에는 mTLS가 필요합니다. 세션 판정 캐시·provider 내장은 없고 실패 시 HTTP fallback/
+replay 없이 거절합니다. 두 전송은 동일한 forwarding/result 처리를 사용합니다. idle
+socket은 서버 기한 전에 회수하고 취소 시 폐기합니다. 포화는 즉시 거절하며 변경 없는
+prepared route는 풀을 재사용합니다.
+
+codec 한도·중복 cookie·잘못되거나 재사용된 ID·키 거절·취소/재연결/포화·실제 세션과
+entry parity·native grant 회수·서명 actor 감사·콘솔 lifecycle을 검증합니다. 전체 신원
+성능은 배포별 측정이 필요하며 Guard 전송 수치를 Hopae 세션 성능으로 쓰지 않습니다.
+
+예약 Hopae 경로는 넓은 콘솔 /보다 먼저 매칭해야 합니다. 높은 priority를 쓰거나 동일
+priority에서 먼저 배치합니다. Hangang은 priority 후 설정 순서이며 자동 최장 prefix가 아닙니다.
+
+## 통합 한강 권위와 SSO
+
+Hangang 로그인/역할을 따르려면 Hopae binding에 delegation_authority:"hangang"을
+설정하고 delegation_cookie를 제거합니다. Hopae admin.hangang_delegation.authority도
+hangang으로 설정하고 같은 별도 키를 사용합니다. 이 명시적 모드는 기존의 좁은 allowlist에서
+서명된 Hangang 관리자 요청만 받습니다. assertion은 권위 모드·요청에 바인딩하며 1회용,
+최대 5초이고 변경 트랜잭션에서 다시 확인합니다. 독립 Hopae와 기본 native 모드는 native
+grant·세션·신선도·assurance를 유지합니다. 통합 패키지는 별도 로그인/로그아웃 링크를
+숨깁니다. 콘솔 권위는 Hangang, provider 자격·신원·세션은 Hopae 소유입니다.
+
+--hopae-sso /private/console-sso.json으로 계정 로그인 아래 SSO 로그인 버튼을 추가합니다.
+설정은 비공개 regular file(0600)입니다.
+
+```json
+{
+  "public_url": "https://console.example.test/",
+  "native_address": "127.0.0.1:8703",
+  "gateway_key_env": "CONSOLE_HOPAE_GATEWAY_KEY",
+  "upstream_token_env": "CONSOLE_HANGANG_SYSTEM_TOKEN",
+  "cookie": "__Host-hopae",
+  "accounts": {"u_example": "operator"}
+}
+```
+
+검증되지 않은 이메일/이름 대신 불투명 Hopae user ID를 계정에 매핑합니다. 기존 활성
+Hangang 계정만 현재 역할로 로그인하며 계정/특권을 자동 생성하지 않습니다. broker system
+자격은 브라우저에 주지 않습니다. Hopae provider login은 /_hopae/login에서 처리하고
+native cookie가 /ui/?sso=hopae에 돌아오면 same-origin POST로 불투명 콘솔 bearer로
+교환합니다. 브라우저에는 upstream lease/provider token을 주지 않습니다. 모든 SSO 요청은
+Hopae cookie·client IP/UA·현재 세션을 검증하고 비공개 5초 lease(재사용 최대 1초)를
+얻습니다. Hangang은 로컬 계정/역할도 다시 확인합니다. 로그아웃은 콘솔 세션과 현재
+lease를 회수하며 다른 Hopae 앱까지 전역 로그아웃하지 않습니다. 어댑터 재시작은 불투명
+SSO 세션을 무효화하며 남아 있는 Hopae 세션으로 다시 로그인합니다. discovery는 provider
+이름과 고정 entry URL만 공개합니다.
+
+요청별 회수·same-origin 교환·명시적 매핑·bearer 격리·로컬 계정 disable/만료·브라우저
+callback·Hangang 권위의 Hopae 읽기/변경/replay/감사는 테스트로 검증합니다.
+
+원격 HOP1에는 native.tls의 server_name·ca·certificate·key(절대 PEM 경로)를 추가하고
+Hopae listen.native_gateway_tls를 켭니다. 고정 native.address만 접속하고 명시적 CA·서버
+신원을 검증하며 client 인증서와 ALPN hop1을 사용합니다. TLS 실패 시 평문/HTTP로
+fallback하지 않습니다. 연결은 Hopae 300초보다 빠른 240초에 회수합니다. TLS 파일은 변경된
+설정을 prepare할 때만 읽으므로 회전 시 native.tls 설정(예: 새 버전 PEM 경로)을 게시합니다.
+
+선택적 콘솔 SSO 설정의 native_tls도 같은 server_name·ca·certificate·key를 지원합니다.
+공유 native client·고정 native_address를 사용하고 명시적 Hopae→Hangang 계정 매핑과
+세션/lease 검사를 유지합니다. 원격은 mTLS이며 이전 과정의 loopback 평문은 지원합니다.
