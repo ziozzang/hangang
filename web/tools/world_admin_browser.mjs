@@ -67,6 +67,21 @@ try {
       const original=await editor.inputValue();
       expect(JSON.parse(original).profiles.some(profile=>profile.service_id==='orders')).toBe(true);
       await protectedStatus(200);
+      const staleContext=await browser.newContext();
+      const stalePage=await staleContext.newPage();
+      await stalePage.goto(config.base+'/ui/');
+      await expect(stalePage.locator('#login-dialog')).toBeVisible();
+      await expect(stalePage.locator('#login-username')).toBeVisible();
+      await stalePage.locator('#login-username').fill('browser-owner');
+      await stalePage.locator('#login-password').fill(password);
+      await stalePage.locator('#login-submit').click();
+      await expect(stalePage.locator('#login-dialog')).toBeHidden();
+      await stalePage.locator('.sidebar a[data-view="plugin-hopae"]').click();
+      const staleHop=stalePage.locator('#view-plugin-hopae .plugin-root');
+      await staleHop.locator('[data-tab="profiles"]').click();
+      const staleEditor=staleHop.getByRole('textbox',{name:'Authentication profile configuration'});
+      await expect(staleEditor).toHaveValue(original);
+      const staleRevision=await staleHop.locator('p').filter({hasText:/^Revision: /}).innerText();
       const publish=async value=>{
         const revision=await hop.locator('p').filter({hasText:/^Revision: /}).innerText();
         await editor.fill(value);
@@ -77,6 +92,14 @@ try {
       await publish('null');
       await expect(editor).toHaveValue('null');
       await protectedStatus(401);
+      const conflict=stalePage.waitForResponse(response=>response.url().endsWith('/authentication/profiles/publish')&&response.request().method()==='POST');
+      await staleHop.getByRole('button',{name:'Save profiles',exact:true}).click();
+      expect((await conflict).status()).toBe(409);
+      await expect(staleHop.locator('.error')).not.toHaveText('');
+      await expect(staleHop.locator('p').filter({hasText:/^Revision: /})).toHaveText(staleRevision);
+      await protectedStatus(401);
+      await staleContext.close();
+      console.log('PASS: independently signed-in stale administrator cannot overwrite profile revocation; actual CAS conflict preserves denied requests');
       if(config.hopaeRestart){
         const {kubectl,namespace}=config.hopaeRestart;
         if(!/^owned-world-[a-f0-9]{12}$/.test(namespace)||!kubectl.startsWith('/'))throw new Error('invalid owned restart scope');
