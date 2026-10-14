@@ -35,6 +35,16 @@ try {
   await expect(root.locator('#blocks-rows')).toContainText('127.0.0.1/32');
   await root.locator('#blocks-rows tr').filter({hasText:'127.0.0.1/32'}).locator('button').click();
   await expect(root.locator('#blocks-rows')).not.toContainText('127.0.0.1/32');
+  if(config.hopae){
+    await page.locator('.sidebar a[data-view="plugin-hopae"]').click();
+    const hop=page.locator('#view-plugin-hopae .plugin-root');
+    await expect(hop).toContainText('Managed with your Hangang administrator session.');
+    await expect(hop.locator('.error')).toHaveText('');
+    await hop.locator('[data-tab="profiles"]').click();
+    await expect(hop).toContainText('orders');
+    await expect(hop.locator('.error')).toHaveText('');
+    console.log('PASS: actual remote Hopae administrator mTLS delegation and profile view under the Hangang login');
+  }
   await page.locator('#logout-button').click();
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#pumgye-document')).toHaveValue('');
