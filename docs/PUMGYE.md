@@ -279,11 +279,20 @@ Exact correlation, supported Allow/Deny, zero cache TTL, safe policy/network
 revisions and monotonically observed floors are checked before returning.
 Receipt verification captures its verification time and monotonic start so
 rollback/stalled clocks cannot extend use. No native/HTTP fallback is introduced.
-Adversarial reply and receipt time tests plus all-target Clippy passed. Actual
-Hangang-to-Pumgye positive RPC and gateway dispatch/configuration remain to be
-connected; this library increment does not change operating routes or issue
-signed permits.
+Adversarial reply and receipt time tests plus all-target Clippy passed. Actual Hangang-to-Pumgye positive RPC is qualified below. Gateway
+dispatch/configuration remains to be connected; this library increment does not
+change operating routes or issue signed permits.
 
 Full all-target regression passed 1,267 tests with 58 explicit ignores after
 the dependency/client/receipt-time changes; strict all-target Clippy passed.
 This is source/library qualification, not live request dispatch activation.
+
+The owned `authenticated_resource_qualification` example uses the actual Hangang
+Hopae and Pumgye clients on persistent mTLS channels against all three authority
+processes. `pumgye/tools/authenticated_resource_smoke.py --live-validation
+--grpc-decisions` passed enforced resource Allow, network block/removal, signed
+identity-profile withdrawal/restoration, owner outage and seven trust refusals.
+Withdrawal and outage additionally query Pumgye with an unexpired previously
+checked receipt and require refusal. This is local debug-process qualification;
+static release, Kubernetes adoption and actual gateway dispatch remain separate
+gates. Fixture credentials enter through environment references only.
