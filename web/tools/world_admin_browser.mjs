@@ -1,9 +1,24 @@
 // Actual owned Kubernetes console: no intercepted API responses or fixture UI server.
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import { randomBytes } from 'node:crypto';
 import { chromium, expect } from '@playwright/test';
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const password=randomBytes(24).toString('hex');
+function exchange(transport,options){
+  return new Promise((resolve,reject)=>{
+    const req=transport.get(options,res=>{let body='';res.setEncoding('utf8');res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve({status:res.statusCode,body}));});
+    req.setTimeout(3000,()=>req.destroy(new Error('owned request deadline')));req.on('error',reject);
+  });
+}
+async function protectedStatus(expected){
+  const before=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
+  const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:'Bearer '+config.application.key}});
+  expect(response.status).toBe(expected);
+  const after=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
+  expect(after).toBe(before+(expected===200?1:0));
+}
 const browser=await chromium.launch({headless:true});
 try {
   const page=await browser.newPage();
@@ -43,10 +58,29 @@ try {
     await hop.locator('[data-tab="profiles"]').click();
     await expect(hop).toContainText('orders');
     await expect(hop.locator('.error')).toHaveText('');
+    if(config.application){
+      const editor=hop.getByRole('textbox',{name:'Authentication profile configuration'});
+      const original=await editor.inputValue();
+      expect(JSON.parse(original).profiles.some(profile=>profile.service_id==='orders')).toBe(true);
+      await protectedStatus(200);
+      const publish=async value=>{
+        const revision=await hop.locator('p').filter({hasText:/^Revision: /}).innerText();
+        await editor.fill(value);
+        await hop.getByRole('button',{name:'Save profiles',exact:true}).click();
+        await expect(hop.locator('p').filter({hasText:/^Revision: /})).not.toHaveText(revision);
+        await expect(hop.locator('.error')).toHaveText('');
+      };
+      await publish('null');
+      await expect(editor).toHaveValue('null');
+      await protectedStatus(401);
+      await publish(original);
+      await protectedStatus(200);
+      console.log('PASS: real Hopae browser profile revocation/restoration changes protected requests immediately; refused request never reaches application');
+    }
     console.log('PASS: actual remote Hopae administrator mTLS delegation and profile view under the Hangang login');
   }
   await page.locator('#logout-button').click();
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#pumgye-document')).toHaveValue('');
   console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu/block/unblock and logout clearing');
-} catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]')); process.exitCode=1; } finally {await browser.close();}
+} catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]').replaceAll(config.application?.key??'unused-secret-placeholder','[redacted]')); process.exitCode=1; } finally {await browser.close();}
