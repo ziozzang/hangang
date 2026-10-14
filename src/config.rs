@@ -452,6 +452,9 @@ fn canonical_methods() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct ExternalAuth {
     pub url: String,
+    /// Renew bounded native machine evidence for long-lived requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub renew_native_evidence: bool,
     /// Optional authenticated HOP1 transport; remote connections require mTLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<HopaeNative>,
@@ -584,7 +587,14 @@ fn unsafe_auth_header(name: &str) -> bool {
         || name == "forwarded"
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 fn validate_static_request_headers(auth: &ExternalAuth) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !auth.renew_native_evidence || auth.native.is_some(),
+        "evidence renewal requires native Hopae transport"
+    );
     ensure!(
         auth.static_request_headers.len() <= MAX_STATIC_REQUEST_HEADERS,
         "too many static authorization request headers"
@@ -3523,6 +3533,7 @@ mod tests {
             config.http[0].access_mode = mode;
             assert!(config.validate().is_ok());
             config.http[0].auth = Some(ExternalAuth {
+                renew_native_evidence: false,
                 native: None,
                 url: "http://127.0.0.1:9/check".into(),
                 request_headers: vec![],
@@ -4158,6 +4169,7 @@ mod tests {
         // External-auth identity headers are protected the same way.
         let mut c = route();
         c.http[0].auth = Some(ExternalAuth {
+            renew_native_evidence: false,
             native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
@@ -4175,6 +4187,7 @@ mod tests {
         let mut c = route();
         c.http[0].basic_auth = Some(basic.clone());
         c.http[0].auth = Some(ExternalAuth {
+            renew_native_evidence: false,
             native: None,
             url: "http://127.0.0.1:9/auth".into(),
             request_headers: vec![],
@@ -4229,6 +4242,7 @@ mod tests {
             identity_header: None,
         });
         document.http[0].auth = Some(ExternalAuth {
+            renew_native_evidence: false,
             native: None,
             url: "http://127.0.0.1:9/check".into(),
             request_headers: vec![],

@@ -721,15 +721,29 @@ async fn pumgye_identity_with(
                     stream.read_exact(&mut body).await.unwrap();
                     let subject = selected.lock().unwrap().clone();
                     let mut identity = vec![
-                        ("x-forwarded-user".into(), subject.into_bytes()),
+                        ("x-forwarded-user".into(), subject.clone().into_bytes()),
                         ("x-hopae-aal".into(), aal.to_vec()),
                     ];
                     if let Some(kind) = kind {
                         identity.push(("x-hopae-principal-kind".into(), kind.as_bytes().to_vec()));
                         identity.push(("x-hopae-service-id".into(), b"orders".to_vec()));
+                        identity.push((
+                            "x-hopae-evidence-ttl-ms".into(),
+                            if subject == "expired" {
+                                b"1".to_vec()
+                            } else {
+                                b"1000".to_vec()
+                            },
+                        ));
                     }
                     let reply = hangang::hopae_wire::Reply {
-                        status: 200,
+                        status: if subject == "revoked" {
+                            401
+                        } else if subject == "outage" {
+                            503
+                        } else {
+                            200
+                        },
                         headers: identity,
                         body: vec![],
                     };
@@ -918,6 +932,21 @@ async fn qualify_nonhuman_principal(kind: &'static str) {
 
 #[tokio::test]
 async fn idle_native_workload_stream_retires_without_policy_or_origin_changes() {
+    qualify_machine_stream(None).await;
+}
+
+#[tokio::test]
+async fn renewed_workload_stream_survives_and_retires_on_denial_outage_identity_or_expiry() {
+    for cause in [
+        "revoked",
+        "outage",
+        "expired",
+        "s_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ] {
+        qualify_machine_stream(Some(cause)).await;
+    }
+}
+async fn qualify_machine_stream(renewal_failure: Option<&str>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = listener.local_addr().unwrap();
     let origin_task = tokio::spawn(async move {
@@ -936,6 +965,7 @@ async fn idle_native_workload_stream_retires_without_policy_or_origin_changes() 
     let identity = format!("s_{}", "a".repeat(48));
     *subject.lock().unwrap() = identity.clone();
     let mut document = pumgye_document(origin, native, false);
+    document["http"][0]["auth"]["renew_native_evidence"] = json!(renewal_failure.is_some());
     document["http"][0]["auth"]["response_headers"] =
         json!(["x-forwarded-user", "x-hopae-aal", "x-hopae-principal-kind"]);
     document["pumgye"]["services"]["orders"]["users"] = json!({identity:["reader"]});
@@ -956,6 +986,16 @@ async fn idle_native_workload_stream_retires_without_policy_or_origin_changes() 
     .await
     .unwrap();
     assert!(head.starts_with(b"HTTP/1.1 200"));
+    if let Some(cause) = renewal_failure {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), client.read_u8())
+                .await
+                .is_err(),
+            "valid renewed stream closed early"
+        );
+        *subject.lock().unwrap() = cause.to_owned();
+    }
+    let revoked_at = std::time::Instant::now();
     let mut remainder = Vec::new();
     let _ = tokio::time::timeout(
         Duration::from_millis(1500),
@@ -963,9 +1003,28 @@ async fn idle_native_workload_stream_retires_without_policy_or_origin_changes() 
     )
     .await
     .expect("idle stream survived native evidence expiry");
-    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert!(revoked_at.elapsed() < Duration::from_millis(1500));
+    if renewal_failure.is_none() {
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
     front_task.abort();
     native_task.abort();
     origin_task.abort();
     policy.shutdown().await;
+}
+
+#[test]
+fn machine_evidence_renewal_requires_a_native_transport() {
+    let mut document = pumgye_document(
+        "127.0.0.1:12345".parse().unwrap(),
+        "127.0.0.1:12346".parse().unwrap(),
+        false,
+    );
+    document["http"][0]["auth"]["renew_native_evidence"] = json!(true);
+    document["http"][0]["auth"]
+        .as_object_mut()
+        .unwrap()
+        .remove("native");
+    let config: Config = serde_json::from_value(document).unwrap();
+    assert!(Snapshot::new(config).is_err());
 }

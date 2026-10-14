@@ -116,7 +116,34 @@ The shared route lease protects response bodies, pending operations, upgrades
 and authenticated upload bodies. Idle streams close when evidence expires even
 if policy and origin remain unchanged. Retirement checks currently run at 250 ms
 intervals; this is a scheduler bound, not an exact wire-level one-second promise.
-Machine requests lasting longer than the lease can fail or close. Automatic
-reauthentication/renewal and targeted Hopae revocation subscriptions remain
-required before claiming sustained long-lived machine connections. This behavior
+Machine requests lasting longer than the lease can fail or close. Non-renewing routes close at expiry. Opt-in reauthentication is described below;
+targeted Hopae revocation subscriptions and fleet qualification remain required. This behavior
 has not yet been deployed into the existing production gateway image.
+
+
+## Opt-in native evidence renewal
+
+Set `auth.renew_native_evidence: true` on a route with native Hopae transport to
+maintain a valid long request. This applies only to authenticated service/workload
+identities. Renewal requires the upgraded peer's explicit evidence TTL and at
+least 100 ms remaining lifetime; a legacy missing TTL cannot enable renewal.
+The gateway verifies the original method/path/client context through the same
+bounded authenticated native pool around halfway through each lease. Subject,
+principal kind, AAL and service must remain exactly unchanged. No body or incoming
+credential is sent to the application for this purpose.
+
+Denial, source failure, capacity exhaustion, changed identity, malformed lifetime
+or expiry permanently retires that lease. A reply arriving after its previous
+expiry cannot revive it. Existing Pumgye/route/JWT/workload retirement still applies
+independently. The original selected authentication headers, including the bearer
+credential, remain private in process memory for the operation; they are not
+persisted or exposed to the backend. Closing the last lease reference aborts its
+verification task and drops this context. At most 4096 renewal leases are active
+per process, in addition to native pool limits. There is no result cache.
+
+The default remains non-renewing expiry. Owned native-peer tests sustain unchanged
+streams beyond two seconds and then exercise denial, unavailable verifier, changed
+subject and short/expired evidence. These establish the gateway renewal mechanism,
+not fleet-scale performance or real-cluster watch availability. Kubernetes source
+polling can independently withdraw a stream during collection; sustained source
+availability still requires the pending watch/follower work.

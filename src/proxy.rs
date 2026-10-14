@@ -88,6 +88,144 @@ fn native_evidence_expiry(
     (std::time::Instant::now() < expiry).then_some(expiry)
 }
 
+enum MachineLease {
+    Fixed(std::time::Instant),
+    Renewing(Arc<Renewal>),
+}
+static RENEWAL_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4096);
+struct Renewal {
+    expires: std::sync::Mutex<std::time::Instant>,
+    failed: std::sync::atomic::AtomicBool,
+    task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    _slot: tokio::sync::SemaphorePermit<'static>,
+}
+impl Drop for Renewal {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+impl Renewal {
+    fn current(&self) -> bool {
+        let current = !self.failed.load(Ordering::Acquire)
+            && self
+                .expires
+                .lock()
+                .is_ok_and(|expiry| std::time::Instant::now() < *expiry);
+        if !current {
+            self.failed.store(true, Ordering::Release);
+        }
+        current
+    }
+    fn identity(headers: &HeaderMap) -> Option<Vec<HeaderValue>> {
+        [
+            "x-forwarded-user",
+            "x-hopae-principal-kind",
+            "x-hopae-aal",
+            "x-hopae-service-id",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut values = headers.get_all(name).iter();
+            let value = values.next()?.clone();
+            values.next().is_none().then_some(value)
+        })
+        .collect()
+    }
+    fn start(
+        client: Arc<crate::hopae_native::Client>,
+        context: HeaderMap,
+        headers: &HeaderMap,
+        started: std::time::Instant,
+    ) -> Option<Arc<Self>> {
+        if !headers.contains_key("x-hopae-evidence-ttl-ms") {
+            return None;
+        }
+        let expires = native_evidence_expiry(headers, started)?;
+        if expires.saturating_duration_since(std::time::Instant::now()) < Duration::from_millis(100)
+        {
+            return None;
+        }
+        let identity = Self::identity(headers)?;
+        let lease = Arc::new(Self {
+            expires: std::sync::Mutex::new(expires),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            task: std::sync::Mutex::new(None),
+            _slot: RENEWAL_SLOTS.try_acquire().ok()?,
+        });
+        let weak = Arc::downgrade(&lease);
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let expiry = match state.expires.lock() {
+                    Ok(v) => *v,
+                    Err(_) => return,
+                };
+                if !state.current() {
+                    return;
+                }
+                let delay = expiry.saturating_duration_since(std::time::Instant::now()) / 2;
+                drop(state);
+                tokio::time::sleep(delay).await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if !state.current() {
+                    return;
+                }
+                // Retain only a Weak reference across I/O so dropping the stream
+                // immediately aborts verification and drops its private context.
+                drop(state);
+                let began = std::time::Instant::now();
+                let remaining = expiry.saturating_duration_since(began);
+                let reply = tokio::time::timeout(remaining, client.verify(&context)).await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let renewed = match reply {
+                    Ok(Ok(reply))
+                        if reply.status().is_success()
+                            && reply.headers().contains_key("x-hopae-evidence-ttl-ms")
+                            && Self::identity(reply.headers()).as_ref() == Some(&identity) =>
+                    {
+                        native_evidence_expiry(reply.headers(), began)
+                    }
+                    _ => None,
+                };
+                if !state.current() || renewed.is_none() {
+                    state.failed.store(true, Ordering::Release);
+                    return;
+                }
+                match state.expires.lock() {
+                    Ok(mut deadline) => {
+                        if state.failed.load(Ordering::Acquire)
+                            || std::time::Instant::now() >= *deadline
+                        {
+                            state.failed.store(true, Ordering::Release);
+                            return;
+                        }
+                        *deadline = renewed.unwrap();
+                    }
+                    Err(_) => {
+                        state.failed.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+            }
+        });
+        *lease.task.lock().ok()? = Some(task.abort_handle());
+        Some(lease)
+    }
+}
+
 /// Result of an external authorization call.
 enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
@@ -98,7 +236,7 @@ enum AuthOutcome {
         HeaderMap,
         Vec<HeaderValue>,
         Option<String>,
-        Option<std::time::Instant>,
+        Option<MachineLease>,
     ),
     /// Fail closed with this status and a generic message.
     Deny(u16),
@@ -358,6 +496,7 @@ struct AuthRouteLease {
     workload: Option<WorkloadRouteLease>,
     jwt: Option<JwtRouteLease>,
     hopae_expires: Option<std::time::Instant>,
+    hopae_renewal: Option<Arc<Renewal>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -402,7 +541,11 @@ impl AuthRouteLease {
             jwt: self.jwt.as_ref().is_some_and(|lease| !lease.current()),
             hopae: self
                 .hopae_expires
-                .is_some_and(|expiry| std::time::Instant::now() >= expiry),
+                .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                || self
+                    .hopae_renewal
+                    .as_ref()
+                    .is_some_and(|lease| !lease.current()),
         }
     }
 
@@ -711,7 +854,7 @@ impl Proxy {
         &self,
         auth: &crate::config::ExternalAuth,
         static_headers: &[(HeaderName, HeaderValue)],
-        native: Option<&crate::hopae_native::Client>,
+        native: Option<&Arc<crate::hopae_native::Client>>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
@@ -748,6 +891,9 @@ impl Proxy {
             for (name, value) in static_headers {
                 request.headers_mut().insert(name.clone(), value.clone());
             }
+            let renewal_context = auth
+                .renew_native_evidence
+                .then(|| request.headers().clone());
             let response = if let Some(native) = native {
                 native.verify(request.headers()).await.map_err(|_| 503u16)?
             } else {
@@ -788,7 +934,21 @@ impl Proxy {
                 false
             };
             let evidence_expires = if service_identity {
-                Some(native_evidence_expiry(&parts.headers, started).ok_or(503u16)?)
+                Some(if auth.renew_native_evidence {
+                    MachineLease::Renewing(
+                        Renewal::start(
+                            native.unwrap().clone(),
+                            renewal_context.unwrap(),
+                            &parts.headers,
+                            started,
+                        )
+                        .ok_or(503u16)?,
+                    )
+                } else {
+                    MachineLease::Fixed(
+                        native_evidence_expiry(&parts.headers, started).ok_or(503u16)?,
+                    )
+                })
             } else {
                 None
             };
@@ -1899,6 +2059,7 @@ impl Proxy {
             pumgye: None,
             pumgye_remote: None,
             hopae_expires: None,
+            hopae_renewal: None,
         });
         if runtime
             .route
@@ -2373,7 +2534,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_deref(), &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);
@@ -2382,7 +2543,10 @@ impl Proxy {
                 AuthOutcome::Allow(headers, cookies, service_scope, evidence_expires) => {
                     if let Some(expiry) = evidence_expires {
                         let lease = auth_route_lease.get_or_insert_with(Default::default);
-                        lease.hopae_expires = Some(expiry);
+                        match expiry {
+                            MachineLease::Fixed(deadline) => lease.hopae_expires = Some(deadline),
+                            MachineLease::Renewing(renewal) => lease.hopae_renewal = Some(renewal),
+                        }
                         if !request.body().is_end_stream() {
                             let body =
                                 std::mem::replace(request.body_mut(), full_body(Bytes::new()));

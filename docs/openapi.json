@@ -4522,6 +4522,11 @@
           "url"
         ],
         "properties": {
+          "renew_native_evidence": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt-in bounded native machine reauthentication. Requires native transport and explicit evidence lifetime; identity, service and AAL must remain unchanged. Maximum 4096 active renewal leases per process. Authentication headers remain private in memory until close."
+          },
           "native": {
             "type": "object",
             "additionalProperties": false,
