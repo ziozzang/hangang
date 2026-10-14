@@ -915,3 +915,57 @@ async fn qualify_nonhuman_principal(kind: &'static str) {
     policy.shutdown().await;
     p2.shutdown().await;
 }
+
+#[tokio::test]
+async fn idle_native_workload_stream_retires_without_policy_or_origin_changes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(connection.read_u8().await.unwrap());
+        }
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nopen\n\r\n")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (native, subject, native_task) = pumgye_identity_with(Some("workload"), b"0").await;
+    let identity = format!("s_{}", "a".repeat(48));
+    *subject.lock().unwrap() = identity.clone();
+    let mut document = pumgye_document(origin, native, false);
+    document["http"][0]["auth"]["response_headers"] =
+        json!(["x-forwarded-user", "x-hopae-aal", "x-hopae-principal-kind"]);
+    document["pumgye"]["services"]["orders"]["users"] = json!({identity:["reader"]});
+    document["pumgye"]["services"]["orders"]["roles"]["reader"]["minimum_aal"] = json!(0);
+    let (front, policy, front_task) = gateway_document(document).await;
+    let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+    let started = std::time::Instant::now();
+    client
+        .write_all(b"GET /secure HTTP/1.1\r\nHost: foo.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !head.ends_with(b"open\n\r\n") {
+            head.push(client.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    let mut remainder = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1500),
+        client.read_to_end(&mut remainder),
+    )
+    .await
+    .expect("idle stream survived native evidence expiry");
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    front_task.abort();
+    native_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}

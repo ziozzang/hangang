@@ -63,13 +63,43 @@ struct ResponseSecurityFinalized;
 
 pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, BodyError>;
 
+/// A legacy trusted peer receives a local one-second cap; explicit TTL is stricter.
+fn native_evidence_expiry(
+    headers: &HeaderMap,
+    started: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let mut values = headers.get_all("x-hopae-evidence-ttl-ms").iter();
+    let ttl = match values.next() {
+        Some(value) => {
+            let text = value.to_str().ok()?;
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u64>()
+                .ok()
+                .filter(|v| (1..=1000).contains(v))?
+        }
+        None => 1000,
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    let expiry = started.checked_add(Duration::from_millis(ttl))?;
+    (std::time::Instant::now() < expiry).then_some(expiry)
+}
+
 /// Result of an external authorization call.
 enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
     /// The second value carries `Set-Cookie` fields from the authorization
     /// response (session refresh) to append to the final client response when
     /// `forward_response` is enabled. The final value binds a native service identity to its authenticated service.
-    Allow(HeaderMap, Vec<HeaderValue>, Option<String>),
+    Allow(
+        HeaderMap,
+        Vec<HeaderValue>,
+        Option<String>,
+        Option<std::time::Instant>,
+    ),
     /// Fail closed with this status and a generic message.
     Deny(u16),
     /// Forward this response (SSO redirect/challenge) to the client verbatim.
@@ -327,6 +357,7 @@ struct AuthRouteLease {
     pumgye_remote: Option<(Arc<crate::pumgye::AuthorityRuntime>, u64)>,
     workload: Option<WorkloadRouteLease>,
     jwt: Option<JwtRouteLease>,
+    hopae_expires: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -334,11 +365,12 @@ struct AuthRetirement {
     pumgye: bool,
     workload: bool,
     jwt: bool,
+    hopae: bool,
 }
 
 impl AuthRetirement {
     fn any(self) -> bool {
-        self.workload || self.jwt || self.pumgye
+        self.workload || self.jwt || self.pumgye || self.hopae
     }
 
     fn record(self, metrics: &Metrics) {
@@ -368,6 +400,9 @@ impl AuthRouteLease {
                     .is_some_and(|(runtime, revision)| !runtime.lease_current(*revision)),
             workload: self.workload.as_ref().is_some_and(|lease| !lease.current()),
             jwt: self.jwt.as_ref().is_some_and(|lease| !lease.current()),
+            hopae: self
+                .hopae_expires
+                .is_some_and(|expiry| std::time::Instant::now() >= expiry),
         }
     }
 
@@ -680,6 +715,7 @@ impl Proxy {
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
+        let started = std::time::Instant::now();
         let operation = async move {
             let mut request = Request::builder()
                 .method(Method::GET)
@@ -750,6 +786,11 @@ impl Proxy {
                 crate::pumgye::identity(&parts.headers).ok_or(503u16)?.1 == 0
             } else {
                 false
+            };
+            let evidence_expires = if service_identity {
+                Some(native_evidence_expiry(&parts.headers, started).ok_or(503u16)?)
+            } else {
+                None
             };
             let service_scope = if service_identity {
                 let mut values = parts.headers.get_all("x-hopae-service-id").iter();
@@ -840,7 +881,12 @@ impl Proxy {
                         cookies.push(value.clone());
                     }
                 }
-                return Ok(AuthOutcome::Allow(headers, cookies, service_scope));
+                return Ok(AuthOutcome::Allow(
+                    headers,
+                    cookies,
+                    service_scope,
+                    evidence_expires,
+                ));
             }
             // SSO passthrough: forward a redirect/challenge to the client so the
             // authorization service can drive login/ban redirects and cookies.
@@ -1852,6 +1898,7 @@ impl Proxy {
             jwt: None,
             pumgye: None,
             pumgye_remote: None,
+            hopae_expires: None,
         });
         if runtime
             .route
@@ -2332,7 +2379,18 @@ impl Proxy {
                 return Ok(denied);
             }
             match authorization {
-                AuthOutcome::Allow(headers, cookies, service_scope) => {
+                AuthOutcome::Allow(headers, cookies, service_scope, evidence_expires) => {
+                    if let Some(expiry) = evidence_expires {
+                        let lease = auth_route_lease.get_or_insert_with(Default::default);
+                        lease.hopae_expires = Some(expiry);
+                        if !request.body().is_end_stream() {
+                            let body =
+                                std::mem::replace(request.body_mut(), full_body(Bytes::new()));
+                            *request.body_mut() =
+                                AuthResponseBody::new(body, lease.clone(), self.metrics.clone())
+                                    .boxed_unsync();
+                        }
+                    }
                     if let Some(service_scope) = service_scope {
                         if resource_policy.is_none_or(|policy| {
                             policy
@@ -4374,6 +4432,35 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_evidence_ttl_is_bounded_unique_and_consumes_exchange_time() {
+        let mut headers = HeaderMap::new();
+        let started = std::time::Instant::now();
+        let legacy = native_evidence_expiry(&headers, started).unwrap();
+        assert_eq!(legacy, started + Duration::from_millis(1000));
+        headers.insert("x-hopae-evidence-ttl-ms", HeaderValue::from_static("400"));
+        assert_eq!(
+            native_evidence_expiry(&headers, started).unwrap(),
+            started + Duration::from_millis(400)
+        );
+        for value in ["0", "1001", "-1", "+1", " 1", "1.0", "18446744073709551616"] {
+            headers.insert(
+                "x-hopae-evidence-ttl-ms",
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(native_evidence_expiry(&headers, started).is_none());
+        }
+        headers.insert("x-hopae-evidence-ttl-ms", HeaderValue::from_static("1"));
+        assert!(native_evidence_expiry(&headers, started - Duration::from_millis(5)).is_none());
+        headers.append("x-hopae-evidence-ttl-ms", HeaderValue::from_static("1"));
+        assert!(native_evidence_expiry(&headers, started).is_none());
+        let lease = AuthRouteLease {
+            hopae_expires: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        assert!(lease.retirement().hopae && lease.retirement().any());
+    }
+
     #[test]
     fn strip_request_cookies_parser_is_quote_aware_and_fails_safe() {
         let names = vec!["s".to_owned()];

@@ -101,3 +101,22 @@ service-bound translation and streaming credential revocation remain follow-up
 work. The current regression uses an owned native Hopae protocol peer and real
 Hangang/Pumgye policy evaluation; actual multi-process API-key deployment is
 still a separate qualification step.
+
+
+## Native machine evidence expiry
+
+Hangang binds successful native service/workload authentication to a monotonic
+expiry. Hopae's optional `x-hopae-evidence-ttl-ms` must be a single decimal integer
+from 1 to 1000; invalid, duplicate or already exhausted values fail closed. A
+legacy trusted peer without the header receives a local one-second cap. The
+clock starts before the exchange, so transport time consumes the budget. This
+control metadata is read from the authenticated response, never client headers.
+
+The shared route lease protects response bodies, pending operations, upgrades
+and authenticated upload bodies. Idle streams close when evidence expires even
+if policy and origin remain unchanged. Retirement checks currently run at 250 ms
+intervals; this is a scheduler bound, not an exact wire-level one-second promise.
+Machine requests lasting longer than the lease can fail or close. Automatic
+reauthentication/renewal and targeted Hopae revocation subscriptions remain
+required before claiming sustained long-lived machine connections. This behavior
+has not yet been deployed into the existing production gateway image.
