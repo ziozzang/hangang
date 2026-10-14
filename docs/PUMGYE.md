@@ -147,3 +147,12 @@ subject and short/expired evidence. These establish the gateway renewal mechanis
 not fleet-scale performance or real-cluster watch availability. Kubernetes source
 polling can independently withdraw a stream during collection; sustained source
 availability still requires the pending watch/follower work.
+
+
+Renewal lifecycle qualification additionally exhausts all 4096 slots and verifies
+admission refusal, cancellation of a real in-flight native socket on last-owner
+drop, recovery of every slot, and timeout/irreversible expiry when no reply arrives.
+The remaining-lifetime minimum also applies to renewal replies; short TTL tests
+keep the authenticated identity unchanged so identity rejection cannot mask this
+check. Retained header values are marked sensitive for debug formatting. These are
+owned transport/lifecycle tests, not a fleet saturation throughput measurement.

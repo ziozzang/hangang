@@ -140,7 +140,7 @@ impl Renewal {
     }
     fn start(
         client: Arc<crate::hopae_native::Client>,
-        context: HeaderMap,
+        mut context: HeaderMap,
         headers: &HeaderMap,
         started: std::time::Instant,
     ) -> Option<Arc<Self>> {
@@ -153,6 +153,9 @@ impl Renewal {
             return None;
         }
         let identity = Self::identity(headers)?;
+        for value in context.values_mut() {
+            value.set_sensitive(true);
+        }
         let lease = Arc::new(Self {
             expires: std::sync::Mutex::new(expires),
             failed: std::sync::atomic::AtomicBool::new(false),
@@ -196,7 +199,10 @@ impl Renewal {
                             && reply.headers().contains_key("x-hopae-evidence-ttl-ms")
                             && Self::identity(reply.headers()).as_ref() == Some(&identity) =>
                     {
-                        native_evidence_expiry(reply.headers(), began)
+                        native_evidence_expiry(reply.headers(), began).filter(|deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                                >= Duration::from_millis(100)
+                        })
                     }
                     _ => None,
                 };
@@ -4596,6 +4602,111 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    fn renewal_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-forwarded-user", "s_fixture"),
+            ("x-hopae-principal-kind", "workload"),
+            ("x-hopae-aal", "0"),
+            ("x-hopae-service-id", "fixture"),
+            ("x-hopae-evidence-ttl-ms", "300"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+    #[tokio::test]
+    async fn renewal_quota_expiry_and_inflight_cancellation_are_fail_closed() {
+        let occupied = RENEWAL_SLOTS.try_acquire_many(4096).unwrap();
+        let client = Arc::new(crate::hopae_native::Client::new(
+            "127.0.0.1:9".parse().unwrap(),
+            1,
+            HeaderValue::from_static("owned-key"),
+        ));
+        assert!(
+            Renewal::start(
+                client,
+                HeaderMap::new(),
+                &renewal_headers(),
+                std::time::Instant::now()
+            )
+            .is_none()
+        );
+        drop(occupied);
+        let expired = Renewal {
+            expires: std::sync::Mutex::new(std::time::Instant::now()),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            task: std::sync::Mutex::new(None),
+            _slot: RENEWAL_SLOTS.try_acquire().unwrap(),
+        };
+        assert!(!expired.current());
+        *expired.expires.lock().unwrap() = std::time::Instant::now() + Duration::from_secs(1);
+        assert!(
+            !expired.current(),
+            "an observed expiration must never revive"
+        );
+        drop(expired);
+        for drop_during_io in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(crate::hopae_native::Client::new(
+                listener.local_addr().unwrap(),
+                1,
+                HeaderValue::from_static("owned-key"),
+            ));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = [0; 16];
+                socket.read_exact(&mut head).await.unwrap();
+                let (id, len) = crate::hopae_wire::parse_header(head).unwrap();
+                assert_eq!(id, 0);
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await.unwrap();
+                socket
+                    .write_all(&crate::hopae_wire::frame_header(0, 1).unwrap())
+                    .await
+                    .unwrap();
+                socket.write_all(&[1]).await.unwrap();
+                socket.read_exact(&mut head).await.unwrap();
+                let (_, len) = crate::hopae_wire::parse_header(head).unwrap();
+                let mut body = vec![0; len];
+                socket.read_exact(&mut body).await.unwrap();
+                started_tx.send(()).unwrap();
+                // No renewal reply: dropping or exhausting the lease must cancel I/O.
+                let mut byte = [0; 1];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            });
+            let lease = Renewal::start(
+                client,
+                HeaderMap::new(),
+                &renewal_headers(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if !drop_during_io {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                assert!(
+                    !lease.current(),
+                    "late or missing response cannot extend a lease"
+                );
+            }
+            drop(lease);
+            peer.await.unwrap();
+            assert_eq!(RENEWAL_SLOTS.available_permits(), 4096);
+        }
+    }
+
     #[test]
     fn native_evidence_ttl_is_bounded_unique_and_consumes_exchange_time() {
         let mut headers = HeaderMap::new();

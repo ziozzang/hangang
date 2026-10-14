@@ -721,7 +721,15 @@ async fn pumgye_identity_with(
                     stream.read_exact(&mut body).await.unwrap();
                     let subject = selected.lock().unwrap().clone();
                     let mut identity = vec![
-                        ("x-forwarded-user".into(), subject.clone().into_bytes()),
+                        (
+                            "x-forwarded-user".into(),
+                            if ["revoked", "outage", "expired", "short"].contains(&subject.as_str())
+                            {
+                                format!("s_{}", "a".repeat(48)).into_bytes()
+                            } else {
+                                subject.clone().into_bytes()
+                            },
+                        ),
                         ("x-hopae-aal".into(), aal.to_vec()),
                     ];
                     if let Some(kind) = kind {
@@ -731,6 +739,8 @@ async fn pumgye_identity_with(
                             "x-hopae-evidence-ttl-ms".into(),
                             if subject == "expired" {
                                 b"1".to_vec()
+                            } else if subject == "short" {
+                                b"50".to_vec()
                             } else {
                                 b"1000".to_vec()
                             },
@@ -941,6 +951,7 @@ async fn renewed_workload_stream_survives_and_retires_on_denial_outage_identity_
         "revoked",
         "outage",
         "expired",
+        "short",
         "s_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ] {
         qualify_machine_stream(Some(cause)).await;
