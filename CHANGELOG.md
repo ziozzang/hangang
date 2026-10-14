@@ -4,6 +4,21 @@
 
 ## Unreleased
 
+### 0.3.4 preparation
+
+- Enforce native resource/action gates through the independent Pumgye authority,
+  keeping classification, permission mapping and minimum assurance in its catalog.
+- Bind resource decisions to the trusted native service scope and retain route,
+  authority revision/freshness and response-stream revocation checks.
+- Display and preserve the owner resource catalog in the integrated administrator
+  console; publish with owner/configuration CAS and keep source-managed policies read-only.
+- Add an opt-in request-bound Hopae service authentication receipt client with
+  pinned signatures and revision fencing. Provider translation/permit dispatch is
+  still pending; ordinary authentication remains unchanged.
+- Qualify resource dispatch in actual static four-server mTLS gRPC and remote
+  Kubernetes/browser fixtures; existing native/gRPC service chains also pass.
+- Linux assets remain static musl. Publication and operating adoption are pending.
+
 ## 0.3.2 — 2026-10-14
 
 - Preserve the original request Host, including its port, on Kubernetes Ingress
