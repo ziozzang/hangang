@@ -45,6 +45,14 @@ kubectl -n demo rollout status deployment/echo-b
 
 ## 기존 외부 게이트웨이 설정
 
+k3d 브릿지 시나리오에서는 컨트롤러 Service를 공통 NodePort로 노출합니다. 클러스터에서 허용하고 다른 서비스가 사용하지 않는 포트를 선택하세요.
+
+```sh
+kubectl -n demo patch service hangang --type merge -p '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":"http","protocol":"TCP","nodePort":30090}]}}'
+```
+
+호스트·네트워크 접근 제어로 외부 게이트웨이의 접속만 허용하세요. 앱 Service는 ClusterIP를 유지합니다.
+
 각 도메인에 대해 같은 내부 진입점을 대상으로 TLS 필수 및 Host 보존 HTTP route를 등록합니다. 다음은 기존 설정/API에 넣는 route 객체이며 전체 설정 파일이 아닙니다.
 
 ```json
@@ -97,7 +105,7 @@ Linux amd64 물리 서버 하나의 k3d v5.9.0 / k3s v1.37.1+k3s1에서 외부 H
 
 RC 네이티브 검증은 라이브러리·프록시·CLI·Host 회귀 검사 687개 통과, 기존 ignored 13개입니다. GNU/musl Linux amd64 gateway smoke는 각각 10개 통과했습니다. Host 회귀 검사는 정확 호스트·와일드카드·기본 백엔드와 Host 포트를 다룹니다. 최종 정식 빌드 결과는 [변경 기록](../../CHANGELOG.md)과 릴리스 설명을 참고하세요.
 
-실제 클러스터 테스트는 WebSocket·SSE·gRPC·물리 노드 장애 전환·장시간 API 장애를 검증하지 않았습니다. GitHub Actions가 비활성화되어 로컬에서 검증했습니다. 문서 검사기의 기존 오류 10개는 수정하지 않은 v0.3.1에서도 재현됐습니다. 이 항목들은 통과한 검사가 아닙니다. 이번 유지보수 릴리스는 다른 아키텍처의 자산을 제공하지 않습니다.
+실제 클러스터 테스트는 WebSocket·SSE·gRPC·물리 노드 장애 전환·장시간 API 장애를 검증하지 않았습니다. RC 검증 당시 GitHub Actions가 비활성화되어 로컬에서 검증했습니다. 정식 버전도 로컬에서 검증하며 워크플로 활성 상태는 별도로 바뀔 수 있습니다. 문서 검사기의 기존 오류 10개는 수정하지 않은 v0.3.1에서도 재현됐습니다. 이 항목들은 통과한 검사가 아닙니다. 이번 유지보수 릴리스는 다른 아키텍처의 자산을 제공하지 않습니다.
 
 ## 문제 확인과 제거
 
