@@ -1,0 +1,42 @@
+// Actual owned Kubernetes console: no intercepted API responses or fixture UI server.
+import fs from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { chromium, expect } from '@playwright/test';
+const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
+const password=randomBytes(24).toString('hex');
+const browser=await chromium.launch({headless:true});
+try {
+  const page=await browser.newPage();
+  await page.goto(config.base+'/ui/');
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#login-description')).not.toHaveText('Checking administrator access…');
+  await expect(page.locator('#setup-login-fields')).toBeVisible();
+  await page.locator('#setup-token').fill(config.token);
+  await page.locator('#setup-username').fill('browser-owner');
+  await page.locator('#setup-password').fill(password);
+  await page.locator('#setup-confirm').fill(password);
+  await page.locator('#login-submit').click();
+  await expect(page.locator('#login-dialog')).toBeHidden();
+  await page.locator('.sidebar a[data-view="pumgye"]').click();
+  await expect(page.locator('#pumgye-authority-panel')).toBeVisible();
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#pumgye-subject').fill('browser-guest');
+  await page.locator('#pumgye-assignment-roles').fill('guest');
+  await page.locator('#pumgye-assignment-form button').click();
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toHaveText('Authorization policy published.');
+  await page.locator('.sidebar a[data-view="plugin-'+config.plugin+'"]').click();
+  const root=page.locator('#view-plugin-'+config.plugin+' .plugin-root');
+  await expect(root.locator('#tab-blocks')).toBeVisible();
+  await root.locator('#tab-blocks').click();
+  await root.locator('#network').fill('127.0.0.1/32');
+  await root.locator('#reason').fill('owned browser qualification');
+  await root.locator('#block-form button[type="submit"]').click();
+  await expect(root.locator('#blocks-rows')).toContainText('127.0.0.1/32');
+  await root.locator('#blocks-rows tr').filter({hasText:'127.0.0.1/32'}).locator('button').click();
+  await expect(root.locator('#blocks-rows')).not.toContainText('127.0.0.1/32');
+  await page.locator('#logout-button').click();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#pumgye-document')).toHaveValue('');
+  console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu/block/unblock and logout clearing');
+} catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]')); process.exitCode=1; } finally {await browser.close();}
