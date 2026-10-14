@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+## 0.3.2 — 2026-10-14
+
+- Preserve the original request Host, including its port, on Kubernetes Ingress
+  rule routes and default backends. Service DNS remains the upstream destination.
+- Add an HTTP regression for exact, wildcard and default-backend routes.
+- Qualify the Ingress fix on Linux amd64 GNU/musl and a live k3d cluster.
+- Document deployment, edge-to-Ingress bridging, multiple Service routing,
+  request reflection, validation results and operational limits.
+- This maintenance release is based on v0.3.1 plus the tested Ingress fix;
+  ongoing main-branch identity changes are excluded.
+
 ## 0.3.1 — 2026-10-12
 
 - Add trusted pinned Guard/Hopae console packages and a native console adapter over an existing administrator authority, including role/revocation checks, bounded requests and durable mutation audit.
