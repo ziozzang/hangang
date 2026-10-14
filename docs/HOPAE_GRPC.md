@@ -39,3 +39,17 @@ must run it after route/body rewriting and must not substitute empty bytes for
 unknown streaming entities. Fixed owner-vector, changed entity/query/scope and
 ambiguous target refusal tests pass. This helper is not yet invoked by credential
 projection dispatch and does not enable receipt RPC or credential delivery.
+
+## Pinned authentication receipt receiver (unreleased)
+
+The contract pin advances to 0225145d. `projection_receipt::IssuerPin` validates
+a native configured issuer/key epoch/public key and refuses weak keys. It checks
+authentication purpose, signature, exact current native context binding and time
+bounds using the shared contract. Its opaque checked result supplies receipt bytes,
+chain hash and expiry; it is not a permission or credential-output capability.
+
+Native adapters must authenticate the context, recheck live key/identity/policy
+state, enforce clock monotonicity and consume replay state at the owning authority.
+Passing a stale or caller-invented context is not made safe by this helper. The
+helper is not wired into request dispatch or receipt RPC. Tests cover every-byte
+tampering, context/generation/key epoch changes and expiry with a real signature.

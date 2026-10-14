@@ -120,3 +120,5 @@ pub mod pumgye;
 pub mod pumgye_grpc_client;
 
 pub mod projection_binding;
+
+pub mod projection_receipt;
