@@ -18,8 +18,7 @@ use std::io::{BufRead, Write};
 #[serde(deny_unknown_fields)]
 struct Configuration {
     pumgye_grpc_address: String,
-    #[serde(rename = "pumgye_endpoint")]
-    _pumgye_endpoint: Option<String>,
+    pumgye_endpoint: String,
     settings: HopaeNative,
     issuer_ref: String,
     key_epoch: u64,
@@ -52,19 +51,22 @@ async fn main() -> Result<()> {
         .strip_prefix("https://")
         .unwrap()
         .replacen("localhost:", "127.0.0.1:", 1);
+    let management = reqwest::Url::parse(&config.pumgye_endpoint)?;
+    ensure!(
+        management.host_str() == Some("127.0.0.1") && management.port().is_some(),
+        "owned management endpoint required"
+    );
+    let management_address = format!("127.0.0.1:{}", management.port().unwrap());
     let tls = config
         .settings
         .tls
         .as_ref()
         .context("native TLS required")?;
     let authority: hangang::pumgye::AuthorityConfig = serde_json::from_value(
-        serde_json::json!({"transport":"grpc","decision_address":address,"management_address":address,"decision_token_env":"PUMGYE_DECISION_TOKEN","admin_token_env":"PUMGYE_ADMIN_TOKEN","tls":{"server_name":tls.server_name,"ca":tls.ca,"certificate":tls.certificate,"key":tls.key},"pool_size":8,"timeout_ms":1000,"minimum_revision":1}),
+        serde_json::json!({"transport":"grpc","decision_address":address,"management_address":management_address,"decision_token_env":"PUMGYE_DECISION_TOKEN","admin_token_env":"PUMGYE_ADMIN_TOKEN","tls":{"server_name":tls.server_name,"ca":tls.ca,"certificate":tls.certificate,"key":tls.key},"pool_size":8,"timeout_ms":1000,"minimum_revision":1}),
     )?;
     authority.validate()?;
-    let pumgye = hangang::pumgye_grpc_client::Client::new(
-        &authority,
-        &std::env::var("PUMGYE_DECISION_TOKEN")?,
-    )?;
+    let pumgye = hangang::pumgye::AuthorityRuntime::prepare(&authority)?;
     let public: [u8; 32] = STANDARD
         .decode(config.public_key)?
         .try_into()
@@ -101,13 +103,12 @@ async fn main() -> Result<()> {
     ))?;
     credential.set_sensitive(true);
     headers.insert("authorization", credential);
-    let query = hangang::pumgye_grpc_client::AuthenticatedQuery {
-        resource: "db:orders",
-        action: "select",
-        ip: "203.0.113.9".parse()?,
-        minimum_revision: 1,
-        request_sha256: digest,
+    let gate = hangang::pumgye::ResourceGate {
+        service_id: "orders".into(),
+        resource: "db:orders".into(),
+        actions: std::collections::BTreeMap::from([("GET".into(), "select".into())]),
     };
+    let ip = "203.0.113.9".parse()?;
     let now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -131,9 +132,12 @@ async fn main() -> Result<()> {
                 old.authentication().valid_at(now()),
                 "cached receipt expired before lifecycle query"
             );
-            let result = pumgye.decide_authenticated_resource(&query, old).await;
+            let result = pumgye
+                .observe_authenticated_resource(&gate, "GET", ip, digest, old)
+                .await;
             ensure!(
-                result.is_err() || result.is_ok_and(|result| !result.allow),
+                result.is_err()
+                    || result.is_ok_and(|result| result.is_none_or(|reply| !reply.allow)),
                 "retired or unavailable proof accepted"
             );
         }
@@ -144,8 +148,48 @@ async fn main() -> Result<()> {
         }
         let outcome = client.issue_service_receipt(&headers, &scope, &pin).await;
         let outcome = match outcome {
-            Ok(checked) => match pumgye.decide_authenticated_resource(&query, &checked).await {
-                Ok(reply) if reply.allow => {
+            Ok(checked) => match pumgye
+                .observe_authenticated_resource(&gate, "GET", ip, digest, &checked)
+                .await
+            {
+                Ok(Some(reply)) if reply.allow => {
+                    let mut wrong_service = gate.clone();
+                    wrong_service.service_id = "billing".into();
+                    ensure!(
+                        pumgye
+                            .observe_authenticated_resource(
+                                &wrong_service,
+                                "GET",
+                                ip,
+                                digest,
+                                &checked
+                            )
+                            .await
+                            .is_err(),
+                        "cross-service receipt accepted"
+                    );
+                    ensure!(
+                        pumgye
+                            .observe_authenticated_resource(&gate, "POST", ip, digest, &checked)
+                            .await?
+                            .is_none(),
+                        "unassigned route method accepted"
+                    );
+                    let mut wrong_digest = digest;
+                    wrong_digest[0] ^= 1;
+                    ensure!(
+                        pumgye
+                            .observe_authenticated_resource(
+                                &gate,
+                                "GET",
+                                ip,
+                                wrong_digest,
+                                &checked
+                            )
+                            .await
+                            .is_err(),
+                        "changed request binding accepted"
+                    );
                     let revision = checked.revision();
                     prior = Some(checked);
                     Ok(revision)

@@ -296,3 +296,13 @@ Withdrawal and outage additionally query Pumgye with an unexpired previously
 checked receipt and require refusal. This is local debug-process qualification;
 static release, Kubernetes adoption and actual gateway dispatch remain separate
 gates. Fixture credentials enter through environment references only.
+
+The owning `AuthorityRuntime::observe_authenticated_resource` now accepts the
+route-owned `ResourceGate`, method, IP, final digest and checked service receipt.
+It enforces route/receipt service equality and configured method/action mapping,
+then uses the same authority's bounded gRPC channel and revision floors. The
+owned example exercises this runtime, including cross-service receipt, unmapped
+method and changed-digest refusal. It returns an observation only: it does not
+start or refresh the older authorization lease health watcher. Final request
+transformation, receipt-owner/route freshness and upstream dispatch integration
+remain required before activating this path in routes.

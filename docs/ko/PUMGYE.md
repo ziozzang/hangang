@@ -253,3 +253,11 @@ tools/authenticated_resource_smoke.py --live-validation --grpc-decisions 검사�
 receipt로 품계에 직접 재질의해 거부도 확인합니다. 로컬 디버그 프로세스
 검증이며 정적 릴리즈·Kubernetes 반영·실제 게이트웨이 전달은 별도 검증입니다.
 테스트 자격은 환경 변수 참조로만 전달합니다.
+
+AuthorityRuntime::observe_authenticated_resource는 라우트 소유 ResourceGate·
+메서드·IP·최종 digest·검증 서비스 receipt를 받습니다. 라우트/증명의 서비스
+일치와 설정된 메서드/액션을 확인한 뒤 같은 품계 연결의 제한된 gRPC 채널과
+리비전 하한을 사용합니다. 전용 예제로 이 연결 계층과 다른 서비스 증명·미등록
+메서드·변경 digest 거부를 검증했습니다. 관측 결과만 반환하며 기존 권한 lease의
+상태 감시를 시작하거나 갱신하지 않습니다. 라우트 활성화 전 최종 요청 변환·
+증명 소유자/라우트 최신성·upstream 전달 연결이 필요합니다.

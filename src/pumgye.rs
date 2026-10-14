@@ -761,6 +761,42 @@ impl AuthorityRuntime {
         )
     }
 
+    /// Fresh authenticated observation only; this is not a dispatch lease or permit.
+    /// Resource ownership remains remote, while the route owns method/service scope.
+    pub async fn observe_authenticated_resource(
+        &self,
+        gate: &ResourceGate,
+        method: &str,
+        ip: std::net::IpAddr,
+        request_sha256: [u8; 32],
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+    ) -> Result<Option<crate::pumgye_grpc_client::AuthenticatedReply>> {
+        gate.validate_remote()?;
+        ensure!(
+            receipt.context().service == gate.service_id,
+            "authenticated receipt belongs to another route service"
+        );
+        let Some(action) = gate.actions.get(method) else {
+            return Ok(None);
+        };
+        let DecisionClient::Grpc(client) = &self.native else {
+            anyhow::bail!("authenticated resource authority requires gRPC");
+        };
+        client
+            .decide_authenticated_resource(
+                &crate::pumgye_grpc_client::AuthenticatedQuery {
+                    resource: &gate.resource,
+                    action,
+                    ip,
+                    minimum_revision: 0,
+                    request_sha256,
+                },
+                receipt,
+            )
+            .await
+            .map(Some)
+    }
+
     /// Fixed owning-domain paths only; never forwards client URLs or credentials.
     pub async fn management(
         &self,
