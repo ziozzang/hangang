@@ -136,3 +136,15 @@ python3 tests/kubernetes_cluster.py
 이전 상태를 지우고, 원천 소유권을 확인하지 못하면 자체 정책 편집을 비활성화합니다.
 Kubernetes 소유 정책은 조회 가능하나 소유 원천에서 변경해야 합니다. Kubernetes
 설정 편집과 네 모듈 전체 통합 배포는 아직 구현·검증이 남았습니다.
+
+### 네이티브 Service 발견
+
+호패·품계·수문장 네이티브 주소는 검증한 Service DNS와 고정 포트를 받습니다.
+DNS 주소는 mTLS가 필수이며 localhost도 인증된 loopback으로 취급하지 않습니다.
+기존 요청 기한 안에서 새 pooled 연결을 열 때 조회하고 연결 재사용·폐기 기한을
+유지합니다. ClusterIP와 headless Service 주소를 가능하게 하며 멤버십 프로토콜
+완료를 의미하지 않습니다. 품계 HTTPS 관리 주소가 DNS이면 설정된 TLS 서버
+이름과 일치해야 합니다. IP 주소는 기존 고정 이름의 주소 override를 유지합니다.
+서버 인증서 SAN에 Service DNS를 넣습니다. 호패 콘솔 SSO도 같은 주소 계약을
+사용합니다. 이 변경만으로 Kubernetes 정책 원천 활성화, TLS 완화 또는
+네 모듈 전체 패키지 완료를 주장하지 않습니다.

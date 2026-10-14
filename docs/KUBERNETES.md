@@ -137,3 +137,16 @@ lease. Source failure clears prior status. Unknown source ownership leaves nativ
 policy editing disabled. Kubernetes-owned policies remain inspectable but must be
 changed through their owning source; Kubernetes configuration editing and full
 four-component deployment remain implementation gates.
+
+### Native Service discovery
+
+Native Hopae, Pumgye and Sumunjang endpoints accept validated Service DNS names
+with fixed ports. DNS names require mTLS; `localhost` is not treated as authenticated
+loopback. DNS is resolved when opening a pooled connection, within the existing
+request deadline. Connection reuse and retirement stay unchanged. This enables
+ClusterIP and headless Service addressing, not a completed membership protocol.
+For Pumgye's HTTPS management endpoint, a DNS endpoint must match the configured
+TLS server name; literal IP endpoints retain the existing fixed-name resolution
+override. Use the Service DNS in the server certificate SAN. Hopae console SSO
+uses the same native address contract. No change activates Kubernetes policy
+authority, weakens native TLS or completes the four-component package by itself.

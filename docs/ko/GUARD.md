@@ -87,3 +87,9 @@ loopback 밖에서 필수입니다. 목적지는 고정된 nonzero unicast socke
 HTTP origin은 신호/evidence·snapshot을 계속 처리합니다. native CA는 HGD1에만 적용하므로
 같은 권위의 HTTP origin을 인증된 HTTPS ingress 또는 로컬 broker로 구성합니다. 이 설정은
 fleet discovery·영속 revision watermark·전체 경로 100k QPS를 구현한 것이 아닙니다.
+
+네이티브 판단 주소는 제한된 Service DNS(`sumunjang.world.svc:9081`) 또는
+IPv4/IPv6 주소를 받습니다. localhost도 DNS이면 mTLS가 필수입니다. 새 pooled
+연결은 기존 요청 기한 안에서 조회하며 별도 설정한 서버 이름·CA를 검증합니다.
+DNS·TLS 실패 시 평문 HTTP fallback하지 않습니다. 원격 근거 내보내기의
+origin은 HTTPS를 유지합니다.

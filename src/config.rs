@@ -492,7 +492,7 @@ pub struct ExternalAuth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HopaeNative {
-    pub address: std::net::SocketAddr,
+    pub address: pumgye_client::Endpoint,
     #[serde(default = "hopae_pool_size")]
     pub pool_size: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1632,11 +1632,9 @@ impl Config {
                     );
                 }
                 if let Some(native) = &auth.native {
+                    native.address.validate()?;
                     ensure!(
-                        (native.address.ip().is_loopback() || native.tls.is_some())
-                            && native.address.port() != 0
-                            && !native.address.ip().is_unspecified()
-                            && !native.address.ip().is_multicast(),
+                        (native.address.is_loopback() || native.tls.is_some()),
                         "native Hopae requires a nonzero unicast address; remote connections require mTLS"
                     );
                     if let Some(tls) = &native.tls {

@@ -154,6 +154,23 @@ mod tests {
         assert!(gate.validate_remote().is_err());
     }
     #[test]
+    fn native_service_dns_requires_tls_and_management_identity_match() {
+        let mut authority: AuthorityConfig = serde_json::from_value(serde_json::json!({
+            "decision_address":"pumgye.world.svc:9085", "management_address":"pumgye.world.svc:9084",
+            "decision_token_env":"PUMGYE_DECISION_TOKEN", "admin_token_env":"PUMGYE_ADMIN_TOKEN"
+        })).unwrap();
+        assert!(authority.validate().is_err());
+        authority.tls = Some(AuthorityTls {
+            server_name: "pumgye.world.svc".into(),
+            ca: "/tls/ca.pem".into(),
+            certificate: "/tls/client.pem".into(),
+            key: "/tls/client.key".into(),
+        });
+        assert!(authority.validate().is_ok());
+        authority.tls.as_mut().unwrap().server_name = "other.world.svc".into();
+        assert!(authority.validate().is_err());
+    }
+    #[test]
     fn route_scope_rejects_undefined_rights_and_empty_methods() {
         let policy: pumgye_core::Policy = serde_json::from_value(serde_json::json!({
             "version":1,"information_classes":["internal"],"services":{"orders":{
@@ -182,8 +199,8 @@ mod tests {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityConfig {
-    pub decision_address: std::net::SocketAddr,
-    pub management_address: std::net::SocketAddr,
+    pub decision_address: pumgye_client::Endpoint,
+    pub management_address: pumgye_client::Endpoint,
     pub decision_token_env: String,
     pub admin_token_env: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,22 +231,12 @@ pub struct AuthorityTls {
 }
 impl AuthorityConfig {
     pub fn validate(&self) -> Result<()> {
+        self.decision_address.validate()?;
+        self.management_address.validate()?;
         ensure!(
             self.tls.is_some()
-                || (self.decision_address.ip().is_loopback()
-                    && self.management_address.ip().is_loopback()),
+                || (self.decision_address.is_loopback() && self.management_address.is_loopback()),
             "remote Pumgye requires mTLS"
-        );
-        ensure!(
-            !self.decision_address.ip().is_unspecified()
-                && !self.management_address.ip().is_unspecified()
-                && !self.decision_address.ip().is_multicast()
-                && !self.management_address.ip().is_multicast(),
-            "invalid Pumgye endpoint address"
-        );
-        ensure!(
-            self.decision_address.port() > 0 && self.management_address.port() > 0,
-            "Pumgye requires fixed listener ports"
         );
         ensure!(
             (1..=1024).contains(&self.pool_size)
@@ -262,6 +269,12 @@ impl AuthorityConfig {
                 "invalid Pumgye TLS server name"
             );
             rustls::pki_types::ServerName::try_from(tls.server_name.clone())?;
+            ensure!(
+                self.management_address
+                    .dns_name()
+                    .is_none_or(|name| name.eq_ignore_ascii_case(&tls.server_name)),
+                "Pumgye management Service DNS must match its TLS server name"
+            );
             for path in [&tls.ca, &tls.certificate, &tls.key] {
                 ensure!(!path.as_os_str().is_empty(), "missing Pumgye TLS path");
             }
@@ -362,12 +375,18 @@ impl AuthorityRuntime {
             let mut identity = crate::tls::read_bounded(&tls.certificate)?;
             identity.push(b'\n');
             identity.extend(crate::tls::read_bounded(&tls.key)?);
-            builder = builder
-                .identity(reqwest::Identity::from_pem(&identity)?)
-                .resolve(
-                    &tls.server_name.to_ascii_lowercase(),
-                    config.management_address,
+            builder = builder.identity(reqwest::Identity::from_pem(&identity)?);
+            if let Some(address) = config.management_address.socket_addr() {
+                builder = builder.resolve(&tls.server_name.to_ascii_lowercase(), address);
+            } else {
+                ensure!(
+                    config
+                        .management_address
+                        .dns_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&tls.server_name)),
+                    "Pumgye management Service DNS must match its TLS server name"
                 );
+            }
             (
                 Some(native),
                 reqwest::Url::parse(&format!(
@@ -383,7 +402,7 @@ impl AuthorityRuntime {
             )
         };
         let native = std::sync::Arc::new(pumgye_client::Client::new(
-            config.decision_address,
+            config.decision_address.clone(),
             tls,
             decision,
             config.pool_size,

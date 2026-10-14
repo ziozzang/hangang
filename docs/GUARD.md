@@ -116,3 +116,9 @@ CA configuration applies only to HGD1. Configure the HTTP origin for the same
 authority through its existing authenticated HTTPS ingress or local broker.
 These settings do not implement fleet discovery, persisted revision watermarks
 or measured full-stack 100k QPS.
+
+Native decision endpoints may use a bounded Service DNS name (`sumunjang.world.svc:9081`)
+or literal IPv4/IPv6 address. Every DNS endpoint requires mTLS, including localhost.
+New pooled connections resolve under the existing request deadline; TLS verifies
+the separately configured server name and CA. No plaintext HTTP fallback is added
+when native DNS or TLS fails. Keep an HTTPS origin for remote evidence exports.

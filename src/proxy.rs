@@ -4628,7 +4628,7 @@ mod tests {
     async fn renewal_quota_expiry_and_inflight_cancellation_are_fail_closed() {
         let occupied = RENEWAL_SLOTS.try_acquire_many(4096).unwrap();
         let client = Arc::new(crate::hopae_native::Client::new(
-            "127.0.0.1:9".parse().unwrap(),
+            "127.0.0.1:9".parse::<pumgye_client::Endpoint>().unwrap(),
             1,
             HeaderValue::from_static("owned-key"),
         ));

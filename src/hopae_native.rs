@@ -3,7 +3,6 @@ use crate::hopae_wire as wire;
 use hyper::{HeaderMap, Response};
 use std::{
     io,
-    net::SocketAddr,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -24,7 +23,7 @@ struct Connection {
     used: Instant,
 }
 pub struct Client {
-    address: SocketAddr,
+    address: pumgye_client::Endpoint,
     tls: Option<(
         tokio_rustls::TlsConnector,
         rustls::pki_types::ServerName<'static>,
@@ -65,16 +64,11 @@ impl Client {
             "invalid native Hopae pool size"
         );
         anyhow::ensure!(
-            settings.address.ip().is_loopback() || settings.tls.is_some(),
+            settings.address.is_loopback() || settings.tls.is_some(),
             "remote native Hopae requires mTLS"
         );
-        anyhow::ensure!(
-            settings.address.port() != 0
-                && !settings.address.ip().is_unspecified()
-                && !settings.address.ip().is_multicast(),
-            "invalid native Hopae address"
-        );
-        let mut client = Self::new(settings.address, settings.pool_size, key);
+        settings.address.validate()?;
+        let mut client = Self::new(settings.address.clone(), settings.pool_size, key);
         if let Some(tls) = &settings.tls {
             client.tls = Some(crate::tls::mutual_client(
                 &tls.ca,
@@ -86,9 +80,13 @@ impl Client {
         }
         Ok(client)
     }
-    pub fn new(address: SocketAddr, pool_size: usize, key: hyper::header::HeaderValue) -> Self {
+    pub fn new(
+        address: impl Into<pumgye_client::Endpoint>,
+        pool_size: usize,
+        key: hyper::header::HeaderValue,
+    ) -> Self {
         Self {
-            address,
+            address: address.into(),
             tls: None,
             key,
             idle: Mutex::new(Vec::with_capacity(pool_size)),
@@ -110,10 +108,10 @@ impl Client {
                     && c.created.elapsed() < Duration::from_secs(240)
             });
         if connection.is_none() {
-            if self.tls.is_none() && !self.address.ip().is_loopback() {
+            if self.tls.is_none() && !self.address.is_loopback() {
                 return Err(invalid());
             }
-            let socket = TcpStream::connect(self.address).await?;
+            let socket = TcpStream::connect(self.address.as_str()).await?;
             socket.set_nodelay(true)?;
             let mut socket: Box<dyn Io> = if let Some((connector, name)) = &self.tls {
                 let stream = connector.connect(name.clone(), socket).await?;
@@ -247,7 +245,7 @@ mod tests {
             }
         });
         let mut settings = crate::config::HopaeNative {
-            address,
+            address: format!("localhost:{}", address.port()).parse().unwrap(),
             pool_size: 1,
             tls: Some(crate::config::HopaeNativeTls {
                 server_name: "wrong.example.test".into(),

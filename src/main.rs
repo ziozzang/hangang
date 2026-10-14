@@ -33,7 +33,7 @@ struct Args {
     guard_url: Option<String>,
     /// Opt-in persistent binary decision pool; remote connections require mTLS.
     #[arg(long, requires = "guard_url")]
-    guard_decision_tcp: Option<SocketAddr>,
+    guard_decision_tcp: Option<pumgye_client::Endpoint>,
     #[arg(long, requires_all = ["guard_decision_tcp","guard_decision_ca","guard_decision_cert","guard_decision_key"])]
     guard_decision_server_name: Option<String>,
     #[arg(long, requires = "guard_decision_server_name")]

@@ -2047,12 +2047,13 @@ dependencies = [
 [[package]]
 name = "pumgye-client"
 version = "0.1.0"
-source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
+source = "git+https://github.com/ziozzang/pumgye?rev=5794fe2e182de0cbfbb338783ccde5aff4442bcc#5794fe2e182de0cbfbb338783ccde5aff4442bcc"
 dependencies = [
  "anyhow",
  "pumgye-protocol",
  "rustls",
  "rustls-pemfile",
+ "serde",
  "tokio",
  "tokio-rustls",
 ]
@@ -2060,7 +2061,7 @@ dependencies = [
 [[package]]
 name = "pumgye-core"
 version = "0.1.0"
-source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
+source = "git+https://github.com/ziozzang/pumgye?rev=5794fe2e182de0cbfbb338783ccde5aff4442bcc#5794fe2e182de0cbfbb338783ccde5aff4442bcc"
 dependencies = [
  "anyhow",
  "guard-core",
@@ -2071,7 +2072,7 @@ dependencies = [
 [[package]]
 name = "pumgye-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ziozzang/pumgye?rev=25a50474fb1a87d5027c71072bf6929f1f947998#25a50474fb1a87d5027c71072bf6929f1f947998"
+source = "git+https://github.com/ziozzang/pumgye?rev=5794fe2e182de0cbfbb338783ccde5aff4442bcc#5794fe2e182de0cbfbb338783ccde5aff4442bcc"
 dependencies = [
  "anyhow",
  "pumgye-core",

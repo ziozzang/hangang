@@ -9,7 +9,6 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     io::Read,
-    net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,7 +19,7 @@ use tokio::time::Instant;
 #[serde(deny_unknown_fields)]
 struct Config {
     public_url: String,
-    native_address: SocketAddr,
+    native_address: pumgye_client::Endpoint,
     #[serde(default)]
     native_tls: Option<hangang::config::HopaeNativeTls>,
     gateway_key_env: String,
@@ -97,7 +96,7 @@ impl Sso {
             "SSO public_url must be an origin"
         );
         ensure!(
-            (config.native_address.ip().is_loopback() || config.native_tls.is_some())
+            (config.native_address.is_loopback() || config.native_tls.is_some())
                 && config.native_address.port() != 0,
             "remote SSO native peer requires mTLS"
         );
@@ -126,9 +125,10 @@ impl Sso {
         let token = std::env::var(&config.upstream_token_env)
             .context("SSO upstream credential unavailable")?;
         let system = secret(format!("Bearer {token}"))?;
+        config.native_address.validate()?;
         let native = Client::from_config(
             &hangang::config::HopaeNative {
-                address: config.native_address,
+                address: config.native_address.clone(),
                 pool_size: 8,
                 tls: config.native_tls.clone(),
             },
@@ -402,7 +402,7 @@ mod tests {
         });
         let config = Config {
             public_url: "https://console.example.test/".into(),
-            native_address: address,
+            native_address: address.into(),
             native_tls: None,
             gateway_key_env: "FIXTURE".into(),
             upstream_token_env: "FIXTURE".into(),

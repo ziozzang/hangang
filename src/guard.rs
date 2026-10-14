@@ -6,7 +6,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -196,7 +196,7 @@ struct IdleSocket {
     last_used: std::time::Instant,
 }
 struct TcpPool {
-    address: SocketAddr,
+    address: pumgye_client::Endpoint,
     tls: Option<(
         tokio_rustls::TlsConnector,
         rustls::pki_types::ServerName<'static>,
@@ -232,7 +232,7 @@ impl TcpPool {
             let (mut socket, created) = if let Some(cached) = cached {
                 cached
             } else {
-                let socket = TcpStream::connect(self.address).await?;
+                let socket = TcpStream::connect(self.address.as_str()).await?;
                 socket.set_nodelay(true)?;
                 let mut socket: Box<dyn NativeIo> = if let Some((connector, name)) = &self.tls {
                     let stream = connector.connect(name.clone(), socket).await?;
@@ -390,7 +390,7 @@ pub struct NativeTls {
     pub key: std::path::PathBuf,
 }
 pub struct Config {
-    pub decision_tcp: Option<SocketAddr>,
+    pub decision_tcp: Option<pumgye_client::Endpoint>,
     pub decision_tls: Option<NativeTls>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
@@ -428,12 +428,10 @@ impl Config {
                 "guard native TLS paths must be absolute"
             );
         }
-        if let Some(address) = self.decision_tcp {
+        if let Some(address) = &self.decision_tcp {
+            address.validate()?;
             ensure!(
-                (address.ip().is_loopback() || self.decision_tls.is_some())
-                    && address.port() > 0
-                    && !address.ip().is_unspecified()
-                    && !address.ip().is_multicast(),
+                (address.is_loopback() || self.decision_tls.is_some()),
                 "remote guard decision TCP requires mTLS and a nonzero unicast address"
             );
             ensure!(
@@ -894,6 +892,7 @@ impl GuardClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     fn snapshot() -> Snapshot {
         Snapshot {
             version: 1,
@@ -979,6 +978,21 @@ mod tests {
         assert!(c.validate().is_ok());
         c.url = "https://user:secret@example.com".into();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn service_dns_never_authorizes_plaintext_loopback() {
+        let mut config = test_config("http://127.0.0.1:8090".into());
+        for endpoint in ["localhost:9081", "sumunjang.world.svc:9081"] {
+            config.decision_tcp = Some(endpoint.parse().unwrap());
+            assert!(config.validate().is_err());
+        }
+        config.decision_tls = Some(NativeTls {
+            server_name: "sumunjang.world.svc".into(),
+            ca: "/tls/ca.pem".into(),
+            certificate: "/tls/client.pem".into(),
+            key: "/tls/client.key".into(),
+        });
+        assert!(config.validate().is_ok());
     }
     #[test]
     fn saturated_export_is_nonblocking() {
@@ -1306,7 +1320,7 @@ mod tests {
             key: temp.path().join("client.key"),
         };
         let mut config = test_config(url.clone());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(format!("localhost:{}", tcp.address.port()).parse().unwrap());
         config.decision_tls = Some(settings.clone());
         let cancel = CancellationToken::new();
         let guard =
@@ -1319,7 +1333,7 @@ mod tests {
         tcp.response.lock().unwrap()[1] = 1;
         assert_eq!(guard.rejection(ip, "/ordinary").await, Some(403));
         let mut config = test_config(url.clone());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(format!("localhost:{}", tcp.address.port()).parse().unwrap());
         config.decision_tls = Some(NativeTls {
             server_name: "wrong.example.test".into(),
             ..settings.clone()
@@ -1333,7 +1347,7 @@ mod tests {
         let other = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
         std::fs::write(temp.path().join("other.pem"), other.pem()).unwrap();
         let mut config = test_config(url);
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(format!("localhost:{}", tcp.address.port()).parse().unwrap());
         config.decision_tls = Some(NativeTls {
             ca: temp.path().join("other.pem"),
             ..settings
@@ -1423,7 +1437,7 @@ mod tests {
         let tcp = tcp_server().await;
         let (url, http_seen, _, http_task) = decision_server().await;
         let mut config = test_config(url);
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         let guard = GuardClient::start_with_token(
             config,
             "test-token-0123456789".into(),
@@ -1458,7 +1472,7 @@ mod tests {
         let tcp = tcp_server().await;
         let (url, http_seen, _, http_task) = decision_server().await;
         let mut config = test_config(url.clone());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         config.timeout_ms = 25;
         let guard = GuardClient::start_with_token(
             config,
@@ -1478,7 +1492,7 @@ mod tests {
             TCP_POOL_SIZE
         );
         let mut config = test_config(url);
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         let guard = GuardClient::start_with_token(
             config,
             "test-token-0123456789".into(),
@@ -1501,7 +1515,7 @@ mod tests {
         let tcp = tcp_server().await;
         let (url, http_seen, _, http_task) = decision_server().await;
         let mut config = test_config(url);
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         config.cache_ms = 1000;
         let guard = GuardClient::start_with_token(
             config,
@@ -1525,7 +1539,7 @@ mod tests {
     async fn tcp_shutdown_closes_idle_pool_and_wakes_waiters() {
         let tcp = tcp_server().await;
         let mut config = test_config("http://127.0.0.1:1".into());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         let cancel = CancellationToken::new();
         let guard =
             GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
@@ -1551,7 +1565,7 @@ mod tests {
     async fn tcp_idle_socket_is_retired_before_server_idle_timeout() {
         let tcp = tcp_server().await;
         let mut config = test_config("http://127.0.0.1:1".into());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         let cancel = CancellationToken::new();
         let guard =
             GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
@@ -1576,13 +1590,13 @@ mod tests {
         use pumgye_core::GuardEvidence;
         let tcp = tcp_server().await;
         let mut config = test_config("http://127.0.0.1:1".into());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         let cancel = CancellationToken::new();
         let guard =
             GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
                 .unwrap();
         let mut other_config = test_config("http://127.0.0.1:1".into());
-        other_config.decision_tcp = Some(tcp.address);
+        other_config.decision_tcp = Some(tcp.address.into());
         let other = GuardClient::start_with_token(
             other_config,
             "test-token-0123456789".into(),
@@ -1621,7 +1635,7 @@ mod tests {
         use pumgye_core::GuardEvidence;
         let tcp = tcp_server().await;
         let mut config = test_config("http://127.0.0.1:1".into());
-        config.decision_tcp = Some(tcp.address);
+        config.decision_tcp = Some(tcp.address.into());
         config.cache_ms = 5000;
         config.failure_mode = FailureMode::Allow;
         let cancel = CancellationToken::new();
