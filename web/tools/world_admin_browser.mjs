@@ -2,6 +2,9 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execute=promisify(execFile);
 import { randomBytes } from 'node:crypto';
 import { chromium, expect } from '@playwright/test';
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
@@ -15,9 +18,10 @@ function exchange(transport,options){
 async function protectedStatus(expected){
   const before=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
   const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:'Bearer '+config.application.key}});
-  expect(response.status).toBe(expected);
+  if(expected!==null)expect(response.status).toBe(expected);
   const after=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
-  expect(after).toBe(before+(expected===200?1:0));
+  expect(after).toBe(before+(response.status===200?1:0));
+  return response.status;
 }
 const browser=await chromium.launch({headless:true});
 try {
@@ -73,6 +77,25 @@ try {
       await publish('null');
       await expect(editor).toHaveValue('null');
       await protectedStatus(401);
+      if(config.hopaeRestart){
+        const {kubectl,namespace}=config.hopaeRestart;
+        if(!/^owned-world-[a-f0-9]{12}$/.test(namespace)||!kubectl.startsWith('/'))throw new Error('invalid owned restart scope');
+        await execute(kubectl,['-n',namespace,'rollout','restart','deployment/hopae'],{timeout:15000});
+        await execute(kubectl,['-n',namespace,'rollout','status','deployment/hopae','--timeout=120s'],{timeout:135000});
+        const reconnectStatuses=[];
+        await expect.poll(async()=>{
+          const status=await protectedStatus(null);
+          reconnectStatuses.push(status);
+          return status;
+        },{timeout:15000,intervals:[200,500,1000]}).toBe(401);
+        expect(reconnectStatuses.every(status=>status===401||status===503)).toBe(true);
+        // Reload the actual authority document after replacing its process.
+        await hop.locator('[data-tab="status"]').click();
+        await expect(hop.getByRole('heading',{name:'Providers',exact:true})).toBeVisible();
+        await hop.locator('[data-tab="profiles"]').click();
+        await expect(editor).toHaveValue('null');
+        console.log('PASS: Hopae profile revocation survives actual K8s Pod replacement despite unchanged bootstrap configuration');
+      }
       await publish(original);
       await protectedStatus(200);
       console.log('PASS: real Hopae browser profile revocation/restoration changes protected requests immediately; refused request never reaches application');
