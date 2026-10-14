@@ -5,9 +5,9 @@ use bytes::Bytes;
 use hangang::{
     config::HopaeNative,
     hopae_native::Client,
-    projection_binding,
     projection_receipt::{IssuerPin, ServiceScope},
 };
+use http_body_util::{BodyExt, Full};
 use hyper::{
     HeaderMap, Request,
     header::{HeaderName, HeaderValue},
@@ -77,8 +77,28 @@ async fn main() -> Result<()> {
         .method(config.method.as_str())
         .uri(&config.target)
         .body(Bytes::from(config.body))?;
-    let digest = projection_binding::digest(&config.service, &config.audience, &request)
-        .map_err(|_| anyhow::anyhow!("invalid native request binding"))?;
+    ensure!(
+        request.uri().scheme().is_none() && request.uri().authority().is_none(),
+        "owned origin target required"
+    );
+    let (mut parts, bytes) = request.into_parts();
+    parts.uri = format!("https://orders.example.test{}", parts.uri).parse()?;
+    let prepared = hangang::projection_entity::prepare(
+        Request::from_parts(
+            parts,
+            Full::new(bytes)
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        ),
+        &config.service,
+        &config.audience,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        1024 * 1024,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("final entity preparation refused"))?;
+    let digest = prepared.digest();
     let scope = ServiceScope {
         service: &config.service,
         audience: &config.audience,

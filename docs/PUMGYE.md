@@ -328,3 +328,21 @@ and ambiguous/invalid paths refuse in this adapter. Service/audience and backend
 owner binding remain separate requirements: the canonical request digest does
 not include the URI authority. This helper does not buffer streams, issue a
 receipt or activate dispatch.
+
+`projection_entity::prepare` materializes the complete final entity under
+owner-supplied global admission, byte cap (1 byte–16 MiB) and deadline (up to five
+seconds). Admission remains with the prepared request and its dispatch body.
+Single-frame bodies retain their original `Bytes` allocation; fragmented bodies
+reserve at most the configured cap once, beyond source frame buffers. The read
+loop yields every 64 frames so continuously ready empty frames cannot starve
+deadline/cancellation. Capacity, length ambiguity/mismatch, excess bytes, body
+errors, unsupported trailers and invalid final targets refuse. Dispatch framing
+is regenerated from the preserved bytes. This phase grants no permission.
+
+Eight entity tests cover byte preservation, admission lifetime/cancellation,
+allocation reuse and adversarial inputs. The actual Hangang three-authority
+fixture now derives its receipt digest from this prepared final request. Both
+empty and `--nonempty-entity` runs pass Allow, network/identity lifecycle, outage
+and trust refusals. The nonempty run also passes with Pumgye's own client. These
+are local preparation/authority tests, not actual gateway transformation or
+upstream dispatch, static release, Kubernetes or production adoption.
