@@ -4,6 +4,10 @@
 
 Hangang은 `networking.k8s.io/v1` Ingress 및 Service 객체를 지속적으로 조정하여 실행 중인 프록시 설정에 반영할 수 있습니다. 각 프록시 복제본이 API를 독립적으로 읽으므로 경로의 가용성이 리더에 의존하지 않습니다. 이전의 `--import-ingress` 명령도 오프라인 변환용으로 계속 사용할 수 있습니다.
 
+생성된 Ingress 경로는 호스트·경로 규칙과 기본 백엔드 모두에서 포트를 포함한
+원래 요청의 `Host` 헤더를 보존합니다. Service DNS 이름은 백엔드 연결 주소이며,
+애플리케이션의 외부 호스트 이름을 대체하지 않습니다.
+
 ## 배포
 
 이 저장소의 이미지를 빌드하고 게시한 뒤, `deploy/kubernetes/deployment.yaml`의 자리표시자 이미지를 교체하고, 비공개 관리자 토큰 파일을 만들어 kustomization을 적용합니다. 루트 [Dockerfile](../../Dockerfile)은 먼저 `make static`을 실행해야 하며 게이트웨이 바이너리만 패키징합니다.

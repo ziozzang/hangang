@@ -304,7 +304,7 @@ fn ingress_routes(
             };
             let backend = service_backend(&path["backend"], namespace, services)?;
             let route: HttpRoute = serde_json::from_value(
-                serde_json::json!({"id":identifier(&prefix,&format!("{rule_index}.{path_index}")),"host":host,"path_prefix":path["path"].as_str().context("Ingress path missing")?,"path_match":kind,"backends":[backend]}),
+                serde_json::json!({"id":identifier(&prefix,&format!("{rule_index}.{path_index}")),"host":host,"path_prefix":path["path"].as_str().context("Ingress path missing")?,"path_match":kind,"preserve_host":true,"backends":[backend]}),
             )?;
             routes.push(route);
         }
@@ -312,7 +312,7 @@ fn ingress_routes(
     let default = if let Some(default) = resource["spec"].get("defaultBackend") {
         let backend = service_backend(default, namespace, services)?;
         Some(serde_json::from_value::<HttpRoute>(
-            serde_json::json!({"id":identifier(&prefix,"default"),"backends":[backend]}),
+            serde_json::json!({"id":identifier(&prefix,"default"),"preserve_host":true,"backends":[backend]}),
         )?)
     } else {
         None
