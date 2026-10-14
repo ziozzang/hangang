@@ -28,12 +28,26 @@ pub struct ResourceReply {
     pub decision: pumgye_core::ResourceDecision,
 }
 
+/// Native target only; identity and assurance come from the checked receipt.
+pub struct AuthenticatedQuery<'a> {
+    pub resource: &'a str,
+    pub action: &'a str,
+    pub ip: std::net::IpAddr,
+    pub minimum_revision: u64,
+    pub request_sha256: [u8; 32],
+}
+pub struct AuthenticatedReply {
+    pub revision: u64,
+    pub network_revision: u64,
+    pub allow: bool,
+}
 pub struct Client {
     channel: Channel,
     token: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     slots: Arc<tokio::sync::Semaphore>,
     timeout: Duration,
     revision: AtomicU64,
+    network_revision: AtomicU64,
     sequence: AtomicU64,
 }
 impl Client {
@@ -64,6 +78,7 @@ impl Client {
             slots: Arc::new(tokio::sync::Semaphore::new(config.pool_size)),
             timeout,
             revision: AtomicU64::new(config.minimum_revision),
+            network_revision: AtomicU64::new(0),
             sequence: AtomicU64::new(1),
         })
     }
@@ -72,6 +87,110 @@ impl Client {
     }
     pub fn require_revision(&self, revision: u64) {
         self.revision.fetch_max(revision, Ordering::AcqRel);
+    }
+    pub async fn decide_authenticated_resource(
+        &self,
+        query: &AuthenticatedQuery<'_>,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+    ) -> Result<AuthenticatedReply> {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let begun = Instant::now();
+        let clock = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_millis().min(u64::MAX as u128) as u64)
+        };
+        let before = clock()?;
+        let context = receipt.context();
+        ensure!(
+            query.minimum_revision <= 9_007_199_254_740_991
+                && query.request_sha256 == context.request_sha256
+                && receipt.authentication().valid_at(before),
+            "authenticated request binding or expiry refused"
+        );
+        ensure!(
+            [query.resource, query.action]
+                .iter()
+                .all(|value| !value.is_empty()
+                    && value.len() <= 128
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))),
+            "invalid authenticated resource scope"
+        );
+        let _permit = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("gRPC decision capacity"))?;
+        let request_id = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                (value < 9_007_199_254_740_991).then(|| value + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("gRPC request sequence exhausted"))?;
+        let floor = self.revision().max(query.minimum_revision);
+        let timeout = self.timeout.min(Duration::from_millis(
+            receipt.authentication().expires_ms() - before,
+        ));
+        let mut request = tonic::Request::new(pumgye_grpc::v1::AuthenticatedResourceRequest {
+            request_id,
+            minimum_revision: floor,
+            ip: match query.ip {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            },
+            resource: query.resource.into(),
+            action: query.action.into(),
+            context: Some(hopae_grpc::v1::AuthenticationReceiptContext {
+                issuer_ref: context.issuer_ref.into(),
+                key_epoch: context.key_epoch,
+                identity_authority_epoch: context.identity_authority_epoch.into(),
+                identity: Some(hopae_grpc::v1::ReceiptIdentity {
+                    subject_ref: context.identity.subject_ref.into(),
+                    kind: 2,
+                    aal: 0,
+                    revision: context.identity.revision,
+                    credential_generation: context.identity.credential_generation,
+                }),
+                service: context.service.into(),
+                audience: context.audience.into(),
+                request_sha256: context.request_sha256.to_vec(),
+            }),
+            receipt: receipt.authentication().receipt_bytes().to_vec(),
+            request_sha256: query.request_sha256.to_vec(),
+        });
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.token.clone());
+        let mut client = pumgye_grpc::v1::authenticated_resource_authorization_client::AuthenticatedResourceAuthorizationClient::new(self.channel.clone()).max_encoding_message_size(4096).max_decoding_message_size(128);
+        let reply = tokio::time::timeout(timeout, client.decide(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("gRPC authenticated deadline"))??
+            .into_inner();
+        let after = clock()?;
+        let final_ms = after
+            .max(before.saturating_add(begun.elapsed().as_millis().min(u64::MAX as u128) as u64));
+        ensure!(
+            after >= before && receipt.authentication().valid_at(final_ms),
+            "authenticated response expired or clock reversed"
+        );
+        let reply = decode_authenticated(
+            reply,
+            request_id,
+            floor.max(self.revision()),
+            self.network_revision.load(Ordering::Acquire),
+        )?;
+        self.network_revision
+            .fetch_max(reply.network_revision, Ordering::AcqRel);
+        self.require_revision(reply.revision);
+        ensure!(
+            reply.revision >= self.revision()
+                && reply.network_revision >= self.network_revision.load(Ordering::Acquire),
+            "authenticated authority revision changed"
+        );
+        Ok(reply)
     }
     pub async fn decide_resource(&self, query: &ResourceQuery<'_>) -> Result<ResourceReply> {
         ensure!(
@@ -209,6 +328,28 @@ impl Client {
         .map_err(|_| anyhow::anyhow!("gRPC decision deadline"))?
     }
 }
+fn decode_authenticated(
+    reply: pumgye_grpc::v1::AuthenticatedResourceReply,
+    request_id: u64,
+    policy_floor: u64,
+    network_floor: u64,
+) -> Result<AuthenticatedReply> {
+    ensure!(
+        reply.request_id == request_id
+            && (1..=9_007_199_254_740_991).contains(&reply.revision)
+            && reply.revision >= policy_floor
+            && (1..=9_007_199_254_740_991).contains(&reply.network_revision)
+            && reply.network_revision >= network_floor
+            && reply.cache_ttl_ms == 0
+            && matches!(reply.verdict, 1 | 2),
+        "invalid authenticated response"
+    );
+    Ok(AuthenticatedReply {
+        revision: reply.revision,
+        network_revision: reply.network_revision,
+        allow: reply.verdict == 1,
+    })
+}
 fn decode_resource(
     result: pumgye_grpc::v1::ResourceDecisionReply,
     request_id: u64,
@@ -259,6 +400,33 @@ fn decode(result: DecisionReply, request_id: u64, floor: u64) -> Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authenticated_reply_refuses_unsupported_verdict_cache_and_stale_owners() {
+        let reply = || pumgye_grpc::v1::AuthenticatedResourceReply {
+            request_id: 7,
+            revision: 3,
+            network_revision: 4,
+            verdict: 1,
+            cache_ttl_ms: 0,
+        };
+        assert!(decode_authenticated(reply(), 7, 3, 4).unwrap().allow);
+        for field in ["id", "policy", "network", "verdict", "cache", "overflow"] {
+            let mut value = reply();
+            match field {
+                "id" => value.request_id = 8,
+                "policy" => value.revision = 2,
+                "network" => value.network_revision = 3,
+                "verdict" => value.verdict = 3,
+                "cache" => value.cache_ttl_ms = 1,
+                "overflow" => value.revision = u64::MAX,
+                _ => unreachable!(),
+            }
+            assert!(decode_authenticated(value, 7, 3, 4).is_err(), "{field}");
+        }
+        let mut denied = reply();
+        denied.verdict = 2;
+        assert!(!decode_authenticated(denied, 7, 3, 4).unwrap().allow);
+    }
     #[test]
     fn resource_reply_rejects_default_conflicting_stale_and_cached_allow() {
         use pumgye_grpc::v1::ResourceDecisionReply;

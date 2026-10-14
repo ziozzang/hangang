@@ -12,6 +12,8 @@ pub struct IssuerPin {
 }
 /// No Clone/Debug/serde: do not install this as an ordinary authentication header.
 pub struct CheckedAuthentication {
+    verified_ms: u64,
+    begun: std::time::Instant,
     bytes: [u8; receipt::LENGTH],
     expires_ms: u64,
 }
@@ -43,6 +45,7 @@ impl IssuerPin {
         if current.issuer_ref != self.issuer || current.key_epoch != self.epoch {
             return Err(Refused);
         }
+        let begun = std::time::Instant::now();
         let binding = receipt_binding::digest(current, None).map_err(|_| Refused)?;
         let checked = receipt::verify(
             &self.key,
@@ -53,6 +56,8 @@ impl IssuerPin {
         )
         .map_err(|_| Refused)?;
         Ok(CheckedAuthentication {
+            verified_ms: now_ms,
+            begun,
             bytes: bytes.try_into().map_err(|_| Refused)?,
             expires_ms: checked.claims().expires_ms,
         })
@@ -163,6 +168,13 @@ impl IssuerPin {
 }
 
 impl CheckedAuthentication {
+    pub fn valid_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.verified_ms
+            && now_ms.max(
+                self.verified_ms
+                    .saturating_add(self.begun.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            ) < self.expires_ms
+    }
     pub fn expires_ms(&self) -> u64 {
         self.expires_ms
     }
@@ -209,6 +221,15 @@ mod tests {
             },
         )
         .unwrap();
+        let mut authenticated = pin.verify_authentication(&context(), &bytes, 101).unwrap();
+        assert!(authenticated.valid_at(101));
+        assert!(!authenticated.valid_at(100));
+        assert!(!authenticated.valid_at(1100));
+        authenticated.begun = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(
+            !authenticated.valid_at(101),
+            "monotonic elapsed time must expire a stalled wall clock"
+        );
         let scope = ServiceScope {
             service: "orders",
             audience: "orders-api",

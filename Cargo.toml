@@ -9,13 +9,13 @@ description = "A dynamically configured asynchronous L4/L7 reverse proxy"
 repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
-hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "0d8d6860780ed0236635f9e92488b5fdea08ddc6" }
+hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "73796eea0466636acfd771964ac40f02328b22af" }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
-pumgye-grpc = { git = "https://github.com/ziozzang/pumgye", rev = "b8e972bad12095eb814ee5545ac2a77468facfbf" }
-pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "b8e972bad12095eb814ee5545ac2a77468facfbf" }
-pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "b8e972bad12095eb814ee5545ac2a77468facfbf" }
-pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "b8e972bad12095eb814ee5545ac2a77468facfbf" }
+pumgye-grpc = { git = "https://github.com/ziozzang/pumgye", rev = "507c3325ae436c19e866277a3a6d1b20cd299ffd" }
+pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "507c3325ae436c19e866277a3a6d1b20cd299ffd" }
+pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "507c3325ae436c19e866277a3a6d1b20cd299ffd" }
+pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "507c3325ae436c19e866277a3a6d1b20cd299ffd" }
 hmac = "0.12"
 anyhow = "1"
 async-trait = "0.1"

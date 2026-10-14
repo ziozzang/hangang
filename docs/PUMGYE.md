@@ -265,3 +265,25 @@ credentials/UID/network, actual management health and current catalog UI assets.
 Resource routes still require explicit owner configuration. This is selected
 release/operating qualification; broader identity, projection, fleet and automatic
 update requirements remain open.
+
+## Native authenticated gRPC client (unreleased)
+
+`pumgye_grpc_client::Client::decide_authenticated_resource` uses the existing
+persistent mTLS channel, shared admission and revision tracking. Input identity,
+service and assurance come only from the opaque checked Hopae service receipt;
+the native query carries resource/action/IP and the final request digest. The
+canonical Hopae protobuf context is shared with Pumgye. Encoding/decoding is
+bounded to 4 KiB/128 bytes and deadlines are capped at receipt expiry.
+
+Exact correlation, supported Allow/Deny, zero cache TTL, safe policy/network
+revisions and monotonically observed floors are checked before returning.
+Receipt verification captures its verification time and monotonic start so
+rollback/stalled clocks cannot extend use. No native/HTTP fallback is introduced.
+Adversarial reply and receipt time tests plus all-target Clippy passed. Actual
+Hangang-to-Pumgye positive RPC and gateway dispatch/configuration remain to be
+connected; this library increment does not change operating routes or issue
+signed permits.
+
+Full all-target regression passed 1,267 tests with 58 explicit ignores after
+the dependency/client/receipt-time changes; strict all-target Clippy passed.
+This is source/library qualification, not live request dispatch activation.
