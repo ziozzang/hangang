@@ -45,6 +45,14 @@ kubectl -n demo rollout status deployment/echo-b
 
 ## 기존 외부 게이트웨이 설정
 
+k3d 브릿지 시나리오에서는 컨트롤러 Service를 공통 NodePort로 노출합니다. 클러스터에서 허용하고 다른 서비스가 사용하지 않는 포트를 선택하세요.
+
+```sh
+kubectl -n demo patch service hangang --type merge -p '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"targetPort":"http","protocol":"TCP","nodePort":30090}]}}'
+```
+
+호스트·네트워크 접근 제어로 외부 게이트웨이의 접속만 허용하세요. 앱 Service는 ClusterIP를 유지합니다.
+
 각 도메인에 대해 같은 내부 진입점을 대상으로 TLS 필수 및 Host 보존 HTTP route를 등록합니다. 다음은 기존 설정/API에 넣는 route 객체이며 전체 설정 파일이 아닙니다.
 
 ```json
