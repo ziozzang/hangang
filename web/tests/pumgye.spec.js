@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-async function setup(page, { scope = '"3"', delayed = false, source = 'native' } = {}) {
+async function setup(page, { scope = '"3"', delayed = false, source = 'native', sourceState = 'native', healthy = true } = {}) {
   const calls = [];
   let release;
   const gate = new Promise(resolve => { release = resolve; });
@@ -25,7 +25,7 @@ async function setup(page, { scope = '"3"', delayed = false, source = 'native' }
       const headers = { etag: `"${document.revision}"` }; if (scope) headers['x-hangang-config-revision'] = scope;
       return route.fulfill({ json: document, headers });
     }
-    if (path === '/v1/pumgye/status') return route.fulfill({ json: { healthy: true, policy_source: source, policy_revision: document.revision, decision_queries: 42 } });
+    if (path === '/v1/pumgye/status') return route.fulfill({ json: { healthy, source_state: sourceState, source_lease_remaining_ms: source === 'kubernetes' ? 0 : null, policy_source: source, policy_revision: document.revision, decision_queries: 42 } });
     if (path === '/v1/pumgye/audit') return route.fulfill({ json: [{ revision: document.revision, actor: 'mtls:fixture-node', sha256: 'a'.repeat(64) }] });
     return route.fulfill({ status: 404, body: '' });
   });
@@ -89,6 +89,32 @@ test('Kubernetes source policy remains inspectable but cannot be edited or publi
   await expect(page.locator('#pumgye-subject')).toBeDisabled();
   await expect(page.locator('#pumgye-new-service')).toBeDisabled();
   for (const button of await page.locator('#pumgye-matrix button').all()) await expect(button).toBeDisabled();
+  await page.locator('#pumgye-publish').dispatchEvent('click');
+  expect(calls.some(call => call.method === 'PUT')).toBe(false);
+});
+
+
+test('expired Kubernetes authority is explicit and its persisted matrix stays read-only', async ({ page }) => {
+  const { calls } = await setup(page, { source: 'kubernetes', sourceState: 'expired', healthy: false });
+  await expect(page.locator('#pumgye-source-summary')).toContainText('Kubernetes source expired');
+  await expect(page.locator('#pumgye-source-summary')).toContainText('Authority unavailable');
+  await expect(page.locator('#pumgye-source-summary')).toContainText('Applied policy revision 7');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  await page.route('**/v1/pumgye/status', route => route.fulfill({ status: 503, json: { error: 'unavailable' } }));
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-source-summary')).toHaveText('Authority unavailable');
+  await expect(page.locator('#pumgye-authority-status')).toHaveText('');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  expect(calls.some(call => call.method === 'PUT')).toBe(false);
+});
+
+test('unreported policy ownership never enables database edits', async ({ page }) => {
+  const { calls } = await setup(page, { source: undefined, sourceState: 'starting', healthy: false });
+  // An unknown explicit source is also not a native authority.
+  await page.route('**/v1/pumgye/status', route => route.fulfill({ json: { healthy: false, policy_revision: 7 } }));
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-source-summary')).toContainText('Source state unreported');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
   await page.locator('#pumgye-publish').dispatchEvent('click');
   expect(calls.some(call => call.method === 'PUT')).toBe(false);
 });

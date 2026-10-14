@@ -127,3 +127,13 @@ python3 tests/kubernetes_cluster.py
 ```
 
 Set `HANGANG_BINARY=/absolute/path/to/hangang` to qualify an already built executable. The script skips only when its repository-local `target/test-tools/kind` binary is absent; it never uses or changes the user's current Kubernetes context.
+
+### Pumgye source diagnostics in the console
+
+The integrated Pumgye page shows the source phase, authority availability, last
+applied policy revision and reported source lease remaining at the last refresh.
+Refresh retrieves a new observation; the displayed countdown is not a permission
+lease. Source failure clears prior status. Unknown source ownership leaves native
+policy editing disabled. Kubernetes-owned policies remain inspectable but must be
+changed through their owning source; Kubernetes configuration editing and full
+four-component deployment remain implementation gates.

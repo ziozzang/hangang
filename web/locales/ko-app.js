@@ -1,6 +1,23 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  "Policy source ownership is unreported. Native editing is disabled.": "정책 원천 소유권이 보고되지 않았습니다. 자체 편집을 비활성화합니다.",
+  "Status at last refresh": "마지막 새로고침 시점의 상태",
+  "Native policy source": "자체 정책 원천",
+  "Kubernetes source starting": "Kubernetes 원천 시작 중",
+  "Kubernetes source collecting": "Kubernetes 원천 수집 중",
+  "Kubernetes source fresh": "Kubernetes 원천 신선",
+  "Kubernetes source expired": "Kubernetes 원천 만료",
+  "Kubernetes source collection failed": "Kubernetes 원천 수집 실패",
+  "Kubernetes policy candidate rejected": "Kubernetes 정책 후보 거부",
+  "Policy persistence failed": "정책 영속화 실패",
+  "Source state unreported": "원천 상태 미보고",
+  "Authority available": "권위 원천 사용 가능",
+  "Authority unavailable": "권위 원천 사용 불가",
+  "Applied policy revision {revision}": "적용 정책 리비전 {revision}",
+  "Source lease remaining {milliseconds} ms": "원천 유효기간 {milliseconds}ms 남음",
+  "Checking authority": "권위 원천 확인 중",
+
   'Search host, ID, listener, or upstream': '호스트, ID, 리스너 또는 업스트림 검색',
   'Public listeners: {names}': '공개 리스너: {names}',
   'Workload mTLS listeners: {names}': '워크로드 mTLS 리스너: {names}',
