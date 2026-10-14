@@ -251,3 +251,17 @@ Only that idempotent read now permits bounded transport retries; the passing run
 needed none. Protected calls are never replayed. Existing nodes/DNS/Ingress and
 backup copies were preserved; the owned namespace was removed. This is candidate
 functional qualification, not production rollout or performance evidence.
+
+## Signed release adoption
+
+[Hangang v0.3.4](https://github.com/ziozzang/hangang/releases/tag/v0.3.4), source
+bd2bdfc, includes the native resource gate and catalog console. All eight Linux
+amd64 executables are static musl. Five uploaded/downloaded assets matched and
+signatures were independently verified against the existing pinned identity.
+The exact signed Hangang 0.3.4/Pumgye 0.1.3 images passed the remote Kubernetes
+and real-browser resource fixture. Internal gateway and standalone console adoption
+passed private rollback backups, production preflight, unchanged configuration,
+credentials/UID/network, actual management health and current catalog UI assets.
+Resource routes still require explicit owner configuration. This is selected
+release/operating qualification; broader identity, projection, fleet and automatic
+update requirements remain open.

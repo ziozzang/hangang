@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-### 0.3.4 preparation
+## 0.3.4 — 2026-10-15
 
 - Enforce native resource/action gates through the independent Pumgye authority,
   keeping classification, permission mapping and minimum assurance in its catalog.
@@ -17,7 +17,9 @@
   still pending; ordinary authentication remains unchanged.
 - Qualify resource dispatch in actual static four-server mTLS gRPC and remote
   Kubernetes/browser fixtures; existing native/gRPC service chains also pass.
-- Linux assets remain static musl. Publication and operating adoption are pending.
+- Publish five independently verified signed Linux amd64 musl assets containing
+  all eight static executables; adopt the gateway and standalone administrator
+  console internally with private rollback backups and preserved configuration.
 
 ## 0.3.2 — 2026-10-14
 
