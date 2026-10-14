@@ -2,6 +2,8 @@
 
 [문서 목차](docs/README.ko.md) · [빠른 시작](#빠른-시작) · [릴리스 노트](CHANGELOG.md) · [English](README.md)
 
+[Ingress 사용법·시나리오·실제 검증](docs/ko/KUBERNETES_SCENARIOS.md).
+
 **엔터프라이즈급 수명 주기 제어, 격리된 Lua 정책, 내장 관리 콘솔을 갖춘 HTTP, TCP, UDP 게이트웨이입니다.**
 
 Hangang은 리버스 프록시, 부하 분산, TLS 인증서 관리, 접근 정책, 트래픽 가시성을 하나의 Rust 바이너리에 담았습니다. 별도의 콘솔 서비스를 배포하지 않고 브라우저나 API에서 경로를 설정하고, 실시간 트래픽을 살펴보고, Lua로 요청 처리를 확장할 수 있습니다. 콘솔은 영어와 한국어를 지원합니다. 이 README와 영문 가이드는 기준 문서입니다.

@@ -2,6 +2,8 @@
 
 [English](README.md)
 
+[Ingress 사용법·시나리오·실제 검증](ko/KUBERNETES_SCENARIOS.md).
+
 영어를 기준 언어로 사용합니다. 제공되는 한국어 문서는 영문 원문의 완역이며, 두 언어에서 동작·예제·제약 조건을 동일하게 유지해야 합니다. 한국어 번역이 없는 가이드는 영문 기준 문서로 연결합니다. [프로젝트 README](../README.ko.md)에 로컬 빠른 시작이 있습니다. [예제 설정 가이드](../examples/README.ko.md)는 최초 JSON을 필드별로 설명하며, [OpenAPI](openapi.json)는 관리 API와 설정 객체를 정의합니다.
 
 ## 먼저 읽기

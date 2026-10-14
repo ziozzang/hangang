@@ -2,6 +2,8 @@
 
 [문서 목차](../README.ko.md) · [English](../KUBERNETES.md)
 
+[Ingress 사용법·시나리오·실제 검증](KUBERNETES_SCENARIOS.md).
+
 Hangang은 `networking.k8s.io/v1` Ingress 및 Service 객체를 지속적으로 조정하여 실행 중인 프록시 설정에 반영할 수 있습니다. 각 프록시 복제본이 API를 독립적으로 읽으므로 경로의 가용성이 리더에 의존하지 않습니다. 이전의 `--import-ingress` 명령도 오프라인 변환용으로 계속 사용할 수 있습니다.
 
 생성된 Ingress 경로는 호스트·경로 규칙과 기본 백엔드 모두에서 포트를 포함한
