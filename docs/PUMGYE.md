@@ -340,7 +340,7 @@ deadline/cancellation. Capacity, length ambiguity/mismatch, excess bytes, body
 errors, unsupported trailers and invalid final targets refuse. Dispatch framing
 is regenerated from the preserved bytes. This phase grants no permission.
 
-Nine entity tests cover byte preservation, admission lifetime/cancellation,
+Ten entity tests cover byte preservation, admission lifetime/cancellation,
 allocation reuse and adversarial inputs. The actual Hangang three-authority
 fixture now derives its receipt digest from this prepared final request. Both
 empty and `--nonempty-entity` runs pass Allow, network/identity lifecycle, outage
@@ -357,3 +357,19 @@ outage/trust fixture passes. It requires the selected client to report two
 prepared frames, and refuses a nonparticipating client. Default empty-body and
 Pumgye's single-entity compatibility modes also pass. These are local functional
 and capacity checks, not complete gateway throughput qualification.
+
+The unreleased `native_resource::Binding` compiles an immutable resource gate,
+service/audience scope and issuer pin once. `prepare_scoped` reuses that scope
+without per-request string copies. The prepared request retains the exact scope
+object, and another binding is refused even when its scalar values are identical.
+The service receipt scope and digest come from the prepared request itself.
+
+`Binding::observe` composes actual receipt issuance, authenticated Pumgye resource
+lookup and positive-result Hopae revalidation. Before returning a positive
+observation it checks proof expiry and the same client's locally observed policy/
+network floors, without refreshing the older authorization-health lease. The
+actual three-authority fixture now uses this phase; empty and fragmented nonempty
+entity lifecycle/trust tests pass. Ten entity tests and four gRPC response/floor
+tests pass. Local floors do not prove remote freshness after return. The result
+remains an observation; selected gateway config/route fences, upstream effects,
+signed permits/projection, release and operating adoption remain open.

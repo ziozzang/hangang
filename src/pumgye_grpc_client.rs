@@ -85,6 +85,13 @@ impl Client {
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
+    /// Local observed floors only; this does not query remote owners or grant a lease.
+    pub fn authenticated_observation_current(&self, reply: &AuthenticatedReply) -> bool {
+        reply.revision != 0
+            && reply.network_revision != 0
+            && reply.revision == self.revision()
+            && reply.network_revision == self.network_revision.load(Ordering::Acquire)
+    }
     pub fn require_revision(&self, revision: u64) {
         self.revision.fetch_max(revision, Ordering::AcqRel);
     }
@@ -542,5 +549,33 @@ mod tests {
             decode(deny, 7, 3).unwrap().decision,
             Some(pumgye_core::Decision::Guest)
         );
+    }
+    #[tokio::test]
+    async fn native_observation_is_invalidated_by_either_observed_owner_floor() {
+        let client = Client {
+            channel: Endpoint::from_static("https://unused.example.test").connect_lazy(),
+            token: "Bearer owned-fixture".parse().unwrap(),
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            timeout: Duration::from_secs(1),
+            revision: AtomicU64::new(1),
+            network_revision: AtomicU64::new(1),
+            sequence: AtomicU64::new(1),
+        };
+        let mut reply = AuthenticatedReply {
+            revision: 1,
+            network_revision: 1,
+            allow: true,
+        };
+        assert!(client.authenticated_observation_current(&reply));
+        client.require_revision(2);
+        assert!(!client.authenticated_observation_current(&reply));
+        reply.revision = 2;
+        assert!(client.authenticated_observation_current(&reply));
+        client.network_revision.fetch_max(2, Ordering::AcqRel);
+        assert!(!client.authenticated_observation_current(&reply));
+        reply.network_revision = 2;
+        assert!(client.authenticated_observation_current(&reply));
+        reply.network_revision = 0;
+        assert!(!client.authenticated_observation_current(&reply));
     }
 }

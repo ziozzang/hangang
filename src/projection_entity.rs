@@ -19,10 +19,31 @@ pub enum Refused {
     Target,
 }
 
+/// Compile once from the owning route; reuse across requests without string copies.
+pub struct Scope {
+    service: String,
+    audience: String,
+}
+impl Scope {
+    pub fn new(service: String, audience: String) -> Result<Arc<Self>, Refused> {
+        if [&service, &audience].iter().any(|value| {
+            value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+        }) {
+            return Err(Refused::Target);
+        }
+        Ok(Arc::new(Self { service, audience }))
+    }
+}
+
 /// Immutable bound bytes; no Clone/serde or mutation before receipt issuance.
 /// Admission is retained until the dispatch body is dropped or consumed.
 pub struct Prepared {
     request: Request<Bytes>,
+    scope: Arc<Scope>,
     digest: [u8; 32],
     admission: OwnedSemaphorePermit,
 }
@@ -32,6 +53,16 @@ impl Prepared {
     }
     pub fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+    pub fn service_scope(&self) -> crate::projection_receipt::ServiceScope<'_> {
+        crate::projection_receipt::ServiceScope {
+            service: &self.scope.service,
+            audience: &self.scope.audience,
+            request_sha256: self.digest,
+        }
+    }
+    pub(crate) fn belongs_to(&self, scope: &Arc<Scope>) -> bool {
+        Arc::ptr_eq(&self.scope, scope)
     }
     /// The caller must finish native authorization and final owner checks first.
     pub fn into_dispatch(self) -> Request<crate::proxy::Body> {
@@ -104,6 +135,24 @@ pub async fn prepare(
     request: Request<crate::proxy::Body>,
     service: &str,
     audience: &str,
+    admission: Arc<Semaphore>,
+    maximum_bytes: usize,
+    deadline: Duration,
+) -> Result<Prepared, Refused> {
+    prepare_scoped(
+        request,
+        Scope::new(service.into(), audience.into())?,
+        admission,
+        maximum_bytes,
+        deadline,
+    )
+    .await
+}
+
+/// Hot path for an already compiled immutable route scope.
+pub async fn prepare_scoped(
+    request: Request<crate::proxy::Body>,
+    scope: Arc<Scope>,
     admission: Arc<Semaphore>,
     maximum_bytes: usize,
     deadline: Duration,
@@ -198,10 +247,12 @@ pub async fn prepare(
         return Err(Refused::Length);
     }
     let request = Request::from_parts(parts, bytes);
-    let digest = crate::projection_binding::digest_upstream(service, audience, &request)
-        .map_err(|_| Refused::Target)?;
+    let digest =
+        crate::projection_binding::digest_upstream(&scope.service, &scope.audience, &request)
+            .map_err(|_| Refused::Target)?;
     Ok(Prepared {
         request,
+        scope,
         digest,
         admission: permit,
     })
@@ -499,6 +550,31 @@ mod tests {
                 reserve_entity(&mut buffer, usize::MAX, limit),
                 Err(Refused::TooLarge)
             );
+        }
+    }
+    #[tokio::test]
+    async fn compiled_scope_identity_and_receipt_fields_survive_preparation() {
+        let scope = Scope::new("orders".into(), "orders-api".into()).unwrap();
+        let replacement = Scope::new("orders".into(), "orders-api".into()).unwrap();
+        let (request, _) = input(vec![Ok(Frame::data(Bytes::from_static(b"entity")))], false);
+        let prepared = prepare_scoped(
+            request,
+            scope.clone(),
+            Arc::new(Semaphore::new(1)),
+            8,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.belongs_to(&scope));
+        assert!(!prepared.belongs_to(&replacement));
+        let native = prepared.service_scope();
+        assert_eq!(native.service, "orders");
+        assert_eq!(native.audience, "orders-api");
+        assert_eq!(native.request_sha256, prepared.digest());
+        for invalid in ["".into(), "*".into(), "한강".into(), "x".repeat(129)] {
+            assert!(Scope::new(invalid.clone(), "orders-api".into()).is_err());
+            assert!(Scope::new("orders".into(), invalid).is_err());
         }
     }
 }

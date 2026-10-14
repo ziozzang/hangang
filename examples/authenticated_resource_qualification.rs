@@ -2,11 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use hangang::{
-    config::HopaeNative,
-    hopae_native::Client,
-    projection_receipt::{IssuerPin, ServiceScope},
-};
+use hangang::{config::HopaeNative, hopae_native::Client, projection_receipt::IssuerPin};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::{
     HeaderMap, Request,
@@ -71,8 +67,15 @@ async fn main() -> Result<()> {
         .decode(config.public_key)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid public pin"))?;
-    let pin = IssuerPin::new(config.issuer_ref, config.key_epoch, public)
+    let pin = IssuerPin::new(config.issuer_ref.clone(), config.key_epoch, public)
         .map_err(|_| anyhow::anyhow!("invalid native issuer pin"))?;
+    let gate = hangang::pumgye::ResourceGate {
+        service_id: config.service.clone(),
+        resource: "db:orders".into(),
+        actions: std::collections::BTreeMap::from([("GET".into(), "select".into())]),
+    };
+    let binding =
+        hangang::native_resource::Binding::new(gate.clone(), config.audience.clone(), pin)?;
     let request = Request::builder()
         .method(config.method.as_str())
         .uri(&config.target)
@@ -109,10 +112,9 @@ async fn main() -> Result<()> {
             .map_err(|never| match never {})
             .boxed_unsync()
     };
-    let prepared = hangang::projection_entity::prepare(
+    let prepared = hangang::projection_entity::prepare_scoped(
         Request::from_parts(parts, body),
-        &config.service,
-        &config.audience,
+        binding.scope(),
         std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         1024 * 1024,
         std::time::Duration::from_secs(1),
@@ -120,11 +122,6 @@ async fn main() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("final entity preparation refused"))?;
     let digest = prepared.digest();
-    let scope = ServiceScope {
-        service: &config.service,
-        audience: &config.audience,
-        request_sha256: digest,
-    };
     let mut headers = HeaderMap::new();
     for (name, value) in config.headers {
         ensure!(
@@ -144,11 +141,6 @@ async fn main() -> Result<()> {
     ))?;
     credential.set_sensitive(true);
     headers.insert("authorization", credential);
-    let gate = hangang::pumgye::ResourceGate {
-        service_id: "orders".into(),
-        resource: "db:orders".into(),
-        actions: std::collections::BTreeMap::from([("GET".into(), "select".into())]),
-    };
     let ip = "203.0.113.9".parse()?;
     let now = || {
         std::time::SystemTime::now()
@@ -195,58 +187,55 @@ async fn main() -> Result<()> {
             std::io::stdout().flush()?;
             continue;
         }
-        let outcome = client.issue_service_receipt(&headers, &scope, &pin).await;
+        let outcome = binding
+            .observe(&prepared, &headers, &client, &pumgye, ip)
+            .await;
         let outcome = match outcome {
-            Ok(checked) => match pumgye
-                .observe_authenticated_resource(&gate, "GET", ip, digest, &checked)
-                .await
-            {
-                Ok(Some(reply)) if reply.allow => {
-                    client.validate_service_receipt(&checked).await?;
-                    let mut wrong_service = gate.clone();
-                    wrong_service.service_id = "billing".into();
-                    ensure!(
-                        pumgye
-                            .observe_authenticated_resource(
-                                &wrong_service,
-                                "GET",
-                                ip,
-                                digest,
-                                &checked
-                            )
-                            .await
-                            .is_err(),
-                        "cross-service receipt accepted"
-                    );
-                    ensure!(
-                        pumgye
-                            .observe_authenticated_resource(&gate, "POST", ip, digest, &checked)
-                            .await?
-                            .is_none(),
-                        "unassigned route method accepted"
-                    );
-                    let mut wrong_digest = digest;
-                    wrong_digest[0] ^= 1;
-                    ensure!(
-                        pumgye
-                            .observe_authenticated_resource(
-                                &gate,
-                                "GET",
-                                ip,
-                                wrong_digest,
-                                &checked
-                            )
-                            .await
-                            .is_err(),
-                        "changed request binding accepted"
-                    );
-                    let revision = checked.revision();
-                    prior = Some(checked);
-                    Ok(revision)
-                }
-                _ => Err(anyhow::anyhow!("native authenticated decision refused")),
-            },
-            Err(_) => Err(anyhow::anyhow!("native authentication refused")),
+            Ok(observation) if observation.allowed() => {
+                let checked = observation.into_receipt();
+                let replacement = hangang::native_resource::Binding::new(
+                    gate.clone(),
+                    config.audience.clone(),
+                    IssuerPin::new(config.issuer_ref.clone(), config.key_epoch, public)
+                        .map_err(|_| anyhow::anyhow!("invalid replacement pin"))?,
+                )?;
+                ensure!(
+                    replacement
+                        .observe(&prepared, &headers, &client, &pumgye, ip)
+                        .await
+                        .is_err(),
+                    "another binding accepted the prepared request"
+                );
+                let mut wrong_service = gate.clone();
+                wrong_service.service_id = "billing".into();
+                ensure!(
+                    pumgye
+                        .observe_authenticated_resource(&wrong_service, "GET", ip, digest, &checked)
+                        .await
+                        .is_err(),
+                    "cross-service receipt accepted"
+                );
+                ensure!(
+                    pumgye
+                        .observe_authenticated_resource(&gate, "POST", ip, digest, &checked)
+                        .await?
+                        .is_none(),
+                    "unassigned route method accepted"
+                );
+                let mut wrong_digest = digest;
+                wrong_digest[0] ^= 1;
+                ensure!(
+                    pumgye
+                        .observe_authenticated_resource(&gate, "GET", ip, wrong_digest, &checked)
+                        .await
+                        .is_err(),
+                    "changed request binding accepted"
+                );
+                let revision = checked.revision();
+                prior = Some(checked);
+                Ok(revision)
+            }
+            _ => Err(anyhow::anyhow!("native authenticated decision refused")),
         };
         match (command.as_str(), outcome) {
             ("allow", Ok(revision)) => println!(

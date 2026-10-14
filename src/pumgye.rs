@@ -761,6 +761,17 @@ impl AuthorityRuntime {
         )
     }
 
+    /// Compare local observed policy/network floors without refreshing lease health.
+    pub fn authenticated_observation_current(
+        &self,
+        reply: &crate::pumgye_grpc_client::AuthenticatedReply,
+    ) -> bool {
+        match &self.native {
+            DecisionClient::Grpc(client) => client.authenticated_observation_current(reply),
+            DecisionClient::Native(_) => false,
+        }
+    }
+
     /// Fresh authenticated observation only; this is not a dispatch lease or permit.
     /// Resource ownership remains remote, while the route owns method/service scope.
     pub async fn observe_authenticated_resource(
