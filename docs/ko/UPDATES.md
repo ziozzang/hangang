@@ -174,3 +174,8 @@ Python 픽스처는 임시 상태, loopback 서비스, 생성된 테스트 인�
 서명 업그레이드 픽스처는 추가로 더 새로운 테스트 버전을 빌드하고, 비공개 테스트 HTTPS CA로 서명 매니페스트와 artifact를 제공하며, 실제 바이너리 교체를 통한 HTTP, WebSocket, TCP 연속성을 확인합니다.
 
 Rust 검사는 descriptor 검증과 readiness timeout, 서명 artifact 검증, fake binary를 사용하는 staging/activation/rollback, update-fetch 취소, publication retirement을 다룹니다. 이 테스트는 메커니즘을 실행하지만, 모든 릴리스 버전 쌍 간 종단간 업그레이드 보장, 지속적인 무오류 처리량, 가용성 SLA를 수립하지는 않습니다. 프로덕션 업그레이드 전에 대표 트래픽으로 의도한 source/target 버전과 배포를 검증하십시오.
+
+Linux 릴리즈 준비 기본은 x86_64-unknown-linux-musl입니다. 포함하는 실행
+파일 모두 ELF 인터프리터가 없어야 자산 생성·서명으로 진행합니다. linux-musl
+아카이브는 GNU와 구분하며 서명한 대상 triple을 업데이트 선택에도 유지합니다.
+다른 플랫폼은 별도 검증이 필요합니다.

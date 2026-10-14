@@ -111,6 +111,27 @@ class PrepareReleaseTests(unittest.TestCase):
         with tarfile.open(archive, "r:gz") as contents:
             self.assertIn(f"hangang-v{VERSION}-linux-arm64/hangang-dsr", contents.getnames())
 
+    def test_default_musl_refuses_dynamic_loader_before_assets(self):
+        self.assertEqual(prepare_release.TARGET, "x86_64-unknown-linux-musl")
+        target = prepare_release.TARGET
+        self.build_fixture(target, prepare_release.TARGETS[target][2])
+        output = self.root / "out"
+        with mock.patch.object(prepare_release, "ROOT", self.root), mock.patch.object(prepare_release, "run", return_value="Program Headers: INTERP"):
+            with self.assertRaisesRegex(ValueError, "dynamic loader"):
+                prepare_release.prepare(None, output, target, unsigned=True)
+        self.assertFalse(output.exists())
+
+    def test_static_default_stages_musl_archive(self):
+        target = prepare_release.TARGET
+        self.build_fixture(target, prepare_release.TARGETS[target][2])
+        output = self.root / "out"
+        def probe(command):
+            return "LOAD" if command[0] == "readelf" else f"hangang {VERSION}"
+        with mock.patch.object(prepare_release, "ROOT", self.root), mock.patch.object(prepare_release, "run", side_effect=probe):
+            prepare_release.prepare(None, output, target, unsigned=True)
+        self.assertTrue((output / f"hangang-v{VERSION}-linux-musl-amd64.tar.gz").exists())
+        self.assertTrue((output / ("hangang-"+target)).exists())
+
     def test_unsupported_target_is_rejected_before_accessing_the_seed(self):
         with self.assertRaisesRegex(ValueError, "unsupported target"):
             prepare_release.prepare(self.root / "missing-seed", self.root / "out", "wasm32-wasi")

@@ -314,3 +314,8 @@ they do not establish an end-to-end upgrade guarantee between every pair of
 released versions, continuous zero-error throughput, or an availability SLA.
 Qualify the intended source/target versions and deployment with representative
 traffic before a production upgrade.
+
+Linux release preparation defaults to x86_64-unknown-linux-musl. Every included
+executable must have no ELF interpreter before assets are staged or signed.
+The linux-musl archive name remains distinct from GNU; the signed target triple
+continues to control update discovery. Other platforms need separate qualification.
