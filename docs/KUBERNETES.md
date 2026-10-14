@@ -4,6 +4,10 @@
 
 Hangang can continuously reconcile `networking.k8s.io/v1` Ingress and Service objects into the live proxy configuration. Each proxy replica reads the API independently, so route availability does not depend on a leader. The older `--import-ingress` command remains available for offline conversion.
 
+Generated Ingress routes preserve the original request `Host` header, including
+its port, for both host/path rules and the default backend. The Service DNS name
+selects the upstream connection; it does not replace the application's public host.
+
 ## Deploy
 
 Build and publish this repository's image, replace the placeholder image in `deploy/kubernetes/deployment.yaml`, create a private administrator token file, and apply the kustomization. The root [Dockerfile](../Dockerfile) needs `make static` first and packages only the gateway binary:
