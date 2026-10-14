@@ -318,3 +318,13 @@ The actual three-authority fixture additionally verifies this Hangang client
 accepts current proofs and rejects still-unexpired withdrawn/outage proofs.
 Before querying Pumgye afterward, it asserts the cached proof is still valid,
 so expiration cannot substitute for the remote lifecycle refusal.
+
+`projection_binding::digest_upstream` binds the exact path/query of the selected
+HTTP(S) upstream URI and complete final entity. The actual gateway URI-composition
+test includes a backend base path, rewritten path, duplicate/encoded query fields
+and host override; pre-composition paths or empty replacement bodies produce
+different digests. Origin-only targets, unsupported schemes, userinfo authorities
+and ambiguous/invalid paths refuse in this adapter. Service/audience and backend
+owner binding remain separate requirements: the canonical request digest does
+not include the URI authority. This helper does not buffer streams, issue a
+receipt or activate dispatch.

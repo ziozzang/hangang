@@ -4674,6 +4674,64 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receipt_binding_uses_actual_backend_composition_and_final_entity() {
+        let original: Uri = "/rewritten/orders?x=%2F&x=2".parse().unwrap();
+        let outgoing = build_upstream_uri(
+            "https://backend.example.test/api/",
+            &original,
+            Some("selected.example.test:8443"),
+        )
+        .unwrap();
+        assert_eq!(
+            outgoing.path_and_query().unwrap().as_str(),
+            "/api/rewritten/orders?x=%2F&x=2"
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(outgoing)
+            .body(Bytes::from_static(b"transformed entity"))
+            .unwrap();
+        let bound =
+            crate::projection_binding::digest_upstream("orders", "orders-api", &request).unwrap();
+        let origin = Request::builder()
+            .method("POST")
+            .uri("/api/rewritten/orders?x=%2F&x=2")
+            .body(Bytes::from_static(b"transformed entity"))
+            .unwrap();
+        assert_eq!(
+            bound,
+            crate::projection_binding::digest("orders", "orders-api", &origin).unwrap()
+        );
+        let before_backend = Request::builder()
+            .method("POST")
+            .uri(original)
+            .body(Bytes::from_static(b"transformed entity"))
+            .unwrap();
+        assert_ne!(
+            bound,
+            crate::projection_binding::digest("orders", "orders-api", &before_backend).unwrap()
+        );
+        *request.body_mut() = Bytes::new();
+        assert_ne!(
+            bound,
+            crate::projection_binding::digest_upstream("orders", "orders-api", &request).unwrap()
+        );
+        for target in [
+            "/api/orders",
+            "ftp://backend.example.test/api/orders",
+            "https://user@backend.example.test/api/orders",
+            "https://backend.example.test//api/orders",
+            "https://backend.example.test/api%zz",
+        ] {
+            *request.uri_mut() = target.parse().unwrap();
+            assert!(
+                crate::projection_binding::digest_upstream("orders", "orders-api", &request)
+                    .is_err()
+            );
+        }
+    }
+
     fn renewal_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in [

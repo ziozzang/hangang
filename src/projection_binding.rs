@@ -20,11 +20,58 @@ pub fn digest(
         .path_and_query()
         .ok_or(InvalidRequest)?
         .as_str();
-    let body = Sha256::digest(request.body());
+    bind(
+        service,
+        audience,
+        request.method().as_str(),
+        target,
+        request.body(),
+    )
+}
+
+/// Use the actual selected upstream URI after backend base-path composition.
+/// The service/audience must be bound independently to the selected owner; the
+/// canonical request contract binds path/query and entity, not the URI authority.
+/// This accepts only a fully materialized final entity, never a streaming proxy.
+pub fn digest_upstream(
+    service: &str,
+    audience: &str,
+    request: &Request<Bytes>,
+) -> Result<[u8; 32], InvalidRequest> {
+    if !matches!(request.uri().scheme_str(), Some("http" | "https"))
+        || request
+            .uri()
+            .authority()
+            .is_none_or(|authority| authority.as_str().contains('@'))
+    {
+        return Err(InvalidRequest);
+    }
+    let target = request
+        .uri()
+        .path_and_query()
+        .ok_or(InvalidRequest)?
+        .as_str();
+    bind(
+        service,
+        audience,
+        request.method().as_str(),
+        target,
+        request.body(),
+    )
+}
+
+fn bind(
+    service: &str,
+    audience: &str,
+    method: &str,
+    target: &str,
+    entity: &Bytes,
+) -> Result<[u8; 32], InvalidRequest> {
+    let body = Sha256::digest(entity);
     hopae_grpc::request_binding::digest(&hopae_grpc::request_binding::Request {
         service,
         audience,
-        method: request.method().as_str(),
+        method,
         target,
         body_sha256: &body.into(),
     })

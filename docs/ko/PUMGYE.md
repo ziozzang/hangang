@@ -271,3 +271,12 @@ permit이 아닙니다. 실제 세 서버 검사에서 한강 클라이언트가
 허용하고 만료 전 회수/장애 증명을 거부함을 추가 확인합니다. 이어 품계에
 질의하기 직전에도 이전 증명이 유효함을 확인하므로 만료를 원격 수명주기
 거부의 근거로 대체하지 않습니다.
+
+projection_binding::digest_upstream은 선택된 HTTP(S) upstream URI의 정확한
+경로/쿼리와 완성된 최종 본문을 바인딩합니다. 실제 게이트웨이 URI 합성
+검사에 backend 기본 경로·재작성 경로·중복/인코딩 쿼리·host override를
+포함했습니다. 합성 이전 경로나 빈 대체 본문은 다른 digest가 됩니다. 이
+어댑터는 origin-only target·미지원 scheme·userinfo authority·모호하거나 잘못된
+경로를 거부합니다. 정규 요청 digest에는 URI authority가 없으므로 서비스/
+audience와 backend 소유자 바인딩은 별도 요구입니다. 이 함수는 스트림 버퍼링·
+증명 발급·전달을 활성화하지 않습니다.
