@@ -80,7 +80,8 @@ backend 본문을 버리고 결과가 불확실함을 알립니다. 비공개 �
 누락하면 `plugin_locale.spec.js`는 성공 검증 대신 skip을 표시합니다. 파일 누락·손상과
 manifest asset 해시 불일치는 실패합니다. 재현 명령과 검토한 원문 commit은
 [영문 문서](../CONSOLE_PLUGINS.md#mounted-package-locale-lifecycle)를 참고하며
-실행 증거에는 두 manifest pin을 함께 기록합니다.
+실행 증거에는 두 manifest pin을 함께 기록합니다. 패키지 버전은 호패 **0.1.6**,
+수문장 **0.1.4**이며 독립 패키지 갱신은 standalone runtime 버전을 변경하지 않습니다.
 
 ## 호패 관리와 로그인
 

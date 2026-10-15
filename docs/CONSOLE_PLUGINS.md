@@ -84,14 +84,19 @@ and reviewed package-pin adoption require separate qualification.
 The real-package browser selection requires both package directories explicitly;
 without them `plugin_locale.spec.js` reports skipped tests, not qualification.
 Malformed/missing files and manifest asset hash mismatches fail the selection.
-Use reviewed source checkouts (Hopae `d8d3f4f4ee1c026d5ed6baef8adc27a0e2fff892`,
-Guard `3e1afcb7496cdb610b722695343fcfa7378e0559`) and record their manifest pins:
+Use reviewed source checkouts (Hopae `b9b2a9a88de5c713c3f4acaf74de9d507db6fb39`,
+Guard `d314d873a27d52d4a5fec981182f8118daeaf1f3`) and record their manifest pins:
 
 ```sh
 HANGANG_TEST_HOPAE_PLUGIN=/reviewed/hopae/plugins/hopae \
 HANGANG_TEST_SUMUNJANG_PLUGIN=/reviewed/sumunjang/plugins/guard \
 npx playwright test --config web/playwright.config.js tests/plugin_locale.spec.js
 ```
+
+Package versions are Hopae **0.1.6** and Guard **0.1.4**. Their manifest SHA-256
+pins are `ec6385edf47321b7be9cfa8ef38c40be629383d1d931e22f1a4e22c090a515b8`
+and `0d81330ffe804ffca3d98761c90f5868008bed359710b80d42c3166324d73310`, respectively.
+These independently packaged assets do not change standalone runtime versions.
 
 ## Hopae management and login
 
