@@ -1082,12 +1082,13 @@ dependencies = [
 [[package]]
 name = "hangang-runtime"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/hangang-runtime?rev=819177c631acb43dcdac8662403e80a13bb6c636#819177c631acb43dcdac8662403e80a13bb6c636"
+source = "git+https://github.com/ziozzang/hangang-runtime?rev=0cdbd1660cefe46eed8bab3c0deb1b62c560ecf6#0cdbd1660cefe46eed8bab3c0deb1b62c560ecf6"
 dependencies = [
  "anyhow",
  "axum",
  "hyper",
  "hyper-util",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "tokio",
@@ -2709,9 +2710,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
  "bitflags",
  "errno",

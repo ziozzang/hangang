@@ -14,7 +14,7 @@ repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
 hangang-route-grpc = { path = "crates/hangang-route-grpc" }
-hangang-runtime = { git = "https://github.com/ziozzang/hangang-runtime", rev = "819177c631acb43dcdac8662403e80a13bb6c636" }
+hangang-runtime = { git = "https://github.com/ziozzang/hangang-runtime", rev = "0cdbd1660cefe46eed8bab3c0deb1b62c560ecf6" }
 hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "96c9af6bc0af1a81cdb42eea3da05f14c763a647" }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
 tonic = { version = "0.14.6", features = ["tls-ring"] }

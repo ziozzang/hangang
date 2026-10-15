@@ -59,6 +59,12 @@ hangang --config /private/config.json --route-owner-config /private/route-owner.
 인증으로 fallback하지 않습니다. 제한된 공용 gRPC 런타임을 사용하고 잘못된 자원은
 거부합니다.
 
+Bearer 메타데이터 인증은 공용 unary ingress의 입장 제어와 본문 읽기 전에 수행합니다.
+연결 간 공유하는 디코드 슬롯 64개는 기존 핸들러 슬롯 4096개와 독립적입니다.
+ingress는 압축하지 않은 메시지 하나와 페이로드 최대 512바이트만 허용하며 추가
+메시지는 거부합니다. 서비스 future가 완료되거나 취소되면 슬롯을 반환합니다.
+생성된 Prost 서버의 요청 512바이트·응답 1024바이트 제한도 유지합니다.
+
 ## 재시작과 종료
 
 감독 프로세스가 별도 타입의 descriptor 역할로 리스너를 전달합니다. 후속 세대는

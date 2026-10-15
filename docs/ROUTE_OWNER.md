@@ -62,6 +62,12 @@ hangang --config /private/config.json --route-owner-config /private/route-owner.
 Queries require both a trusted client certificate and the dedicated Bearer
 credential. Existing administrator/browser authentication is not a fallback.
 The service uses the common bounded gRPC runtime and fails on invalid resources.
+Bearer metadata authentication runs before shared unary ingress admission and body
+polling. A separate pool of 64 decode slots is shared across connections; the
+existing 4096 handler slots remain independent. Ingress accepts one uncompressed
+message of at most 512 payload bytes, rejects additional messages, and releases
+its slot when the service future completes or is cancelled. Generated Prost limits
+remain 512 request bytes and 1024 response bytes.
 
 ## Restart and shutdown
 

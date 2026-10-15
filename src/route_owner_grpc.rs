@@ -148,6 +148,36 @@ impl Service {
             && bool::from(value.as_bytes().ct_eq(self.credential.as_bytes()))
     }
 }
+// Authentication runs before ingress admission and body polling. Retain the
+// handler check as defense in depth for direct in-process callers.
+#[derive(Clone)]
+struct Authenticate(Service);
+impl tonic::service::Interceptor for Authenticate {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        if !self.0.authorized(request.metadata()) {
+            return Err(Status::unauthenticated(
+                "route decision credential required",
+            ));
+        }
+        Ok(request)
+    }
+}
+fn ingress(
+    service: Service,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> tonic::service::interceptor::InterceptedService<
+    hangang_runtime::unary_ingress::UnaryIngress<RouteOwnershipServer<Service>>,
+    Authenticate,
+> {
+    let auth = Authenticate(service.clone());
+    let generated = RouteOwnershipServer::new(service)
+        .max_decoding_message_size(512)
+        .max_encoding_message_size(1024);
+    tonic::service::interceptor::InterceptedService::new(
+        hangang_runtime::unary_ingress::UnaryIngress::new(generated, slots, 512),
+        auth,
+    )
+}
 #[tonic::async_trait]
 impl RouteOwnership for Service {
     async fn observe(
@@ -262,11 +292,10 @@ impl Server {
         // Fence any retained service tasks when this owner future is cancelled.
         let _retire = Retire(self.service.available.clone());
         hangang_runtime::server(self.tls)?
-            .add_service(
-                RouteOwnershipServer::new(self.service)
-                    .max_decoding_message_size(512)
-                    .max_encoding_message_size(1024),
-            )
+            .add_service(ingress(
+                self.service,
+                Arc::new(tokio::sync::Semaphore::new(64)),
+            ))
             .serve_with_incoming_shutdown(hangang_runtime::incoming(self.listener), shutdown)
             .await?;
         Ok(())
@@ -331,6 +360,90 @@ mod tests {
             .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
         request.set_timeout(std::time::Duration::from_secs(1));
         request
+    }
+    struct WireBody {
+        data: Option<bytes::Bytes>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        pending: bool,
+    }
+    impl hyper::body::Body for WireBody {
+        type Data = bytes::Bytes;
+        type Error = Status;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(
+                    self.data
+                        .take()
+                        .map(|data| Ok(hyper::body::Frame::data(data))),
+                )
+            }
+        }
+    }
+    fn wire_request(body: WireBody, authorized: bool) -> hyper::Request<WireBody> {
+        let mut request = hyper::Request::builder()
+            .uri("/hangang.route.v1.RouteOwnership/Observe")
+            .header("content-type", "application/grpc")
+            .body(body)
+            .unwrap();
+        if authorized {
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        }
+        request
+    }
+    #[tokio::test]
+    async fn generated_ingress_auth_framing_admission_and_cancellation() {
+        use tower_service::Service as _;
+        let (registry, _, _, _) = crate::native_route_owner::tests::fixture(1).await;
+        // A retired handler always returns Unavailable: any other result proves
+        // malformed framing never reached the actual route handler.
+        let service = Service {
+            registry,
+            credential: TOKEN.into(),
+            admission: Arc::new(tokio::sync::Semaphore::new(4096)),
+            available: Arc::new(AtomicBool::new(false)),
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut wrapped = ingress(service, slots.clone());
+        let body = |data: Vec<u8>, pending| WireBody {
+            data: Some(data.into()),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending,
+        };
+        let response = wrapped
+            .call(wire_request(body(vec![0; 10], false), true))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["grpc-status"], "3");
+        assert_eq!(slots.available_permits(), 1);
+        let response = wrapped
+            .call(wire_request(body(vec![0; 5], false), true))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["grpc-status"], "14");
+        let mut waiting = wrapped.call(wire_request(body(vec![], true), true));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        assert_eq!(slots.available_permits(), 0);
+        for (authorized, expected) in [(false, "16"), (true, "8")] {
+            let rejected = body(vec![0; 5], false);
+            let polls = rejected.polls.clone();
+            let response = wrapped
+                .clone()
+                .call(wire_request(rejected, authorized))
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["grpc-status"], expected);
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+        }
+        drop(waiting);
+        assert_eq!(slots.available_permits(), 1);
     }
     #[tokio::test]
     async fn credentials_are_reference_only_distinct_and_checked_before_tls_or_bind() {
