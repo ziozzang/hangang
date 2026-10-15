@@ -4,32 +4,23 @@
 
 ## Unreleased
 
-- Add opt-in native credential projection through Hopae's authenticated mTLS RPC.
-  Retain the exact permission request, verify the response scope and signed plan,
-  remove incoming credentials and install only a bounded sensitive origin header.
-  Intersect independent live deadlines without extending earlier authority.
-- Issue and verify independent Pumgye permission receipts, then require live
-  validation of current permission, network, route and projection-plan owners.
-  Missing or incompatible RPCs refuse without fallback or backend dispatch.
+## 0.3.6 — 2026-10-15
 
-- Deliver native request references and destination digests to route-aware
-  Pumgye; require acknowledgement of live route checks and reject legacy
-  downgrade without backend dispatch. Existing no-owner mode stays explicit.
-- Start the native route observation service with `--route-owner-config`.
-  Validate TLS/credentials and address conflicts without binding in `--check`;
-  preserve its typed listener during supervised restart and retain the active
-  generation when replacement resources are invalid. Shutdown owns its task.
-- Add an independent `hangang-route-grpc` observation contract and bounded
-  mandatory-mTLS server library using the shared Hangang Runtime. Dedicated-role
-  authentication precedes lookup; native owners supply client IP and resource
-  context. Startup/supervisor and Pumgye request wiring remain open.
-- Bind native final admission to bounded, request-scoped random route references.
-  Exact route/snapshot, absolute URI, method and prepared digest must still agree;
-  expiry, cancellation and capacity exhaustion refuse without upstream effects.
-  Remote lookup, permit and replay protocols remain separate work.
-- Fence native receipt requests with the exact activated snapshot identity,
-  including equal-revision replacement. Apply the fence to pending authority
-  work, final upstream admission and guarded request/response bodies.
+- Add opt-in native credential projection through Hopae's authenticated mTLS RPC.
+  Retain the original permission request, verify response scope/hash and signed
+  plan revision, remove incoming credentials and install a sensitive origin header.
+- Intersect independent live deadlines without extending previously accepted
+  authority; reject scope/header injection and responses beyond signed expiry.
+- Verify independent Pumgye permission receipts and require current permission,
+  network, route and projection-plan ownership before final dispatch.
+- Start the bounded native route observation service with `--route-owner-config`.
+  Require mTLS and dedicated caller credentials, validate resources before binding,
+  preserve its typed listener during supervised restart and own shutdown tasks.
+- Bind random request-scoped route references to exact snapshot/scope identity,
+  final absolute URI, method, prepared entity digest and client IP. Cancellation,
+  expiry, replacement and capacity exhaustion refuse without backend effects.
+- Qualify actual four-server credential delivery, durable withdrawal, wrong trust
+  and caller refusal, configuration/class restoration and existing-mode compatibility.
 
 ## 0.3.5 — 2026-10-15
 
