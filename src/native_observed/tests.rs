@@ -487,6 +487,23 @@ impl h::authentication_server::Authentication for Sources {
     ) -> Result<Response<h::VerifyReply>, Status> {
         self.authorize(&r)?;
         self.verify_calls.fetch_add(1, Ordering::AcqRel);
+        if self.attack.load(Ordering::Acquire) == 25 {
+            for (name, expected) in [
+                ("x-hopae-contract", "1"),
+                ("x-hangang-route-id", "frontdoor"),
+                ("x-hangang-canonical-path", "/orders"),
+            ] {
+                let values: Vec<_> = r
+                    .get_ref()
+                    .headers
+                    .iter()
+                    .filter(|h| h.name.eq_ignore_ascii_case(name))
+                    .collect();
+                assert_eq!(values.len(), 1, "trusted Human marker {name}");
+                assert_eq!(values[0].value, expected.as_bytes());
+            }
+        }
+
         let kind = if self.attack.load(Ordering::Acquire) == 21 {
             if self.class == AuthenticationClass::Workload {
                 "service"
@@ -1233,6 +1250,21 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
                     header_policy_revision: 1,
                     header_names: Vec::new(),
                 });
+                for name in [
+                    "x-hopae-contract",
+                    "x-hangang-route-id",
+                    "x-hangang-canonical-path",
+                ] {
+                    next.http[0]
+                        .auth
+                        .as_mut()
+                        .unwrap()
+                        .static_request_headers
+                        .insert(
+                            name.into(),
+                            crate::config::StaticHeaderValue::Literal("configured-spoof".into()),
+                        );
+                }
                 active.store(Arc::new(crate::config::Snapshot::new(next).unwrap()));
             }
             source.attack.store(attack, Ordering::Release);
@@ -1244,6 +1276,10 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
             let request = hyper::Request::post(format!("http://{front_address}/orders"))
                 .header("host", "app.example.test")
                 .header("authorization", "Bearer source-token-fixture")
+                .header("x-hangang-route-id", "client-spoof")
+                .header("x-hangang-route-id", "client-duplicate")
+                .header("x-hangang-canonical-path", "/spoof")
+                .header("x-hopae-contract", "spoof")
                 .header("x-forwarded-user", "forged")
                 .header("x-hopae-principal-kind", "workload")
                 .body(crate::proxy::full_body(bytes::Bytes::from_static(

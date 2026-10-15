@@ -5125,6 +5125,61 @@ impl hyper::body::Body for RequestBody {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_human_trusted_ingress_overwrites_duplicates_and_requires_canonical_path() {
+        use super::NativeAuthorization;
+        use crate::native_observed::AuthenticationClass;
+        let mut headers = hyper::HeaderMap::new();
+        for name in [
+            "x-hopae-contract",
+            "x-hangang-route-id",
+            "x-hangang-canonical-path",
+        ] {
+            headers.append(name, "client-spoof".parse().unwrap());
+            headers.append(name, "configured-spoof".parse().unwrap());
+        }
+        NativeAuthorization {
+            class: AuthenticationClass::Human,
+            issuer: "native-human",
+            route_id: "actual-route",
+            canonical_path: Some("/actual"),
+        }
+        .apply(&mut headers)
+        .unwrap();
+        for (name, value) in [
+            ("x-hopae-contract", "1"),
+            ("x-hangang-route-id", "actual-route"),
+            ("x-hangang-canonical-path", "/actual"),
+        ] {
+            assert_eq!(headers.get_all(name).iter().count(), 1);
+            assert_eq!(headers[name], value);
+        }
+        assert_eq!(
+            NativeAuthorization {
+                class: AuthenticationClass::Human,
+                issuer: "native-human",
+                route_id: "actual-route",
+                canonical_path: None
+            }
+            .apply(&mut headers),
+            Err(503)
+        );
+        for class in [AuthenticationClass::Service, AuthenticationClass::Workload] {
+            let mut untouched = hyper::HeaderMap::new();
+            untouched.insert("x-hangang-route-id", "legacy-value".parse().unwrap());
+            let before = untouched.clone();
+            NativeAuthorization {
+                class,
+                issuer: "issuer",
+                route_id: "actual-route",
+                canonical_path: None,
+            }
+            .apply(&mut untouched)
+            .unwrap();
+            assert_eq!(untouched, before);
+        }
+    }
+
+    #[test]
     fn native_human_policy_metadata_requires_pinned_unique_canonical_subject() {
         use hyper::{HeaderMap, header::HeaderValue};
         let subject = format!("human1:{}", "a".repeat(64));
