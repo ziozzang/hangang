@@ -217,6 +217,12 @@ impl Registry {
     }
 }
 impl Capture {
+    pub(crate) fn wire(&self) -> pumgye_grpc::v1::NativeRouteReference {
+        pumgye_grpc::v1::NativeRouteReference {
+            reference: self.reference.to_vec(),
+            destination_sha256: self.entry.destination_sha256.to_vec(),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn request(&self, request_id: u64) -> hangang_route_grpc::v1::RouteRequest {
         hangang_route_grpc::v1::RouteRequest {

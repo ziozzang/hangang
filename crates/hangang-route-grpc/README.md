@@ -28,6 +28,7 @@ a successful reply is neither an authorization grant nor a distributed lease.
 
 The current Hangang source has a server library, [CLI startup and supervised
 handover](../../docs/ROUTE_OWNER.md), with actual socket/process qualification.
-Outbound Pumgye reference delivery, remote decision clients, signed permits,
+Route-aware Pumgye can now query the configured owner before and after native
+evaluation, using actual gateway reference delivery. Signed permits,
 projection/replay and Kubernetes release adoption remain integration work. Never accept a caller-selected URL or an application
 classification/allow claim as authoritative owner state.

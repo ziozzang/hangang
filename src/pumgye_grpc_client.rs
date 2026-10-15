@@ -30,6 +30,7 @@ pub struct ResourceReply {
 
 /// Native target only; identity and assurance come from the checked receipt.
 pub struct AuthenticatedQuery<'a> {
+    pub route: Option<&'a pumgye_grpc::v1::NativeRouteReference>,
     pub resource: &'a str,
     pub action: &'a str,
     pub ip: std::net::IpAddr,
@@ -141,6 +142,7 @@ impl Client {
             receipt.authentication().expires_ms() - before,
         ));
         let mut request = tonic::Request::new(pumgye_grpc::v1::AuthenticatedResourceRequest {
+            route: query.route.cloned(),
             request_id,
             minimum_revision: floor,
             ip: match query.ip {
@@ -188,6 +190,7 @@ impl Client {
             request_id,
             floor.max(self.revision()),
             self.network_revision.load(Ordering::Acquire),
+            query.route.is_some(),
         )?;
         self.network_revision
             .fetch_max(reply.network_revision, Ordering::AcqRel);
@@ -340,6 +343,7 @@ fn decode_authenticated(
     request_id: u64,
     policy_floor: u64,
     network_floor: u64,
+    route_required: bool,
 ) -> Result<AuthenticatedReply> {
     ensure!(
         reply.request_id == request_id
@@ -348,6 +352,7 @@ fn decode_authenticated(
             && (1..=9_007_199_254_740_991).contains(&reply.network_revision)
             && reply.network_revision >= network_floor
             && reply.cache_ttl_ms == 0
+            && reply.route_observed == route_required
             && matches!(reply.verdict, 1 | 2),
         "invalid authenticated response"
     );
@@ -410,13 +415,20 @@ mod tests {
     #[test]
     fn authenticated_reply_refuses_unsupported_verdict_cache_and_stale_owners() {
         let reply = || pumgye_grpc::v1::AuthenticatedResourceReply {
+            route_observed: false,
             request_id: 7,
             revision: 3,
             network_revision: 4,
             verdict: 1,
             cache_ttl_ms: 0,
         };
-        assert!(decode_authenticated(reply(), 7, 3, 4).unwrap().allow);
+        assert!(decode_authenticated(reply(), 7, 3, 4, false).unwrap().allow);
+        assert!(decode_authenticated(reply(), 7, 3, 4, true).is_err());
+        let mut routed = reply();
+        routed.route_observed = true;
+        assert!(decode_authenticated(routed, 7, 3, 4, true).unwrap().allow);
+        assert!(decode_authenticated(routed, 7, 3, 4, false).is_err());
+
         for field in ["id", "policy", "network", "verdict", "cache", "overflow"] {
             let mut value = reply();
             match field {
@@ -428,11 +440,14 @@ mod tests {
                 "overflow" => value.revision = u64::MAX,
                 _ => unreachable!(),
             }
-            assert!(decode_authenticated(value, 7, 3, 4).is_err(), "{field}");
+            assert!(
+                decode_authenticated(value, 7, 3, 4, false).is_err(),
+                "{field}"
+            );
         }
         let mut denied = reply();
         denied.verdict = 2;
-        assert!(!decode_authenticated(denied, 7, 3, 4).unwrap().allow);
+        assert!(!decode_authenticated(denied, 7, 3, 4, false).unwrap().allow);
     }
     #[test]
     fn resource_reply_rejects_default_conflicting_stale_and_cached_allow() {

@@ -1187,6 +1187,7 @@ async fn run(args: Args) -> Result<()> {
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
     .with_guard(guard)
+    .with_route_owner_queries(args.route_owner_config.is_some())
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
     tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
     let route_owner_server = match (route_owner_configuration, route_owner_listener) {

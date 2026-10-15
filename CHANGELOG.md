@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Deliver native request references and destination digests to route-aware
+  Pumgye; require acknowledgement of live route checks and reject legacy
+  downgrade without backend dispatch. Existing no-owner mode stays explicit.
 - Start the native route observation service with `--route-owner-config`.
   Validate TLS/credentials and address conflicts without binding in `--check`;
   preserve its typed listener during supervised restart and retain the active

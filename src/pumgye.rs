@@ -782,6 +782,25 @@ impl AuthorityRuntime {
         request_sha256: [u8; 32],
         receipt: &crate::projection_receipt::CheckedServiceReceipt,
     ) -> Result<Option<crate::pumgye_grpc_client::AuthenticatedReply>> {
+        self.observe_authenticated_resource_with_route(
+            gate,
+            method,
+            ip,
+            request_sha256,
+            receipt,
+            None,
+        )
+        .await
+    }
+    pub async fn observe_authenticated_resource_with_route(
+        &self,
+        gate: &ResourceGate,
+        method: &str,
+        ip: std::net::IpAddr,
+        request_sha256: [u8; 32],
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        route: Option<&pumgye_grpc::v1::NativeRouteReference>,
+    ) -> Result<Option<crate::pumgye_grpc_client::AuthenticatedReply>> {
         gate.validate_remote()?;
         ensure!(
             receipt.context().service == gate.service_id,
@@ -796,6 +815,7 @@ impl AuthorityRuntime {
         client
             .decide_authenticated_resource(
                 &crate::pumgye_grpc_client::AuthenticatedQuery {
+                    route,
                     resource: &gate.resource,
                     action,
                     ip,

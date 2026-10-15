@@ -226,5 +226,8 @@ adds a separate mandatory-mTLS route observation server library. Its independent
 Server replies derive client IP/service/resource/action from native owners;
 request fields cannot supply classification or an allow verdict. The server is
 started with [--route-owner-config](docs/ROUTE_OWNER.md), including validation,
-shutdown and supervised socket handover. Outbound Pumgye reference delivery,
-signed permission, projection and replay consumption remain separate work.
+shutdown and supervised socket handover. This mode sends the actual native
+reference and destination digest to route-aware Pumgye, which checks the configured
+mTLS owner before and after evaluation. Missing route-observation acknowledgement
+fails closed, including a legacy authority. Signed permission, projection and
+replay consumption remain separate work.

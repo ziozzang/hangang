@@ -149,6 +149,18 @@ impl Binding {
         pumgye: &pumgye::AuthorityRuntime,
         ip: std::net::IpAddr,
     ) -> Result<Observation> {
+        self.observe_with_route(prepared, headers, hopae, pumgye, ip, None)
+            .await
+    }
+    pub async fn observe_with_route(
+        &self,
+        prepared: &projection_entity::Prepared,
+        headers: &hyper::HeaderMap,
+        hopae: &hopae_native::Client,
+        pumgye: &pumgye::AuthorityRuntime,
+        ip: std::net::IpAddr,
+        route: Option<&pumgye_grpc::v1::NativeRouteReference>,
+    ) -> Result<Observation> {
         ensure!(
             prepared.belongs_to(&self.scope),
             "final request belongs to another route binding"
@@ -162,7 +174,14 @@ impl Binding {
             .issue_service_receipt(headers, &prepared.service_scope(), &self.pin)
             .await?;
         let reply = pumgye
-            .observe_authenticated_resource(&self.gate, method, ip, prepared.digest(), &receipt)
+            .observe_authenticated_resource_with_route(
+                &self.gate,
+                method,
+                ip,
+                prepared.digest(),
+                &receipt,
+                route,
+            )
             .await?
             .ok_or_else(|| anyhow::anyhow!("native route method unassigned"))?;
         if reply.allow {

@@ -4,8 +4,12 @@
 
 The optional `--route-owner-config` starts a separate, read-only mTLS gRPC
 listener backed by actual request-scoped native route references. It does not
-authorize a principal, sign permission or issue an upstream credential. Pumgye
-reference delivery and the resulting permit/projection path remain pending.
+authorize a principal, sign permission or issue an upstream credential. Configure
+Pumgye with `--route-live` for the corresponding fixed mTLS owner. In this mode
+Hangang sends the real registered reference/destination digest, and Pumgye checks
+scope/IP both before and after policy evaluation. Missing acknowledgement,
+including an older authority, refuses without backend dispatch. Signed permission
+and projection/replay remain pending.
 
 ## Private configuration
 
@@ -27,6 +31,21 @@ in this document. TLS identity and client CA are mandatory.
 The JSON file is limited to 16 KiB and rejects unknown fields. Shared-runtime TLS
 file bounds apply. The listener cannot overlap another declared process, public
 HTTP, workload HTTP or TCP listener. Supervised mode requires a fixed nonzero port.
+
+Pumgye uses a separate `--route-live` file with a fixed owner endpoint and its
+client identity. The token reference must resolve to the dedicated server
+credential; server and client CA trust directions are separate.
+
+```json
+{
+  "address": "https://edge-a.example.test:19086",
+  "server_name": "edge-a.example.test",
+  "ca": "/private/tls/route-ca.pem",
+  "certificate": "/private/tls/pumgye.pem",
+  "key": "/private/tls/pumgye.key",
+  "token_env": "HANGANG_ROUTE_OWNER_TOKEN"
+}
+```
 
 ## Validation and startup
 

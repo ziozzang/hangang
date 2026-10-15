@@ -313,6 +313,7 @@ pub struct Proxy {
     request_inspectors: Arc<tokio::sync::Semaphore>,
     native_bodies: Arc<tokio::sync::Semaphore>,
     native_routes: Arc<crate::native_route_owner::Registry>,
+    route_owner_queries: bool,
     request_spools: Arc<crate::request_block_spool::Pool>,
     acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
@@ -717,6 +718,7 @@ impl Proxy {
             request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
             native_bodies: Arc::new(tokio::sync::Semaphore::new(128)),
             native_routes,
+            route_owner_queries: false,
             request_spools: Arc::new(crate::request_block_spool::Pool::new()),
             acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
@@ -744,6 +746,10 @@ impl Proxy {
         }
     }
 
+    pub fn with_route_owner_queries(mut self, enabled: bool) -> Self {
+        self.route_owner_queries = enabled;
+        self
+    }
     pub fn route_owner_on(
         &self,
         prepared: crate::route_owner_grpc::PreparedConfiguration,
@@ -3352,13 +3358,14 @@ impl Proxy {
                         Ok(owner) => owner,
                         Err(_) => return Ok(response(503, "native route owner unavailable")),
                     };
+                let route_reference = self.route_owner_queries.then(|| route_owner.wire());
                 let observation = tokio::select! {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
                         retired.record(&self.metrics);
                         return Ok(response(503, "route authorization retired"));
                     }
-                    result = binding.observe(&prepared, &context, hopae, authority, edge.client_ip) => match result {
+                    result = binding.observe_with_route(&prepared, &context, hopae, authority, edge.client_ip, route_reference.as_ref()) => match result {
                         Ok(observation) => observation,
                         Err(_) => return Ok(response(503, "native resource authority unavailable")),
                     }
