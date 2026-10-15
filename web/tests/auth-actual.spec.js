@@ -29,7 +29,7 @@ test('real backend bootstraps an admin and restricts a newly created viewer', as
   await expect(page.locator('#signed-in-user')).toHaveText('owner · admin');
   expect((await (await request.get(`${base}/v1/auth/setup`)).json()).bootstrap_required).toBe(false);
 
-  await page.getByRole('link', { name: 'Users' }).click();
+  await page.getByRole('link', { name: 'Console accounts' }).click();
   const create = page.locator('#create-user-form');
   await create.locator('[name="username"]').fill('reader');
   await create.locator('[name="password"]').fill(viewerPassword);
@@ -46,7 +46,7 @@ test('real backend bootstraps an admin and restricts a newly created viewer', as
   await page.reload();
   expect((await viewerRestore).status()).toBe(200);
   await expect(page.locator('#signed-in-user')).toHaveText('reader · viewer');
-  await expect(page.getByRole('link', { name: 'Users' })).toBeHidden();
+  await expect(page.getByRole('link', { name: 'Console accounts' })).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Proxy status' })).toBeVisible();
   expect((await request.get(`${base}/v1/config`, { headers: { Authorization: `Bearer ${viewerToken}` } })).status()).toBe(403);
   expect((await request.get(`${base}/v1/users`, { headers: { Authorization: `Bearer ${viewerToken}` } })).status()).toBe(403);

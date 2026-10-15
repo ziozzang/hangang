@@ -273,7 +273,7 @@ test('logout scrubs stream data and viewer never requests or renders administrat
     route.fulfill({ contentType: 'text/event-stream', body: event('status', statusAt(11, 3)) }) });
   await signIn(page);
   await expect(page.locator('#activity-rows tr')).toHaveCount(1);
-  await page.getByRole('link', { name: 'Security' }).click();
+  await page.getByRole('link', { name: 'Gateway protections' }).click();
   await expect(page.locator('#security-content .metric')).toHaveCount(4);
   await page.getByRole('button', { name: 'Log out' }).click();
   await expect(page.locator('#login-dialog')).toBeVisible();
@@ -289,7 +289,7 @@ test('logout scrubs stream data and viewer never requests or renders administrat
       event('status', statusAt(11, 4)) + event('traffic', traffic([record(7)])) }) });
   await signIn(viewerPage, true);
   await expect(viewerPage.locator('#activity-panel')).toBeHidden();
-  await expect(viewerPage.getByRole('link', { name: 'Security' })).toBeHidden();
+  await expect(viewerPage.getByRole('link', { name: 'Gateway protections' })).toBeHidden();
   await expect(viewerPage.locator('#activity-rows tr')).toHaveCount(0);
   expect(viewerCalls.filter((call) => call.path === '/v1/traffic' || call.path === '/v1/config')).toHaveLength(0);
   await viewerPage.close();

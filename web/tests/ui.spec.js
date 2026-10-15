@@ -338,7 +338,7 @@ test('viewer sign-in shows status and cannot navigate to administrator controls'
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('heading', { name: 'Proxy status' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'HTTP routes' })).toBeHidden();
-  await expect(page.getByRole('link', { name: 'Users' })).toBeHidden();
+  await expect(page.getByRole('link', { name: 'Console accounts' })).toBeHidden();
   await expect(page.locator('#restart-server')).toBeHidden();
   await expect(page.locator('#check-update')).toBeHidden();
   await page.evaluate(() => { location.hash = '#users'; });
@@ -370,7 +370,7 @@ test('administrator creates, edits, and deletes local users', async ({ page }) =
   await page.locator('#login-username').fill('owner');
   await page.locator('#login-password').fill('owner-password');
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await page.getByRole('link', { name: 'Users' }).click();
+  await page.getByRole('link', { name: 'Console accounts' }).click();
   await expect(page.getByRole('heading', { name: 'Users' })).toBeVisible();
   const create = page.locator('#create-user-form');
   await create.locator('[name="username"]').fill('alice');
@@ -403,7 +403,7 @@ test('user names render as text and duplicate creation stays on the form', async
   await page.locator('#login-username').fill('owner');
   await page.locator('#login-password').fill('owner-password');
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await page.getByRole('link', { name: 'Users' }).click();
+  await page.getByRole('link', { name: 'Console accounts' }).click();
   await expect(page.getByRole('heading', { name: '<img src=x onerror=alert(1)>' })).toBeVisible();
   await expect(page.locator('.user-card img')).toHaveCount(0);
   const create = page.locator('#create-user-form');
