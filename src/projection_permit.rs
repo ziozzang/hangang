@@ -324,6 +324,114 @@ mod tests {
     use crate::projection_receipt::{IssuerPin, ServiceScope};
     use base64::Engine;
     use ed25519_dalek::SigningKey;
+    #[test]
+    fn observed_human_permit_signature_preserves_actual_assurance() {
+        for aal in [1u8, 2] {
+            let key = SigningKey::from_bytes(&[91; 32]);
+            let subject = format!("human1:{}", "a".repeat(64));
+            let wire_identity = hopae_grpc::v1::ReceiptIdentity {
+                subject_ref: subject.clone(),
+                kind: 1,
+                aal: u32::from(aal),
+                revision: 7,
+                credential_generation: 9,
+            };
+            // Independent signer uses actual Human assurance, never the receiver helper.
+            let expected = receipt_binding::Context {
+                issuer_ref: "pumgye",
+                key_epoch: 1,
+                identity_authority_epoch: "owned-human",
+                identity: receipt_binding::Identity {
+                    subject_ref: &subject,
+                    kind: hopae_grpc::PrincipalKind::Human,
+                    aal,
+                    revision: 7,
+                    credential_generation: 9,
+                },
+                service: "orders",
+                audience: "orders-api",
+                request_sha256: [3; 32],
+            };
+            let permit = receipt_binding::Permit {
+                authentication_receipt_sha256: [4; 32],
+                decision_ref: "decision",
+                resource: "db:orders",
+                action: "select",
+                authority_epoch: "policy",
+                catalog_revision: 2,
+                policy_revision: 2,
+                network_revision: 3,
+                route_revision: 4,
+                plan_revision: 5,
+            };
+            let digest = receipt_binding::digest(&expected, Some(&permit)).unwrap();
+            let raw = receipt::sign(
+                &key,
+                &receipt::Claims {
+                    purpose: receipt::Purpose::Permit,
+                    issued_ms: 100,
+                    expires_ms: 900,
+                    binding: digest,
+                    nonce: [8; 32],
+                },
+            )
+            .unwrap();
+            let checked = receipt_binding::Context {
+                identity: observed_binding_identity(
+                    &wire_identity,
+                    hopae_grpc::PrincipalKind::Human,
+                )
+                .unwrap(),
+                ..expected
+            };
+            let actual = receipt_binding::digest(&checked, Some(&permit)).unwrap();
+            assert!(
+                receipt::verify_signature(
+                    &key.verifying_key(),
+                    &raw,
+                    receipt::Purpose::Permit,
+                    &actual
+                )
+                .is_ok()
+            );
+            let wrong = receipt_binding::Context {
+                identity: receipt_binding::Identity {
+                    aal: 0,
+                    ..checked.identity
+                },
+                ..checked
+            };
+            let wrong_digest = receipt_binding::digest(&wrong, Some(&permit));
+            assert!(
+                wrong_digest.is_err()
+                    || receipt::verify_signature(
+                        &key.verifying_key(),
+                        &raw,
+                        receipt::Purpose::Permit,
+                        &wrong_digest.unwrap()
+                    )
+                    .is_err()
+            );
+        }
+        for (kind, aal, allowed) in [
+            (hopae_grpc::PrincipalKind::Human, 0, false),
+            (hopae_grpc::PrincipalKind::Human, 3, false),
+            (hopae_grpc::PrincipalKind::Human, 257, false),
+            (hopae_grpc::PrincipalKind::Service, 0, true),
+            (hopae_grpc::PrincipalKind::Workload, 0, true),
+            (hopae_grpc::PrincipalKind::Service, 1, false),
+        ] {
+            let identity = hopae_grpc::v1::ReceiptIdentity {
+                subject_ref: "data-only".into(),
+                kind: 1,
+                aal,
+                revision: 1,
+                credential_generation: 1,
+            };
+            assert_eq!(observed_binding_identity(&identity, kind).is_ok(), allowed);
+        }
+    }
+
     fn fixture() -> (Pin, CheckedServiceReceipt, ProjectionPermitReply) {
         let authentication_key = SigningKey::from_bytes(&[7; 32]);
         let permission_key = SigningKey::from_bytes(&[8; 32]);
