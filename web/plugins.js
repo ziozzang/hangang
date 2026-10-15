@@ -34,14 +34,23 @@ export function pausePlugins() { for(const m of mounted.values()){m.paused=true;
 export async function loadPlugin(name) {
   const p=catalog.find(p=>p.name===name);if(!p)throw Error('Unknown console plugin');
   if(mounted.has(name)){const record=mounted.get(name);record.paused=false;record.instance?.resume?.();return;}
-  const epoch=generation, controller=new AbortController(), record={controller,instance:null,paused:false};mounted.set(name,record);
+  const epoch=generation, controller=new AbortController(), record={controller,instance:null,paused:false,localeListeners:new Set()};mounted.set(name,record);
+  controller.signal.addEventListener('abort',()=>record.localeListeners.clear(),{once:true});
   const base=p.entry.slice(0,p.entry.lastIndexOf('/')+1);
   const style=document.createElement('link');style.rel='stylesheet';style.href=base+'style.css';style.dataset.consolePlugin=p.id;document.head.append(style);
   try {
     const module=await import(p.entry);
     if(epoch!==generation || controller.signal.aborted)return;
     if(typeof module.mount!=='function')throw Error('Console plugin has no mount function');
-    record.instance=await module.mount(Object.freeze({root:p.root,signal:controller.signal,locale:host.locale,authentication:p.authentication==='hangang'?'hangang':'native',
+    record.instance=await module.mount(Object.freeze({root:p.root,signal:controller.signal,locale:host.locale,onLocaleChange:(listener)=>{
+        if(typeof listener!=='function')throw Error('Invalid locale listener');
+        if(controller.signal.aborted)return ()=>{};
+        if(record.localeListeners.size>=8)throw Error('Too many locale listeners');
+        const notify=()=>{if(epoch===generation&&!controller.signal.aborted)listener(host.locale());};
+        record.localeListeners.add(notify);
+        window.addEventListener('hangang:localechange',notify,{signal:controller.signal});
+        return ()=>{record.localeListeners.delete(notify);window.removeEventListener('hangang:localechange',notify);};
+      },authentication:p.authentication==='hangang'?'hangang':'native',
       api:(path,options={})=>{if(controller.signal.aborted) return Promise.reject(Error('Session ended'));if(!/^[a-z0-9-]+(?:\/[a-z0-9-]+)*$/.test(path))return Promise.reject(Error('Invalid plugin API path'));return host.api(p.api_base+'/'+path,{...options,signal:controller.signal});},
       asset:(file)=>{if(!/^[a-zA-Z0-9_-]+\.(html|css)$/.test(file))return Promise.reject(Error('Invalid plugin asset'));return fetch(base+file,{signal:controller.signal,cache:'no-store'}).then(r=>{if(!r.ok)throw Error('Plugin asset unavailable');return r;});}
     }));

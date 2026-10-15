@@ -60,6 +60,28 @@ backend 본문을 버리고 결과가 불확실함을 알립니다. 비공개 �
 수 있는 실제 backend 결과를 유지합니다. dispatch 전 권한 검사에서 거부한 요청에는 새 작업
 참조를 부여하지 않습니다.
 
+## 마운트된 패키지의 언어 수명주기
+
+언어는 호스트가 소유합니다. mount는
+`const unsubscribe = context.onLocaleChange?.(() => render(context.locale()));`로
+구독할 수 있습니다. 선택적 hook은 mount마다 최대 8개 listener를 허용하고 구독 해제
+함수를 반환합니다. pause 중에도 알림을 받으며 abort/로그아웃 시 listener를 제거하고
+이전 mount 세대의 callback을 차단합니다. 이벤트 payload를 언어 권위로 사용하지
+않습니다. hook 존재를 확인하는 패키지는 기존 호스트도 지원합니다.
+
+언어 callback은 화면 표현만 제자리에서 변경합니다. draft·진행 중 변경·선택 상태·
+캐시된 관측 시각을 유지하며 조회 요청·권위 신선도 갱신·remount를 수행하지 않습니다.
+호패와 수문장은 이 계약으로 마운트된 label과 상태 합성 문구를 갱신합니다. 브라우저
+회귀는 실제 패키지 asset과 모의 소유 API로 검증하며 실제 4개 서비스 배포와 검토된
+패키지 pin 적용은 별도 검증이 필요합니다.
+
+실제 패키지 브라우저 검사는 `HANGANG_TEST_HOPAE_PLUGIN`과
+`HANGANG_TEST_SUMUNJANG_PLUGIN`에 검토한 패키지 디렉터리를 명시해야 합니다.
+누락하면 `plugin_locale.spec.js`는 성공 검증 대신 skip을 표시합니다. 파일 누락·손상과
+manifest asset 해시 불일치는 실패합니다. 재현 명령과 검토한 원문 commit은
+[영문 문서](../CONSOLE_PLUGINS.md#mounted-package-locale-lifecycle)를 참고하며
+실행 증거에는 두 manifest pin을 함께 기록합니다.
+
 ## 호패 관리와 로그인
 
 기본 native 위임은 Hopae handle 인증·grant/role·assurance·신선도·CSRF·트랜잭션 변경

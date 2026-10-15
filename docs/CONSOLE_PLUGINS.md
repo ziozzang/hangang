@@ -64,6 +64,35 @@ already admitted operation; it grants no audit access or authority to retry. The
 private audit retains the actual backend result, which may already be committed.
 Requests refused by the authority check before dispatch do not gain a new operation reference.
 
+## Mounted package locale lifecycle
+
+The host owns the locale. A mount may subscribe with
+`const unsubscribe = context.onLocaleChange?.(() => render(context.locale()));`.
+The optional hook permits at most eight listeners per mount and returns an
+unsubscribe function. Notifications also reach paused mounts; the host removes
+listeners on abort/logout and fences callbacks from an older mount generation.
+Event payloads are not locale authority. Older hosts without this hook remain
+supported by packages that feature-detect it.
+
+A locale callback updates presentation in place. It must preserve drafts, pending
+mutations, selections and cached observation timestamps, and must not fetch data,
+renew authority freshness or remount the package. Hopae and Guard update their
+mounted labels and status composites through this contract. Browser regressions
+exercise real package assets with mocked owner APIs; live four-service deployment
+and reviewed package-pin adoption require separate qualification.
+
+The real-package browser selection requires both package directories explicitly;
+without them `plugin_locale.spec.js` reports skipped tests, not qualification.
+Malformed/missing files and manifest asset hash mismatches fail the selection.
+Use reviewed source checkouts (Hopae `d8d3f4f4ee1c026d5ed6baef8adc27a0e2fff892`,
+Guard `3e1afcb7496cdb610b722695343fcfa7378e0559`) and record their manifest pins:
+
+```sh
+HANGANG_TEST_HOPAE_PLUGIN=/reviewed/hopae/plugins/hopae \
+HANGANG_TEST_SUMUNJANG_PLUGIN=/reviewed/sumunjang/plugins/guard \
+npx playwright test --config web/playwright.config.js tests/plugin_locale.spec.js
+```
+
 ## Hopae management and login
 
 The default native delegation mode preserves Hopae handle authentication, grant/role, assurance,
