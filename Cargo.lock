@@ -1082,7 +1082,7 @@ dependencies = [
 [[package]]
 name = "hangang-runtime"
 version = "0.1.2"
-source = "git+https://github.com/ziozzang/hangang-runtime?rev=0cdbd1660cefe46eed8bab3c0deb1b62c560ecf6#0cdbd1660cefe46eed8bab3c0deb1b62c560ecf6"
+source = "git+https://github.com/ziozzang/hangang-runtime?rev=bf3ba2c0ccfb8603a34b14a30bc52d5112f0677a#bf3ba2c0ccfb8603a34b14a30bc52d5112f0677a"
 dependencies = [
  "anyhow",
  "axum",
@@ -1222,14 +1222,16 @@ dependencies = [
 [[package]]
 name = "hopae-grpc"
 version = "0.0.3"
-source = "git+https://github.com/ziozzang/hopae?rev=96c9af6bc0af1a81cdb42eea3da05f14c763a647#96c9af6bc0af1a81cdb42eea3da05f14c763a647"
+source = "git+https://github.com/ziozzang/hopae?rev=e01c67ed63203931aba0f45fbc8c10e42ed4a66f#e01c67ed63203931aba0f45fbc8c10e42ed4a66f"
 dependencies = [
  "ed25519-dalek",
+ "hangang-runtime",
  "prost",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "subtle",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2321,8 +2323,8 @@ dependencies = [
 
 [[package]]
 name = "pumgye-client"
-version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
+version = "0.1.7"
+source = "git+https://github.com/ziozzang/pumgye?rev=401d72f8aef4b3167a7055f2c2b3e368a2379d04#401d72f8aef4b3167a7055f2c2b3e368a2379d04"
 dependencies = [
  "anyhow",
  "pumgye-protocol",
@@ -2335,8 +2337,8 @@ dependencies = [
 
 [[package]]
 name = "pumgye-core"
-version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
+version = "0.1.7"
+source = "git+https://github.com/ziozzang/pumgye?rev=401d72f8aef4b3167a7055f2c2b3e368a2379d04#401d72f8aef4b3167a7055f2c2b3e368a2379d04"
 dependencies = [
  "anyhow",
  "guard-core",
@@ -2346,8 +2348,8 @@ dependencies = [
 
 [[package]]
 name = "pumgye-grpc"
-version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
+version = "0.1.7"
+source = "git+https://github.com/ziozzang/pumgye?rev=401d72f8aef4b3167a7055f2c2b3e368a2379d04#401d72f8aef4b3167a7055f2c2b3e368a2379d04"
 dependencies = [
  "hopae-grpc",
  "prost",
@@ -2358,8 +2360,8 @@ dependencies = [
 
 [[package]]
 name = "pumgye-protocol"
-version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
+version = "0.1.7"
+source = "git+https://github.com/ziozzang/pumgye?rev=401d72f8aef4b3167a7055f2c2b3e368a2379d04#401d72f8aef4b3167a7055f2c2b3e368a2379d04"
 dependencies = [
  "anyhow",
  "pumgye-core",

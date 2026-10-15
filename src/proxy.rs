@@ -3270,7 +3270,12 @@ impl Proxy {
                 Ok(uri) => uri,
                 Err((code, message)) => return Ok(response(code, message)),
             };
-            let client = if custom_outbound {
+            let client = if custom_outbound
+                && !runtime
+                    .native_resource
+                    .as_ref()
+                    .is_some_and(|binding| binding.observed_mode())
+            {
                 let client = match &docker_target {
                     Some((configured, target, discovery)) => self.outbound.client_for_epoch(
                         &runtime,
@@ -3383,7 +3388,11 @@ impl Proxy {
                 {
                     return Ok(response(503, "native credential expired"));
                 }
-                native_observation = Some((observation, authority.clone(), route_owner));
+                native_observation = Some((
+                    Arc::new(observation),
+                    authority.clone(),
+                    Arc::new(route_owner),
+                ));
             }
             // Raw request bodies already carry the guard installed before
             // external auth/Lua/transform buffering. A transformed body is a
@@ -3429,7 +3438,60 @@ impl Proxy {
             {
                 return Ok(response(503, "native resource observation retired"));
             }
+            // Observed credentials belong to one operation. The native gate is
+            // carried to the actual transport writes, including detached Hyper
+            // driver tasks and rustls buffered ciphertext. No pool may retain it.
+            let mut dispatch_timeout = header_timeout;
+            let gated_client =
+                if let Some((observation, authority, route_owner)) = &native_observation {
+                    if let Some(remaining) = observation.remaining_dispatch() {
+                        let Ok(remaining) = remaining else {
+                            return Ok(response(503, "native dispatch expired"));
+                        };
+                        dispatch_timeout = dispatch_timeout.min(remaining);
+                        let observation = observation.clone();
+                        let authority = authority.clone();
+                        let route_owner = route_owner.clone();
+                        let ip = edge.client_ip;
+                        let gate: crate::http_outbound::DispatchGate = Arc::new(move || {
+                            route_owner.current_for(ip) && observation.local_fences_hold(&authority)
+                        });
+                        let result = match &docker_target {
+                            Some((configured, target, discovery)) => self.outbound.gated_client(
+                                &runtime,
+                                configured,
+                                &target.endpoint,
+                                target.epoch,
+                                Some(discovery.clone()),
+                                snapshot.upstream_tls.get(&runtime.route.id),
+                                gate,
+                            ),
+                            None => self.outbound.gated_client(
+                                &runtime,
+                                &backend,
+                                &backend,
+                                0,
+                                None,
+                                snapshot.upstream_tls.get(&runtime.route.id),
+                                gate,
+                            ),
+                        };
+                        match result {
+                            Ok(client) => Some(client),
+                            Err(_) => {
+                                return Ok(response(503, "native dispatch transport unavailable"));
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
             let send = async {
+                if let Some(client) = &gated_client {
+                    return client.request(outgoing).await;
+                }
                 match &client {
                     Some(client) => client.request(outgoing).await,
                     None => self.client.request(outgoing).await,
@@ -3441,7 +3503,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                result = timeout(header_timeout, send) => result,
+                result = timeout(dispatch_timeout, send) => result,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);

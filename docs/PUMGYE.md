@@ -534,3 +534,66 @@ and absence of the incoming API credential. The earlier full regression passed
 1,301 tests (58 existing exclusions); four focused permit/projection tests and
 strict Clippy pass after the correction. The corrected final full workspace passes 1,302 tests (58 existing exclusions);
 no-permit/no-projection compatibility and 942 local documentation links pass. This is not a release or operating-adoption claim.
+
+### Opt-in native observed dispatch
+
+The `auth.native_resource.observed` object selects the complete observed chain.
+Keep `project_credentials: true` and the independent `permission_permit` public
+pin configured, and configure the existing fixed Hopae and Pumgye gRPC mTLS peers
+and native route owner (`--route-owner-config`). The SDK native caller key must
+contain 32–256 ASCII graphic characters. Example additional object:
+
+```json
+"observed": {
+  "identity_authority": "profiles",
+  "minimum_profile_revision": 1,
+  "minimum_application_generation": 1,
+  "minimum_key_registry_revision": 1,
+  "source_error_ppm": 100,
+  "receiver_error_ppm": 100,
+  "maximum_final_header_bytes": 32768
+}
+```
+
+The rate bounds are explicit deployment assumptions for each source and receiver;
+choose bounds qualified for all participating clocks. The stable identity authority
+is configured; random source process domains are discovered only from the signed
+receipt and matching authenticated current-owner response. A route owns one
+persistent SDK service client across subjects and domains, bound to its exact native
+transport. Configuration publication retires predecessor clients before exposing
+the successor. A missing observed endpoint refuses the request without strict or
+HTTP fallback.
+
+The actual HTTP request path buffers the final transformed entity once and retains
+its immutable digest/body ownership throughout authentication, observed permission
+issuance, consuming authentication refresh, and observed credential projection.
+Projection contract 2 binds the SHA256 of the exact permission query bytes. The
+receiver converts each authenticated source duration onto its own Linux BOOTTIME
+axis and intersects admission through independent local checks; it never takes a
+minimum of foreign absolute timestamps. Authentication, Pumgye permission and
+projection output are separate source domains. All cache TTLs must be zero.
+
+Immediately before upstream dispatch, the gateway checks the current native route,
+request owner, authority floors, transport identity and all three local deadlines.
+It strips original authorization/subject headers, installs only the allowed native
+credential header and enforces the configured final header byte budget. Observed
+evidence is point-in-time evidence, not a lease against later remote revocation.
+Omitting `observed` preserves the separate strict UTC path. The opt-in path is
+covered by owned mTLS source fixtures with independent source offsets and a real
+HTTP backend; this does not itself qualify a production deployment.
+
+Observed dispatch uses an operation-owned, unpooled HTTP/1 or HTTP/2 connection.
+The same native gate checks source deadlines, route/configuration ownership and
+Docker epoch before/after connection setup and on every raw write, vectored write,
+flush and shutdown below TLS. The request timeout also uses the shortest remaining
+local budget. Thus a detached Hyper task or buffered TLS record cannot silently
+bypass the native gate after an asynchronous connection wait. Bytes already
+accepted by the kernel before a check fails cannot be recalled; this is a local
+send boundary, not a promise about remote receipt time or future revocation.
+Native route references also use an original one-second BOOTTIME budget, with
+irreversible refusal on clock read failure, reversal or expiry. Shared observed
+HTTP pooling and throughput qualification remain open optimization work.
+
+Observed mode requires Linux BOOTTIME and refuses unsupported receiver clocks.
+Other platforms retain the separate legacy strict route timer; they do not obtain
+observed evidence through an Instant or wall-clock fallback.

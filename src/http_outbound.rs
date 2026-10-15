@@ -27,7 +27,27 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type HttpClient = Client<hyper_rustls::HttpsConnector<Dial>, Body>;
 /// Hyper requires connection metadata in addition to Tokio I/O. The boxed
 /// transport may be TCP or a Unix socket, so neither address type is assumed.
-pub struct DialIo(crate::upstream::BoxIo);
+pub(crate) type DispatchGate = Arc<dyn Fn() -> bool + Send + Sync>;
+pub struct DialIo {
+    io: crate::upstream::BoxIo,
+    gate: Option<DispatchGate>,
+    fence: Option<DockerFence>,
+    failed: bool,
+}
+impl DialIo {
+    fn check(&mut self) -> io::Result<()> {
+        if self.failed
+            || self.gate.as_ref().is_some_and(|gate| !gate())
+            || self.fence.as_ref().is_some_and(|fence| !fence.current())
+        {
+            self.failed = true;
+            return Err(io::Error::other(
+                "native dispatch observation expired or retired",
+            ));
+        }
+        Ok(())
+    }
+}
 impl Connection for DialIo {
     fn connected(&self) -> Connected {
         Connected::new()
@@ -39,7 +59,7 @@ impl AsyncRead for DialIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
 impl AsyncWrite for DialIo {
@@ -48,13 +68,35 @@ impl AsyncWrite for DialIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 #[derive(Clone)]
@@ -62,6 +104,7 @@ pub struct Dial {
     target: String,
     options: OutboundOptions,
     fence: Option<DockerFence>,
+    gate: Option<DispatchGate>,
 }
 #[derive(Clone)]
 struct DockerFence {
@@ -87,7 +130,11 @@ impl Service<Uri> for Dial {
         let target = self.target.clone();
         let options = self.options.clone();
         let fence = self.fence.clone();
+        let gate = self.gate.clone();
         Box::pin(async move {
+            if gate.as_ref().is_some_and(|gate| !gate()) {
+                return Err(io::Error::other("native dispatch retired before connect").into());
+            }
             if fence.as_ref().is_some_and(|fence| !fence.current()) {
                 return Err(anyhow::anyhow!("stale Docker endpoint").into_boxed_dyn_error());
             }
@@ -97,7 +144,14 @@ impl Service<Uri> for Dial {
             if fence.as_ref().is_some_and(|fence| !fence.current()) {
                 return Err(anyhow::anyhow!("stale Docker endpoint").into_boxed_dyn_error());
             }
-            Ok(TokioIo::new(DialIo(stream)))
+            let mut stream = DialIo {
+                io: stream,
+                failed: false,
+                fence: if gate.is_some() { fence } else { None },
+                gate,
+            };
+            stream.check()?;
+            Ok(TokioIo::new(stream))
         })
     }
 }
@@ -184,6 +238,71 @@ impl Pools {
         {
             return Ok(entry.client.as_ref().clone());
         }
+        let client = self.build_client(
+            runtime,
+            configured,
+            endpoint,
+            epoch,
+            discovery.clone(),
+            prepared,
+            None,
+        )?;
+        if clients.len() >= 1024 {
+            clients.retain(|_, e| e.runtime.strong_count() > 0);
+        }
+        // Replacing an epoch under an existing logical key does not increase
+        // cardinality and should not evict unrelated live route pools.
+        if clients.len() >= 1024 && !clients.contains_key(&key) {
+            clients.clear();
+        }
+        clients.insert(
+            key,
+            Entry {
+                runtime: Arc::downgrade(runtime),
+                discovery: discovery.as_ref().map(Arc::downgrade),
+                endpoint: endpoint.to_owned(),
+                epoch,
+                client: Arc::new(client.clone()),
+            },
+        );
+        Ok(client)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gated_client(
+        &self,
+        runtime: &Arc<HttpRuntime>,
+        configured: &str,
+        endpoint: &str,
+        epoch: u64,
+        discovery: Option<Arc<Discovery>>,
+        prepared: Option<&Arc<rustls::ClientConfig>>,
+        gate: DispatchGate,
+    ) -> anyhow::Result<HttpClient> {
+        anyhow::ensure!(
+            !configured.starts_with("docker://") || discovery.is_some(),
+            "missing Docker discovery fence"
+        );
+        self.build_client(
+            runtime,
+            configured,
+            endpoint,
+            epoch,
+            discovery,
+            prepared,
+            Some(gate),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_client(
+        &self,
+        runtime: &Arc<HttpRuntime>,
+        configured: &str,
+        endpoint: &str,
+        epoch: u64,
+        discovery: Option<Arc<Discovery>>,
+        prepared: Option<&Arc<rustls::ClientConfig>>,
+        gate: Option<DispatchGate>,
+    ) -> anyhow::Result<HttpClient> {
         let uri: Uri = endpoint.parse()?;
         let host = uri
             .host()
@@ -227,6 +346,7 @@ impl Pools {
             .wrap_connector(Dial {
                 target,
                 options: options.clone(),
+                gate: gate.clone(),
                 fence: discovery.as_ref().map(|discovery| DockerFence {
                     discovery: discovery.clone(),
                     configured: configured.to_owned(),
@@ -238,30 +358,12 @@ impl Pools {
             });
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(if runtime.route.preserve_host {
+            .pool_max_idle_per_host(if gate.is_some() || runtime.route.preserve_host {
                 0
             } else {
                 self.idle.clamp(1, 4096)
             })
             .build(connector);
-        if clients.len() >= 1024 {
-            clients.retain(|_, e| e.runtime.strong_count() > 0);
-        }
-        // Replacing an epoch under an existing logical key does not increase
-        // cardinality and should not evict unrelated live route pools.
-        if clients.len() >= 1024 && !clients.contains_key(&key) {
-            clients.clear();
-        }
-        clients.insert(
-            key,
-            Entry {
-                runtime: Arc::downgrade(runtime),
-                discovery: discovery.as_ref().map(Arc::downgrade),
-                endpoint: endpoint.to_owned(),
-                epoch,
-                client: Arc::new(client.clone()),
-            },
-        );
         Ok(client)
     }
 }
@@ -639,6 +741,7 @@ mod tests {
                 configured: reference.into(),
                 target: first.clone(),
             }),
+            gate: None,
         };
         let dialing = tokio::spawn(async move {
             Service::call(&mut dial, Uri::from_static("http://example.test/")).await
@@ -679,5 +782,138 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn observed_gate_refuses_delayed_tls_after_expiry_or_native_route_retirement() {
+        for retire_owner in [false, true] {
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![pair.cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        pair.signing_key.serialize_der().into(),
+                    ),
+                )
+                .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(pair.cert.der().clone()).unwrap();
+            let tls = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let effect_count = effects.clone();
+            let task = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if let Ok(mut tls) = server.accept(socket).await {
+                    let mut bytes = [0u8; 4096];
+                    if let Ok(n) = tls.read(&mut bytes).await {
+                        effect_count.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+                    }
+                }
+            });
+            let (registry, snapshot, runtime, prepared) =
+                crate::native_route_owner::tests::fixture(2).await;
+            let capture = Arc::new(
+                registry
+                    .capture(&snapshot, &runtime, &prepared, "192.0.2.9".parse().unwrap())
+                    .unwrap(),
+            );
+            let retirement = if retire_owner {
+                let registry = registry.clone();
+                Some(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    registry
+                        .active_for_test()
+                        .store(Arc::new(Snapshot::new(Config::default()).unwrap()));
+                }))
+            } else {
+                None
+            };
+            let started = hangang_runtime::time::ElapsedStamp::now().unwrap();
+            let gate: DispatchGate = Arc::new(move || {
+                capture.current()
+                    && started.elapsed().is_ok_and(|elapsed| {
+                        elapsed < Duration::from_millis(if retire_owner { 2000 } else { 150 })
+                    })
+            });
+            let pools = Pools::new(tls, 8);
+            let endpoint = format!("https://localhost:{}", address.port());
+            let client = pools
+                .gated_client(&runtime, &endpoint, &endpoint, 0, None, None, gate)
+                .unwrap();
+            let request = hyper::Request::post(&endpoint)
+                .header("authorization", "Bearer must-never-arrive")
+                .body(crate::proxy::full_body(bytes::Bytes::from_static(
+                    b"effect",
+                )))
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), client.request(request))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                effects.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "expired HTTP credentials/body reached delayed TLS backend"
+            );
+            assert!(
+                pools.clients.lock().unwrap().is_empty(),
+                "observed operation entered reusable pool"
+            );
+            if let Some(retirement) = retirement {
+                retirement.await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn observed_raw_gate_refusal_is_irreversible_for_every_write_operation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for operation in 0..4 {
+            let (writer, mut reader) = tokio::io::duplex(64);
+            let active = Arc::new(AtomicBool::new(false));
+            let flag = active.clone();
+            let gate: DispatchGate = Arc::new(move || flag.load(Ordering::Acquire));
+            let mut stream = DialIo {
+                io: Box::new(writer),
+                gate: Some(gate),
+                fence: None,
+                failed: false,
+            };
+            let refused = match operation {
+                0 => stream.write_all(b"never").await,
+                1 => stream
+                    .write_vectored(&[io::IoSlice::new(b"never")])
+                    .await
+                    .map(|_| ()),
+                2 => stream.flush().await,
+                _ => stream.shutdown().await,
+            };
+            assert!(refused.is_err());
+            active.store(true, Ordering::Release);
+            assert!(stream.write_all(b"resurrected").await.is_err());
+            drop(stream);
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).await.unwrap();
+            assert!(received.is_empty());
+        }
     }
 }

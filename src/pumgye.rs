@@ -762,6 +762,12 @@ impl AuthorityRuntime {
     }
 
     /// Compare local observed policy/network floors without refreshing lease health.
+    pub(crate) fn observed_permit_current(&self, permit: &crate::native_observed::Permit) -> bool {
+        match &self.native {
+            DecisionClient::Grpc(client) => client.observed_permit_current(permit),
+            _ => false,
+        }
+    }
     pub fn authenticated_observation_current(
         &self,
         reply: &crate::pumgye_grpc_client::AuthenticatedReply,
@@ -774,6 +780,21 @@ impl AuthorityRuntime {
 
     /// Fresh authenticated observation only; this is not a dispatch lease or permit.
     /// Resource ownership remains remote, while the route owns method/service scope.
+    pub(crate) async fn issue_observed_permit(
+        &self,
+        query: &crate::pumgye_grpc_client::AuthenticatedQuery<'_>,
+        authentication: &crate::native_observed::Authentication,
+        pin: &crate::projection_permit::Pin,
+        clock: std::sync::Arc<hangang_runtime::time::ReceiverClock>,
+        rates: &hopae_grpc::receipt_time::ClockRates,
+    ) -> Result<crate::native_observed::Permit> {
+        let DecisionClient::Grpc(client) = &self.native else {
+            anyhow::bail!("observed permission requires gRPC");
+        };
+        client
+            .issue_observed_permit(query, authentication, pin, clock, rates)
+            .await
+    }
     pub async fn observe_authenticated_resource(
         &self,
         gate: &ResourceGate,

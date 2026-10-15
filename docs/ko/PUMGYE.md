@@ -462,3 +462,60 @@ sensitive입니다. 기존 인증·주체 헤더를 제거한 뒤 결과를 설�
 엄격한 Clippy를 통과했습니다. 수정 후 최종 전체 workspace 1,302개 통과(기존 제외 58개), 무허가/무투영
 호환 검사와 로컬 문서 링크 942개를 통과했습니다. 신규
 릴리즈·운영 반영 완료를 뜻하지 않습니다.
+
+### 네이티브 observed 디스패치 선택
+
+`auth.native_resource.observed`를 설정하면 전체 observed 체인을 선택합니다.
+`project_credentials: true`, 독립 `permission_permit` 공개 핀, 기존 고정 호패·품계
+gRPC mTLS 피어와 네이티브 라우트 소유자(`--route-owner-config`)를 모두 설정해야
+합니다. SDK 네이티브 호출자 키는 ASCII graphic 문자 32–256자여야 합니다. 추가 객체 예:
+
+```json
+"observed": {
+  "identity_authority": "profiles",
+  "minimum_profile_revision": 1,
+  "minimum_application_generation": 1,
+  "minimum_key_registry_revision": 1,
+  "source_error_ppm": 100,
+  "receiver_error_ppm": 100,
+  "maximum_final_header_bytes": 32768
+}
+```
+
+클록 오차 상한은 각 소스·수신기에 대한 명시적 배포 가정이며 모든 참여 클록을
+검증한 값이어야 합니다. 안정적인 identity authority를 설정하고, 임의 프로세스
+도메인은 서명된 receipt와 인증된 현재 소유자 응답이 일치할 때만 받습니다.
+라우트가 소유하는 영속 SDK 서비스 클라이언트 하나를 여러 주체·소스 도메인에서
+사용하며 정확한 네이티브 전송 인스턴스에 묶습니다. 설정 교체는 이전 클라이언트를
+먼저 폐기합니다. observed 엔드포인트가 없으면 strict 또는 HTTP로 우회하지 않고
+요청을 거부합니다.
+
+실제 HTTP 경로는 최종 변환 본문을 한 번만 버퍼링하고 불변 digest·본문 소유권을
+인증, observed 허가 발급, 기존 인증 관측을 소비하는 refresh, observed 자격증명
+투영까지 유지합니다. 투영 계약 2는 정확한 permission query 바이트의 SHA256을
+묶습니다. 서로 독립적인 인증·품계 허가·투영 출력 소스의 남은 시간을 수신기
+Linux BOOTTIME 좌표로 변환하고 각각의 로컬 마감시간을 확인합니다. 서로 다른
+소스의 절대 타임스탬프를 최솟값으로 비교하지 않습니다. 모든 cache TTL은 0이어야
+합니다.
+
+upstream 전송 직전에 현재 라우트·요청 소유자·authority floor·전송 인스턴스와
+세 로컬 마감시간을 다시 확인합니다. 원래 authorization·subject 헤더를 제거하고
+허용된 네이티브 자격증명 헤더만 설치한 뒤 최종 헤더 바이트 예산을 검사합니다.
+관측은 특정 시점의 증거이며 이후 원격 취소를 막는 lease가 아닙니다. `observed`를
+생략하면 별도 strict UTC 경로를 유지합니다. 독립 소스 오프셋과 실제 HTTP backend를
+사용하는 소유 mTLS fixture로 경로를 검사하며, 이 결과만으로 운영 배포를 인증하지는
+않습니다.
+
+Observed 전송은 요청 한 건이 소유하는 비풀링 HTTP/1 또는 HTTP/2 연결을 사용합니다.
+동일한 네이티브 게이트가 연결 전후와 TLS 아래의 모든 raw write·vectored write·
+flush·shutdown에서 소스 마감시간, 라우트·설정 소유권과 Docker epoch를 확인합니다.
+요청 timeout도 가장 짧은 로컬 잔여 예산으로 제한합니다. 비동기 연결 대기 후의
+Hyper 백그라운드 작업이나 TLS 버퍼도 이 게이트를 우회할 수 없습니다. 검사 실패
+전에 커널이 받은 바이트는 회수할 수 없습니다. 이는 로컬 송신 경계이며 원격 수신
+시각이나 이후 취소에 대한 보장이 아닙니다. 네이티브 라우트 참조 역시 최초의
+1초 BOOTTIME 예산을 사용하고 클록 읽기 실패·역행·만료를 발견하면 영구 거부합니다.
+Observed HTTP 공유 풀과 처리량 검증은 후속 최적화 과제로 남아 있습니다.
+
+Observed 모드는 Linux BOOTTIME이 필요하며 지원하지 않는 수신기 클록은 거부합니다.
+다른 플랫폼의 기존 strict 라우트 타이머는 별도로 유지하며, Instant나 wall clock으로
+대체하여 observed 증거를 만들지 않습니다.

@@ -54,6 +54,50 @@ impl Client {
             receipt_started,
         })
     }
+    pub(super) async fn project_observed(
+        &self,
+        mut query: pumgye_grpc::v1::PermitValidationRequest,
+        timeout: Duration,
+    ) -> io::Result<(hopae_grpc::v1::ObservedProjectionReply, [u8; 32])> {
+        let _slot = self.slots.try_acquire().map_err(|_| invalid())?;
+        if timeout.is_zero() {
+            return Err(invalid());
+        }
+        let request_id = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v < 9_007_199_254_740_991).then(|| v + 1)
+            })
+            .map_err(|_| invalid())?;
+        use prost::Message;
+        use sha2::{Digest, Sha256};
+        query.request_id = request_id;
+        let query = query.encode_to_vec();
+        if query.len() > 8192 {
+            return Err(invalid());
+        }
+        let chain_sha256: [u8; 32] = Sha256::digest(&query).into();
+        let timeout = timeout.min(Duration::from_secs(1));
+        let mut request = tonic::Request::new(hopae_grpc::v1::ProjectionRequest {
+            request_id,
+            permission_contract: 2,
+            permission_query: query,
+        });
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.key.clone());
+        let mut client = hopae_grpc::v1::observed_credential_projection_client::ObservedCredentialProjectionClient::new(self.channel.clone()).max_encoding_message_size(8448).max_decoding_message_size(8192);
+        let reply = tokio::time::timeout(timeout, client.project(request))
+            .await
+            .map_err(|_| invalid())?
+            .map_err(|_| invalid())?
+            .into_inner();
+        if reply.request_id != request_id {
+            return Err(invalid());
+        }
+        Ok((reply, chain_sha256))
+    }
     pub(super) async fn project_credential(
         &self,
         receipt: &crate::projection_receipt::CheckedServiceReceipt,

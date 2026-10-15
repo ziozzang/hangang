@@ -122,6 +122,86 @@ impl CheckedPermit {
 }
 impl Pin {
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_observed_signature(
+        &self,
+        request_id: u64,
+        resource: &str,
+        action: &str,
+        minimum_revision: u64,
+        network_floor: u64,
+        authentication: &crate::native_observed::Authentication,
+        wire: ProjectionPermitReply,
+    ) -> Result<hopae_grpc::receipt::SignatureEvidence, Refused> {
+        let auth = authentication.context();
+        let context = wire.context.as_ref().ok_or(Refused)?;
+        let identity = context.identity.as_ref().ok_or(Refused)?;
+        let auth_identity = auth.identity.as_ref().ok_or(Refused)?;
+        let p = wire.binding.as_ref().ok_or(Refused)?;
+        if wire.request_id != request_id
+            || wire.cache_ttl_ms != 0
+            || context.issuer_ref != self.issuer
+            || context.key_epoch != self.epoch
+            || context.identity_authority_epoch != auth.identity_authority_epoch
+            || identity.subject_ref != auth_identity.subject_ref
+            || identity.kind != 2
+            || identity.aal != 0
+            || identity.revision != auth_identity.revision
+            || identity.credential_generation != auth_identity.credential_generation
+            || context.service != auth.service
+            || context.audience != auth.audience
+            || context.request_sha256.as_slice() != auth.request_sha256.as_slice()
+            || p.resource != resource
+            || p.action != action
+            || p.policy_revision < minimum_revision
+            || p.catalog_revision != p.policy_revision
+            || p.network_revision < network_floor
+            || p.authentication_receipt_sha256.as_slice() != authentication.sha256()
+            || authentication.remaining().is_err()
+        {
+            return Err(Refused);
+        }
+        let context = receipt_binding::Context {
+            issuer_ref: &context.issuer_ref,
+            key_epoch: context.key_epoch,
+            identity_authority_epoch: &context.identity_authority_epoch,
+            identity: receipt_binding::Identity {
+                subject_ref: &identity.subject_ref,
+                kind: hopae_grpc::PrincipalKind::Service,
+                aal: 0,
+                revision: identity.revision,
+                credential_generation: identity.credential_generation,
+            },
+            service: &context.service,
+            audience: &context.audience,
+            request_sha256: auth
+                .request_sha256
+                .as_slice()
+                .try_into()
+                .map_err(|_| Refused)?,
+        };
+        let permit = receipt_binding::Permit {
+            authentication_receipt_sha256: p
+                .authentication_receipt_sha256
+                .as_slice()
+                .try_into()
+                .map_err(|_| Refused)?,
+            decision_ref: &p.decision_ref,
+            resource: &p.resource,
+            action: &p.action,
+            authority_epoch: &p.authority_epoch,
+            catalog_revision: p.catalog_revision,
+            policy_revision: p.policy_revision,
+            network_revision: p.network_revision,
+            route_revision: p.route_revision,
+            plan_revision: p.plan_revision,
+        };
+        let binding = receipt_binding::digest(&context, Some(&permit)).map_err(|_| Refused)?;
+        let checked =
+            receipt::verify_signature(&self.key, &wire.receipt, receipt::Purpose::Permit, &binding)
+                .map_err(|_| Refused)?;
+        Ok(checked)
+    }
+    #[allow(clippy::too_many_arguments)]
     pub fn verify(
         &self,
         request_id: u64,

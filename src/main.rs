@@ -926,6 +926,15 @@ async fn run(args: Args) -> Result<()> {
         .map(hangang::admin_plugins::Registry::load)
         .transpose()?
         .map(Arc::new);
+    anyhow::ensure!(
+        args.route_owner_config.is_some()
+            || !config.http.iter().any(|route| route
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.native_resource.as_ref())
+                .is_some_and(|native| native.observed.is_some())),
+        "observed native dispatch requires --route-owner-config"
+    );
     if args.check {
         if let Some(path) = args.fleet_observer_config.clone() {
             let _ =

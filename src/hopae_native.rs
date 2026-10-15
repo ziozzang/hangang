@@ -25,6 +25,8 @@ struct Connection {
 }
 pub struct Client {
     grpc: Option<grpc::Client>,
+    observed_settings: Option<crate::config::HopaeNative>,
+    pub(crate) observed_owner: std::sync::Arc<()>,
     address: pumgye_client::Endpoint,
     tls: Option<(
         tokio_rustls::TlsConnector,
@@ -74,6 +76,7 @@ impl Client {
             let grpc = grpc::Client::new(settings, &key)?;
             let mut client = Self::new(settings.address.clone(), settings.pool_size, key);
             client.grpc = Some(grpc);
+            client.observed_settings = Some(settings.clone());
             return Ok(client);
         }
         let mut client = Self::new(settings.address.clone(), settings.pool_size, key);
@@ -95,6 +98,8 @@ impl Client {
     ) -> Self {
         Self {
             grpc: None,
+            observed_settings: None,
+            observed_owner: std::sync::Arc::new(()),
             address: address.into(),
             tls: None,
             key,
@@ -102,6 +107,43 @@ impl Client {
             slots: Semaphore::new(pool_size),
             next: AtomicU64::new(1),
         }
+    }
+    pub(crate) fn observed_client(
+        &self,
+        policy: hopae_grpc::observed_client::ServiceTrustPolicy,
+        clock: std::sync::Arc<hangang_runtime::time::ReceiverClock>,
+        rates: hopae_grpc::receipt_time::ClockRates,
+    ) -> anyhow::Result<hopae_grpc::observed_client::Client> {
+        use hopae_grpc::observed_client::{Client, EndpointConfig, Limits};
+        let settings = self
+            .observed_settings
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("observed authentication requires gRPC"))?;
+        let tls = settings
+            .tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("observed authentication requires mTLS"))?;
+        let ca = crate::tls::read_bounded(&tls.ca)?;
+        let certificate = crate::tls::read_bounded(&tls.certificate)?;
+        let private_key = zeroize::Zeroizing::new(crate::tls::read_bounded(&tls.key)?);
+        Client::new_service(
+            EndpointConfig {
+                address: &format!("https://{}", settings.address),
+                server_name: &tls.server_name,
+                ca: &ca,
+                certificate: &certificate,
+                private_key: &private_key,
+                caller_key: self.key.to_str()?,
+            },
+            policy,
+            clock,
+            rates,
+            Limits {
+                concurrent: settings.pool_size,
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("observed native client configuration refused"))
     }
     /// Separate native receipt phase. Unsupported transports refuse without fallback.
     pub async fn issue_service_receipt(
@@ -130,6 +172,17 @@ impl Client {
             .await
     }
 
+    pub(crate) async fn project_observed(
+        &self,
+        query: pumgye_grpc::v1::PermitValidationRequest,
+        timeout: Duration,
+    ) -> io::Result<(hopae_grpc::v1::ObservedProjectionReply, [u8; 32])> {
+        self.grpc
+            .as_ref()
+            .ok_or_else(invalid)?
+            .project_observed(query, timeout)
+            .await
+    }
     pub(crate) async fn project_credential(
         &self,
         receipt: &crate::projection_receipt::CheckedServiceReceipt,

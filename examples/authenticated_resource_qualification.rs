@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
         public_key: config.public_key.clone(),
         permission_permit: None,
         project_credentials: false,
+        observed: None,
         maximum_body_bytes: 1024 * 1024,
         body_timeout_ms: 1000,
     };

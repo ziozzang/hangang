@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -24,7 +24,64 @@ struct Entry {
     uri: hyper::Uri,
     method: hyper::Method,
     destination_sha256: [u8; 32],
-    expires: Instant,
+    lifetime: Mutex<Lifetime>,
+}
+enum SourceStamp {
+    #[cfg(target_os = "linux")]
+    Boottime(hangang_runtime::time::ElapsedStamp),
+    #[cfg(not(target_os = "linux"))]
+    LegacyStrict(std::time::Instant),
+}
+impl SourceStamp {
+    fn new(_observed: bool) -> Result<Self, Refused> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self::Boottime(
+                hangang_runtime::time::ElapsedStamp::now().map_err(|_| Refused)?,
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if _observed {
+                return Err(Refused);
+            }
+            Ok(Self::LegacyStrict(std::time::Instant::now()))
+        }
+    }
+    fn elapsed(&self) -> Result<Duration, Refused> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Boottime(stamp) => stamp.elapsed().map_err(|_| Refused),
+            #[cfg(not(target_os = "linux"))]
+            Self::LegacyStrict(stamp) => Ok(stamp.elapsed()),
+        }
+    }
+}
+struct Lifetime {
+    started: SourceStamp,
+    last: Duration,
+    failed: bool,
+}
+impl Entry {
+    fn remaining(&self) -> Option<Duration> {
+        let mut lifetime = self.lifetime.lock().ok()?;
+        if lifetime.failed {
+            return None;
+        }
+        let elapsed = match lifetime.started.elapsed() {
+            Ok(elapsed) => elapsed,
+            Err(_) => {
+                lifetime.failed = true;
+                return None;
+            }
+        };
+        if elapsed < lifetime.last || elapsed >= Duration::from_secs(1) {
+            lifetime.failed = true;
+            return None;
+        }
+        lifetime.last = elapsed;
+        Duration::from_secs(1).checked_sub(elapsed)
+    }
 }
 pub(crate) struct Registry {
     active: Arc<ArcSwap<Snapshot>>,
@@ -111,9 +168,16 @@ impl Registry {
             uri: prepared.request().uri().clone(),
             method: prepared.request().method().clone(),
             destination_sha256: destination_digest(prepared.request().uri()),
-            expires: Instant::now()
-                .checked_add(Duration::from_secs(1))
-                .ok_or(Refused)?,
+            lifetime: Mutex::new(Lifetime {
+                started: SourceStamp::new(
+                    runtime
+                        .native_resource
+                        .as_ref()
+                        .is_some_and(|binding| binding.observed_mode()),
+                )?,
+                last: Duration::ZERO,
+                failed: false,
+            }),
         });
         let mut shard = self.entries[Self::shard(&reference)]
             .lock()
@@ -167,13 +231,7 @@ impl Registry {
             IpAddr::V4(ip) => ip.octets().to_vec(),
             IpAddr::V6(ip) => ip.octets().to_vec(),
         };
-        let remaining_ms = u32::try_from(
-            entry
-                .expires
-                .checked_duration_since(Instant::now())?
-                .as_millis(),
-        )
-        .ok()?;
+        let remaining_ms = u32::try_from(entry.remaining()?.as_millis()).ok()?;
         if !(1..=1000).contains(&remaining_ms) {
             return None;
         }
@@ -190,7 +248,7 @@ impl Registry {
             destination_sha256: entry.destination_sha256.to_vec(),
             remaining_ms,
         };
-        if Instant::now() >= entry.expires || !Arc::ptr_eq(&self.active.load(), &entry.snapshot) {
+        if entry.remaining().is_none() || !Arc::ptr_eq(&self.active.load(), &entry.snapshot) {
             return None;
         }
         Some(reply)
@@ -212,7 +270,7 @@ impl Registry {
             && entry.digest == *digest
             && entry.uri == *uri
             && entry.method == *method
-            && Instant::now() < entry.expires
+            && entry.remaining().is_some()
             && Arc::ptr_eq(&self.active.load(), &entry.snapshot)
     }
 }
@@ -312,6 +370,32 @@ pub(crate) mod tests {
             .await
             .unwrap();
         (registry, snapshot, runtime, prepared)
+    }
+    #[tokio::test]
+    async fn route_clock_reversal_irreversibly_retires_the_original_capture() {
+        let (registry, snapshot, runtime, prepared) = fixture(2).await;
+        let capture = registry
+            .capture(&snapshot, &runtime, &prepared, ip())
+            .unwrap();
+        assert!(capture.current());
+        capture.entry.lifetime.lock().unwrap().last = Duration::from_secs(2);
+        assert!(!capture.current());
+        capture.entry.lifetime.lock().unwrap().last = Duration::ZERO;
+        assert!(
+            !capture.current(),
+            "a later good clock read resurrected a refused capture"
+        );
+        let wire = capture.request(7);
+        assert!(
+            registry
+                .observe(
+                    &capture.reference,
+                    &prepared.digest(),
+                    &wire.destination_sha256.as_slice().try_into().unwrap(),
+                    7
+                )
+                .is_none()
+        );
     }
     #[test]
     fn final_absolute_uri_digest_matches_an_independent_vector() {

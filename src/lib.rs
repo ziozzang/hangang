@@ -119,6 +119,7 @@ pub mod pumgye;
 
 pub mod pumgye_grpc_client;
 
+pub mod native_observed;
 pub mod native_resource;
 pub mod projection_binding;
 pub mod projection_entity;

@@ -16,6 +16,8 @@ pub struct Configuration {
     pub permission_permit: Option<crate::projection_permit::Configuration>,
     #[serde(default)]
     pub project_credentials: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<crate::native_observed::Configuration>,
     #[serde(default = "default_body_limit")]
     pub maximum_body_bytes: usize,
     #[serde(default = "default_body_timeout")]
@@ -58,6 +60,20 @@ impl Configuration {
             "credential projection requires signed permission permits"
         );
         binding.project_credentials = self.project_credentials;
+        if let Some(observed) = &self.observed {
+            ensure!(
+                self.project_credentials && self.permission_permit.is_some(),
+                "observed mode requires authentication, observed permit and observed projection peers"
+            );
+            binding.observed = Some(crate::native_observed::Owner::compile(
+                observed.clone(),
+                self.issuer_ref.clone(),
+                self.key_epoch,
+                public,
+                binding.gate.service_id.clone(),
+                self.audience.clone(),
+            )?);
+        }
         binding.permit_pin = self
             .permission_permit
             .as_ref()
@@ -85,6 +101,7 @@ pub struct Binding {
     pin: projection_receipt::IssuerPin,
     permit_pin: Option<crate::projection_permit::Pin>,
     project_credentials: bool,
+    observed: Option<crate::native_observed::Owner>,
     gate: pumgye::ResourceGate,
     maximum_body_bytes: usize,
     body_timeout: std::time::Duration,
@@ -138,6 +155,36 @@ impl Observation {
         self.receipt
     }
 }
+pub enum DispatchObservation {
+    Strict(Observation),
+    Observed(crate::native_observed::Dispatch),
+}
+impl DispatchObservation {
+    pub(crate) fn remaining_dispatch(&self) -> Option<Result<std::time::Duration>> {
+        match self {
+            Self::Strict(_) => None,
+            Self::Observed(v) => Some(v.remaining()),
+        }
+    }
+    pub fn allowed(&self) -> bool {
+        match self {
+            Self::Strict(v) => v.allowed(),
+            Self::Observed(_) => true,
+        }
+    }
+    pub fn local_fences_hold(&self, authority: &pumgye::AuthorityRuntime) -> bool {
+        match self {
+            Self::Strict(v) => v.local_fences_hold(authority),
+            Self::Observed(v) => v.current(authority),
+        }
+    }
+    pub(crate) fn install_credential(&self, headers: &mut hyper::HeaderMap) -> Result<()> {
+        match self {
+            Self::Strict(v) => v.install_credential(headers),
+            Self::Observed(v) => v.install(headers),
+        }
+    }
+}
 impl Binding {
     pub fn new(
         gate: pumgye::ResourceGate,
@@ -152,10 +199,25 @@ impl Binding {
             pin,
             permit_pin: None,
             project_credentials: false,
+            observed: None,
             gate,
             maximum_body_bytes: default_body_limit(),
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
         })
+    }
+    pub(crate) fn observed_mode(&self) -> bool {
+        self.observed.is_some()
+    }
+    pub(crate) fn prepare_transport(&self, transport: &hopae_native::Client) -> Result<()> {
+        if let Some(owner) = &self.observed {
+            owner.client(transport)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn retire(&self) {
+        if let Some(owner) = &self.observed {
+            owner.retire();
+        }
     }
     pub(crate) fn owner_scope(&self, method: &hyper::Method) -> Option<OwnerScope<'_>> {
         Some(OwnerScope {
@@ -198,8 +260,15 @@ impl Binding {
         pumgye: &pumgye::AuthorityRuntime,
         ip: std::net::IpAddr,
     ) -> Result<Observation> {
-        self.observe_with_route(prepared, headers, hopae, pumgye, ip, None)
-            .await
+        match self
+            .observe_with_route(prepared, headers, hopae, pumgye, ip, None)
+            .await?
+        {
+            DispatchObservation::Strict(observation) => Ok(observation),
+            DispatchObservation::Observed(_) => {
+                anyhow::bail!("observed dispatch requires native route ownership")
+            }
+        }
     }
     pub async fn observe_with_route(
         &self,
@@ -209,11 +278,37 @@ impl Binding {
         pumgye: &pumgye::AuthorityRuntime,
         ip: std::net::IpAddr,
         route: Option<&pumgye_grpc::v1::NativeRouteReference>,
-    ) -> Result<Observation> {
+    ) -> Result<DispatchObservation> {
         ensure!(
             prepared.belongs_to(&self.scope),
             "final request belongs to another route binding"
         );
+        if let Some(owner) = &self.observed {
+            let action = self
+                .gate
+                .actions
+                .get(prepared.request().method().as_str())
+                .ok_or_else(|| anyhow::anyhow!("native route method unassigned"))?;
+            let route = route.ok_or_else(|| {
+                anyhow::anyhow!("observed projection requires native route owner")
+            })?;
+            let dispatch = owner
+                .dispatch(
+                    prepared,
+                    headers,
+                    hopae,
+                    pumgye,
+                    self.permit_pin
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("observed permission pin missing"))?,
+                    &self.gate.resource,
+                    action,
+                    ip,
+                    route,
+                )
+                .await?;
+            return Ok(DispatchObservation::Observed(dispatch));
+        }
         let method = prepared.request().method().as_str();
         ensure!(
             self.gate.actions.contains_key(method),
@@ -280,12 +375,12 @@ impl Binding {
         } else {
             None
         };
-        Ok(Observation {
+        Ok(DispatchObservation::Strict(Observation {
             credential,
             receipt,
             reply,
             permit,
-        })
+        }))
     }
 }
 
@@ -305,6 +400,7 @@ mod tests {
             ),
             permission_permit: None,
             project_credentials: false,
+            observed: None,
             maximum_body_bytes: default_body_limit(),
             body_timeout_ms: default_body_timeout(),
         }
@@ -348,6 +444,42 @@ mod tests {
         let mut json = serde_json::to_value(valid).unwrap();
         json["signing_seed"] = "must-not-be-accepted".into();
         assert!(serde_json::from_value::<Configuration>(json).is_err());
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn observed_configuration_requires_the_entire_chain_and_explicit_bounded_clocks() {
+        let mut config = configuration();
+        config.observed = Some(crate::native_observed::Configuration {
+            identity_authority: "profiles".into(),
+            minimum_profile_revision: 1,
+            minimum_application_generation: 1,
+            minimum_key_registry_revision: 1,
+            source_error_ppm: 100,
+            receiver_error_ppm: 100,
+            maximum_final_header_bytes: 32768,
+        });
+        assert!(config.compile(gate()).is_err());
+        config.project_credentials = true;
+        assert!(config.compile(gate()).is_err());
+        config.permission_permit = Some(crate::projection_permit::Configuration {
+            issuer_ref: "pum-owned".into(),
+            key_epoch: 1,
+            public_key: base64::engine::general_purpose::STANDARD.encode(
+                ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+        });
+        assert!(config.compile(gate()).is_ok());
+        config.observed.as_mut().unwrap().source_error_ppm = 1_000_000;
+        assert!(config.compile(gate()).is_err());
+        config.observed.as_mut().unwrap().source_error_ppm = 100;
+        config
+            .observed
+            .as_mut()
+            .unwrap()
+            .minimum_key_registry_revision = 0;
+        assert!(config.compile(gate()).is_err());
     }
     #[tokio::test]
     async fn compiled_budget_limits_actual_preparation() {

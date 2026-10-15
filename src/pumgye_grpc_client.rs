@@ -50,6 +50,7 @@ pub struct Client {
     revision: AtomicU64,
     network_revision: AtomicU64,
     sequence: AtomicU64,
+    observed_owner: Arc<()>,
 }
 impl Client {
     pub fn new(config: &crate::pumgye::AuthorityConfig, token: &str) -> Result<Self> {
@@ -80,8 +81,97 @@ impl Client {
             timeout,
             revision: AtomicU64::new(config.minimum_revision),
             network_revision: AtomicU64::new(0),
+            observed_owner: Arc::new(()),
             sequence: AtomicU64::new(1),
         })
+    }
+    pub(crate) async fn issue_observed_permit(
+        &self,
+        query: &AuthenticatedQuery<'_>,
+        authentication: &crate::native_observed::Authentication,
+        pin: &crate::projection_permit::Pin,
+        clock: Arc<hangang_runtime::time::ReceiverClock>,
+        rates: &hopae_grpc::receipt_time::ClockRates,
+    ) -> Result<crate::native_observed::Permit> {
+        ensure!(
+            query.route.is_some()
+                && query.request_sha256.as_slice() == authentication.context().request_sha256,
+            "observed permission request binding refused"
+        );
+        let _slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("gRPC observed permit capacity"))?;
+        let request_id = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v < 9_007_199_254_740_991).then(|| v + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("gRPC sequence exhausted"))?;
+        let original = pumgye_grpc::v1::AuthenticatedResourceRequest {
+            request_id,
+            minimum_revision: self.revision().max(query.minimum_revision),
+            ip: match query.ip {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            },
+            resource: query.resource.into(),
+            action: query.action.into(),
+            context: Some(authentication.context().clone()),
+            receipt: authentication.receipt().to_vec(),
+            request_sha256: query.request_sha256.to_vec(),
+            route: query.route.cloned(),
+        };
+        let timeout = self.timeout.min(authentication.remaining()?);
+        let mut request = tonic::Request::new(original.clone());
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.token.clone());
+        let mut client = pumgye_grpc::v1::observed_projection_permits_client::ObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
+        let start = clock
+            .begin_exchange()
+            .map_err(|_| anyhow::anyhow!("receiver clock unavailable"))?;
+        let reply = tokio::time::timeout(timeout, client.issue(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("observed permit deadline"))?
+            .map_err(|status| {
+                if status.code() == tonic::Code::PermissionDenied {
+                    anyhow::Error::new(crate::projection_permit::Denied)
+                } else {
+                    anyhow::Error::new(status)
+                }
+            })?
+            .into_inner();
+        let sample = clock
+            .finish_exchange(start)
+            .map_err(|_| anyhow::anyhow!("receiver clock unavailable"))?;
+        let permit = crate::native_observed::Permit::from_owner_reply(
+            original,
+            reply,
+            pin,
+            authentication,
+            clock,
+            sample,
+            rates,
+            self.network_revision.load(Ordering::Acquire),
+            self.observed_owner.clone(),
+        )?;
+        let binding = permit.wire.binding.as_ref().unwrap();
+        ensure!(
+            binding.policy_revision >= self.revision()
+                && binding.network_revision >= self.network_revision.load(Ordering::Acquire),
+            "observed permission floors superseded"
+        );
+        self.revision
+            .fetch_max(binding.policy_revision, Ordering::AcqRel);
+        self.network_revision
+            .fetch_max(binding.network_revision, Ordering::AcqRel);
+        Ok(permit)
+    }
+    pub(crate) fn observed_permit_current(&self, permit: &crate::native_observed::Permit) -> bool {
+        Arc::ptr_eq(&self.observed_owner, &permit.owner)
     }
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
@@ -702,6 +792,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             revision: AtomicU64::new(1),
             network_revision: AtomicU64::new(1),
+            observed_owner: Arc::new(()),
             sequence: AtomicU64::new(1),
         };
         let mut reply = AuthenticatedReply {

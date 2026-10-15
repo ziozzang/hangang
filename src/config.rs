@@ -2240,6 +2240,7 @@ pub struct Snapshot {
     pub pumgye: Option<std::sync::Arc<pumgye_core::CompiledPolicy>>,
     pub pumgye_remote: Option<std::sync::Arc<crate::pumgye::AuthorityRuntime>>,
     retirements: std::sync::Mutex<Option<PublicationRetirements>>,
+    native_predecessors: Vec<std::sync::Arc<crate::native_resource::Binding>>,
     pub retired_members: std::sync::Arc<crate::retired_members::Registry>,
     pub settings: std::sync::Arc<PreparedSettings>,
     /// Header names used by any declarative HTTP route predicate. Incoming
@@ -2409,6 +2410,11 @@ impl Snapshot {
         if next.config.geoip_database == previous.config.geoip_database {
             next.geoip = previous.geoip.clone();
         }
+        next.native_predecessors = previous
+            .http
+            .iter()
+            .filter_map(|route| route.native_resource.clone())
+            .collect();
         next.retired_members = previous.retired_members.clone();
         next.retirements = std::sync::Mutex::new(Some(next.retirements_from(previous)?));
         Ok(next)
@@ -2490,6 +2496,9 @@ impl Snapshot {
             .retirements
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for binding in &self.native_predecessors {
+            binding.retire();
+        }
         if let Some(plan) = retirements.take() {
             plan.reservation.commit(plan.records);
         }
@@ -2692,6 +2701,29 @@ impl Snapshot {
                 }
             }
         }
+        let mut native_bindings = std::collections::HashMap::new();
+        for route in &config.http {
+            if let Some(native) = route
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.native_resource.as_ref())
+            {
+                let binding = native.compile(
+                    route
+                        .resource_policy
+                        .as_ref()
+                        .unwrap()
+                        .pumgye_resource
+                        .as_ref()
+                        .unwrap()
+                        .clone(),
+                )?;
+                if let Some(transport) = native_clients.get(&route.id) {
+                    binding.prepare_transport(transport)?;
+                }
+                native_bindings.insert(route.id.clone(), std::sync::Arc::new(binding));
+            }
+        }
         let mut http: Vec<std::sync::Arc<HttpRuntime>> = config
             .http
             .iter()
@@ -2731,26 +2763,7 @@ impl Snapshot {
                     auth_static_headers: auth_static_headers.remove(&route.id).unwrap_or_default(),
                     auth_unavailable: auth_unavailable.remove(&route.id),
                     auth_native: native_clients.remove(&route.id),
-                    native_resource: route
-                        .auth
-                        .as_ref()
-                        .and_then(|auth| auth.native_resource.as_ref())
-                        .map(|native| {
-                            std::sync::Arc::new(
-                                native
-                                    .compile(
-                                        route
-                                            .resource_policy
-                                            .as_ref()
-                                            .unwrap()
-                                            .pumgye_resource
-                                            .as_ref()
-                                            .unwrap()
-                                            .clone(),
-                                    )
-                                    .expect("validated native resource configuration"),
-                            )
-                        }),
+                    native_resource: native_bindings.remove(&route.id),
                     admission: admissions[&route.id].clone(),
                     balancer: prepare_http_balancer(&route, previous, &upstream_trust),
                     request_transform: route.request_transform.clone().map(std::sync::Arc::new),
@@ -3085,6 +3098,11 @@ impl Snapshot {
             pumgye,
             pumgye_remote,
             retirements: Default::default(),
+            native_predecessors: previous
+                .into_iter()
+                .flat_map(|old| old.http.iter())
+                .filter_map(|route| route.native_resource.clone())
+                .collect(),
             retired_members: previous
                 .map(|old| old.retired_members.clone())
                 .unwrap_or_default(),
