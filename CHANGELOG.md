@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Start the native route observation service with `--route-owner-config`.
+  Validate TLS/credentials and address conflicts without binding in `--check`;
+  preserve its typed listener during supervised restart and retain the active
+  generation when replacement resources are invalid. Shutdown owns its task.
 - Add an independent `hangang-route-grpc` observation contract and bounded
   mandatory-mTLS server library using the shared Hangang Runtime. Dedicated-role
   authentication precedes lookup; native owners supply client IP and resource

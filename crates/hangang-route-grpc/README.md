@@ -26,8 +26,8 @@ is diagnostic; it is not an owner incarnation. Remaining time is 1–1,000 milli
 and is only a point-in-time observation. Clients must account for exchange time;
 a successful reply is neither an authorization grant nor a distributed lease.
 
-The current Hangang source has a server library and actual socket qualification.
-Gateway startup/supervisor handover, outbound Pumgye reference delivery, remote
-decision clients, signed permits, projection/replay and Kubernetes release adoption
-remain integration work. Never accept a caller-selected URL or an application
+The current Hangang source has a server library, [CLI startup and supervised
+handover](../../docs/ROUTE_OWNER.md), with actual socket/process qualification.
+Outbound Pumgye reference delivery, remote decision clients, signed permits,
+projection/replay and Kubernetes release adoption remain integration work. Never accept a caller-selected URL or an application
 classification/allow claim as authoritative owner state.

@@ -225,5 +225,6 @@ adds a separate mandatory-mTLS route observation server library. Its independent
 [contract crate](crates/hangang-route-grpc/README.md) contains no policy logic.
 Server replies derive client IP/service/resource/action from native owners;
 request fields cannot supply classification or an allow verdict. The server is
-not yet wired into gateway process startup/supervisor handover or outbound Pumgye
-requests. Signed permission, projection and replay consumption remain separate work.
+started with [--route-owner-config](docs/ROUTE_OWNER.md), including validation,
+shutdown and supervised socket handover. Outbound Pumgye reference delivery,
+signed permission, projection and replay consumption remain separate work.

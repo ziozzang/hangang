@@ -158,6 +158,9 @@ struct Args {
     admin_socket: Option<PathBuf>,
     #[arg(long, env = "HANGANG_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// Private mandatory-mTLS native route observation listener configuration.
+    #[arg(long)]
+    route_owner_config: Option<PathBuf>,
     /// Private dynamically reloaded local fleet observer credential file.
     #[arg(long)]
     fleet_observer_config: Option<PathBuf>,
@@ -502,6 +505,26 @@ fn main() -> Result<()> {
 }
 async fn run(args: Args) -> Result<()> {
     hangang::admin::initialize_clock();
+    let route_owner_configuration = args
+        .route_owner_config
+        .as_deref()
+        .map(|path| {
+            hangang::route_owner_grpc::Configuration::load(path)?.prepare(
+                &args
+                    .admin_token
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()?;
+    let route_owner_address = route_owner_configuration
+        .as_ref()
+        .map(|configuration| configuration.listen());
+    anyhow::ensure!(
+        !args.supervised || route_owner_address.is_none_or(|address| address.port() != 0),
+        "supervised route owner requires a fixed port"
+    );
     use hangang::restart::{ControlChannel, ControlMessage, DescriptorRole, ProtocolMessage};
     let channel = if args.serve_child {
         let raw: i32 = std::env::var("HANGANG_CONTROL_FD")
@@ -512,6 +535,7 @@ async fn run(args: Args) -> Result<()> {
         None
     };
     let mut inherited_acme = None;
+    let mut inherited_route_owner = None;
     let mut inherited_public = None;
     let mut inherited_admin = None;
     let mut inherited_lock = None;
@@ -546,6 +570,13 @@ async fn run(args: Args) -> Result<()> {
                     DescriptorRole::Public(address) => {
                         anyhow::ensure!(address == args.listen, "public listener address mismatch");
                         inherited_public = Some(descriptor.fd);
+                    }
+                    DescriptorRole::RouteOwner(address) => {
+                        anyhow::ensure!(
+                            Some(address) == route_owner_address,
+                            "route owner listener address mismatch"
+                        );
+                        inherited_route_owner = Some(descriptor.fd);
                     }
                     DescriptorRole::Admin(address) => {
                         anyhow::ensure!(address == args.admin, "admin listener address mismatch");
@@ -762,6 +793,7 @@ async fn run(args: Args) -> Result<()> {
                 Some(args.listen),
                 (args.admin_socket.is_none()).then_some(args.admin),
                 args.acme_http_listen,
+                route_owner_address,
             ]
             .into_iter()
             .flatten()
@@ -858,6 +890,35 @@ async fn run(args: Args) -> Result<()> {
                 .await
                 .context("Lua validation")?;
         }
+    }
+    if let Some(route_owner) = route_owner_configuration.as_ref() {
+        let mut listeners = vec![args.listen];
+        if args.admin_socket.is_none() {
+            listeners.push(args.admin);
+        }
+        listeners.extend(args.acme_http_listen);
+        listeners.extend(
+            config
+                .tcp
+                .iter()
+                .filter(|route| route.enabled)
+                .map(|route| route.listen),
+        );
+        listeners.extend(
+            config
+                .public_http
+                .iter()
+                .filter(|listener| listener.enabled)
+                .map(|listener| listener.listen),
+        );
+        listeners.extend(
+            config
+                .workload_http
+                .iter()
+                .filter(|listener| listener.enabled)
+                .map(|listener| listener.listen),
+        );
+        route_owner.validate_addresses(&listeners)?;
     }
     let admin_plugins = args
         .admin_plugins
@@ -982,6 +1043,20 @@ async fn run(args: Args) -> Result<()> {
         TcpListener::bind(args.listen)
             .await
             .context("bind HTTP listener")?
+    };
+    let (route_owner_listener, route_owner_export) = if let Some(address) = route_owner_address {
+        let listener = if let Some(fd) = inherited_route_owner {
+            adopt_listener(fd, address)?
+        } else {
+            anyhow::ensure!(!replacing, "missing inherited route owner listener");
+            TcpListener::bind(address)
+                .await
+                .context("bind route owner listener")?
+        };
+        let (listener, export) = retain_listener(listener, channel.is_some())?;
+        (Some(listener), export)
+    } else {
+        (None, None)
     };
     let admin_socket_listener = if let Some(path) = &args.admin_socket {
         Some(hangang::admin_socket::BoundAdminSocket::bind(path)?)
@@ -1114,6 +1189,13 @@ async fn run(args: Args) -> Result<()> {
     .with_guard(guard)
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
     tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
+    let route_owner_server = match (route_owner_configuration, route_owner_listener) {
+        (Some(configuration), Some(listener)) => {
+            Some(proxy.route_owner_on(configuration, listener)?)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("incomplete route owner listener preparation"),
+    };
     let manager = Arc::new(Manager {
         active: active.clone(),
         tcp: tcp.clone(),
@@ -1292,6 +1374,26 @@ async fn run(args: Args) -> Result<()> {
         tls_watchers.push(tokio::spawn(tls.watch(cancel.clone())));
     }
     let grace = Duration::from_secs(args.drain_seconds);
+    let (route_owner_task, route_owner_failure) = if let Some(server) = route_owner_server {
+        tracing::info!(route_owner=%server.local_addr()?, "native route owner ready");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancellation = cancel.clone();
+        let shutdown = cancel.clone();
+        let task = tokio::spawn(async move {
+            let result = server
+                .serve(async move {
+                    shutdown.cancelled().await;
+                })
+                .await;
+            if !cancellation.is_cancelled() {
+                let _ = sender.send(());
+            }
+            result
+        });
+        (Some(task), Some(receiver))
+    } else {
+        (None, None)
+    };
     let public_task = tokio::spawn(serve(
         public_listener,
         Handler::Proxy(Arc::new(proxy.clone())),
@@ -1365,25 +1467,33 @@ async fn run(args: Args) -> Result<()> {
     // retires a replaced generation with `Drain` alone, in which case the
     // endpoint stays healthy through the successor and this generation must
     // not advertise failure on connections it still owns.
-    let ending = if let Some(channel) = channel {
-        channel.send_control(ControlMessage::Ready)?;
-        lifecycle_wait(
-            channel,
-            &manager,
-            &tcp,
-            HandoffFiles {
-                public: public_export.as_ref().unwrap(),
-                admin: admin_export.as_ref().unwrap(),
-                lock: lock.as_ref(),
-                docker: &docker,
-                acme_listener: acme_export.as_ref(),
-            },
-            acme.as_ref(),
-        )
-        .await?
-    } else {
-        shutdown_signal().await?;
-        Ending::Local
+    let ending_future = async {
+        let ending = if let Some(channel) = channel {
+            channel.send_control(ControlMessage::Ready)?;
+            lifecycle_wait(
+                channel,
+                &manager,
+                &tcp,
+                HandoffFiles {
+                    public: public_export.as_ref().unwrap(),
+                    admin: admin_export.as_ref().unwrap(),
+                    lock: lock.as_ref(),
+                    docker: &docker,
+                    acme_listener: acme_export.as_ref(),
+                    route_owner: route_owner_export.as_ref(),
+                },
+                acme.as_ref(),
+            )
+            .await?
+        } else {
+            shutdown_signal().await?;
+            Ending::Local
+        };
+        Ok::<_, anyhow::Error>(ending)
+    };
+    let (ending, route_failed) = tokio::select! {
+        result = ending_future => (result?, false),
+        _ = async { if let Some(receiver) = route_owner_failure { let _ = receiver.await; } else { std::future::pending::<()>().await; } } => (Ending::Local, true),
     };
     // Nothing below waits for an in-flight transaction or poll before the
     // accept loops are closed: readiness/freeze flags flip immediately, the
@@ -1420,6 +1530,14 @@ async fn run(args: Args) -> Result<()> {
     // authority poll, a slow writer, ACME, watchers): a retiring or draining
     // generation must not keep taking connections meanwhile.
     tcp.stop_accepting().await;
+    if let Some(mut task) = route_owner_task
+        && tokio::time::timeout(grace.max(Duration::from_secs(1)), &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
     if ending != Ending::Retire {
         // Now wait for an admitted write to complete (it keeps its CAS).
         manager.stop_updates().await;
@@ -1454,6 +1572,7 @@ async fn run(args: Args) -> Result<()> {
     pool.shutdown().await;
     validation_pool.shutdown().await;
     drop(lock);
+    anyhow::ensure!(!route_failed, "route owner listener stopped unexpectedly");
     Ok(())
 }
 
@@ -1671,6 +1790,7 @@ struct HandoffFiles<'a> {
     lock: Option<&'a std::fs::File>,
     docker: &'a hangang::docker_connections::DockerConnections,
     acme_listener: Option<&'a std::net::TcpListener>,
+    route_owner: Option<&'a std::net::TcpListener>,
 }
 async fn lifecycle_wait(
     channel: Arc<hangang::restart::ControlChannel>,
@@ -1685,6 +1805,7 @@ async fn lifecycle_wait(
         lock,
         docker,
         acme_listener,
+        route_owner,
     } = files;
     use hangang::restart::{ControlMessage as Control, DescriptorRole, ProtocolMessage};
     use std::{
@@ -1757,6 +1878,12 @@ async fn lifecycle_wait(
                 if let Some(listener) = acme_listener {
                     channel.send_descriptor(
                         DescriptorRole::AcmeHttp(listener.local_addr()?),
+                        listener.as_fd(),
+                    )?;
+                }
+                if let Some(listener) = route_owner {
+                    channel.send_descriptor(
+                        DescriptorRole::RouteOwner(listener.local_addr()?),
                         listener.as_fd(),
                     )?;
                 }

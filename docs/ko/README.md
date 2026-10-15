@@ -106,3 +106,5 @@ HTTP 라우트 목록과 백엔드 편집 화면은 기존 관리자 전용 `GET
 콘솔은 관리 리스너의 `/ui/`에서 제공됩니다. 같은 빌드는 `/openapi.json`에서 API 명세를 제공합니다. `hangang --help`로 명령줄 옵션을 확인할 수 있습니다.
 
 - [Guard zero-trust backbone](GUARD.md)
+
+- [네이티브 라우팅 관측 서비스](ROUTE_OWNER.md) — 비공개 mTLS 리스너·검사·감독 인계.

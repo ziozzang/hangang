@@ -744,6 +744,17 @@ impl Proxy {
         }
     }
 
+    pub fn route_owner_on(
+        &self,
+        prepared: crate::route_owner_grpc::PreparedConfiguration,
+        listener: tokio::net::TcpListener,
+    ) -> anyhow::Result<crate::route_owner_grpc::Server> {
+        crate::route_owner_grpc::Server::from_listener(
+            prepared,
+            self.native_routes.clone(),
+            listener,
+        )
+    }
     /// Prepare an independent read-only native route observation listener.
     /// Runtime/supervisor ownership of the returned server remains explicit.
     pub async fn bind_route_owner(

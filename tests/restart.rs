@@ -15,6 +15,21 @@ fn listener() -> (TcpListener, SocketAddr) {
 }
 
 #[test]
+fn export_rejects_multiple_route_owners_even_at_different_addresses() {
+    let (sender, receiver) = control_channel().unwrap();
+    let (first, first_address) = listener();
+    let (second, second_address) = listener();
+    sender
+        .send_descriptor(DescriptorRole::RouteOwner(first_address), first.as_fd())
+        .unwrap();
+    sender
+        .send_descriptor(DescriptorRole::RouteOwner(second_address), second.as_fd())
+        .unwrap();
+    sender.send_control(ControlMessage::ExportDone).unwrap();
+    assert!(receiver.receive_export(Duration::from_secs(1)).is_err());
+}
+
+#[test]
 fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
     let (sender, receiver) = control_channel().unwrap();
     let (public, public_address) = listener();
@@ -22,6 +37,7 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
     let (tcp, tcp_address) = listener();
     let (workload, workload_address) = listener();
     let (named_public, named_public_address) = listener();
+    let (route_owner, route_owner_address) = listener();
     let snapshot = tempfile::tempfile().unwrap();
     let lock = tempfile::tempfile().unwrap();
     let docker_lock = tempfile::tempfile().unwrap();
@@ -57,12 +73,23 @@ fn transfers_typed_descriptors_with_cloexec_and_control_messages() {
         sender
             .send_descriptor(DescriptorRole::DockerLock, docker_lock.as_fd())
             .unwrap();
+        sender
+            .send_descriptor(
+                DescriptorRole::RouteOwner(route_owner_address),
+                route_owner.as_fd(),
+            )
+            .unwrap();
         sender.send_control(ControlMessage::ExportDone).unwrap();
         sender.send_control(ControlMessage::Prepared).unwrap();
     });
 
     let received = receiver.receive_export(Duration::from_secs(1)).unwrap();
-    assert_eq!(received.len(), 8);
+    assert_eq!(received.len(), 9);
+    assert!(
+        received
+            .iter()
+            .any(|item| item.role == DescriptorRole::RouteOwner(route_owner_address))
+    );
     assert!(
         received
             .iter()

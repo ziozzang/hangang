@@ -29,6 +29,7 @@ const CONFIG_SNAPSHOT_FD: u8 = 5;
 const DOCKER_LOCK_FD: u8 = 7;
 const WORKLOAD_HTTP_FD: u8 = 8;
 const PUBLIC_HTTP_FD: u8 = 9;
+const ROUTE_OWNER_FD: u8 = 10;
 const FREEZE_EXPORT: u8 = 16;
 const RESUME: u8 = 17;
 const COMMIT: u8 = 18;
@@ -66,6 +67,7 @@ pub enum DescriptorRole {
     Tcp(SocketAddr),
     WorkloadHttp(SocketAddr),
     PublicHttp(SocketAddr),
+    RouteOwner(SocketAddr),
     ConfigLock,
     DockerLock,
     ConfigSnapshot,
@@ -172,6 +174,7 @@ impl ControlChannel {
         let mut public = false;
         let mut admin = false;
         let mut acme_http = false;
+        let mut route_owner = false;
         let mut lock = false;
         let mut snapshot = false;
         loop {
@@ -210,6 +213,14 @@ impl ControlChannel {
                                 return Err(invalid_data("duplicate ACME listener in handoff"));
                             }
                             acme_http = true;
+                        }
+                        DescriptorRole::RouteOwner(address) => {
+                            if route_owner || !listener_addresses.insert(address) {
+                                return Err(invalid_data(
+                                    "duplicate route owner listener in handoff",
+                                ));
+                            }
+                            route_owner = true;
                         }
                         DescriptorRole::ConfigLock => lock = true,
                         DescriptorRole::DockerLock => {}
@@ -333,6 +344,10 @@ fn encode_descriptor(role: DescriptorRole) -> [u8; FRAME_LEN] {
             frame[8] = WORKLOAD_HTTP_FD;
             Some(address)
         }
+        DescriptorRole::RouteOwner(address) => {
+            frame[8] = ROUTE_OWNER_FD;
+            Some(address)
+        }
         DescriptorRole::Tcp(address) => {
             frame[8] = TCP_FD;
             Some(address)
@@ -404,6 +419,7 @@ fn decode_descriptor(frame: &[u8; FRAME_LEN]) -> io::Result<DescriptorRole> {
         TCP_FD => DescriptorRole::Tcp(address),
         WORKLOAD_HTTP_FD => DescriptorRole::WorkloadHttp(address),
         PUBLIC_HTTP_FD => DescriptorRole::PublicHttp(address),
+        ROUTE_OWNER_FD => DescriptorRole::RouteOwner(address),
         _ => return Err(invalid_data("invalid descriptor role")),
     })
 }
@@ -527,7 +543,8 @@ fn receive_frame(socket: BorrowedFd<'_>) -> io::Result<ProtocolMessage> {
     }
 
     match frame[8] {
-        PUBLIC_FD | ADMIN_FD | TCP_FD | ACME_HTTP_FD | WORKLOAD_HTTP_FD | PUBLIC_HTTP_FD => {
+        PUBLIC_FD | ADMIN_FD | TCP_FD | ACME_HTTP_FD | WORKLOAD_HTTP_FD | PUBLIC_HTTP_FD
+        | ROUTE_OWNER_FD => {
             if descriptors.len() != 1 {
                 return Err(invalid_data("descriptor frame must carry exactly one fd"));
             }

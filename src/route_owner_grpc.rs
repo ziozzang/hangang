@@ -44,6 +44,88 @@ impl Configuration {
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
+/// Validated private resources; preparation opens no listening socket.
+pub struct PreparedConfiguration {
+    listen: SocketAddr,
+    tls: ServerTlsConfig,
+    credential: Arc<str>,
+}
+impl PreparedConfiguration {
+    pub fn validate_addresses(&self, listeners: &[SocketAddr]) -> Result<()> {
+        fn normalized(ip: std::net::IpAddr) -> std::net::IpAddr {
+            match ip {
+                std::net::IpAddr::V6(ip) => ip
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(ip)),
+                other => other,
+            }
+        }
+        let local = normalized(self.listen.ip());
+        for address in listeners {
+            if self.listen.port() == 0 || self.listen.port() != address.port() {
+                continue;
+            }
+            let other = normalized(address.ip());
+            let overlap = match (local, other) {
+                (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                    a == b || a.is_unspecified() || b.is_unspecified()
+                }
+                (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                    a == b || a.is_unspecified() || b.is_unspecified()
+                }
+                (std::net::IpAddr::V6(a), _) => a.is_unspecified(),
+                (_, std::net::IpAddr::V6(b)) => b.is_unspecified(),
+            };
+            ensure!(
+                !overlap,
+                "route owner listener overlaps another declared listener"
+            );
+        }
+        Ok(())
+    }
+    pub fn listen(&self) -> SocketAddr {
+        self.listen
+    }
+}
+impl Configuration {
+    pub fn prepare(self, forbidden_credentials: &[&str]) -> Result<PreparedConfiguration> {
+        self.prepare_resolved(forbidden_credentials, &|name| std::env::var(name).ok())
+    }
+    fn prepare_resolved(
+        self,
+        forbidden_credentials: &[&str],
+        resolve: &(dyn Fn(&str) -> Option<String> + Sync),
+    ) -> Result<PreparedConfiguration> {
+        ensure!(
+            !self.token_env.is_empty()
+                && self.token_env.len() <= 128
+                && self
+                    .token_env
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "invalid route credential reference"
+        );
+        let credential = resolve(&self.token_env)
+            .ok_or_else(|| anyhow::anyhow!("route credential unavailable"))?;
+        ensure!(
+            (32..=256).contains(&credential.len())
+                && credential.bytes().all(|byte| byte.is_ascii_graphic())
+                && forbidden_credentials
+                    .iter()
+                    .all(|other| credential.as_bytes() != other.as_bytes()),
+            "route credential must be distinct and bounded"
+        );
+        let tls = hangang_runtime::configuration(&self.certificate, &self.key, &self.client_ca)?;
+        // Validate the shared mandatory-mTLS builder before opening a socket.
+        hangang_runtime::server(tls.clone())?;
+        Ok(PreparedConfiguration {
+            listen: self.listen,
+            tls,
+            credential: credential.into(),
+        })
+    }
+}
 #[derive(Clone)]
 struct Service {
     registry: Arc<Registry>,
@@ -137,39 +219,28 @@ impl Server {
         forbidden_credentials: &[&str],
         resolve: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> Result<Self> {
+        let prepared = configuration.prepare_resolved(forbidden_credentials, resolve)?;
+        let listener = TcpListener::bind(prepared.listen).await?;
+        Self::from_listener(prepared, registry, listener)
+    }
+    pub(crate) fn from_listener(
+        prepared: PreparedConfiguration,
+        registry: Arc<Registry>,
+        listener: TcpListener,
+    ) -> Result<Self> {
+        let actual = listener.local_addr()?;
         ensure!(
-            !configuration.token_env.is_empty()
-                && configuration.token_env.len() <= 128
-                && configuration
-                    .token_env
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-            "invalid route credential reference"
+            actual.ip() == prepared.listen.ip()
+                && (prepared.listen.port() == 0 || actual.port() == prepared.listen.port()),
+            "route listener address mismatch"
         );
-        let credential = resolve(&configuration.token_env)
-            .ok_or_else(|| anyhow::anyhow!("route credential unavailable"))?;
-        ensure!(
-            (32..=256).contains(&credential.len())
-                && credential.bytes().all(|byte| byte.is_ascii_graphic())
-                && forbidden_credentials
-                    .iter()
-                    .all(|other| credential.as_bytes() != other.as_bytes()),
-            "route credential must be distinct and bounded"
-        );
-        let tls = hangang_runtime::configuration(
-            &configuration.certificate,
-            &configuration.key,
-            &configuration.client_ca,
-        )?;
-        // Validate the shared mandatory-mTLS builder before opening a socket.
-        hangang_runtime::server(tls.clone())?;
-        let listener = TcpListener::bind(configuration.listen).await?;
+
         Ok(Self {
             listener,
-            tls,
+            tls: prepared.tls,
             service: Service {
                 registry,
-                credential: credential.into(),
+                credential: prepared.credential,
                 admission: Arc::new(tokio::sync::Semaphore::new(4096)),
                 available: Arc::new(AtomicBool::new(true)),
             },

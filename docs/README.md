@@ -110,3 +110,5 @@ The administrator console **Lua policies** menu lists HTTP route policy and requ
 The console is available at `/ui/` on the management listener. The same build serves its API specification at `/openapi.json`. `hangang --help` lists command-line options.
 
 - [Hopae gRPC gateway client](HOPAE_GRPC.md)
+
+- [Native route observation service](ROUTE_OWNER.md) — private mTLS listener, validation and supervised handover.
