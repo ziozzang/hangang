@@ -1086,6 +1086,7 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
             "http":[{"id":"frontdoor","host":"app.example.test","path_prefix":"/orders","access_mode":"protected","backends":[endpoint],
                 "auth":{"url":"http://127.0.0.1:9/_hopae/verify","native":hop_settings,"request_headers":["authorization"],"response_headers":["x-forwarded-user","x-hopae-aal","x-hopae-principal-kind"],"static_request_headers":{"x-hopae-gateway-key":{"env":authority_config.decision_token_env}},"native_resource":configuration},
                 "resource_policy":{"resource_id":"orders","principal":{"source":"external","subject_header":"x-forwarded-user"},"allow":[],"pumgye_resource":{"service_id":"orders","resource":"db:orders","actions":{"POST":"write"}}}}],
+            "settings":{"response_security":[{"hosts":["app.example.test"],"headers":{"strict-transport-security":"max-age=600"}}]},
             "pumgye_authority":authority_config})).unwrap();
         // Reservation follows the existing snapshot-wide union model. A
         // nonobserved snapshot retains its old namespace; adding an observed
@@ -1152,10 +1153,18 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(
                             hyper_util::rt::TokioIo::new(socket),
-                            hyper::service::service_fn(move |request| {
-                                let proxy = proxy.clone();
-                                async move { proxy.handle(request, peer).await }
-                            }),
+                            hyper::service::service_fn(
+                                move |mut request: hyper::Request<hyper::body::Incoming>| {
+                                    // Authenticated transport metadata fixture; actual TLS
+                                    // handshake coverage lives in tests/proxy.rs.
+                                    request.extensions_mut().insert(crate::tls::TransportInfo {
+                                        tls: true,
+                                        local_port: 443,
+                                    });
+                                    let proxy = proxy.clone();
+                                    async move { proxy.handle(request, peer).await }
+                                },
+                            ),
                         )
                         .await;
                 });
@@ -1215,6 +1224,15 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
                 lua_marker.exists()
             );
             assert_eq!(reply.status().as_u16(), status, "frontdoor attack {attack}");
+            assert_eq!(
+                reply
+                    .headers()
+                    .get_all("strict-transport-security")
+                    .iter()
+                    .count(),
+                1
+            );
+            assert_eq!(reply.headers()["strict-transport-security"], "max-age=600");
             reply.into_body().collect().await.unwrap();
             assert_eq!(
                 effects.load(Ordering::Acquire),

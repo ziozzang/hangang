@@ -7500,3 +7500,314 @@ async fn native_hopae_transport_uses_normal_identity_cookie_and_terminal_handlin
     front_task.abort();
     backend_task.abort();
 }
+
+// Real TLS handshake: TransportInfo is installed only after the authenticated
+// server-side handshake. The raw client also exercises duplicate request fields.
+async fn sacho_tls_frontend(
+    proxy: Proxy,
+) -> (SocketAddr, JoinHandle<()>, Arc<rustls::ClientConfig>) {
+    let cert = rcgen::generate_simple_self_signed(vec![
+        "sacho.example.test".into(),
+        "monitor.example.test".into(),
+    ])
+    .unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((socket, peer)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let stream = acceptor.accept(socket).await.unwrap();
+                let service = service_fn(move |mut request: Request<Incoming>| {
+                    request
+                        .extensions_mut()
+                        .insert(hangang::tls::TransportInfo {
+                            tls: true,
+                            local_port: address.port(),
+                        });
+                    let proxy = proxy.clone();
+                    async move { proxy.handle(request, peer).await }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (address, task, Arc::new(client))
+}
+async fn sacho_tls_request(
+    address: SocketAddr,
+    client: Arc<rustls::ClientConfig>,
+    path: &str,
+    fields: &str,
+) -> (u16, Vec<(String, String)>) {
+    let mut stream = tokio_rustls::TlsConnector::from(client)
+        .connect(
+            rustls::pki_types::ServerName::try_from("sacho.example.test").unwrap(),
+            TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\n{fields}Connection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut wire = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut wire))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(wire).unwrap();
+    let head = text.split("\r\n\r\n").next().unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let headers = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    (status, headers)
+}
+#[tokio::test]
+async fn sacho_security_real_tls_hsts_finalizes_success_denials_and_forwarding_errors() {
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let mut ok = route(vec![format!("http://{origin}")]);
+    ok.id = "sacho-public".into();
+    ok.path_prefix = Some("/ok".into());
+    ok.hosts = vec!["sacho.example.test".into(), "monitor.example.test".into()];
+    ok.response_set_headers
+        .insert("strict-transport-security".into(), "max-age=1".into());
+    let mut auth = ok.clone();
+    auth.id = "protected".into();
+    auth.path_prefix = Some("/auth".into());
+    auth.basic_auth = Some(hangang::config::BasicAuth {
+        realm: "restricted".into(),
+        credentials: vec![basic_credential("alice", "password")],
+        hide_credentials: true,
+        accept_proxy_authorization: false,
+        identity_header: None,
+    });
+    let mut denied = ok.clone();
+    denied.id = "denied".into();
+    denied.path_prefix = Some("/denied".into());
+    denied.deny_cidrs = vec!["127.0.0.1/32".parse().unwrap()];
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_address = dead.local_addr().unwrap();
+    drop(dead);
+    let mut failed = ok.clone();
+    failed.id = "failed".into();
+    failed.path_prefix = Some("/failed".into());
+    failed.backends = vec![format!("http://{dead_address}").into()];
+    let settings: hangang::config::Settings = serde_json::from_value(serde_json::json!({
+        "trusted_proxy_cidrs":["127.0.0.1/32"],
+        "response_security":[{"hosts":["sacho.example.test","monitor.example.test"],"headers":{"strict-transport-security":"max-age=31536000; includeSubDomains","x-content-type-options":"nosniff"}}]
+    })).unwrap();
+    let ((proxy, policy), active) = proxy_with_settings(vec![ok, auth, denied, failed], settings);
+    let (address, task, tls) = sacho_tls_frontend(proxy.clone()).await;
+    for host in ["sacho.example.test", "monitor.example.test"] {
+        for (path, expected) in [
+            ("/ok", 200),
+            ("/auth", 401),
+            ("/denied", 403),
+            ("/absent", 404),
+            ("/failed", 502),
+        ] {
+            let (status, headers) =
+                sacho_tls_request(address, tls.clone(), path, &format!("Host: {host}\r\n")).await;
+            assert_eq!(status, expected, "{host}{path}");
+            assert_eq!(
+                headers
+                    .iter()
+                    .filter(|(name, _)| name == "strict-transport-security")
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>(),
+                ["max-age=31536000; includeSubDomains"]
+            );
+        }
+    }
+    let before = seen.lock().unwrap().len();
+    for fields in [
+        "Host: sacho.example.test\r\nX-Forwarded-Host: attacker.example.test\r\nX-Forwarded-Host: sacho.example.test\r\n",
+        "Host: sacho.example.test\r\nX-Forwarded-For: invalid\r\nX-Forwarded-Proto: https\r\n",
+        "Host: sacho.example.test\r\nConnection: x-forwarded-host\r\n",
+        "Host: sacho.example.test\r\nConnection: X-Forwarded-Proto\r\nX-Forwarded-Proto: http\r\n",
+    ] {
+        let (status, headers) = sacho_tls_request(address, tls.clone(), "/ok", fields).await;
+        assert_eq!(status, 400);
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name == "strict-transport-security")
+                .count(),
+            1,
+            "TLS early error lost HSTS"
+        );
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "invalid forwarding reached origin"
+    );
+    for fields in [
+        "Host: unrelated.example.test\r\n",
+        "Host: sacho.example.test\r\nHost: attacker.example.test\r\n",
+        "Host: sacho.example.test:bad\r\n",
+    ] {
+        let (_, headers) = sacho_tls_request(address, tls.clone(), "/ok", fields).await;
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name == "strict-transport-security"),
+            "unmatched/ambiguous Host selected policy"
+        );
+    }
+    // Untrusted forwarding cannot suppress authenticated TLS either.
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.trusted_proxy_cidrs = None;
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    let (status, headers) = sacho_tls_request(
+        address,
+        tls.clone(),
+        "/ok",
+        "Host: sacho.example.test\r\nX-Forwarded-Proto: http\r\n",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .iter()
+            .filter(|(name, _)| name == "strict-transport-security")
+            .count(),
+        1
+    );
+    // An untrusted plaintext peer cannot turn on HSTS by claiming HTTPS.
+    let (plain, plain_task) =
+        frontend_with_peer_transport(proxy, "192.0.2.55:12345".parse().unwrap(), false).await;
+    let reply = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{plain}/ok"))
+                .header("host", "sacho.example.test")
+                .header("x-forwarded-proto", "https")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!reply.headers().contains_key("strict-transport-security"));
+    reply.into_body().collect().await.unwrap();
+    plain_task.abort();
+    task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn sacho_security_public_and_protected_email_ignore_spoofed_elevated_duplicates() {
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let auth = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auth_address = auth.local_addr().unwrap();
+    let auth_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = auth.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|request: Request<Incoming>| async move {
+                    for name in [
+                        "x-forwarded-email",
+                        "x-forwarded-user",
+                        "x-forwarded-groups",
+                    ] {
+                        assert!(!request.headers().contains_key(name));
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header("x-forwarded-email", "reader@example.test")
+                            .header("x-forwarded-user", "reader")
+                            .header("x-forwarded-groups", "readers")
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let mut public = route(vec![format!("http://{origin}")]);
+    public.id = "public".into();
+    public.path_prefix = Some("/public".into());
+    public.access_mode = hangang::config::AccessMode::Public;
+    let mut protected = public.clone();
+    protected.id = "protected".into();
+    protected.path_prefix = Some("/protected".into());
+    protected.access_mode = hangang::config::AccessMode::Protected;
+    protected.auth=Some(serde_json::from_value(serde_json::json!({"url":format!("http://{auth_address}/verify"),"response_headers":["x-forwarded-email","x-forwarded-user","x-forwarded-groups"]})).unwrap());
+    let (proxy, policy) = proxy(vec![public, protected]);
+    let (front, front_task, _) = frontend(proxy).await;
+    for path in ["/public", "/protected"] {
+        let reply = client()
+            .request(
+                Request::builder()
+                    .uri(format!("http://{front}{path}"))
+                    .header("host", "sacho.example.test")
+                    .header("x-forwarded-email", "admin@example.test")
+                    .header("X-Forwarded-Email", "other@example.test")
+                    .header("x-forwarded-user", "admin")
+                    .header("x-forwarded-groups", "admins")
+                    .header("x-forwarded-groups", "superusers")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), 200);
+        reply.into_body().collect().await.unwrap();
+        let records = seen.lock().unwrap();
+        let last = &records.last().unwrap().headers;
+        for (name, expected) in [
+            ("x-forwarded-email", "reader@example.test"),
+            ("x-forwarded-user", "reader"),
+            ("x-forwarded-groups", "readers"),
+        ] {
+            let values = last
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>();
+            if path == "/public" {
+                assert!(values.is_empty());
+            } else {
+                assert_eq!(values, [expected]);
+            }
+        }
+    }
+    front_task.abort();
+    auth_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}

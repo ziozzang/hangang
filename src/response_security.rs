@@ -304,6 +304,46 @@ mod tests {
         );
     }
     #[test]
+    fn sacho_security_policy_replaces_all_hsts_duplicates_only_for_selected_tls() {
+        let rules = prepare(&[serde_json::from_value(serde_json::json!({
+            "hosts":["sacho.example.test"],
+            "headers":{"strict-transport-security":"max-age=31536000"}
+        }))
+        .unwrap()])
+        .unwrap();
+        for status in [200, 401, 403, 404, 500, 502, 503] {
+            for https in [true, false] {
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(crate::proxy::full_body(bytes::Bytes::new()))
+                    .unwrap();
+                response.headers_mut().append(
+                    "strict-transport-security",
+                    HeaderValue::from_static("max-age=0"),
+                );
+                response.headers_mut().append(
+                    "strict-transport-security",
+                    HeaderValue::from_static("max-age=1"),
+                );
+                let mut ctx = context("sacho.example.test");
+                ctx.https = https;
+                let response = apply(response, &rules, Some(ctx));
+                let values = response
+                    .headers()
+                    .get_all("strict-transport-security")
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect::<Vec<_>>();
+                if https {
+                    assert_eq!(values, ["max-age=31536000"]);
+                } else {
+                    assert!(values.is_empty());
+                }
+                assert_eq!(response.status().as_u16(), status);
+            }
+        }
+    }
+    #[test]
     fn validation_rejects_framing_and_header_aliases() {
         for headers in [
             serde_json::json!({"location":"https://evil.test"}),

@@ -1267,6 +1267,7 @@ impl Proxy {
             context = request
                 .headers()
                 .get(header::HOST)
+                .filter(|host| valid_authority(host))
                 .and_then(|h| h.to_str().ok())
                 .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
                 .filter(|a| {
@@ -1275,7 +1276,13 @@ impl Proxy {
                 })
                 .map(|authority| crate::response_security::Context {
                     authority,
-                    https: false,
+                    // Forwarding validation may fail on a genuine TLS request.
+                    // Preserve authenticated transport for error hardening only;
+                    // client X-Forwarded-Proto cannot enable this fallback.
+                    https: request
+                        .extensions()
+                        .get::<crate::tls::TransportInfo>()
+                        .is_some_and(|transport| transport.tls),
                     explicit_port: None,
                 });
         }
