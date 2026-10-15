@@ -1,6 +1,7 @@
 //! Opt-in native hangang-guard transport and local, expiring admission cache.
 //! Query mode awaits bounded remote decisions; snapshot exports never wait for queue capacity.
 mod grpc;
+mod lifetime;
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwapOption;
 use ipnet::IpNet;
@@ -332,12 +333,14 @@ pub enum FailureMode {
     Allow,
     Deny,
 }
-/// Request-local authenticated network evidence, never a cross-request cache.
+/// Native capture retains the original query clock and source owner, including cache hits.
+#[derive(Clone)]
 pub(crate) struct RequestEvidence {
-    authority: usize,
+    authority: Arc<()>,
     ip: IpAddr,
     revision: u64,
-    expires: std::time::Instant,
+    lifetime: Arc<lifetime::Lifetime>,
+    ttl_ms: u64,
     value: pumgye_core::GuardEvidence,
 }
 impl RequestEvidence {
@@ -346,16 +349,22 @@ impl RequestEvidence {
         guard: &GuardClient,
         ip: IpAddr,
     ) -> Option<pumgye_core::GuardEvidence> {
-        (self.authority == guard as *const GuardClient as usize
+        self.remaining(guard, ip).map(|_| self.value)
+    }
+    fn bound_to(&self, guard: &GuardClient, ip: IpAddr) -> bool {
+        !guard.cancel.is_cancelled()
+            && Arc::ptr_eq(&self.authority, &guard.owner)
             && self.ip == ip.to_canonical()
-            && std::time::Instant::now() < self.expires
             && guard
                 .cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .revision
-                == Some(self.revision))
-        .then_some(self.value)
+                .map(|cache| cache.revision == Some(self.revision))
+                .unwrap_or(false)
+    }
+    pub(crate) fn remaining(&self, guard: &GuardClient, ip: IpAddr) -> Option<Duration> {
+        self.bound_to(guard, ip)
+            .then(|| self.lifetime.remaining(self.ttl_ms.min(1000)))
+            .flatten()
     }
 }
 #[derive(Deserialize)]
@@ -376,7 +385,8 @@ enum Action {
 }
 struct Cached {
     denied: bool,
-    expires: std::time::Instant,
+    proof: RequestEvidence,
+    ttl_ms: u64,
 }
 #[derive(Default)]
 struct Cache {
@@ -498,6 +508,10 @@ impl Config {
 }
 
 pub struct GuardClient {
+    owner: Arc<()>,
+    cancel: CancellationToken,
+    #[cfg(test)]
+    test_clock: Mutex<Option<lifetime::TestClock>>,
     grpc: Option<grpc::Client>,
     tcp: Option<TcpPool>,
     transport_mode: TransportMode,
@@ -516,6 +530,13 @@ pub struct GuardClient {
     scanner_paths: HashSet<String>,
 }
 impl GuardClient {
+    fn start_query(&self) -> Result<lifetime::Lifetime> {
+        #[cfg(test)]
+        if let Some(clock) = self.test_clock.lock().unwrap().as_ref() {
+            return Ok(lifetime::Lifetime::manual(clock.clone()));
+        }
+        lifetime::Lifetime::start()
+    }
     pub fn start(config: Config, cancel: CancellationToken) -> Result<Arc<Self>> {
         config.validate()?;
         let token = std::env::var(&config.token_env)
@@ -564,6 +585,10 @@ impl GuardClient {
             .transpose()?;
         let (queue, rx) = mpsc::channel(QUEUE);
         let guard = Arc::new(Self {
+            owner: Arc::new(()),
+            cancel: cancel.clone(),
+            #[cfg(test)]
+            test_clock: Mutex::new(None),
             grpc,
             tcp: config
                 .decision_tcp
@@ -627,10 +652,20 @@ impl GuardClient {
     }
     /// Fresh authenticated evidence for mandatory Pumgye authorization; never fail open.
     pub async fn authorization_evidence(&self, ip: IpAddr) -> pumgye_core::GuardEvidence {
+        self.authorization_capture(ip).await.0
+    }
+    pub(crate) async fn authorization_capture(
+        &self,
+        ip: IpAddr,
+    ) -> (pumgye_core::GuardEvidence, Option<RequestEvidence>) {
         use pumgye_core::GuardEvidence;
-        if self.transport_mode == TransportMode::Snapshot {
-            return GuardEvidence::Unavailable;
+        if self.transport_mode == TransportMode::Snapshot || self.cancel.is_cancelled() {
+            return (GuardEvidence::Unavailable, None);
         }
+        let started = match self.start_query() {
+            Ok(started) => Arc::new(started),
+            Err(_) => return (GuardEvidence::Unavailable, None),
+        };
         let result: Result<Decision> = async {
             if let Some(client) = &self.grpc {
                 return client.query(ip.to_canonical()).await;
@@ -672,22 +707,30 @@ impl GuardClient {
             Ok(decision)
         });
         match result {
-            Ok(Decision {
-                mode: Mode::Enforce,
-                action: Action::Allow,
-                ..
-            }) => GuardEvidence::EnforcedAllow,
-            Ok(Decision {
-                mode: Mode::Enforce,
-                action: Action::Deny,
-                ..
-            }) => GuardEvidence::Deny,
-            Ok(Decision {
-                mode: Mode::Observe,
-                action: Action::Allow,
-                ..
-            }) => GuardEvidence::Observe,
-            _ => GuardEvidence::Unavailable,
+            Ok(decision) => {
+                let value = match (decision.mode, decision.action) {
+                    (Mode::Enforce, Action::Allow) => GuardEvidence::EnforcedAllow,
+                    (Mode::Enforce, Action::Deny) => GuardEvidence::Deny,
+                    (Mode::Observe, Action::Allow) => GuardEvidence::Observe,
+                    _ => return (GuardEvidence::Unavailable, None),
+                };
+                // TTL zero remains a point-in-time legacy decision, never a
+                // reusable capture. Positive evidence ages across the RPC.
+                let ttl_ms = decision.ttl_ms.min(1000);
+                if self.cancel.is_cancelled() || ttl_ms > 0 && started.remaining(ttl_ms).is_none() {
+                    return (GuardEvidence::Unavailable, None);
+                }
+                let proof = (ttl_ms > 0).then(|| RequestEvidence {
+                    authority: self.owner.clone(),
+                    ip: ip.to_canonical(),
+                    revision: decision.revision,
+                    lifetime: started,
+                    ttl_ms,
+                    value,
+                });
+                (value, proof)
+            }
+            Err(_) => (GuardEvidence::Unavailable, None),
         }
     }
     /// Explicit denials are 403; unavailable query authority fails closed with 503.
@@ -707,6 +750,12 @@ impl GuardClient {
             self.observe_path(ip, path);
             return (None, None);
         }
+        if self.cancel.is_cancelled() {
+            return (
+                (self.failure_mode == FailureMode::Deny).then_some(503),
+                None,
+            );
+        }
         let kind = self.path_kind(path);
         if kind.is_none() && self.cache_ms > 0 {
             let cache = self
@@ -716,12 +765,27 @@ impl GuardClient {
             if let Some(entry) = cache
                 .entries
                 .get(&ip)
-                .filter(|entry| entry.expires > std::time::Instant::now())
+                .filter(|entry| entry.proof.lifetime.remaining(entry.ttl_ms).is_some())
             {
-                return (entry.denied.then_some(403), None);
+                return (
+                    entry.denied.then_some(403),
+                    (!entry.denied).then(|| {
+                        let mut proof = entry.proof.clone();
+                        proof.ttl_ms = entry.ttl_ms;
+                        proof
+                    }),
+                );
             }
         }
-        let query_started = std::time::Instant::now();
+        let query_started = match self.start_query() {
+            Ok(started) => Arc::new(started),
+            Err(_) => {
+                return (
+                    (self.failure_mode == FailureMode::Deny).then_some(503),
+                    None,
+                );
+            }
+        };
         let result: Result<Decision> = async {
             if kind.is_none()
                 && let Some(client) = &self.grpc
@@ -785,39 +849,47 @@ impl GuardClient {
                     cache.entries.clear();
                     cache.revision = Some(decision.revision);
                 }
+                // Age the entire transport exchange from original query start.
+                if self.cancel.is_cancelled()
+                    || decision.ttl_ms > 0 && query_started.remaining(decision.ttl_ms).is_none()
+                {
+                    return (
+                        (self.failure_mode == FailureMode::Deny).then_some(503),
+                        None,
+                    );
+                }
+                let value = if decision.mode == Mode::Enforce {
+                    pumgye_core::GuardEvidence::EnforcedAllow
+                } else {
+                    pumgye_core::GuardEvidence::Observe
+                };
+                let capture = RequestEvidence {
+                    authority: self.owner.clone(),
+                    ip,
+                    revision: decision.revision,
+                    lifetime: query_started,
+                    ttl_ms: decision.ttl_ms,
+                    value,
+                };
                 let ttl = self.cache_ms.min(decision.ttl_ms);
                 if kind.is_none() && ttl > 0 {
                     if cache.entries.len() >= 10_000 {
-                        cache
-                            .entries
-                            .retain(|_, entry| entry.expires > std::time::Instant::now());
+                        cache.entries.retain(|_, entry| {
+                            entry.proof.lifetime.remaining(entry.ttl_ms).is_some()
+                        });
                     }
                     if cache.entries.len() < 10_000 {
                         cache.entries.insert(
                             ip,
                             Cached {
                                 denied,
-                                expires: query_started + Duration::from_millis(ttl),
+                                proof: capture.clone(),
+                                ttl_ms: ttl,
                             },
                         );
                     }
                 }
-                let proof = if !denied && decision.ttl_ms > 0 {
-                    let value = if decision.mode == Mode::Enforce {
-                        pumgye_core::GuardEvidence::EnforcedAllow
-                    } else {
-                        pumgye_core::GuardEvidence::Observe
-                    };
-                    Some(RequestEvidence {
-                        authority: self as *const GuardClient as usize,
-                        ip,
-                        revision: decision.revision,
-                        expires: query_started + Duration::from_millis(decision.ttl_ms.min(1000)),
-                        value,
-                    })
-                } else {
-                    None
-                };
+                let proof = (!denied && decision.ttl_ms > 0).then_some(capture);
                 (denied.then_some(403), proof)
             }
             Err(_) => {
@@ -1054,6 +1126,10 @@ mod tests {
     fn saturated_export_is_nonblocking() {
         let (queue, mut rx) = mpsc::channel(1);
         let guard = GuardClient {
+            owner: Arc::new(()),
+            cancel: CancellationToken::new(),
+            #[cfg(test)]
+            test_clock: Mutex::new(None),
             grpc: None,
             tcp: None,
             transport_mode: TransportMode::Snapshot,
@@ -1673,6 +1749,126 @@ mod tests {
         tcp.task.abort();
     }
     #[tokio::test]
+    async fn original_query_budget_survives_cache_reuse_suspend_and_clock_failure() {
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address.into());
+        config.cache_ms = 5000;
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let clock = Arc::new(Mutex::new(Some(Duration::ZERO)));
+        *guard.test_clock.lock().unwrap() = Some(clock.clone());
+        let ip = "192.0.2.8".parse().unwrap();
+        let (_, first) = guard.admission(ip, "/").await;
+        let first = first.unwrap();
+        *clock.lock().unwrap() = Some(Duration::from_millis(400));
+        let (_, cached) = guard.admission(ip, "/").await;
+        let cached = cached.unwrap();
+        assert!(Arc::ptr_eq(&first.lifetime, &cached.lifetime));
+        assert_eq!(tcp.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            cached.remaining(&guard, ip),
+            Some(Duration::from_millis(599))
+        );
+        // Simulated Linux suspend ages BOOTTIME while Tokio's timer does not move.
+        *clock.lock().unwrap() = Some(Duration::from_secs(20));
+        assert!(first.current(&guard, ip).is_none());
+        assert!(cached.remaining(&guard, ip).is_none());
+        // A reversed clock cannot resurrect old captures, even with a later valid reading.
+        *clock.lock().unwrap() = Some(Duration::from_millis(500));
+        assert!(cached.remaining(&guard, ip).is_none());
+        *clock.lock().unwrap() = Some(Duration::from_secs(21));
+        assert!(cached.remaining(&guard, ip).is_none());
+        let clock = Arc::new(Mutex::new(Some(Duration::ZERO)));
+        *guard.test_clock.lock().unwrap() = Some(clock.clone());
+        let (_, proof) = guard.admission(ip, "/").await;
+        let proof = proof.unwrap();
+        *clock.lock().unwrap() = None;
+        assert!(proof.remaining(&guard, ip).is_none());
+        *clock.lock().unwrap() = Some(Duration::ZERO);
+        assert!(
+            proof.remaining(&guard, ip).is_none(),
+            "read failure is irreversible"
+        );
+        tcp.task.abort();
+    }
+    #[tokio::test]
+    async fn retired_native_owner_cannot_reuse_cache_or_captured_network_evidence() {
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address.into());
+        config.cache_ms = 5000;
+        let cancel = CancellationToken::new();
+        let guard =
+            GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
+                .unwrap();
+        let ip = "192.0.2.8".parse().unwrap();
+        let (_, proof) = guard.admission(ip, "/").await;
+        let proof = proof.unwrap();
+        assert!(proof.current(&guard, ip).is_some());
+        cancel.cancel();
+        assert!(proof.current(&guard, ip).is_none());
+        assert_eq!(guard.rejection(ip, "/").await, Some(503));
+        assert_eq!(
+            guard.authorization_evidence(ip).await,
+            pumgye_core::GuardEvidence::Unavailable
+        );
+        assert_eq!(
+            tcp.requests.lock().unwrap().len(),
+            1,
+            "retirement must not query or reuse the cache"
+        );
+        tcp.task.abort();
+    }
+    #[tokio::test]
+    async fn transport_wait_consumes_positive_budget_but_zero_ttl_never_creates_capture() {
+        let tcp = tcp_server().await;
+        let mut config = test_config("http://127.0.0.1:1".into());
+        config.decision_tcp = Some(tcp.address.into());
+        let guard = GuardClient::start_with_token(
+            config,
+            "test-token-0123456789".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let clock = Arc::new(Mutex::new(Some(Duration::ZERO)));
+        *guard.test_clock.lock().unwrap() = Some(clock.clone());
+        tcp.delay_ms.store(30, Ordering::Relaxed);
+        let ip = "192.0.2.8".parse().unwrap();
+        for fresh in [false, true] {
+            *clock.lock().unwrap() = Some(Duration::ZERO);
+            let before = tcp.requests.lock().unwrap().len();
+            let advance = async {
+                while tcp.requests.lock().unwrap().len() == before {
+                    tokio::task::yield_now().await;
+                }
+                *clock.lock().unwrap() = Some(Duration::from_secs(2));
+            };
+            if fresh {
+                let ((evidence, capture), ()) =
+                    tokio::join!(guard.authorization_capture(ip), advance);
+                assert_eq!(evidence, pumgye_core::GuardEvidence::Unavailable);
+                assert!(capture.is_none());
+            } else {
+                let ((rejected, capture), ()) = tokio::join!(guard.admission(ip, "/"), advance);
+                assert_eq!(rejected, Some(503));
+                assert!(capture.is_none());
+            }
+        }
+        tcp.response.lock().unwrap()[16..20].copy_from_slice(&0u32.to_be_bytes());
+        let (rejected, capture) = guard.admission(ip, "/").await;
+        assert!(rejected.is_none() && capture.is_none());
+        let (evidence, capture) = guard.authorization_capture(ip).await;
+        assert_eq!(evidence, pumgye_core::GuardEvidence::EnforcedAllow);
+        assert!(capture.is_none());
+        assert!(guard.cache.lock().unwrap().entries.is_empty());
+        tcp.task.abort();
+    }
+    #[tokio::test]
     async fn request_evidence_is_bound_to_authority_ip_revision_and_deadline() {
         use pumgye_core::GuardEvidence;
         let tcp = tcp_server().await;
@@ -1693,7 +1889,7 @@ mod tests {
         let ip = "192.0.2.8".parse().unwrap();
         let (denied, proof) = guard.admission(ip, "/").await;
         assert!(denied.is_none());
-        let mut proof = proof.unwrap();
+        let proof = proof.unwrap();
         assert_eq!(
             proof.current(&guard, ip),
             Some(GuardEvidence::EnforcedAllow)
@@ -1712,7 +1908,8 @@ mod tests {
         guard.cache.lock().unwrap().revision = Some(proof.revision + 1);
         assert!(proof.current(&guard, ip).is_none());
         guard.cache.lock().unwrap().revision = Some(proof.revision);
-        proof.expires = std::time::Instant::now();
+        let mut proof = proof;
+        proof.ttl_ms = 0;
         assert!(proof.current(&guard, ip).is_none());
         cancel.cancel();
         tcp.task.abort();
