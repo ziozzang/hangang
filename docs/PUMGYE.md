@@ -602,7 +602,7 @@ observed evidence through an Instant or wall-clock fallback.
 ### Workload observed dispatch integration
 
 Status: implementation in progress, not yet qualified or released. Current public
-0.3.8 supports the Service chain described above; this section defines the typed
+0.3.9 supports the Service chain described above; this section defines the typed
 Workload extension and must not be read as an operating activation claim.
 
 Set `auth.native_resource.observed.authentication_class` to `"workload"` for an

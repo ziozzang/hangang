@@ -523,7 +523,7 @@ Observed 모드는 Linux BOOTTIME이 필요하며 지원하지 않는 수신기 
 
 ### Workload observed 전달 통합
 
-상태: 구현 중이며 아직 검증·릴리즈 완료가 아니다. 공개 0.3.8은 위의 Service 경로를
+상태: 구현 중이며 아직 검증·릴리즈 완료가 아니다. 공개 0.3.9는 위의 Service 경로를
 지원한다. 이 절은 개발 중 확장 계약이며 운영 활성화 완료를 뜻하지 않는다.
 
 `auth.native_resource.observed.authentication_class`를 `"workload"`로 설정해 명시적으로
