@@ -1,5 +1,6 @@
 // Actual owned Kubernetes console: no intercepted API responses or fixture UI server.
 import fs from 'node:fs';
+import {applicationAuthorization,redact} from './world_admin_credentials.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import { execFile } from 'node:child_process';
@@ -9,6 +10,9 @@ import { randomBytes } from 'node:crypto';
 import { chromium, expect } from '@playwright/test';
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const password=randomBytes(24).toString('hex');
+const sensitive=[config.token,password,config.application?.key,...(config.redactionSecrets??[])];
+let authorization;
+try{if(config.application)authorization=applicationAuthorization(config.application);}catch(error){console.error(redact(String(error),sensitive));process.exit(1);}
 function exchange(transport,options){
   return new Promise((resolve,reject)=>{
     const req=transport.get(options,res=>{let body='';res.setEncoding('utf8');res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve({status:res.statusCode,body}));});
@@ -17,16 +21,29 @@ function exchange(transport,options){
 }
 async function protectedStatus(expected){
   const before=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
-  const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:'Bearer '+config.application.key}});
+  const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:authorization}});
   const after=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
   expect(after).toBe(before+(response.status===200?1:0));
   if(expected!==null)expect(response.status).toBe(expected);
   return response.status;
 }
 const browser=await chromium.launch({headless:true});
+let phase='initial-navigation';
+const browserEvents=[];
+const diagnosticStart=performance.now();
+function diagnosticPath(url){
+  const path=new URL(url).pathname;
+  return ['/v1/auth/sso/config','/v1/auth/setup','/v1/auth/me','/v1/auth/login','/v1/auth/logout','/v1/status','/ui/'].includes(path)||/^\/ui\/[a-z0-9_-]+\.js$/.test(path)?path:null;
+}
+function recordBrowser(kind,request,status){const path=diagnosticPath(request.url());if(path){browserEvents.push({kind,path,status,atMs:Math.round(performance.now()-diagnosticStart)});if(browserEvents.length>40)browserEvents.shift();}}
 try {
   const page=await browser.newPage();
+  page.on('request',request=>recordBrowser('request',request,null));
+  page.on('response',response=>recordBrowser('response',response.request(),response.status()));
+  page.on('requestfailed',request=>recordBrowser('requestfailed',request,null));
+  page.on('pageerror',error=>{browserEvents.push({kind:'pageerror',name:error.name,atMs:Math.round(performance.now()-diagnosticStart)});if(browserEvents.length>40)browserEvents.shift();});
   await page.goto(config.base+'/ui/');
+  phase='initial-login-dialog';
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#login-description')).not.toHaveText('Checking administrator access…');
   await expect(page.locator('#setup-login-fields')).toBeVisible();
@@ -34,8 +51,10 @@ try {
   await page.locator('#setup-username').fill('browser-owner');
   await page.locator('#setup-password').fill(password);
   await page.locator('#setup-confirm').fill(password);
+  phase='first-administrator-bootstrap';
   await page.locator('#login-submit').click();
   await expect(page.locator('#login-dialog')).toBeHidden();
+  phase='pumgye-console';
   await page.locator('.sidebar a[data-view="pumgye"]').click();
   await expect(page.locator('#pumgye-authority-panel')).toBeVisible();
   await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
@@ -52,6 +71,7 @@ try {
   await page.locator('.sidebar a[data-view="plugin-'+config.plugin+'"]').click();
   const root=page.locator('#view-plugin-'+config.plugin+' .plugin-root');
   await expect(root.locator('#tab-blocks')).toBeVisible();
+  phase='network-console';
   if(config.nativeSource){
     await expect(root.locator('#native-authority-status')).toContainText('Kubernetes native IP policy source');
     for(const selector of ['#block-form button[type="submit"]','#allow-save','#policy-form button[type="submit"]','#rules-save','#lua-save','#geoip-reload'])await expect(root.locator(selector)).toBeDisabled();
@@ -78,6 +98,7 @@ try {
     await root.locator('#blocks-rows tr').filter({hasText:'127.0.0.1/32'}).locator('button').click();
     await expect(root.locator('#blocks-rows')).not.toContainText('127.0.0.1/32');
   }
+  phase='hopae-console';
   if(config.hopae){
     await page.locator('.sidebar a[data-view="plugin-hopae"]').click();
     const hop=page.locator('#view-plugin-hopae .plugin-root');
@@ -171,8 +192,9 @@ try {
     }
     console.log('PASS: actual remote Hopae administrator mTLS delegation and profile view under the Hangang login');
   }
+  phase='final-logout';
   await page.locator('#logout-button').click();
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#pumgye-document')).toHaveValue('');
   console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu and owning policy block/unblock, and logout clearing');
-} catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]').replaceAll(config.application?.key??'unused-secret-placeholder','[redacted]')); process.exitCode=1; } finally {await browser.close();}
+} catch(error) { console.error('Owned browser diagnostic '+JSON.stringify({phase,events:browserEvents}));console.error(redact(error.stack??String(error),sensitive)); process.exitCode=1; } finally {await browser.close();}
