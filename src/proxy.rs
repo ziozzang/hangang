@@ -3367,6 +3367,7 @@ impl Proxy {
                     }
                     result = binding.observe_with_route(&prepared, &context, hopae, authority, edge.client_ip, route_reference.as_ref()) => match result {
                         Ok(observation) => observation,
+                        Err(error) if error.is::<crate::projection_permit::Denied>() => return Ok(response(403, "native resource permission denied")),
                         Err(_) => return Ok(response(503, "native resource authority unavailable")),
                     }
                 };

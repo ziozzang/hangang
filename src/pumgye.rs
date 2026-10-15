@@ -828,6 +828,48 @@ impl AuthorityRuntime {
             .map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue_projection_permit(
+        &self,
+        gate: &ResourceGate,
+        method: &str,
+        ip: std::net::IpAddr,
+        request_sha256: [u8; 32],
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        route: Option<&pumgye_grpc::v1::NativeRouteReference>,
+        pin: &crate::projection_permit::Pin,
+    ) -> Result<(
+        crate::pumgye_grpc_client::AuthenticatedReply,
+        crate::projection_permit::CheckedPermit,
+    )> {
+        gate.validate_remote()?;
+        ensure!(
+            receipt.context().service == gate.service_id,
+            "receipt service mismatch"
+        );
+        let action = gate
+            .actions
+            .get(method)
+            .ok_or_else(|| anyhow::anyhow!("native route method unassigned"))?;
+        let DecisionClient::Grpc(client) = &self.native else {
+            anyhow::bail!("permit issuance requires gRPC");
+        };
+        client
+            .issue_projection_permit(
+                &crate::pumgye_grpc_client::AuthenticatedQuery {
+                    route,
+                    resource: &gate.resource,
+                    action,
+                    ip,
+                    minimum_revision: 0,
+                    request_sha256,
+                },
+                receipt,
+                pin,
+            )
+            .await
+    }
+
     /// Fixed owning-domain paths only; never forwards client URLs or credentials.
     pub async fn management(
         &self,

@@ -12,6 +12,8 @@ pub struct Configuration {
     pub issuer_ref: String,
     pub key_epoch: u64,
     pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_permit: Option<crate::projection_permit::Configuration>,
     #[serde(default = "default_body_limit")]
     pub maximum_body_bytes: usize,
     #[serde(default = "default_body_timeout")]
@@ -43,6 +45,21 @@ impl Configuration {
             projection_receipt::IssuerPin::new(self.issuer_ref.clone(), self.key_epoch, public)
                 .map_err(|_| anyhow::anyhow!("invalid native issuer public pin"))?;
         let mut binding = Binding::new(gate, self.audience.clone(), pin)?;
+        ensure!(
+            self.permission_permit
+                .as_ref()
+                .is_none_or(|permit| permit.public_key != self.public_key),
+            "authentication and permit purpose keys must be independent"
+        );
+        binding.permit_pin = self
+            .permission_permit
+            .as_ref()
+            .map(|configuration| {
+                configuration
+                    .compile()
+                    .map_err(|_| anyhow::anyhow!("invalid native permit issuer pin"))
+            })
+            .transpose()?;
         binding.maximum_body_bytes = self.maximum_body_bytes;
         binding.body_timeout = std::time::Duration::from_millis(self.body_timeout_ms);
         Ok(binding)
@@ -59,11 +76,13 @@ pub(crate) struct OwnerScope<'a> {
 pub struct Binding {
     scope: Arc<projection_entity::Scope>,
     pin: projection_receipt::IssuerPin,
+    permit_pin: Option<crate::projection_permit::Pin>,
     gate: pumgye::ResourceGate,
     maximum_body_bytes: usize,
     body_timeout: std::time::Duration,
 }
 pub struct Observation {
+    permit: Option<crate::projection_permit::CheckedPermit>,
     receipt: projection_receipt::CheckedServiceReceipt,
     reply: crate::pumgye_grpc_client::AuthenticatedReply,
 }
@@ -77,6 +96,10 @@ impl Observation {
             return false;
         };
         self.reply.allow
+            && self
+                .permit
+                .as_ref()
+                .is_none_or(|permit| permit.valid_at(now.as_millis().min(u64::MAX as u128) as u64))
             && self
                 .receipt
                 .authentication()
@@ -103,6 +126,7 @@ impl Binding {
         Ok(Self {
             scope,
             pin,
+            permit_pin: None,
             gate,
             maximum_body_bytes: default_body_limit(),
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
@@ -173,17 +197,33 @@ impl Binding {
         let receipt = hopae
             .issue_service_receipt(headers, &prepared.service_scope(), &self.pin)
             .await?;
-        let reply = pumgye
-            .observe_authenticated_resource_with_route(
-                &self.gate,
-                method,
-                ip,
-                prepared.digest(),
-                &receipt,
-                route,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("native route method unassigned"))?;
+        let (reply, permit) = if let Some(pin) = &self.permit_pin {
+            let (reply, permit) = pumgye
+                .issue_projection_permit(
+                    &self.gate,
+                    method,
+                    ip,
+                    prepared.digest(),
+                    &receipt,
+                    route,
+                    pin,
+                )
+                .await?;
+            (reply, Some(permit))
+        } else {
+            let reply = pumgye
+                .observe_authenticated_resource_with_route(
+                    &self.gate,
+                    method,
+                    ip,
+                    prepared.digest(),
+                    &receipt,
+                    route,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("native route method unassigned"))?;
+            (reply, None)
+        };
         if reply.allow {
             hopae.validate_service_receipt(&receipt).await?;
             let now = u64::try_from(
@@ -197,7 +237,11 @@ impl Binding {
                 "native authority observation superseded or expired"
             );
         }
-        Ok(Observation { receipt, reply })
+        Ok(Observation {
+            receipt,
+            reply,
+            permit,
+        })
     }
 }
 
@@ -215,6 +259,7 @@ mod tests {
                     .verifying_key()
                     .to_bytes(),
             ),
+            permission_permit: None,
             maximum_body_bytes: default_body_limit(),
             body_timeout_ms: default_body_timeout(),
         }

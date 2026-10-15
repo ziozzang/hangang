@@ -101,6 +101,47 @@ impl Client {
         query: &AuthenticatedQuery<'_>,
         receipt: &crate::projection_receipt::CheckedServiceReceipt,
     ) -> Result<AuthenticatedReply> {
+        self.authenticated(query, receipt, None)
+            .await
+            .map(|(reply, _)| reply)
+    }
+    pub async fn issue_projection_permit(
+        &self,
+        query: &AuthenticatedQuery<'_>,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        pin: &crate::projection_permit::Pin,
+    ) -> Result<(AuthenticatedReply, crate::projection_permit::CheckedPermit)> {
+        ensure!(
+            query.route.is_some(),
+            "native route owner required for permit issuance"
+        );
+        let (reply, permit) = self
+            .authenticated(query, receipt, Some(pin))
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::PermissionDenied)
+                {
+                    anyhow::Error::new(crate::projection_permit::Denied)
+                } else {
+                    error
+                }
+            })?;
+        Ok((
+            reply,
+            permit.ok_or_else(|| anyhow::anyhow!("native permit missing"))?,
+        ))
+    }
+    async fn authenticated(
+        &self,
+        query: &AuthenticatedQuery<'_>,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        pin: Option<&crate::projection_permit::Pin>,
+    ) -> Result<(
+        AuthenticatedReply,
+        Option<crate::projection_permit::CheckedPermit>,
+    )> {
         use std::time::{Instant, SystemTime, UNIX_EPOCH};
         let begun = Instant::now();
         let clock = || {
@@ -173,11 +214,26 @@ impl Client {
         request
             .metadata_mut()
             .insert("authorization", self.token.clone());
-        let mut client = pumgye_grpc::v1::authenticated_resource_authorization_client::AuthenticatedResourceAuthorizationClient::new(self.channel.clone()).max_encoding_message_size(4096).max_decoding_message_size(128);
-        let reply = tokio::time::timeout(timeout, client.decide(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("gRPC authenticated deadline"))??
-            .into_inner();
+        let (decision, issued) = if pin.is_some() {
+            let mut client =
+                pumgye_grpc::v1::projection_permits_client::ProjectionPermitsClient::new(
+                    self.channel.clone(),
+                )
+                .max_encoding_message_size(4096)
+                .max_decoding_message_size(2048);
+            let reply = tokio::time::timeout(timeout, client.issue(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("gRPC permit deadline"))??
+                .into_inner();
+            (None, Some(reply))
+        } else {
+            let mut client = pumgye_grpc::v1::authenticated_resource_authorization_client::AuthenticatedResourceAuthorizationClient::new(self.channel.clone()).max_encoding_message_size(4096).max_decoding_message_size(128);
+            let reply = tokio::time::timeout(timeout, client.decide(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("gRPC authenticated deadline"))??
+                .into_inner();
+            (Some(reply), None)
+        };
         let after = clock()?;
         let final_ms = after
             .max(before.saturating_add(begun.elapsed().as_millis().min(u64::MAX as u128) as u64));
@@ -185,13 +241,38 @@ impl Client {
             after >= before && receipt.authentication().valid_at(final_ms),
             "authenticated response expired or clock reversed"
         );
-        let reply = decode_authenticated(
-            reply,
-            request_id,
-            floor.max(self.revision()),
-            self.network_revision.load(Ordering::Acquire),
-            query.route.is_some(),
-        )?;
+        let permit = match (pin, issued) {
+            (Some(pin), Some(wire)) => Some(
+                pin.verify(
+                    request_id,
+                    query.resource,
+                    query.action,
+                    floor.max(self.revision()),
+                    self.network_revision.load(Ordering::Acquire),
+                    receipt,
+                    wire,
+                    final_ms,
+                )
+                .map_err(|_| anyhow::anyhow!("native permit verification refused"))?,
+            ),
+            (None, None) => None,
+            _ => anyhow::bail!("native permit mode mismatch"),
+        };
+        let reply = if let Some(permit) = &permit {
+            AuthenticatedReply {
+                revision: permit.revision(),
+                network_revision: permit.network_revision(),
+                allow: true,
+            }
+        } else {
+            decode_authenticated(
+                decision.ok_or_else(|| anyhow::anyhow!("decision missing"))?,
+                request_id,
+                floor.max(self.revision()),
+                self.network_revision.load(Ordering::Acquire),
+                query.route.is_some(),
+            )?
+        };
         self.network_revision
             .fetch_max(reply.network_revision, Ordering::AcqRel);
         self.require_revision(reply.revision);
@@ -200,7 +281,7 @@ impl Client {
                 && reply.network_revision >= self.network_revision.load(Ordering::Acquire),
             "authenticated authority revision changed"
         );
-        Ok(reply)
+        Ok((reply, permit))
     }
     pub async fn decide_resource(&self, query: &ResourceQuery<'_>) -> Result<ResourceReply> {
         ensure!(

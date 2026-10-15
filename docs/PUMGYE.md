@@ -435,3 +435,35 @@ budget refusal without upstream effects, network/permission/class/AAL/service
 checks, restoration and durable authority-restart withdrawal. These are prepared
 local candidates, not new published releases or operating replacements. Remote
 Kubernetes and deployment/rollback qualification remain required.
+
+## Native signed permission evidence (unreleased source)
+
+A protected native resource route may set `auth.native_resource.permission_permit`
+to a separate public-only object with `issuer_ref`, `key_epoch` and canonical
+Base64 Ed25519 `public_key`. This is the Pumgye permit-purpose key, independent
+of the Hopae authentication key. Unknown fields and invalid/weak pins refuse.
+This mode requires configured native route ownership and Pumgye route/plan live
+clients plus its permit signer. Missing service or failed issuance never falls
+back to ordinary Decide.
+
+After Hopae authentication the gateway calls `ProjectionPermits/Issue` on its
+existing persistent bounded mTLS channel. It verifies purpose/signature, exact
+identity/generation/service/audience/final-request hash, the authentication
+receipt hash, resource/action, revision floors, zero cache TTL and expiry bounded
+by authentication. Canonical binding validation rejects zero owner revisions.
+Native permission denial returns 403; invalid/unavailable evidence returns 503.
+The opaque checked permit stays in the native observation and expires through
+its final dispatch fences. It is never forwarded as an application header.
+
+This increment verifies signed permission evidence. Hopae receiver verification,
+paired replay consumption and actual upstream credential projection remain
+separate required gates; a signature alone is not replay admission or a remote
+lease. Existing routes without `permission_permit` retain observation mode.
+
+Local source qualification passes: 1,300 workspace tests (58 existing explicit
+ignores), strict Clippy and 942 documentation links. The actual four-server
+`--permit-issuance` fixture passes final request dispatch, wrong permit public
+key/issuer/epoch refusal and restoration, durable permission/profile withdrawal,
+route/plan trust failures and authority outages. This qualifies issuance and
+gateway verification, not receiver replay/projection, static release, Kubernetes,
+operating adoption, multi-owner epoch retirement or throughput.
