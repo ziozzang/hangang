@@ -1,6 +1,10 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  "Native Service": "네이티브 서비스",
+  "Native Workload": "네이티브 워크로드",
+  "Native Human": "네이티브 사용자",
+  "Native class unrecognized": "인식할 수 없는 네이티브 종류",
   "User": "사용자",
   "Kind": "종류",
   "Subject": "대상",

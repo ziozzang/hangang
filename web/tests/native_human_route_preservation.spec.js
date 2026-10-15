@@ -88,3 +88,29 @@ test('advanced Human scope edits survive form synchronization without aliasing t
   expect(writes[0].document.auth.native_resource).toEqual(draft.auth.native_resource);
   expect(original.auth.native_resource.human_binding.header_policy_revision).toBe(11);
 });
+
+for (const [kind, label] of [['human', 'Native Human'], ['workload', 'Native Workload'], [undefined, 'Native Service'], [null, 'Native class unrecognized'], ['<img src=x onerror=window.pwned=1>', 'Native class unrecognized']]) {
+  test(`route inventory identifies configured native class: ${String(kind)}`, async ({ page }) => {
+    const document = { ...structuredClone(original), access_mode: 'protected', require_tls: true, path_match: 'exact' };
+    if (kind === undefined) delete document.auth.native_resource.observed.authentication_class;
+    else document.auth.native_resource.observed.authentication_class = kind;
+    await fixture(page, document);
+    await page.goto('/ui/');
+    await page.getByLabel('Administrator token').fill('fixture-token');
+    await page.getByRole('button', { name: 'Connect' }).click();
+    await page.getByRole('link', { name: 'HTTP routes' }).click();
+    await expect(page.locator('[data-route-id="human-route"] .route-policy-cell')).toContainText(label);
+    await expect(page.locator('[data-route-id="human-route"] img')).toHaveCount(0);
+    expect(await page.evaluate(() => window.pwned)).toBeUndefined();
+  });
+}
+
+test('native Human inventory label follows Korean locale', async ({ page }) => {
+  await fixture(page);
+  await page.goto('/ui/');
+  await page.getByLabel('Administrator token').fill('fixture-token');
+  await page.getByRole('button', { name: 'Connect' }).click();
+  await page.getByRole('link', { name: 'HTTP routes' }).click();
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(page.locator('[data-route-id="human-route"] .route-policy-cell')).toContainText('네이티브 사용자');
+});

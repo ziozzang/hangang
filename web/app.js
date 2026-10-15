@@ -1586,6 +1586,12 @@ function routeSummaryTags(type, route) {
   if (route.enabled === false) tags.push(t('Disabled'));
   if (route.country_policy) tags.push(t(route.country_policy.enforce === false ? 'GeoIP configured, not enforced' : 'GeoIP country admission'));
   if (type === 'http') {
+    const observed = route.auth?.native_resource?.observed;
+    if (isObject(observed)) {
+      const nativeLabels = { service: 'Native Service', workload: 'Native Workload', human: 'Native Human' };
+      const nativeClass = observed.authentication_class === undefined ? 'service' : observed.authentication_class;
+      tags.push(t(typeof nativeClass === 'string' && Object.hasOwn(nativeLabels, nativeClass) ? nativeLabels[nativeClass] : 'Native class unrecognized'));
+    }
     if (['public', 'application', 'protected'].includes(route.access_mode)) tags.push(t('Access: {mode}', { mode: t(route.access_mode) }));
     if (route.require_tls) tags.push(t('TLS required'));
     if (route.path_match && route.path_match !== 'prefix') tags.push(t('Path {mode}', { mode: route.path_match }));
