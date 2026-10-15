@@ -18,9 +18,9 @@ function exchange(transport,options){
 async function protectedStatus(expected){
   const before=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
   const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:'Bearer '+config.application.key}});
-  if(expected!==null)expect(response.status).toBe(expected);
   const after=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
   expect(after).toBe(before+(response.status===200?1:0));
+  if(expected!==null)expect(response.status).toBe(expected);
   return response.status;
 }
 const browser=await chromium.launch({headless:true});
@@ -153,8 +153,21 @@ try {
         console.log('PASS: Hopae profile revocation survives actual K8s Pod replacement despite unchanged bootstrap configuration');
       }
       await publish(original);
-      await protectedStatus(200);
-      console.log('PASS: real Hopae browser profile revocation/restoration changes protected requests immediately; refused request never reaches application');
+      // Publication commits the profile; native peer/source readiness may still
+      // refuse safely while connections recover. Preserve every request budget
+      // and require zero backend effects before considering a refused response.
+      const restoreDeadline=Date.now()+15000;
+      const restoreStatuses=[];
+      for(;;){
+        if(Date.now()>=restoreDeadline)throw new Error('owned profile restoration deadline');
+        const restored=await protectedStatus(null);
+        restoreStatuses.push(restored);
+        if(restored===200)break;
+        expect(restored).toBe(503); // Other statuses fail immediately, without polling.
+        if(Date.now()>=restoreDeadline)throw new Error('owned profile restoration deadline');
+        await new Promise(resolve=>setTimeout(resolve,200));
+      }
+      console.log('PASS: real Hopae browser profile revocation and bounded restoration; every refusal has zero backend effects; restore statuses '+restoreStatuses.join(','));
     }
     console.log('PASS: actual remote Hopae administrator mTLS delegation and profile view under the Hangang login');
   }
