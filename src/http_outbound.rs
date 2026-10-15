@@ -357,6 +357,7 @@ impl Pools {
                 }),
             });
         let client = Client::builder(TokioExecutor::new())
+            .retry_canceled_requests(gate.is_none())
             .pool_idle_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(if gate.is_some() || runtime.route.preserve_host {
                 0
