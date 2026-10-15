@@ -1,5 +1,12 @@
 // English source text is the key. Technical identifiers and user data remain untranslated.
 export default {
+  "Workload": "워크로드",
+  "Hopae user ID, Workload subject, or network CIDR": "호패 사용자 ID, 워크로드 주체 또는 네트워크 CIDR",
+  "Choose a supported assignment kind.": "지원하는 할당 종류를 선택하세요.",
+  "Correct the authorization policy JSON before changing assignments.": "할당을 바꾸기 전에 권한 정책 JSON을 수정하세요.",
+  "Workload subject must be s_ followed by exactly 48 lowercase hexadecimal characters.": "워크로드 주체는 s_ 뒤에 소문자 16진수 48자가 정확히 있어야 합니다.",
+  "Workload subjects are kind 3 and AAL0, with separate assignments. Roles and resources with minimum AAL above 0 cannot authorize a Workload. Unassigned subjects and guest roles have no permissions. This policy editor does not authenticate Workloads or activate protected routes.": "워크로드 주체는 종류 3·AAL0이며 별도로 할당합니다. 최소 AAL이 0보다 높은 역할과 자원은 워크로드를 허용할 수 없습니다. 미할당 주체와 guest 역할에는 권한이 없습니다. 이 정책 편집기는 워크로드를 인증하거나 보호 라우트를 활성화하지 않습니다.",
+
   "Authorization sections": "권한 관리 영역",
   "Services and assignments": "서비스 및 할당",
   "Identity · Hopae": "신원 · 호패",

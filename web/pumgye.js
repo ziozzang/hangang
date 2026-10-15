@@ -1,5 +1,6 @@
 import { t } from './i18n.js';
 let generation = 0;
+let matrixGeneration = 0;
 let context = null;
 let document = null;
 let etag = null;
@@ -20,6 +21,15 @@ function sourceControls() {
 const $ = (id) => window.document.getElementById(id);
 const text = (value) => window.document.createTextNode(value);
 function message(value) { $('pumgye-message').textContent = value; }
+function assignmentDraft() {
+  try {
+    const current = JSON.parse($('pumgye-document').value);
+    if (!current || typeof current !== 'object' || Array.isArray(current)) throw new Error();
+    return current;
+  } catch { message(t('Correct the authorization policy JSON before changing assignments.')); return null; }
+}
+const assignmentMap = value => value && typeof value === 'object' && !Array.isArray(value);
+
 function sourceSummary(status) {
   const states = {
     native: 'Native policy source', starting: 'Kubernetes source starting',
@@ -55,24 +65,36 @@ function render() {
   }
 }
 function renderMatrix() {
+  const matrix = ++matrixGeneration, own = generation, serviceId = $('pumgye-service').value;
   const table = $('pumgye-matrix'); table.replaceChildren();
-  const service = draft?.services?.[$('pumgye-service').value];
+  const service = draft?.services?.[serviceId];
   const requirement = service ? (service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
   $('pumgye-guard-requirement').textContent = requirement ? t(requirement) : '';
   if (requirement) $('pumgye-guard-requirement').dataset.i18n = requirement;
   else delete $('pumgye-guard-requirement').dataset.i18n;
   if (!service) return;
-  for (const [kind, rows] of [['User', Object.entries(service.users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
+  for (const [kind, rows] of [['User', Object.entries(service.users || {})], ['Workload', Object.entries(service.workload_users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
     for (const [id, roles] of rows) {
-      const tr = window.document.createElement('tr');
-      for (const value of [t(kind), id, roles.join(', ')]) { const td = window.document.createElement('td'); td.append(text(value)); tr.append(td); }
-      const td = window.document.createElement('td'); const button = window.document.createElement('button'); button.type = 'button'; button.className = 'button button-quiet'; button.textContent = t('Remove'); button.disabled = sourceManaged;
-      button.addEventListener('click', () => { if (sourceManaged) return; if (kind === 'User') delete service.users[id]; else service.networks = service.networks.filter(n => n.cidr !== id); dirty = true; render(); }); td.append(button); tr.append(td); table.append(tr);
+      const tr = window.document.createElement('tr'); tr.dataset.assignmentKind = kind.toLowerCase();
+      for (const [column, value] of [t(kind), id, roles.join(', ')].entries()) { const td = window.document.createElement('td'); if (column === 0) td.dataset.i18n = kind; td.append(text(value)); tr.append(td); }
+      const td = window.document.createElement('td'); const button = window.document.createElement('button'); button.type = 'button'; button.className = 'button button-quiet'; button.textContent = t('Remove'); button.dataset.i18n = 'Remove'; button.disabled = sourceManaged;
+      button.addEventListener('click', () => {
+        if (sourceManaged || own !== generation || matrix !== matrixGeneration) return;
+        const current = assignmentDraft(); if (!current) return;
+        const active = current.services?.[serviceId]; if (!active) return;
+        if (kind === 'User' || kind === 'Workload') {
+          const field = kind === 'Workload' ? 'workload_users' : 'users';
+          if (!assignmentMap(active[field]) || !Object.hasOwn(active[field], id)) return;
+          delete active[field][id];
+          if (kind === 'Workload' && !Object.keys(active[field]).length) delete active[field];
+        } else { if (!Array.isArray(active.networks)) return; active.networks = active.networks.filter(n => n.cidr !== id); }
+        draft = current; dirty = true; render();
+      }); td.append(button); tr.append(td); table.append(tr);
     }
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { publishing = false; outcomeUnknown = false; sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject','pumgye-new-service','pumgye-assignment-roles']) if ($(id)) $(id).value=''; if ($('pumgye-service')) $('pumgye-service').replaceChildren(); if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit','pumgye-message']) if ($(id)) $(id).textContent=''; }
+export function resetPumgye() { publishing = false; outcomeUnknown = false; sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-kind')) $('pumgye-kind').value='user'; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject','pumgye-new-service','pumgye-assignment-roles']) if ($(id)) $(id).value=''; if ($('pumgye-service')) $('pumgye-service').replaceChildren(); if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit','pumgye-message']) if ($(id)) $(id).textContent=''; }
 export async function loadPumgye(host, { resume = false } = {}) {
   // A navigation resume retains the exact draft and its base revisions in memory.
   // Only explicit Refresh may replace it, including invalid raw JSON.
@@ -117,12 +139,25 @@ $('pumgye-service-form').addEventListener('submit', (event) => {
   dirty=true; render(); $('pumgye-service').value=id; renderMatrix();
 });
 $('pumgye-assignment-form').addEventListener('submit', event => {
-  event.preventDefault(); if (sourceManaged) return; const service=draft?.services?.[$('pumgye-service').value]; if (!service) return;
-  const id=$('pumgye-subject').value.trim(); const roles=$('pumgye-assignment-roles').value.split(',').map(x=>x.trim()).filter(Boolean);
-  if (!id || !roles.length || roles.some(role=>role!=='guest' && !Object.hasOwn(service.roles,role))) return message(t('Use an existing role or guest.'));
-  if ($('pumgye-kind').value==='user') Object.defineProperty(service.users,id,{value:roles,enumerable:true,writable:true,configurable:true});
-  else { service.networks=service.networks.filter(n=>n.cidr!==id);service.networks.push({cidr:id,roles}); }
-  dirty=true;render();message(t('Draft updated. Publish to apply.'));
+  event.preventDefault(); if (sourceManaged) return;
+  const kind = $('pumgye-kind').value;
+  if (!['user', 'workload', 'network'].includes(kind)) return message(t('Choose a supported assignment kind.'));
+  // Never replace invalid raw editor work with the last valid structured draft.
+  const current = assignmentDraft(); if (!current) return;
+  const service = current?.services?.[$('pumgye-service').value]; if (!service) return;
+  const raw = $('pumgye-subject').value;
+  const id = kind === 'workload' ? raw : raw.trim();
+  if (kind === 'workload' && (id.length !== 50 || !/^s_[0-9a-f]{48}$/.test(id))) return message(t('Workload subject must be s_ followed by exactly 48 lowercase hexadecimal characters.'));
+  const roles = $('pumgye-assignment-roles').value.split(',').map(x => x.trim()).filter(Boolean);
+  if (!id || !roles.length || roles.some(role => role !== 'guest' && !Object.hasOwn(service.roles || {}, role))) return message(t('Use an existing role or guest.'));
+  draft = current;
+  if (kind === 'user' || kind === 'workload') {
+    const field = kind === 'workload' ? 'workload_users' : 'users';
+    if (!Object.hasOwn(service, field)) Object.defineProperty(service, field, { value: {}, enumerable: true, writable: true, configurable: true });
+    if (!assignmentMap(service[field])) return message(t('Correct the authorization policy JSON before changing assignments.'));
+    Object.defineProperty(service[field], id, { value: roles, enumerable: true, writable: true, configurable: true });
+  } else { if (!Array.isArray(service.networks)) return message(t('Correct the authorization policy JSON before changing assignments.')); service.networks = service.networks.filter(n => n.cidr !== id); service.networks.push({ cidr: id, roles }); }
+  dirty = true; render(); message(t('Draft updated. Publish to apply.'));
 });
 $('pumgye-publish').addEventListener('click', async () => {
   if (sourceManaged || publishing || outcomeUnknown || !context || !document) return; const own=generation;
