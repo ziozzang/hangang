@@ -714,13 +714,25 @@ impl Registry {
                     "plugin outcome uncertain; inspect current state before retrying",
                 );
             }
+        }
+        if authority.check().await.is_err() {
+            // Never disclose the protected backend response after revocation.
+            // A dispatched mutation may nevertheless have committed; preserve
+            // its admitted, non-secret correlation without claiming rollback.
+            response = problem(
+                StatusCode::FORBIDDEN,
+                if record.is_some() {
+                    "administrator authority was revoked; plugin outcome uncertain; inspect current state before retrying"
+                } else {
+                    "administrator authority was revoked"
+                },
+            );
+        }
+        if let Some(record) = record {
             response.headers_mut().insert(
                 "x-hangang-plugin-operation",
                 record.to_string().parse().unwrap(),
             );
-        }
-        if authority.check().await.is_err() {
-            return problem(StatusCode::FORBIDDEN, "administrator authority was revoked");
         }
         response
     }
@@ -895,6 +907,9 @@ mod tests {
                     if body["expected_revision"]!=4 {
                         return reply(StatusCode::CONFLICT,json!({"title":"Revision Conflict","revision":4,"detail":"policy changed; draft retained"}));
                     }
+                    if body["policy"]["revoke_after_apply"]==true {
+                        admin.store(false,Ordering::SeqCst);
+                    }
                     reply(StatusCode::OK,json!({"revision":5,"policy":body["policy"]}))
                 }
             }
@@ -997,16 +1012,35 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
         assert_eq!(calls.lock().unwrap().len(), 3);
-        admin.store(false, Ordering::SeqCst);
+        let late = json!({"expected_revision":4,"policy":{"revoke_after_apply":true,"protected_value":"backend-secret-sentinel"}});
+        let revoked = client.put(&endpoint).json(&late).send().await.unwrap();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+        let operation: i64 = revoked.headers()["x-hangang-plugin-operation"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let redacted = revoked.text().await.unwrap();
+        assert!(!redacted.contains("backend-secret-sentinel"));
+        assert!(redacted.contains("outcome uncertain"));
+        let audit = audit_read(&registry.audit).unwrap();
+        assert_eq!(audit["operations"][0]["id"], operation);
+        assert_eq!(audit["operations"][0]["status"], 200);
+        assert_eq!(calls.lock().unwrap().len(), 4);
         let forbidden = client.put(&endpoint).json(&current).send().await.unwrap();
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
-        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(
+            !forbidden
+                .headers()
+                .contains_key("x-hangang-plugin-operation")
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4);
         assert_eq!(
             audit_read(&registry.audit).unwrap()["operations"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            3
         );
         proxy_task.abort();
         backend_task.abort();

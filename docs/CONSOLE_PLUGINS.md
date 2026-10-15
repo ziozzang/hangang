@@ -57,6 +57,13 @@ and secrets are excluded. Audit admission failure prevents dispatch. Ambiguous
 outcomes are not retried automatically. Separate authorities cannot promise atomic
 revocation of an operation already accepted by a backend.
 
+Dispatched mutation replies retain `x-hangang-plugin-operation`, including a final
+403 caused by parent authority withdrawal. That non-secret ID correlates only the
+already admitted operation; it grants no audit access or authority to retry. The
+403 discards the protected backend body and reports an uncertain outcome. The
+private audit retains the actual backend result, which may already be committed.
+Requests refused by the authority check before dispatch do not gain a new operation reference.
+
 ## Hopae management and login
 
 The default native delegation mode preserves Hopae handle authentication, grant/role, assurance,

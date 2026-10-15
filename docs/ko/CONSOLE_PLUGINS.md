@@ -53,6 +53,13 @@ GET /ui/plugins/<id>/<asset>는 pin한 목록만 제공합니다. 활성 관리�
 결과를 자동 재시도하지 않습니다. backend가 이미 수락한 작업의 회수를 서로 다른
 권위 사이에서 원자적으로 보장하지 않습니다.
 
+dispatch한 변경 응답은 parent 권한 회수로 최종 403이 되어도
+`x-hangang-plugin-operation`을 유지합니다. 비밀정보가 아닌 이 ID는 이미 수락한
+해당 작업만 연결하며 감사 조회 권한이나 재시도 권한을 주지 않습니다. 403은 보호된
+backend 본문을 버리고 결과가 불확실함을 알립니다. 비공개 감사에는 이미 commit됐을
+수 있는 실제 backend 결과를 유지합니다. dispatch 전 권한 검사에서 거부한 요청에는 새 작업
+참조를 부여하지 않습니다.
+
 ## 호패 관리와 로그인
 
 기본 native 위임은 Hopae handle 인증·grant/role·assurance·신선도·CSRF·트랜잭션 변경
