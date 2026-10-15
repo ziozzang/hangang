@@ -52,13 +52,32 @@ try {
   await page.locator('.sidebar a[data-view="plugin-'+config.plugin+'"]').click();
   const root=page.locator('#view-plugin-'+config.plugin+' .plugin-root');
   await expect(root.locator('#tab-blocks')).toBeVisible();
-  await root.locator('#tab-blocks').click();
-  await root.locator('#network').fill('127.0.0.1/32');
-  await root.locator('#reason').fill('owned browser qualification');
-  await root.locator('#block-form button[type="submit"]').click();
-  await expect(root.locator('#blocks-rows')).toContainText('127.0.0.1/32');
-  await root.locator('#blocks-rows tr').filter({hasText:'127.0.0.1/32'}).locator('button').click();
-  await expect(root.locator('#blocks-rows')).not.toContainText('127.0.0.1/32');
+  if(config.nativeSource){
+    await expect(root.locator('#native-authority-status')).toContainText('Kubernetes native IP policy source');
+    for(const selector of ['#block-form button[type="submit"]','#allow-save','#policy-form button[type="submit"]','#rules-save','#lua-save','#geoip-reload'])await expect(root.locator(selector)).toBeDisabled();
+    const source=config.nativeSource;
+    async function patchSource(blocks){
+      const result=await execute(source.kubectl,['-n',source.namespace,'get','sumunjangpolicy',source.name,'-o','json']);
+      expect(JSON.parse(result.stdout).metadata.uid).toBe(source.uid);
+      await execute(source.kubectl,['-n',source.namespace,'patch','sumunjangpolicy',source.name,'--type=merge','-p',JSON.stringify({spec:{blocks}})]);
+    }
+    await patchSource([{network:'127.0.0.1/32',expires_at:Math.floor(Date.now()/1000)+600,reason:'owned source browser qualification'}]);
+    await expect.poll(()=>protectedStatus(null),{timeout:15000}).toBe(403);
+    await patchSource([]);
+    await expect.poll(()=>protectedStatus(null),{timeout:15000}).toBe(200);
+    await root.locator('#refresh').click();
+    await expect(root.locator('#native-authority-status')).toContainText('Kubernetes native IP policy source');
+    await expect(root.locator('#block-form button[type="submit"]')).toBeDisabled();
+    console.log('PASS: actual source-owned console stays read-only while operator CRD block/unblock controls final403/200 with backend non-dispatch');
+  } else {
+    await root.locator('#tab-blocks').click();
+    await root.locator('#network').fill('127.0.0.1/32');
+    await root.locator('#reason').fill('owned browser qualification');
+    await root.locator('#block-form button[type="submit"]').click();
+    await expect(root.locator('#blocks-rows')).toContainText('127.0.0.1/32');
+    await root.locator('#blocks-rows tr').filter({hasText:'127.0.0.1/32'}).locator('button').click();
+    await expect(root.locator('#blocks-rows')).not.toContainText('127.0.0.1/32');
+  }
   if(config.hopae){
     await page.locator('.sidebar a[data-view="plugin-hopae"]').click();
     const hop=page.locator('#view-plugin-hopae .plugin-root');
@@ -142,5 +161,5 @@ try {
   await page.locator('#logout-button').click();
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#pumgye-document')).toHaveValue('');
-  console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu/block/unblock and logout clearing');
+  console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu and owning policy block/unblock, and logout clearing');
 } catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]').replaceAll(config.application?.key??'unused-secret-placeholder','[redacted]')); process.exitCode=1; } finally {await browser.close();}
