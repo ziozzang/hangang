@@ -6,6 +6,8 @@ The native console imports operator-installed packages as sidebar entries under
 ZERO TRUST. Guard and Hopae own their management APIs and data; Hangang owns
 console authentication. Packages are trusted same-origin JavaScript, not a sandbox.
 Never install unreviewed code. No separate console account database is created.
+Plugin views have labelled page headings and appear above the shared DB-IP
+attribution footer, keeping its source link available beneath the active view.
 
 ## Load packages
 

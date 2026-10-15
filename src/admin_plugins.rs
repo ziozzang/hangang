@@ -841,6 +841,176 @@ mod tests {
                 .is_none()
         );
     }
+    /// Exercise Incoming request bodies through real loopback HTTP on both sides of
+    /// the mediator. CAS must live in JSON: proxy header allowlists are not a lock.
+    #[tokio::test]
+    async fn guard_policy_document_body_cas_survives_proxy_and_conflict_is_audited_once() {
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        async fn serve<F, Fut>(handler: F) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+        where
+            F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = Response<Body>> + Send + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handler = Arc::new(handler);
+            let task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request| {
+                            let handler = handler.clone();
+                            async move { Ok::<_, std::convert::Infallible>(handler(request).await) }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            (address, task)
+        }
+        let calls = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let admin = Arc::new(AtomicBool::new(true));
+        let (backend,backend_task)=serve({
+            let calls=calls.clone();let admin=admin.clone();
+            move |request| {
+                let calls=calls.clone();let admin=admin.clone();
+                async move {
+                    if request.uri().path()=="/authority" {
+                        return reply(StatusCode::OK,json!({"user":{"id":7,"username":"fixture-operator","role":if admin.load(Ordering::SeqCst){"admin"}else{"viewer"},"enabled":true}}));
+                    }
+                    let method=request.method().to_string();let path=request.uri().path().to_owned();
+                    let bytes=request.into_body().collect().await.unwrap().to_bytes();
+                    let body=if bytes.is_empty(){Value::Null}else{serde_json::from_slice(&bytes).unwrap()};
+                    calls.lock().unwrap().push((method.clone(),path.clone(),body.clone()));
+                    assert_eq!(path,"/v1/policy/document","no legacy route or caller-selected backend");
+                    if method=="GET" {return reply(StatusCode::OK,json!({"revision":4,"policy":{"mode":"observe"}}));}
+                    if body["expected_revision"]!=4 {
+                        return reply(StatusCode::CONFLICT,json!({"title":"Revision Conflict","revision":4,"detail":"policy changed; draft retained"}));
+                    }
+                    reply(StatusCode::OK,json!({"revision":5,"policy":body["policy"]}))
+                }
+            }
+        }).await;
+        let (dir, path) = package();
+        let manifest_path = dir.path().join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["routes"] = json!([{"path":"policy/document","method":"GET","mutation":false},{"path":"policy/document","method":"PUT","mutation":true}]);
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &manifest).unwrap();
+        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["plugins"][0]["backend"] = json!(format!("http://{backend}"));
+        config["plugins"][0]["manifest_sha256"] = json!(sha(&manifest));
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let registry = Arc::new(Registry::load(&path).unwrap());
+        let (proxy, proxy_task) = serve({
+            let registry = registry.clone();
+            move |request| {
+                let registry = registry.clone();
+                async move {
+                    registry
+                        .handle(
+                            request,
+                            Authority::Remote {
+                                client: reqwest::Client::new(),
+                                endpoint: format!("http://{backend}/authority").parse().unwrap(),
+                                authorization: reqwest::header::HeaderValue::from_static(
+                                    "Bearer fixture-only",
+                                ),
+                                actor_id: 7,
+                            },
+                            User {
+                                id: 7,
+                                username: "fixture-operator".into(),
+                                role: crate::admin_users::Role::Admin,
+                                enabled: true,
+                            },
+                        )
+                        .await
+                }
+            }
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{proxy}/v1/plugins/guard/policy/document");
+        let read = client.get(&endpoint).send().await.unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(read.json::<Value>().await.unwrap()["revision"], 4);
+        let stale = json!({"expected_revision":3,"policy":{"mode":"enforce"}});
+        let conflict = client
+            .put(&endpoint)
+            .header("if-match", "4")
+            .json(&stale)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(
+            conflict
+                .headers()
+                .contains_key("x-hangang-plugin-operation")
+        );
+        assert_eq!(
+            conflict.json::<Value>().await.unwrap(),
+            json!({"title":"Revision Conflict","revision":4,"detail":"policy changed; draft retained"})
+        );
+        let current = json!({"expected_revision":4,"policy":{"mode":"enforce"}});
+        let applied = client.put(&endpoint).json(&current).send().await.unwrap();
+        assert_eq!(applied.status(), StatusCode::OK);
+        assert_eq!(applied.json::<Value>().await.unwrap()["revision"], 5);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("GET".into(), "/v1/policy/document".into(), Value::Null),
+                ("PUT".into(), "/v1/policy/document".into(), stale.clone()),
+                ("PUT".into(), "/v1/policy/document".into(), current.clone())
+            ]
+        );
+        let audit = audit_read(&registry.audit).unwrap();
+        let operations = audit["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0]["status"], 200);
+        assert_eq!(operations[1]["status"], 409);
+        for (operation, body) in operations.iter().zip([&current, &stale]) {
+            assert_eq!(operation["actor_id"], 7);
+            assert_eq!(operation["actor_name"], "fixture-operator");
+            assert_eq!(operation["path"], "policy/document");
+            assert_eq!(operation["method"], "PUT");
+            assert_eq!(
+                operation["body_sha256"],
+                sha(&serde_json::to_vec(body).unwrap())
+            );
+        }
+        let legacy = client
+            .put(format!("http://{proxy}/v1/plugins/guard/policy"))
+            .json(&current)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        admin.store(false, Ordering::SeqCst);
+        let forbidden = client.put(&endpoint).json(&current).send().await.unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(
+            audit_read(&registry.audit).unwrap()["operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        proxy_task.abort();
+        backend_task.abort();
+    }
     #[test]
     fn mutual_tls_requires_https_matching_dns_and_absolute_paths() {
         let (_dir, path) = package();

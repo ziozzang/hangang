@@ -9,9 +9,12 @@ let independent = false;
 let authorityRevision = null;
 let sourceManaged = false;
 let sourceOwner = 'native';
+let publishing = false;
+let outcomeUnknown = false;
 function sourceControls() {
   $('pumgye-document').readOnly = sourceManaged;
-  $('pumgye-publish').disabled = sourceManaged;
+  $('pumgye-publish').disabled = sourceManaged || publishing || outcomeUnknown;
+  $('pumgye-refresh').disabled = publishing;
   for (const id of ['pumgye-service-form','pumgye-assignment-form']) for (const element of $(id).elements) element.disabled = sourceManaged;
 }
 const $ = (id) => window.document.getElementById(id);
@@ -69,8 +72,12 @@ function renderMatrix() {
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject']) if ($(id)) $(id).value=''; if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit']) if ($(id)) $(id).textContent=''; }
-export async function loadPumgye(host) {
+export function resetPumgye() { publishing = false; outcomeUnknown = false; sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject','pumgye-new-service','pumgye-assignment-roles']) if ($(id)) $(id).value=''; if ($('pumgye-service')) $('pumgye-service').replaceChildren(); if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit','pumgye-message']) if ($(id)) $(id).textContent=''; }
+export async function loadPumgye(host, { resume = false } = {}) {
+  // A navigation resume retains the exact draft and its base revisions in memory.
+  // Only explicit Refresh may replace it, including invalid raw JSON.
+  if (resume && document) { context = host; return; }
+  if (publishing) return;
   context = host; const own = ++generation; sourceManaged = true; sourceControls();
   $('pumgye-source-summary').textContent = t('Checking authority');
   $('pumgye-authority-status').textContent = '';
@@ -98,9 +105,10 @@ export async function loadPumgye(host) {
     $('pumgye-authority-status').textContent=JSON.stringify(status.data,null,2);
     $('pumgye-audit').textContent=JSON.stringify(audit.data,null,2);
   } else { sourceOwner = 'native'; sourceManaged = false; document = result.data; etag = result.etag || `"${document.revision}"`; authorityRevision=null; }
-  draft = structuredClone((independent?document.policy:document.pumgye) || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; sourceControls(); render(); message(sourceManaged ? t(sourceOwner === 'kubernetes' ? 'Kubernetes owns this policy. Change the source RBAC or its mapping, then refresh.' : 'Policy source ownership is unreported. Native editing is disabled.') : t('Unassigned users are guests with no permissions. User and network rights must both allow access.'));
+  draft = structuredClone((independent?document.policy:document.pumgye) || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; outcomeUnknown=false; sourceControls(); render(); message(sourceManaged ? t(sourceOwner === 'kubernetes' ? 'Kubernetes owns this policy. Change the source RBAC or its mapping, then refresh.' : 'Policy source ownership is unreported. Native editing is disabled.') : t('Unassigned users are guests with no permissions. User and network rights must both allow access.'));
 }
 $('pumgye-service').addEventListener('change', renderMatrix);
+$('pumgye-document').addEventListener('input', () => { if (!sourceManaged) dirty = true; });
 $('pumgye-document').addEventListener('change', () => { try { edit(); message(t('Draft updated. Publish to apply.')); } catch (e) { dirty=true; message(e.message); } });
 $('pumgye-refresh').addEventListener('click', () => { if (dirty && !confirm(t('Discard unsaved authorization changes?'))) return; if (context) loadPumgye(context).catch(e=>message(e.message)); });
 $('pumgye-service-form').addEventListener('submit', (event) => {
@@ -117,13 +125,20 @@ $('pumgye-assignment-form').addEventListener('submit', event => {
   dirty=true;render();message(t('Draft updated. Publish to apply.'));
 });
 $('pumgye-publish').addEventListener('click', async () => {
-  if (sourceManaged || !context || !document) return; const own=generation; const button=$('pumgye-publish');button.disabled=true;
+  if (sourceManaged || publishing || outcomeUnknown || !context || !document) return; const own=generation;
+  const submitted = $('pumgye-document').value;
+  let requested = false; publishing = true; sourceControls();
   try {
-    const policy=JSON.parse($('pumgye-document').value);
+    const policy=JSON.parse(submitted);
     const next=independent?{revision:document.revision,policy}:structuredClone(document);if (!independent) next.pumgye=policy;
     const headers={'If-Match':etag};if (independent) {if (!authorityRevision) throw new Error(t('Reload before publishing.'));headers['x-hangang-config-revision']=authorityRevision;}
+    requested = true;
     const result=await context.api(independent?'/v1/pumgye/policy':'/v1/config',{method:'PUT',headers,json:next});
-    if (own!==generation) return;document=result.data;if (independent) authorityRevision=result.response.headers.get('x-hangang-config-revision');etag=result.etag || `"${document.revision}"`;draft=structuredClone(independent?document.policy:document.pumgye);dirty=false;render();message(t('Authorization policy published.'));
-  } catch (e) { if (own===generation) message(e.status===409?t('Configuration changed. Reload before publishing.'):e.message); }
-  finally { if (own === generation) button.disabled=sourceManaged; }
+    if (own!==generation) return;document=result.data;if (independent) authorityRevision=result.response.headers.get('x-hangang-config-revision');etag=result.etag || `"${document.revision}"`;if ($('pumgye-document').value === submitted) { draft=structuredClone(independent?document.policy:document.pumgye);dirty=false;render();message(t('Authorization policy published.')); }
+    else { dirty=true; message(t('Authorization policy published. Newer draft edits are still unsaved.')); }
+  } catch (e) { if (own===generation) {
+      outcomeUnknown = requested && (!e.status || e.status >= 500);
+      message(outcomeUnknown ? t('Outcome unknown; refresh to reconcile before publishing again.') : e.status===409?t('Configuration changed. Reload before publishing.'):e.message);
+    } }
+  finally { if (own === generation) { publishing=false; sourceControls(); } }
 });

@@ -15,7 +15,7 @@ export async function discoverPlugins(context) {
     const icon=document.createElement('span');icon.setAttribute('aria-hidden','true');icon.textContent='◇';const label=document.createElement('bdi');label.textContent=p.name;link.append(icon,label);
     navigation.insertBefore(link,anchor);
     const section=document.createElement('section');section.id='view-'+name;section.className='view';section.hidden=true;section.dataset.consolePlugin=p.id;
-    const head=document.createElement('div');head.className='page-head';const title=document.createElement('h1');title.textContent=p.name;head.append(title);const root=document.createElement('div');root.className='plugin-root';section.append(head,root);document.querySelector('#main').append(section);
+    const head=document.createElement('div');head.className='page-head';const title=document.createElement('h1');title.id='plugin-'+p.id+'-title';title.textContent=p.name;section.setAttribute('aria-labelledby',title.id);head.append(title);const root=document.createElement('div');root.className='plugin-root';section.append(head,root);document.querySelector('#main').insertBefore(section,document.querySelector('#geoip-attribution'));
     catalog.push({...p,name,root});
   }
 }

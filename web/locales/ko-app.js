@@ -1241,6 +1241,8 @@ export default {
   "Discard unsaved authorization changes?": "저장하지 않은 권한 변경을 버릴까요?",
   "Choose a new service ID.": "새 서비스 ID를 입력하세요.",
   "Use an existing role or guest.": "기존 역할 또는 guest를 사용하세요.",
+  "Authorization policy published. Newer draft edits are still unsaved.": "권한 정책을 게시했습니다. 이후 수정한 초안은 아직 저장되지 않았습니다.",
+  "Outcome unknown; refresh to reconcile before publishing again.": "게시 결과를 확인할 수 없습니다. 다시 게시하기 전에 새로고침하여 실제 적용 상태를 확인하세요.",
   "Authorization policy published.": "권한 정책을 게시했습니다.",
   "Configuration changed. Reload before publishing.": "설정이 변경됐습니다. 다시 불러온 뒤 게시하세요.",
 };

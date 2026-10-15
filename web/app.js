@@ -635,7 +635,7 @@ async function loadView(name, quiet = false) {
     if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
-    if (name === 'pumgye' && isAdmin()) await loadPumgye({ api });
+    if (name === 'pumgye' && isAdmin()) await loadPumgye({ api }, { resume: true });
     if (name === 'config') await loadConfig(false);
     if (name === 'config' && isAdmin()) await loadGeoIpStatus();
     if (name === 'config' || name === 'tcp') {

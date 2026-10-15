@@ -159,3 +159,110 @@ test('catalog draft changes publish to the owner and source-managed catalogs sta
   await expect(page.locator('#pumgye-resources')).toContainText('inspect → read');
   await expect(page.locator('#pumgye-publish')).toBeDisabled();
 });
+
+test('navigation retains invalid raw draft and refresh requires explicit discard', async ({ page }) => {
+  const { calls } = await setup(page);
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#pumgye-document').fill('{ incomplete draft');
+  await page.locator('.sidebar a[data-view="status"]').click();
+  await page.locator('.sidebar a[data-view="pumgye"]').click();
+  await expect(page.locator('#pumgye-document')).toHaveValue('{ incomplete draft');
+  const before = calls.filter(c => c.path === '/v1/pumgye/policy').length;
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-document')).toHaveValue('{ incomplete draft');
+  expect(calls.filter(c => c.path === '/v1/pumgye/policy')).toHaveLength(before);
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-document')).toHaveValue(/"version": 1/);
+});
+
+for (const locale of ['en', 'ko']) {
+test(`delayed publish retains newer edits and advances their exact request base (${locale})`, async ({ page }) => {
+  await setup(page);
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#locale-select').selectOption(locale);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const writes = [];
+  await page.route('**/v1/pumgye/policy', async route => {
+    if (route.request().method() !== 'PUT') return route.fallback();
+    const request = route.request();
+    writes.push({ body: request.postDataJSON(), headers: request.headers() });
+    if (writes.length === 1) await gate;
+    await route.fulfill({ json: { ...request.postDataJSON(), revision: 7 + writes.length }, headers: { etag: `"${7 + writes.length}"`, 'x-hangang-config-revision': '"4"' } });
+  });
+  await page.locator('#pumgye-publish').click();
+  await expect.poll(() => writes.length).toBe(1);
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  await expect(page.locator('#pumgye-refresh')).toBeDisabled();
+  await page.locator('#pumgye-subject').fill('later-guest');
+  await page.locator('#pumgye-assignment-form button').click();
+  release();
+  await expect(page.locator('#pumgye-message')).toContainText(locale === 'ko' ? '이후 수정한 초안은 아직 저장되지 않았습니다.' : 'Newer draft edits are still unsaved.');
+  await expect(page.locator('#pumgye-matrix')).toContainText('later-guest');
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toContainText(locale === 'ko' ? '권한 정책을 게시했습니다.' : 'Authorization policy published.');
+  expect(writes).toHaveLength(2);
+  expect(writes[1].headers['if-match']).toBe('"8"');
+  expect(writes[1].headers['x-hangang-config-revision']).toBe('"4"');
+  expect(writes[1].body.revision).toBe(8);
+  expect(writes[1].body.policy.services.orders.users['later-guest']).toEqual(['guest']);
+});
+
+}
+
+for (const locale of ['en', 'ko']) {
+test(`uncertain publish keeps draft and requires explicit reconciliation (${locale})`, async ({ page }) => {
+  await setup(page);
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  await page.locator('#locale-select').selectOption(locale);
+  await page.locator('#pumgye-subject').fill('uncertain-guest');
+  await page.locator('#pumgye-assignment-form button').click();
+  let writes = 0;
+  await page.route('**/v1/pumgye/policy', route => {
+    if (route.request().method() !== 'PUT') return route.fallback();
+    writes++;
+    return route.abort('failed');
+  });
+  await page.locator('#pumgye-publish').click();
+  await expect(page.locator('#pumgye-message')).toContainText(locale === 'ko' ? '게시 결과를 확인할 수 없습니다.' : 'Outcome unknown; refresh to reconcile');
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  await expect(page.locator('#pumgye-matrix')).toContainText('uncertain-guest');
+  await page.locator('#pumgye-publish').dispatchEvent('click');
+  expect(writes).toBe(1);
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-publish')).toBeDisabled();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#pumgye-refresh').click();
+  await expect(page.locator('#pumgye-publish')).toBeEnabled();
+});
+
+}
+
+test('late publish result cannot restore draft or mutation state after logout', async ({ page }) => {
+  await setup(page);
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let started = false;
+  await page.route('**/v1/pumgye/policy', async route => {
+    if (route.request().method() !== 'PUT') return route.fallback();
+    const data = route.request().postDataJSON(); started = true;
+    await gate;
+    await route.fulfill({ json: { ...data, revision: 8 }, headers: { etag: '"8"', 'x-hangang-config-revision': '"3"' } });
+  });
+  await page.locator('#pumgye-subject').fill('private-draft-user');
+  await page.locator('#pumgye-assignment-form button').click();
+  await page.locator('#pumgye-publish').click();
+  await expect.poll(() => started).toBe(true);
+  await page.locator('#logout-button').click();
+  release();
+  await expect(page.locator('#login-dialog')).toBeVisible();
+  await expect(page.locator('#pumgye-document')).toHaveValue('');
+  await expect(page.locator('#pumgye-service option')).toHaveCount(0);
+  await expect(page.locator('#pumgye-message')).toHaveText('');
+  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(0);
+  await expect(page.locator('#pumgye-subject')).toHaveValue('');
+});

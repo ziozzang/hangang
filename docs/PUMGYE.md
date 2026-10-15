@@ -63,6 +63,16 @@ secret; policy enforcement works while management fails closed. Owning Pumgye
 records its verified transport caller; individual delegated user audit remains
 subsequent work.
 
+The console retains the Pumgye draft, including invalid raw JSON and its base
+revisions, when switching sidebar views within the current signed-in page. This is
+in-memory state: a page reload or logout clears it. Explicit Refresh asks before
+discarding unsaved edits. While publication is pending, Publish and Refresh are
+disabled; edits made during the request remain unsaved after success and use the
+returned revisions for their next publication. A network failure or server error
+leaves the outcome unknown and blocks further publication until an explicit
+Refresh reconciles the owning policy. Copy any draft you need before discarding
+it. Conflict responses retain the draft for review.
+
 The earlier embedded policy is a migration baseline, not the new policy owner.
 There is no automatic assignment/grant or automatic schema/DB transfer. Validate
 and publish any migration into the owning Pumgye authority before enabling routes.

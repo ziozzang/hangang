@@ -1793,6 +1793,13 @@ test('trusted console menu mounts through host API and clears on logout', async 
   await expect(page.locator('.sidebar').getByText('ZERO TRUST')).toBeVisible();
   await page.getByRole('link',{name:'Fixture'}).click();
   await expect(page.locator('#view-plugin-fixture')).toContainText('delegated backend');
+  await expect(page.locator('#view-plugin-fixture')).toHaveAttribute('aria-labelledby', 'plugin-fixture-title');
+  await expect(page.locator('#plugin-fixture-title')).toHaveText('Fixture');
+  await expect(page.locator('#geoip-attribution').getByRole('link')).toHaveAttribute('href', 'https://db-ip.com');
+  expect(await page.locator('#view-plugin-fixture').evaluate(section => {
+    const footer = document.querySelector('#geoip-attribution');
+    return section.parentElement === footer.parentElement && Boolean(section.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING) && section.getBoundingClientRect().bottom <= footer.getBoundingClientRect().top;
+  })).toBe(true);
   expect(calls.find(c=>c.path==='/v1/plugins/fixture/status').headers.authorization).toBe('Bearer correct-token');
   await page.locator('#logout-button').click();
   await expect(page.locator('[data-console-plugin]')).toHaveCount(0);
