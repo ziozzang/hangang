@@ -237,12 +237,14 @@ enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
     /// The second value carries `Set-Cookie` fields from the authorization
     /// response (session refresh) to append to the final client response when
-    /// `forward_response` is enabled. The final value binds a native service identity to its authenticated service.
+    /// `forward_response` is enabled. Scope binds a native machine to its service;
+    /// the final tuple is authenticated point-query metadata, not a capability.
     Allow(
         HeaderMap,
         Vec<HeaderValue>,
         Option<String>,
         Option<MachineLease>,
+        Option<(String, u8)>, // authenticated typed point-query metadata, not a capability
     ),
     /// Fail closed with this status and a generic message.
     Deny(u16),
@@ -906,6 +908,7 @@ impl Proxy {
         auth: &crate::config::ExternalAuth,
         static_headers: &[(HeaderName, HeaderValue)],
         native: Option<&Arc<crate::hopae_native::Client>>,
+        expected_class: Option<crate::native_observed::AuthenticationClass>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
@@ -941,6 +944,31 @@ impl Proxy {
             // configured identity headers or forwarding an SSO response.
             strip_hop_by_hop(&mut parts.headers);
             let status = parts.status;
+            if status.is_success()
+                && let Some(class) = expected_class
+            {
+                // Inspect the authenticated native response BEFORE configurable
+                // header forwarding; old Service routes may omit kind from the
+                // response_headers allowlist without changing this trust check.
+                if native.is_none() {
+                    return Err(503);
+                }
+                let expected = match class {
+                    crate::native_observed::AuthenticationClass::Service => "service",
+                    crate::native_observed::AuthenticationClass::Workload => "workload",
+                };
+                let mut kinds = parts.headers.get_all("x-hopae-principal-kind").iter();
+                if kinds.next().and_then(|v| v.to_str().ok()) != Some(expected)
+                    || kinds.next().is_some()
+                    || crate::pumgye::identity(&parts.headers).is_none_or(|(_, aal)| aal != 0)
+                {
+                    return Err(503);
+                }
+            }
+            let typed_identity = expected_class.and_then(|_| {
+                crate::pumgye::identity(&parts.headers)
+                    .map(|(subject, aal)| (subject.to_owned(), aal))
+            });
             let service_identity = if native.is_some()
                 && status.is_success()
                 && (parts.headers.contains_key("x-hopae-principal-kind")
@@ -1072,6 +1100,7 @@ impl Proxy {
                     cookies,
                     service_scope,
                     evidence_expires,
+                    typed_identity,
                 ));
             }
             // SSO passthrough: forward a redirect/challenge to the client so the
@@ -2549,6 +2578,7 @@ impl Proxy {
         }
 
         let mut native_auth_context = None;
+        let mut native_preliminary_identity = None;
         if let Some(auth) = &runtime.route.auth {
             if auth
                 .request_headers
@@ -2580,13 +2610,24 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), runtime.native_resource.as_ref().and_then(|binding| binding.observed_class()), &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);
             }
             match authorization {
-                AuthOutcome::Allow(headers, cookies, service_scope, evidence_expires) => {
+                AuthOutcome::Allow(
+                    headers,
+                    cookies,
+                    service_scope,
+                    evidence_expires,
+                    typed_identity,
+                ) => {
+                    let workload_preliminary = runtime
+                        .native_resource
+                        .as_ref()
+                        .and_then(|binding| binding.observed_class())
+                        == Some(crate::native_observed::AuthenticationClass::Workload);
                     if let Some(expiry) = evidence_expires {
                         let lease = auth_route_lease.get_or_insert_with(Default::default);
                         match expiry {
@@ -2620,7 +2661,10 @@ impl Proxy {
                         )
                     {
                         resource_allowed = if let Some(gate) = &policy.pumgye_resource {
-                            let identity = crate::pumgye::identity(&headers);
+                            let identity = typed_identity
+                                .as_ref()
+                                .map(|(subject, aal)| (subject.as_str(), *aal))
+                                .or_else(|| crate::pumgye::identity(&headers));
                             let evidence = match &self.guard {
                                 Some(guard) => match guard_evidence
                                     .take()
@@ -2633,36 +2677,56 @@ impl Proxy {
                             };
                             if snapshot.config.pumgye_authority.is_some() {
                                 match (snapshot.pumgye_remote.as_ref(), identity) {
-                                    (Some(remote), Some((subject, aal))) => match remote
-                                        .authorize_resource(
-                                            gate,
-                                            request.method().as_str(),
-                                            subject,
-                                            edge.client_ip,
-                                            aal,
-                                            evidence,
-                                        )
-                                        .await
-                                    {
-                                        Ok(Some(revision)) => {
-                                            auth_route_lease
-                                                .get_or_insert_with(Default::default)
-                                                .pumgye_remote = Some((remote.clone(), revision));
-                                            true
+                                    (Some(remote), Some((subject, aal))) => {
+                                        match if workload_preliminary {
+                                            remote
+                                                .authorize_workload_resource(
+                                                    gate,
+                                                    request.method().as_str(),
+                                                    subject,
+                                                    edge.client_ip,
+                                                    aal,
+                                                    evidence,
+                                                )
+                                                .await
+                                        } else {
+                                            remote
+                                                .authorize_resource(
+                                                    gate,
+                                                    request.method().as_str(),
+                                                    subject,
+                                                    edge.client_ip,
+                                                    aal,
+                                                    evidence,
+                                                )
+                                                .await
+                                        } {
+                                            Ok(Some(revision)) => {
+                                                auth_route_lease
+                                                    .get_or_insert_with(Default::default)
+                                                    .pumgye_remote =
+                                                    Some((remote.clone(), revision));
+                                                true
+                                            }
+                                            Err(_) if policy.enforce => {
+                                                return Ok(response(
+                                                    503,
+                                                    "Pumgye authority unavailable",
+                                                ));
+                                            }
+                                            _ => false,
                                         }
-                                        Err(_) if policy.enforce => {
-                                            return Ok(response(
-                                                503,
-                                                "Pumgye authority unavailable",
-                                            ));
-                                        }
-                                        _ => false,
-                                    },
+                                    }
                                     (None, _) if policy.enforce => {
                                         return Ok(response(503, "Pumgye authority unavailable"));
                                     }
                                     _ => false,
                                 }
+                            } else if workload_preliminary {
+                                return Ok(response(
+                                    503,
+                                    "Workload resource authority requires typed remote decision",
+                                ));
                             } else {
                                 match (
                                     snapshot.pumgye.as_ref(),
@@ -2766,6 +2830,7 @@ impl Proxy {
                         request.headers_mut().insert(name.clone(), value.clone());
                         established_identity.push((name.clone(), value.clone()));
                     }
+                    native_preliminary_identity = typed_identity;
                     auth_cookies = cookies;
                 }
                 AuthOutcome::Deny(status) => {
@@ -3370,7 +3435,7 @@ impl Proxy {
                         retired.record(&self.metrics);
                         return Ok(response(503, "route authorization retired"));
                     }
-                    result = binding.observe_with_route(&prepared, &context, hopae, authority, edge.client_ip, route_reference.as_ref()) => match result {
+                    result = binding.observe_after_preliminary(&prepared, &context, hopae, authority, edge.client_ip, route_reference.as_ref(), native_preliminary_identity.as_ref().map(|(subject, aal)| (subject.as_str(), *aal))) => match result {
                         Ok(observation) => observation,
                         Err(error) if error.is::<crate::projection_permit::Denied>() => return Ok(response(403, "native resource permission denied")),
                         Err(_) => return Ok(response(503, "native resource authority unavailable")),

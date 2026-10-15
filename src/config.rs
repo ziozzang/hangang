@@ -3166,6 +3166,27 @@ fn authentication_identity_headers(
 ) -> anyhow::Result<std::collections::HashSet<String>> {
     let mut names = std::collections::HashSet::new();
     for route in routes {
+        if route
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.native_resource.as_ref())
+            .is_some_and(|native| native.observed.is_some())
+        {
+            // Fixed native outputs remain reserved even when the origin allowlist
+            // omits them. Client lookalikes must not become forwarded metadata.
+            names.extend(
+                [
+                    "x-forwarded-user",
+                    "x-hopae-aal",
+                    "x-hopae-principal-kind",
+                    "x-hopae-service-id",
+                    "x-hopae-evidence-ttl-ms",
+                    "x-hopae-subject",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+        }
         for name in route
             .workload_auth
             .iter()

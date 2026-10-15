@@ -429,6 +429,20 @@ impl Client {
         Ok((reply, permit))
     }
     pub async fn decide_resource(&self, query: &ResourceQuery<'_>) -> Result<ResourceReply> {
+        self.decide_resource_typed(query, false).await
+    }
+    pub(crate) async fn decide_workload_resource(
+        &self,
+        query: &ResourceQuery<'_>,
+    ) -> Result<ResourceReply> {
+        ensure!(query.aal == 0, "Workload point decision requires AAL0");
+        self.decide_resource_typed(query, true).await
+    }
+    async fn decide_resource_typed(
+        &self,
+        query: &ResourceQuery<'_>,
+        workload: bool,
+    ) -> Result<ResourceReply> {
         ensure!(
             query.aal <= 3
                 && [
@@ -478,16 +492,13 @@ impl Client {
         request
             .metadata_mut()
             .insert("authorization", self.token.clone());
-        let mut client =
-            pumgye_grpc::v1::resource_authorization_client::ResourceAuthorizationClient::new(
-                self.channel.clone(),
-            )
-            .max_decoding_message_size(1024)
-            .max_encoding_message_size(2048);
-        let response = tokio::time::timeout(self.timeout, client.decide(request))
-            .await
-            .map_err(|_| anyhow::anyhow!("gRPC decision deadline"))??
-            .into_inner();
+        let response = if workload {
+            let mut client = pumgye_grpc::v1::workload_resource_authorization_client::WorkloadResourceAuthorizationClient::new(self.channel.clone()).max_decoding_message_size(1024).max_encoding_message_size(2048);
+            tokio::time::timeout(self.timeout, client.decide(request)).await
+        } else {
+            let mut client = pumgye_grpc::v1::resource_authorization_client::ResourceAuthorizationClient::new(self.channel.clone()).max_decoding_message_size(1024).max_encoding_message_size(2048);
+            tokio::time::timeout(self.timeout, client.decide(request)).await
+        }.map_err(|_| anyhow::anyhow!("gRPC decision deadline"))??.into_inner();
         let reply = decode_resource(response, request_id, floor.max(self.revision()))?;
         self.require_revision(reply.revision);
         ensure!(
