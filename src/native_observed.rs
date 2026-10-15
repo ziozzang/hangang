@@ -100,6 +100,9 @@ impl Owner {
             active: AtomicBool::new(true),
         })
     }
+    pub(crate) fn configured_class(&self) -> AuthenticationClass {
+        self.configuration.authentication_class
+    }
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
         if let Some((_, client)) = self.client.get() {
@@ -548,8 +551,26 @@ impl Owner {
         action: &str,
         ip: std::net::IpAddr,
         route: &pumgye_grpc::v1::NativeRouteReference,
+        preliminary: Option<(&str, u8)>,
     ) -> Result<Dispatch> {
         let authentication = self.issue(prepared, headers, hopae).await?;
+        if let Some((subject, aal)) = preliminary {
+            let context = authentication.context();
+            let identity = context
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("observed identity missing"))?;
+            ensure!(
+                authentication.class() == self.configuration.authentication_class
+                    && context.service == self.scope.service
+                    && context.audience == self.scope.audience
+                    && identity.subject_ref == subject
+                    && identity.aal == u32::from(aal)
+                    && aal == 0
+                    && identity.kind == authentication.wire_kind(),
+                "observed identity differs from authenticated preliminary principal"
+            );
+        }
         let rates = receipt_time::ClockRates::new(
             self.configuration.source_error_ppm,
             self.configuration.receiver_error_ppm,

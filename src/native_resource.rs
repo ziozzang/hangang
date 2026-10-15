@@ -205,6 +205,11 @@ impl Binding {
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
         })
     }
+    /// Native configuration selects this metadata; no response or caller header
+    /// can choose the principal class or a different permission endpoint.
+    pub(crate) fn observed_class(&self) -> Option<crate::native_observed::AuthenticationClass> {
+        self.observed.as_ref().map(|owner| owner.configured_class())
+    }
     pub(crate) fn observed_mode(&self) -> bool {
         self.observed.is_some()
     }
@@ -279,6 +284,20 @@ impl Binding {
         ip: std::net::IpAddr,
         route: Option<&pumgye_grpc::v1::NativeRouteReference>,
     ) -> Result<DispatchObservation> {
+        self.observe_after_preliminary(prepared, headers, hopae, pumgye, ip, route, None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn observe_after_preliminary(
+        &self,
+        prepared: &projection_entity::Prepared,
+        headers: &hyper::HeaderMap,
+        hopae: &hopae_native::Client,
+        pumgye: &pumgye::AuthorityRuntime,
+        ip: std::net::IpAddr,
+        route: Option<&pumgye_grpc::v1::NativeRouteReference>,
+        preliminary: Option<(&str, u8)>,
+    ) -> Result<DispatchObservation> {
         ensure!(
             prepared.belongs_to(&self.scope),
             "final request belongs to another route binding"
@@ -305,6 +324,7 @@ impl Binding {
                     action,
                     ip,
                     route,
+                    preliminary,
                 )
                 .await?;
             return Ok(DispatchObservation::Observed(dispatch));

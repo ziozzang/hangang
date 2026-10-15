@@ -18,10 +18,10 @@ hangang-runtime = { git = "https://github.com/ziozzang/hangang-runtime", rev = "
 hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "4ea3e1473de61d6b46f5420efe481c126790d800", features = ["native-client"] }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
-pumgye-grpc = { git = "https://github.com/ziozzang/pumgye", rev = "ac47d448ba56b7ebb210b8ced56543d65c09f293" }
-pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "ac47d448ba56b7ebb210b8ced56543d65c09f293" }
-pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "ac47d448ba56b7ebb210b8ced56543d65c09f293" }
-pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "ac47d448ba56b7ebb210b8ced56543d65c09f293" }
+pumgye-grpc = { git = "https://github.com/ziozzang/pumgye", rev = "adaf985042b7af7b6aecc48cf34a02661abd4644" }
+pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "adaf985042b7af7b6aecc48cf34a02661abd4644" }
+pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "adaf985042b7af7b6aecc48cf34a02661abd4644" }
+pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "adaf985042b7af7b6aecc48cf34a02661abd4644" }
 prost = "0.14"
 zeroize = "1"
 hmac = "0.12"

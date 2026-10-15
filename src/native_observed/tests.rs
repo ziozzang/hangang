@@ -6,7 +6,7 @@ use pumgye_grpc::v1 as p;
 use sha2::{Digest, Sha256};
 use std::{
     sync::atomic::{AtomicU8, AtomicU64},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tonic::{Request, Response, Status};
 const TOKEN: &str = "owned-observed-native-caller-token-0001";
@@ -17,6 +17,9 @@ struct Sources {
     permit_calls: Arc<AtomicU64>,
     output_calls: Arc<AtomicU64>,
     wrong_endpoints: Arc<AtomicU64>,
+    point_calls: Arc<AtomicU64>,
+    legacy_point_calls: Arc<AtomicU64>,
+    verify_calls: Arc<AtomicU64>,
     started: Instant,
     attack: Arc<AtomicU8>,
     auth_key: ed25519_dalek::SigningKey,
@@ -102,7 +105,15 @@ impl Sources {
                 .unwrap(),
             },
             identity: Some(h::ReceiptIdentity {
-                subject_ref: format!("s_{:048x}", self.next.fetch_add(1, Ordering::Relaxed)),
+                subject_ref: format!(
+                    "s_{}",
+                    if self.attack.load(Ordering::Acquire) == 24 {
+                        "b"
+                    } else {
+                        "a"
+                    }
+                    .repeat(48)
+                ),
                 kind: if self.attack.load(Ordering::Acquire) == 13 {
                     if self.class == AuthenticationClass::Service {
                         3
@@ -133,7 +144,7 @@ impl Sources {
                         950
                     },
                 binding: digest(&c, None),
-                nonce: [1; 32],
+                nonce: [self.next.fetch_add(1, Ordering::Relaxed) as u8; 32],
             },
         )
         .unwrap()
@@ -457,6 +468,177 @@ impl h::workload_observed_credential_projection_server::WorkloadObservedCredenti
     }
 }
 
+// Metadata-only preliminary queries use the same actual core compiler. These
+// fixture peers do not create a checked authentication/permission capability.
+#[tonic::async_trait]
+impl h::authentication_server::Authentication for Sources {
+    async fn verify(
+        &self,
+        r: Request<h::VerifyRequest>,
+    ) -> Result<Response<h::VerifyReply>, Status> {
+        self.authorize(&r)?;
+        self.verify_calls.fetch_add(1, Ordering::AcqRel);
+        let kind = if self.attack.load(Ordering::Acquire) == 21 {
+            if self.class == AuthenticationClass::Workload {
+                "service"
+            } else {
+                "workload"
+            }
+        } else if self.class == AuthenticationClass::Workload {
+            "workload"
+        } else {
+            "service"
+        };
+        let headers = [
+            ("x-forwarded-user", format!("s_{}", "a".repeat(48))),
+            (
+                "x-hopae-aal",
+                if self.attack.load(Ordering::Acquire) == 23 {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+            ("x-hopae-principal-kind", kind.into()),
+            ("x-hopae-service-id", "orders".into()),
+            ("x-hopae-evidence-ttl-ms", "950".into()),
+        ]
+        .into_iter()
+        .map(|(name, value)| h::Header {
+            name: name.into(),
+            value: value.into_bytes(),
+        })
+        .collect();
+        Ok(Response::new(h::VerifyReply {
+            request_id: r.into_inner().request_id,
+            status: 200,
+            headers,
+            body: vec![],
+        }))
+    }
+}
+impl Sources {
+    fn point_reply(
+        &self,
+        q: p::ResourceDecisionRequest,
+        workload: bool,
+    ) -> p::ResourceDecisionReply {
+        if workload {
+            self.point_calls.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.legacy_point_calls.fetch_add(1, Ordering::AcqRel);
+        }
+        let subject = format!("s_{}", "a".repeat(48));
+        let mut document = serde_json::json!({"version":1,"information_classes":["internal"],"services":{"orders":{"permissions":["write"],"require_guard":false,"roles":{"writer":{"permissions":["write"],"information_classes":["internal"],"minimum_aal":0}},"users":{},"workload_users":{},"networks":[{"cidr":"127.0.0.0/8","roles":["writer"]}]}},"resources":{"db:orders":{"service":"orders","information_class":"internal","actions":{"write":"write"}}}});
+        if self.attack.load(Ordering::Acquire) != 20 {
+            document["services"]["orders"][if self.class == AuthenticationClass::Workload {
+                "workload_users"
+            } else {
+                "users"
+            }][subject] = serde_json::json!(["writer"]);
+        }
+        // Both A and B are granted: the native lineage fence, not policy denial,
+        // must reject Verify(A) followed by an independently valid SDK Issue(B).
+        let map = if self.class == AuthenticationClass::Workload {
+            "workload_users"
+        } else {
+            "users"
+        };
+        if self.attack.load(Ordering::Acquire) != 20 {
+            document["services"]["orders"][map][format!("s_{}", "b".repeat(48))] =
+                serde_json::json!(["writer"]);
+        }
+        let compiled = serde_json::from_value::<pumgye_core::Policy>(document)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(q.ip.as_slice()).unwrap(),
+        ));
+        let guard = if q.guard == 1 {
+            pumgye_core::GuardEvidence::EnforcedAllow
+        } else {
+            pumgye_core::GuardEvidence::Unavailable
+        };
+        let decision = if workload {
+            compiled.evaluate_scoped_workload_resource(
+                &q.service_id,
+                &q.resource,
+                &q.action,
+                &q.subject,
+                ip,
+                guard,
+            )
+        } else {
+            compiled.evaluate_scoped_resource(
+                &q.service_id,
+                &q.resource,
+                &q.action,
+                &q.subject,
+                ip,
+                q.aal as u8,
+                guard,
+            )
+        };
+        p::ResourceDecisionReply {
+            request_id: q.request_id,
+            revision: 5,
+            verdict: if decision
+                == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow)
+            {
+                1
+            } else {
+                2
+            },
+            reason: match decision {
+                pumgye_core::ResourceDecision::Decided(native) => format!("{native:?}"),
+                other => format!("{other:?}"),
+            },
+            cache_ttl_ms: 0,
+        }
+    }
+}
+#[tonic::async_trait]
+impl p::resource_authorization_server::ResourceAuthorization for Sources {
+    async fn decide(
+        &self,
+        r: Request<p::ResourceDecisionRequest>,
+    ) -> Result<Response<p::ResourceDecisionReply>, Status> {
+        self.authorize(&r)?;
+        Ok(Response::new(self.point_reply(r.into_inner(), false)))
+    }
+}
+#[tonic::async_trait]
+impl p::workload_resource_authorization_server::WorkloadResourceAuthorization for Sources {
+    async fn decide(
+        &self,
+        r: Request<p::ResourceDecisionRequest>,
+    ) -> Result<Response<p::ResourceDecisionReply>, Status> {
+        self.authorize(&r)?;
+        if r.get_ref().aal != 0 {
+            return Err(Status::invalid_argument("Workload AAL0"));
+        }
+        Ok(Response::new(self.point_reply(r.into_inner(), true)))
+    }
+}
+#[tonic::async_trait]
+impl p::authorization_server::Authorization for Sources {
+    async fn decide(
+        &self,
+        r: Request<p::DecisionRequest>,
+    ) -> Result<Response<p::DecisionReply>, Status> {
+        self.authorize(&r)?;
+        Ok(Response::new(p::DecisionReply {
+            request_id: r.into_inner().request_id,
+            revision: 5,
+            verdict: 2,
+            native_reason: pumgye_core::Decision::UnknownService as u32,
+            cache_ttl_ms: 0,
+        }))
+    }
+}
+
 fn certificates(root: &std::path::Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
@@ -502,6 +684,9 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
         permit_calls: Arc::new(AtomicU64::new(0)),
         output_calls: Arc::new(AtomicU64::new(0)),
         wrong_endpoints: Arc::new(AtomicU64::new(0)),
+        point_calls: Arc::new(AtomicU64::new(0)),
+        legacy_point_calls: Arc::new(AtomicU64::new(0)),
+        verify_calls: Arc::new(AtomicU64::new(0)),
         started: Instant::now(),
         attack: Arc::new(AtomicU8::new(0)),
         auth_key: ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
@@ -537,6 +722,21 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
         .add_service(h::workload_authentication_receipts_server::WorkloadAuthenticationReceiptsServer::new(source.clone()))
         .add_service(p::workload_observed_projection_permits_server::WorkloadObservedProjectionPermitsServer::new(source.clone()))
         .add_service(h::workload_observed_credential_projection_server::WorkloadObservedCredentialProjectionServer::new(source.clone()));
+    let server = server
+        .add_service(h::authentication_server::AuthenticationServer::new(
+            source.clone(),
+        ))
+        .add_service(p::authorization_server::AuthorizationServer::new(
+            source.clone(),
+        ))
+        .add_service(
+            p::resource_authorization_server::ResourceAuthorizationServer::new(source.clone()),
+        )
+        .add_service(
+            p::workload_resource_authorization_server::WorkloadResourceAuthorizationServer::new(
+                source.clone(),
+            ),
+        );
     let serving = tokio::spawn(server.serve_with_incoming(incoming));
     let hop_settings = crate::config::HopaeNative {
         transport: crate::config::HopaeTransport::Grpc,
@@ -632,10 +832,12 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
     let backend_address = backend.local_addr().unwrap();
     let effects = Arc::new(AtomicU64::new(0));
     let backend_effects = effects.clone();
+    let backend_attack = source.attack.clone();
     let backend_task = tokio::spawn(async move {
         loop {
             let (socket, _) = backend.accept().await.unwrap();
             let effects = backend_effects.clone();
+            let backend_attack = backend_attack.clone();
             tokio::spawn(async move {
                 hyper::server::conn::http1::Builder::new()
                     .serve_connection(
@@ -643,7 +845,19 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
                         hyper::service::service_fn(
                             move |r: hyper::Request<hyper::body::Incoming>| {
                                 let effects = effects.clone();
+                                let backend_attack = backend_attack.clone();
                                 async move {
+                                    if backend_attack.load(Ordering::Acquire) == 22 {
+                                        assert!(
+                                            !r.headers().contains_key("x-hopae-principal-kind"),
+                                            "omitted native kind must not forward client lookalike"
+                                        );
+                                        assert_eq!(
+                                            r.headers()["x-forwarded-user"],
+                                            format!("s_{}", "a".repeat(48))
+                                        );
+                                        assert_eq!(r.headers()["x-hopae-aal"], "0");
+                                    }
                                     assert_eq!(r.headers()["authorization"], "Bearer owned-origin");
                                     assert_eq!(
                                         r.into_body().collect().await.unwrap().to_bytes(),
@@ -864,6 +1078,197 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
     );
     assert_eq!(source.wrong_endpoints.load(Ordering::Acquire), 1);
     assert_eq!(effects.load(Ordering::Acquire), 1);
+    {
+        // REAL frontdoor: generic native Verify + preliminary typed Pum metadata
+        // gate run before the final opaque auth/permit/output/raw dispatch chain.
+        source.attack.store(0, Ordering::Release);
+        let config:crate::config::Config=serde_json::from_value(serde_json::json!({
+            "http":[{"id":"frontdoor","host":"app.example.test","path_prefix":"/orders","access_mode":"protected","backends":[endpoint],
+                "auth":{"url":"http://127.0.0.1:9/_hopae/verify","native":hop_settings,"request_headers":["authorization"],"response_headers":["x-forwarded-user","x-hopae-aal","x-hopae-principal-kind"],"static_request_headers":{"x-hopae-gateway-key":{"env":authority_config.decision_token_env}},"native_resource":configuration},
+                "resource_policy":{"resource_id":"orders","principal":{"source":"external","subject_header":"x-forwarded-user"},"allow":[],"pumgye_resource":{"service_id":"orders","resource":"db:orders","actions":{"POST":"write"}}}}],
+            "pumgye_authority":authority_config})).unwrap();
+        // Reservation follows the existing snapshot-wide union model. A
+        // nonobserved snapshot retains its old namespace; adding an observed
+        // route reserves fixed outputs even on another public route.
+        let mut baseline = config.clone();
+        baseline.http[0].auth.as_mut().unwrap().native_resource = None;
+        let baseline = crate::config::Snapshot::new(baseline).unwrap();
+        assert!(
+            !baseline
+                .authentication_identity_headers
+                .iter()
+                .any(|name| name == "x-hopae-subject")
+        );
+        let mut config = config;
+        let mut public = config.http[0].clone();
+        public.id = "public-unrelated".into();
+        public.path_prefix = Some("/public".into());
+        public.auth = None;
+        public.access_mode = crate::config::AccessMode::Public;
+        public.resource_policy = None;
+        config.http.push(public);
+        let snapshot = crate::config::Snapshot::new(config).unwrap();
+        for name in [
+            "x-hopae-subject",
+            "x-hopae-evidence-ttl-ms",
+            "x-hopae-principal-kind",
+        ] {
+            assert!(
+                snapshot
+                    .authentication_identity_headers
+                    .iter()
+                    .any(|value| value == name)
+            );
+        }
+        let active = Arc::new(arc_swap::ArcSwap::from_pointee(snapshot));
+        let lua_marker = root.path().join("unexpected-lua-invocation");
+        let worker = root.path().join("lua-must-not-run.sh");
+        std::fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 1\n",
+                lua_marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = Arc::new(crate::policy::PolicyPool::new(worker, 1));
+        let proxy = Arc::new(
+            crate::proxy::Proxy::new(
+                active.clone(),
+                policy.clone(),
+                Arc::new(crate::metrics::Metrics::default()),
+            )
+            .with_route_owner_queries(true),
+        );
+        let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_address = front.local_addr().unwrap();
+        let serving_proxy = proxy.clone();
+        let front_task = tokio::spawn(async move {
+            while let Ok((socket, peer)) = front.accept().await {
+                let proxy = serving_proxy.clone();
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(socket),
+                            hyper::service::service_fn(move |request| {
+                                let proxy = proxy.clone();
+                                async move { proxy.handle(request, peer).await }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<crate::proxy::Body>();
+        for (attack, status) in [
+            (0, 200),
+            (22, 200),
+            (24, 503),
+            (20, 403),
+            (21, 503),
+            (23, 503),
+        ] {
+            if attack == 22 {
+                let mut next = active.load_full().config.clone();
+                next.http[0]
+                    .auth
+                    .as_mut()
+                    .unwrap()
+                    .response_headers
+                    .retain(|name| name != "x-hopae-principal-kind");
+                active.store(Arc::new(crate::config::Snapshot::new(next).unwrap()));
+            }
+            if attack == 20 {
+                let mut next = active.load_full().config.clone();
+                next.http[0].lua = Some("return {allow = true}".into());
+                active.store(Arc::new(crate::config::Snapshot::new(next).unwrap()));
+            }
+            source.attack.store(attack, Ordering::Release);
+            let before = effects.load(Ordering::Acquire);
+            let point_before = source.point_calls.load(Ordering::Acquire);
+            let permits_before = source.permit_calls.load(Ordering::Acquire);
+            let sdk_before = source.auth_calls.load(Ordering::Acquire);
+            let output_before = source.output_calls.load(Ordering::Acquire);
+            let request = hyper::Request::post(format!("http://{front_address}/orders"))
+                .header("host", "app.example.test")
+                .header("authorization", "Bearer source-token-fixture")
+                .header("x-forwarded-user", "forged")
+                .header("x-hopae-principal-kind", "workload")
+                .body(crate::proxy::full_body(bytes::Bytes::from_static(
+                    b"materialized once",
+                )))
+                .unwrap();
+            let reply = client.request(request).await.unwrap();
+            eprintln!(
+                "frontdoor attack={attack} HTTP={} typed_point={} legacy_point={} SDK_delta={} permit_delta={} output_delta={} backend_delta={} lua_invoked={}",
+                reply.status().as_u16(),
+                source.point_calls.load(Ordering::Acquire) - point_before,
+                source.legacy_point_calls.load(Ordering::Acquire),
+                source.auth_calls.load(Ordering::Acquire) - sdk_before,
+                source.permit_calls.load(Ordering::Acquire) - permits_before,
+                source.output_calls.load(Ordering::Acquire) - output_before,
+                effects.load(Ordering::Acquire) - before,
+                lua_marker.exists()
+            );
+            assert_eq!(reply.status().as_u16(), status, "frontdoor attack {attack}");
+            reply.into_body().collect().await.unwrap();
+            assert_eq!(
+                effects.load(Ordering::Acquire),
+                before + u64::from(status == 200)
+            );
+            if class == AuthenticationClass::Workload {
+                assert_eq!(
+                    source.legacy_point_calls.load(Ordering::Acquire),
+                    0,
+                    "Workload used untyped users RPC"
+                );
+            } else {
+                assert_eq!(
+                    source.point_calls.load(Ordering::Acquire),
+                    0,
+                    "Service used Workload query"
+                );
+            }
+            if attack == 21 || attack == 23 {
+                assert_eq!(
+                    source.point_calls.load(Ordering::Acquire),
+                    point_before,
+                    "wrong authenticated kind reached Pum"
+                );
+            }
+            if status != 200 {
+                assert_eq!(
+                    source.auth_calls.load(Ordering::Acquire),
+                    sdk_before + u64::from(attack == 24),
+                    "principal mismatch stops after SDK Issue; earlier refusals never issue"
+                );
+                assert_eq!(
+                    source.output_calls.load(Ordering::Acquire),
+                    output_before,
+                    "early refusal reached credential output"
+                );
+                assert!(!lua_marker.exists(), "early refusal executed Lua worker");
+                assert_eq!(
+                    source.permit_calls.load(Ordering::Acquire),
+                    permits_before,
+                    "early denial reached final permit/Lua phase"
+                );
+            }
+        }
+        assert!(if class == AuthenticationClass::Workload {
+            source.point_calls.load(Ordering::Acquire) >= 3
+        } else {
+            source.legacy_point_calls.load(Ordering::Acquire) >= 3
+        });
+        assert!(source.verify_calls.load(Ordering::Acquire) >= 6);
+        proxy.shutdown(Duration::from_millis(1)).await;
+        policy.shutdown().await;
+        front_task.abort();
+    }
     backend_task.abort();
     serving.abort();
 }

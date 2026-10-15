@@ -108,3 +108,5 @@ HTTP 라우트 목록과 백엔드 편집 화면은 기존 관리자 전용 `GET
 - [Guard zero-trust backbone](GUARD.md)
 
 - [네이티브 라우팅 관측 서비스](ROUTE_OWNER.md) — 비공개 mTLS 리스너·검사·감독 인계.
+
+- [Typed observed HTTP 앞단](WORKLOAD_FRONTDOOR.md) — 고정 class 사전 권한과 최종 네이티브 체인 경계.

@@ -734,6 +734,34 @@ impl AuthorityRuntime {
         aal: u8,
         guard: pumgye_core::GuardEvidence,
     ) -> Result<Option<u64>> {
+        self.authorize_resource_typed(gate, method, subject, ip, aal, guard, false)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn authorize_workload_resource(
+        self: &std::sync::Arc<Self>,
+        gate: &ResourceGate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+    ) -> Result<Option<u64>> {
+        anyhow::ensure!(aal == 0, "Workload point decision requires AAL0");
+        self.authorize_resource_typed(gate, method, subject, ip, aal, guard, true)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize_resource_typed(
+        self: &std::sync::Arc<Self>,
+        gate: &ResourceGate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+        workload: bool,
+    ) -> Result<Option<u64>> {
         let Some(action) = gate.actions.get(method) else {
             return Ok(None);
         };
@@ -741,18 +769,21 @@ impl AuthorityRuntime {
             anyhow::bail!("resource authority requires gRPC");
         };
         self.start_watch();
-        let reply = client
-            .decide_resource(&crate::pumgye_grpc_client::ResourceQuery {
-                service_id: &gate.service_id,
-                resource: &gate.resource,
-                action,
-                subject,
-                ip,
-                aal,
-                guard,
-                minimum_revision: 0,
-            })
-            .await?;
+        let query = crate::pumgye_grpc_client::ResourceQuery {
+            service_id: &gate.service_id,
+            resource: &gate.resource,
+            action,
+            subject,
+            ip,
+            aal,
+            guard,
+            minimum_revision: 0,
+        };
+        let reply = if workload {
+            client.decide_workload_resource(&query).await?
+        } else {
+            client.decide_resource(&query).await?
+        };
         self.success();
         Ok(
             (reply.decision

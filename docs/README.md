@@ -112,3 +112,5 @@ The console is available at `/ui/` on the management listener. The same build se
 - [Hopae gRPC gateway client](HOPAE_GRPC.md)
 
 - [Native route observation service](ROUTE_OWNER.md) — private mTLS listener, validation and supervised handover.
+
+- [Typed observed HTTP frontdoor](WORKLOAD_FRONTDOOR.md) — fixed-class preliminary metadata permission and final native chain boundaries.
