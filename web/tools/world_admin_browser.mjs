@@ -68,6 +68,31 @@ try {
   await page.locator('#pumgye-assignment-form button').click();
   await page.locator('#pumgye-publish').click();
   await expect(page.locator('#pumgye-message')).toHaveText('Authorization policy published.');
+  if(config.pumgyeResponsive){
+    phase='pumgye-responsive-390';
+    try {
+      await page.setViewportSize({width:390,height:900});
+      await expect(page.locator('#pumgye-source-summary')).toBeVisible();
+      const bounds=await page.evaluate(()=>({viewport:document.documentElement.clientWidth,width:document.documentElement.scrollWidth,
+        panels:[...document.querySelectorAll('#view-pumgye .pumgye-panel')].map(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return {left:r.left,right:r.right,padding:[s.paddingTop,s.paddingRight,s.paddingBottom,s.paddingLeft].map(parseFloat)};}),
+        controls:[...document.querySelectorAll('#view-pumgye .pumgye-table-wrap,#view-pumgye input,#view-pumgye select,#view-pumgye textarea,#view-pumgye button')].filter(el=>el.getClientRects().length&&(el.classList.contains('pumgye-table-wrap')||!el.closest('.pumgye-table-wrap'))).map(el=>{const r=el.getBoundingClientRect();return {id:el.id,left:r.left,right:r.right};})}));
+      expect(bounds.viewport).toBe(390);expect(bounds.width).toBeLessThanOrEqual(390);
+      expect(bounds.panels.length).toBeGreaterThanOrEqual(3);
+      for(const panel of bounds.panels){expect(panel.left).toBeGreaterThanOrEqual(0);expect(panel.right).toBeLessThanOrEqual(391);for(const padding of panel.padding)expect(padding).toBeGreaterThan(0);}
+      expect(bounds.controls.length).toBeGreaterThan(0);
+      for(const control of bounds.controls){expect(control.left,control.id).toBeGreaterThanOrEqual(0);expect(control.right,control.id).toBeLessThanOrEqual(391);}
+      const table=page.locator('#view-pumgye .pumgye-table-wrap').first();
+      await expect(table).toHaveAttribute('role','region');await expect(table).toHaveAttribute('tabindex','0');
+      expect((await table.getAttribute('aria-label'))?.length).toBeGreaterThan(0);
+      await table.focus();await expect(table).toBeFocused();
+      const scrollable=await table.evaluate(el=>el.scrollWidth>el.clientWidth);
+      expect(scrollable).toBe(true);await page.keyboard.press('ArrowRight');
+      await expect.poll(()=>table.evaluate(el=>el.scrollLeft)).toBeGreaterThan(0);
+      await table.evaluate(el=>el.scrollLeft=0);
+      console.log('PASS: actual embedded Pumgye UI at390px has no document overflow, padded panels, bounded form/table wrappers and keyboard-scrollable authorization region');
+    } finally {await page.setViewportSize({width:1280,height:900});}
+    phase='pumgye-responsive-desktop-restored';
+  }
   await page.locator('.sidebar a[data-view="plugin-'+config.plugin+'"]').click();
   const root=page.locator('#view-plugin-'+config.plugin+' .plugin-root');
   await expect(root.locator('#tab-blocks')).toBeVisible();
