@@ -181,7 +181,14 @@ Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUG
 
 ## 네이티브 서비스 요청 집행
 
-미릴리스 auth.native_resource 옵션은 최종 upstream 경로·본문을 실제 호패/품계/수문장의 mTLS gRPC 판정에 바인딩합니다. 전용 네 프로세스·origin 검사로 전달/거부를 확인했으며 릴리즈·Kubernetes·운영 반영은 남아 있습니다.
+0.3.5에 게시된 auth.native_resource 옵션은 최종 upstream 경로·본문을 실제 호패/품계/수문장의 mTLS gRPC 판정에 바인딩합니다. 정확한 서명 정적 자산이 백업한 네 서버 Kubernetes/브라우저 검사를 통과하고 내부에 배포됐습니다. 기존 운영 receipt 자원은 미설정이며 정상 네이티브 집행은 격리 환경에서 검증했습니다. [통합 검증 기록](https://github.com/ziozzang/hangang-zerotrust/blob/main/docs/ko/PACKAGING.md)을 참고하십시오.
+
+현재 소스는 네이티브 요청에 설정 번호뿐 아니라 실제 활성 스냅샷도 보존합니다.
+같은 리비전의 새 스냅샷이어도 대기 중인 인증·본문 준비·원천 호출·upstream 진입·
+보호된 본문을 중단합니다. Arc 동일성 검사로 SQL이나 프레임별 설정 직렬화가
+필요하지 않습니다. 기존 네이티브 리비전 검사와 마찬가지로 무관한 스냅샷 교체도
+요청을 중단하는 보수적 경계입니다. 로컬 소유자 검사이며 분산 route lease·서명
+permit·replay 원장은 아닙니다.
 
 ```mermaid
 flowchart LR

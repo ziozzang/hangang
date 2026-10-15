@@ -186,7 +186,16 @@ Trusted Guard/Hopae menus and native Hopae transport: [console integration](docs
 
 ## Native service request enforcement
 
-The unreleased `auth.native_resource` option binds the final upstream target and entity to actual Hopae/Pumgye/Sumunjang decisions over mTLS gRPC. The owned four-process origin fixture qualifies dispatch/refusal; release, Kubernetes and operating adoption remain pending.
+The `auth.native_resource` option, published in 0.3.5, binds the final upstream target and entity to actual Hopae/Pumgye/Sumunjang decisions over mTLS gRPC. Exact signed static artifacts passed the backed-up four-server Kubernetes/browser fixture and are internally deployed. Existing operating receipt resources remain unconfigured; positive native enforcement is qualified in owned fixtures. See the [cross-component qualification record](https://github.com/ziozzang/hangang-zerotrust/blob/main/docs/PACKAGING.md).
+
+The current source additionally retains the exact activated snapshot for native
+requests, rather than relying solely on a numeric configuration revision. A new
+snapshot with even an identical revision retires pending native authentication,
+entity preparation and authority calls, upstream admission and guarded bodies.
+Checks compare retained Arc identities without SQL or per-frame configuration
+serialization. This conservative fence also retires requests on unrelated snapshot
+replacement, consistent with the existing native revision fence. It is a local
+owner fence, not a distributed route lease, signed permit or replay ledger.
 
 ```mermaid
 flowchart LR

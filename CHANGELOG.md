@@ -4,6 +4,23 @@
 
 ## Unreleased
 
+- Fence native receipt requests with the exact activated snapshot identity,
+  including equal-revision replacement. Apply the fence to pending authority
+  work, final upstream admission and guarded request/response bodies.
+
+## 0.3.5 — 2026-10-15
+
+- Add opt-in final native resource dispatch: compose the selected backend URI,
+  bound the complete transformed entity and obtain actual Hopae/Pumgye/Sumunjang
+  mTLS gRPC observations before upstream effects.
+- Reject wrong issuer/public pin/audience, oversized or ambiguous bodies, stale
+  revisions and unavailable authorities without dispatching to the origin.
+- Qualify exact signed static packages on the backed-up four-server Kubernetes
+  fixture, including integrated browser administration and durable revocation.
+- Publish and internally adopt the gateway and console while preserving existing
+  configuration and rights. Operating receipt resources remain unconfigured;
+  signed permits, credential projection and replay admission remain separate work.
+
 ## 0.3.4 — 2026-10-15
 
 - Enforce native resource/action gates through the independent Pumgye authority,

@@ -498,6 +498,9 @@ impl JwtRouteLease {
 
 #[derive(Clone, Default)]
 struct AuthRouteLease {
+    /// The native request retains its exact activated snapshot, not a caller's
+    /// revision claim. Even equal-revision fresh-authority replacement retires it.
+    native_snapshot: Option<(Arc<ArcSwap<Snapshot>>, Arc<Snapshot>)>,
     pumgye: Option<(Arc<ArcSwap<Snapshot>>, u64)>,
     pumgye_remote: Option<(Arc<crate::pumgye::AuthorityRuntime>, u64)>,
     workload: Option<WorkloadRouteLease>,
@@ -508,6 +511,7 @@ struct AuthRouteLease {
 
 #[derive(Clone, Copy, Default)]
 struct AuthRetirement {
+    native_route: bool,
     pumgye: bool,
     workload: bool,
     jwt: bool,
@@ -516,7 +520,7 @@ struct AuthRetirement {
 
 impl AuthRetirement {
     fn any(self) -> bool {
-        self.workload || self.jwt || self.pumgye || self.hopae
+        self.native_route || self.workload || self.jwt || self.pumgye || self.hopae
     }
 
     fn record(self, metrics: &Metrics) {
@@ -536,6 +540,10 @@ impl AuthRetirement {
 impl AuthRouteLease {
     fn retirement(&self) -> AuthRetirement {
         AuthRetirement {
+            native_route: self
+                .native_snapshot
+                .as_ref()
+                .is_some_and(|(active, captured)| !Arc::ptr_eq(&active.load(), captured)),
             pumgye: self
                 .pumgye
                 .as_ref()
@@ -2040,6 +2048,7 @@ impl Proxy {
                 (None, None)
             };
         let mut auth_route_lease = workload_route_lease.map(|workload| AuthRouteLease {
+            native_snapshot: None,
             workload: Some(workload),
             jwt: None,
             pumgye: None,
@@ -2047,6 +2056,11 @@ impl Proxy {
             hopae_expires: None,
             hopae_renewal: None,
         });
+        if runtime.native_resource.is_some() {
+            auth_route_lease
+                .get_or_insert_with(Default::default)
+                .native_snapshot = Some((self.active.clone(), snapshot.clone()));
+        }
         if runtime
             .route
             .resource_policy
@@ -4915,6 +4929,54 @@ mod tests {
             peer.await.unwrap();
             assert_eq!(RENEWAL_SLOTS.available_permits(), 4096);
         }
+    }
+
+    #[tokio::test]
+    async fn native_route_fences_exact_snapshot_even_with_an_identical_revision() {
+        let original = Arc::new(Snapshot::new(crate::config::Config::default()).unwrap());
+        let active = Arc::new(ArcSwap::from(original.clone()));
+        let lease = AuthRouteLease {
+            native_snapshot: Some((active.clone(), original.clone())),
+            ..Default::default()
+        };
+        assert!(!lease.retirement().any());
+        // Equal public configuration and revision are insufficient to preserve
+        // a request across fresh native owner activation.
+        let replacement = Arc::new(Snapshot::new(original.config.clone()).unwrap());
+        assert_eq!(replacement.config.revision, original.config.revision);
+        active.store(replacement);
+        assert!(lease.retirement().native_route && lease.retirement().any());
+        let metrics = Metrics::default();
+        assert_eq!(
+            retired_auth_response(Some(&lease), &metrics)
+                .unwrap()
+                .status(),
+            503
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lease.revoked())
+                .await
+                .unwrap()
+                .native_route
+        );
+    }
+
+    #[tokio::test]
+    async fn native_route_retirement_stops_an_already_prepared_body() {
+        use http_body_util::BodyExt;
+        let original = Arc::new(Snapshot::new(crate::config::Config::default()).unwrap());
+        let active = Arc::new(ArcSwap::from(original.clone()));
+        let lease = AuthRouteLease {
+            native_snapshot: Some((active.clone(), original.clone())),
+            ..Default::default()
+        };
+        let mut body = AuthResponseBody::new(
+            full_body(Bytes::from_static(b"owned final entity")),
+            lease,
+            Arc::new(Metrics::default()),
+        );
+        active.store(Arc::new(Snapshot::new(original.config.clone()).unwrap()));
+        assert!(body.frame().await.unwrap().is_err());
     }
 
     #[test]
