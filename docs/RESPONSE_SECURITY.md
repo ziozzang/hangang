@@ -73,3 +73,13 @@ authentication establishes it. Test this with restricted fixture items, duplicat
 and mixed-case forged headers, and a public route sharing the same origin; a
 public-only production dataset cannot establish restricted-data isolation. Direct
 origin access must remain restricted to the trusted proxy.
+
+The response-policy authority guard also accepts a valid HTTP/2 URI `:authority`
+when no regular Host exists. If both are present they must identify the same
+case-insensitive hostname (trailing dot ignored) and effective port, defaulting to
+443 only for authenticated TLS, otherwise80. An ambiguous, duplicate or invalid
+request authority selects no response policy. This guard controls response
+headers/redirect hardening; it does not change existing routing decisions.
+Malformed trusted forwarding cannot suppress HSTS on a valid selected TLS
+request, including an early400. Client URI scheme or forwarding claims alone do
+not establish TLS for the error fallback.

@@ -7511,7 +7511,7 @@ async fn sacho_tls_frontend(
         "monitor.example.test".into(),
     ])
     .unwrap();
-    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+    let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
@@ -7531,6 +7531,7 @@ async fn sacho_tls_frontend(
     .unwrap()
     .with_root_certificates(roots)
     .with_no_client_auth();
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -7550,7 +7551,7 @@ async fn sacho_tls_frontend(
                     let proxy = proxy.clone();
                     async move { proxy.handle(request, peer).await }
                 });
-                let _ = http1::Builder::new()
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await;
             });
@@ -7808,6 +7809,109 @@ async fn sacho_security_public_and_protected_email_ignore_spoofed_elevated_dupli
     }
     front_task.abort();
     auth_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn sacho_security_real_tls_h2_authority_and_forwarding_error_policy_are_unambiguous() {
+    let (origin, seen, origin_task) = upstream("ok").await;
+    let mut route = route(vec![format!("http://{origin}")]);
+    route.path_prefix = Some("/ok".into());
+    let settings: hangang::config::Settings = serde_json::from_value(serde_json::json!({
+        "trusted_proxy_cidrs":["127.0.0.1/32"],
+        "response_security":[{"hosts":["sacho.example.test","monitor.example.test"],
+            "headers":{"strict-transport-security":"max-age=31536000"}}]
+    }))
+    .unwrap();
+    let ((proxy, policy), _) = proxy_with_settings(vec![route], settings);
+    let (address, task, config) = sacho_tls_frontend(proxy).await;
+    let mut config = (*config).clone();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from("sacho.example.test").unwrap(),
+            TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+    let (mut client, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+    let connection_task = tokio::spawn(connection);
+    for (authority, host, invalid_forwarding, status, hsts, origin_delta) in [
+        ("sacho.example.test", None, false, 200, true, 1),
+        ("monitor.example.test", None, false, 200, true, 1),
+        ("unrelated.example.test", None, false, 200, false, 1),
+        ("sacho.example.test", None, true, 400, true, 0),
+        (
+            "sacho.example.test",
+            Some("other.example.test"),
+            false,
+            200,
+            false,
+            1,
+        ),
+        (
+            "other.example.test",
+            Some("sacho.example.test"),
+            false,
+            200,
+            false,
+            1,
+        ),
+        (
+            "sacho.example.test",
+            Some("sacho.example.test:bad"),
+            false,
+            400,
+            false,
+            0,
+        ),
+        (
+            "sacho.example.test:443",
+            Some("SACHO.EXAMPLE.TEST."),
+            false,
+            200,
+            true,
+            1,
+        ),
+    ] {
+        let before = seen.lock().unwrap().len();
+        let mut request = Request::builder().uri(format!("https://{authority}/ok"));
+        if let Some(host) = host {
+            request = request.header("host", host);
+        }
+        if invalid_forwarding {
+            request = request.header("x-forwarded-for", "invalid");
+        }
+        let response = client
+            .send_request(request.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status, "{authority}/{host:?}");
+        let values = response
+            .headers()
+            .get_all("strict-transport-security")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>();
+        if hsts {
+            assert_eq!(values, ["max-age=31536000"]);
+        } else {
+            assert!(
+                values.is_empty(),
+                "ambiguous/unmatched authority selected policy: {authority}/{host:?}"
+            );
+        }
+        response.into_body().collect().await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), before + origin_delta);
+    }
+    drop(client);
+    connection_task.abort();
+    task.abort();
     origin_task.abort();
     policy.shutdown().await;
 }

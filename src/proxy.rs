@@ -1231,7 +1231,14 @@ impl Proxy {
                 .map(Vec::as_slice)
                 .unwrap_or(&self.trusted_proxies)
         };
+        let transport_tls = request
+            .extensions()
+            .get::<crate::tls::TransportInfo>()
+            .is_some_and(|transport| transport.tls);
+        let response_authority =
+            response_security_authority(request.headers(), request.uri(), transport_tls);
         let mut context = if retired
+            || response_authority.is_none()
             || connection_tokens(request.headers())
                 .iter()
                 .any(is_forwarding_identity_header)
@@ -1245,14 +1252,8 @@ impl Proxy {
                         .forwarded_host
                         .as_ref()
                         .and_then(|h| h.to_str().ok())
-                        .or_else(|| {
-                            request
-                                .headers()
-                                .get(header::HOST)
-                                .and_then(|h| h.to_str().ok())
-                        })
                         .and_then(|h| h.parse().ok())
-                        .or_else(|| request.uri().authority().cloned())?;
+                        .or_else(|| response_authority.clone())?;
                     Some(crate::response_security::Context {
                         authority,
                         https: edge.proto == "https",
@@ -1260,31 +1261,14 @@ impl Proxy {
                     })
                 })
         };
-        if context.is_none()
-            && !retired
-            && request.headers().get_all(header::HOST).iter().count() == 1
-        {
-            context = request
-                .headers()
-                .get(header::HOST)
-                .filter(|host| valid_authority(host))
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
-                .filter(|a| {
-                    !a.as_str().contains('@')
-                        && (a.port().is_none() || a.port_u16().is_some_and(|p| p > 0))
-                })
-                .map(|authority| crate::response_security::Context {
-                    authority,
-                    // Forwarding validation may fail on a genuine TLS request.
-                    // Preserve authenticated transport for error hardening only;
-                    // client X-Forwarded-Proto cannot enable this fallback.
-                    https: request
-                        .extensions()
-                        .get::<crate::tls::TransportInfo>()
-                        .is_some_and(|transport| transport.tls),
-                    explicit_port: None,
-                });
+        if context.is_none() && !retired {
+            context = response_authority.map(|authority| crate::response_security::Context {
+                authority,
+                // Invalid forwarding does not erase authenticated TLS. Neither
+                // URI scheme nor client forwarding fields establish transport.
+                https: transport_tls,
+                explicit_port: None,
+            });
         }
         let mut response = self
             .handle_unfinalized(request, peer, snapshot.clone(), context.clone())
@@ -4559,6 +4543,54 @@ fn forward_auth_context(
     context
 }
 
+/// Select only unambiguous request authority metadata for response policies.
+/// Routing keeps its existing rules; this guard must not use trusted forwarding
+/// to reconcile a conflicting raw Host and URI :authority.
+fn response_security_authority(
+    headers: &HeaderMap,
+    uri: &Uri,
+    transport_tls: bool,
+) -> Option<hyper::http::uri::Authority> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = match hosts.next() {
+        Some(value) => {
+            if hosts.next().is_some() || !valid_authority(value) {
+                return None;
+            }
+            Some(
+                value
+                    .to_str()
+                    .ok()?
+                    .parse::<hyper::http::uri::Authority>()
+                    .ok()?,
+            )
+        }
+        None => None,
+    };
+    let authority = match uri.authority() {
+        Some(value) => {
+            if !valid_authority(&HeaderValue::from_str(value.as_str()).ok()?) {
+                return None;
+            }
+            Some(value.clone())
+        }
+        None => None,
+    };
+    if let (Some(host), Some(authority)) = (&host, &authority) {
+        let default_port = if transport_tls { 443 } else { 80 };
+        if !host
+            .host()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(authority.host().trim_end_matches('.'))
+            || host.port_u16().unwrap_or(default_port)
+                != authority.port_u16().unwrap_or(default_port)
+        {
+            return None;
+        }
+    }
+    host.or(authority)
+}
+
 /// A Host / X-Forwarded-Host value that is a well-formed authority (host with
 /// optional port, no userinfo, no path/query/fragment characters).
 fn valid_authority(value: &HeaderValue) -> bool {
@@ -4957,6 +4989,60 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sacho_security_response_authority_checks_both_sources_without_trusting_scheme() {
+        use hyper::header::HeaderValue;
+        use hyper::{HeaderMap, Uri};
+        let authority = |hosts: &[&str], uri: &str, tls| {
+            let mut headers = HeaderMap::new();
+            for host in hosts {
+                headers.append("host", HeaderValue::from_str(host).unwrap());
+            }
+            super::response_security_authority(&headers, &uri.parse::<Uri>().unwrap(), tls)
+                .map(|authority| authority.to_string())
+        };
+        assert_eq!(
+            authority(&[], "https://sacho.example.test/x", true).as_deref(),
+            Some("sacho.example.test")
+        );
+        assert!(
+            authority(
+                &["other.example.test"],
+                "https://sacho.example.test/x",
+                true
+            )
+            .is_none()
+        );
+        assert!(authority(&["sacho.example.test", "sacho.example.test"], "/x", true).is_none());
+        assert!(authority(&[], "https://user@sacho.example.test/x", true).is_none());
+        assert!(authority(&[], "https://sacho.example.test:bad/x", true).is_none());
+        assert!(
+            authority(
+                &["sacho.example.test:80"],
+                "http://sacho.example.test/x",
+                true
+            )
+            .is_none(),
+            "URI scheme must not choose a plaintext default for actual TLS"
+        );
+        assert!(
+            authority(
+                &["sacho.example.test:443"],
+                "http://sacho.example.test/x",
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            authority(
+                &["SACHO.EXAMPLE.TEST."],
+                "https://sacho.example.test:443/x",
+                true
+            )
+            .is_some()
+        );
+    }
+
     #[test]
     fn receipt_binding_uses_actual_backend_composition_and_final_entity() {
         let original: Uri = "/rewritten/orders?x=%2F&x=2".parse().unwrap();

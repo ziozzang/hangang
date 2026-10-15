@@ -68,3 +68,10 @@ includeSubDomains는 선택한 각 호스트의 하위에만 적용되며 형제
 공유하는 공개 경로와 제한된 fixture 항목으로 중복·대소문자 위조 헤더를 검사한다. 운영
 항목이 모두 공개인 상태만으로 제한 데이터 격리를 증명할 수 없다. 원점 직접 접근도
 신뢰한 프록시로 제한한다.
+
+응답 정책 authority 검사는 일반 Host가 없는 HTTP/2 URI `:authority`도 검증한다.
+둘 다 있으면 대소문자·끝점 정규화 hostname과 유효 port가 같아야 하며 기본 port는
+인증된 TLS에서만443, 그 외80이다. 모호·중복·잘못된 authority는 응답 정책을
+선택하지 않는다. 이는 헤더/redirect 강화용 검사이며 기존 routing 결정은 바꾸지
+않는다. 유효한 TLS authority에서는 trusted forwarding 오류의400에도 HSTS를
+유지하고, URI scheme이나 client forwarding 주장만으로 TLS를 만들지 않는다.
