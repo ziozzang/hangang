@@ -149,3 +149,31 @@ python /path/to/sumunjang/tools/grpc_smoke.py --binary /path/to/sumunjang --hang
 ```
 
 Admission and fresh authorization evidence share a monotonically increasing observed revision. An older reply cannot replace newer cached policy evidence, including when HTTP signals and gRPC/native queries are mixed.
+
+### Query budget and cache lifetime
+
+On Linux, positive decision TTLs age from the original local query start using
+suspend-inclusive BOOTTIME, including connection/queue/RPC/body-read time. Cache
+hits share that original capture and never start a new TTL. A clock read failure
+or reversal permanently invalidates the capture; a later successful read cannot
+restore it. One millisecond of source quantization is excluded. Cache entries
+still use `min(configured_cache_ms, reply.ttl_ms)` (up to five seconds); native
+request evidence additionally remains capped at one second and bound to the
+exact client owner, canonical IP, and current revision. No foreign absolute
+clock is compared. Other platforms retain the legacy Instant behavior; this does
+not qualify them for the Linux observed contract.
+
+The classic protocol's TTL is a bounded cache/reuse hint, not a remote revocation
+lease or a guarantee covering all later proxy transport writes. TTL zero is a
+valid point-in-time decision, including the final second of a timed rule. It
+creates neither a cache entry nor reusable request evidence; disabling the local
+cache does not change the authority's TTL. The public numeric authorization
+result preserves this compatibility and must not be treated as retained proof.
+A positive reply whose original budget has already elapsed after transport is
+unavailable (subject to the configured admission failure mode; mandatory fresh
+authorization remains unavailable). Existing legacy connection pooling and
+point-in-time dispatch behavior are preserved. The explicit observed native
+chain has separate local authority/output/transport fences; this cache change
+does not claim that every legacy socket write is fenced by network evidence.
+Canceling the native guard owner also retires its cached and retained captures;
+query-mode admission cannot reuse the cache or issue fresh proof under that owner.

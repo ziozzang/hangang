@@ -116,3 +116,28 @@ python /path/to/sumunjang/tools/grpc_smoke.py --binary /path/to/sumunjang --hang
 ```
 
 입장 판정과 새 권한 근거는 이미 확인한 리비전을 공유하며 단조 증가합니다. HTTP 신호와 gRPC/네이티브 질의가 섞여도 오래된 응답이 최신 근거를 덮어쓰지 못합니다.
+
+### Query 예산과 캐시 수명
+
+Linux의 양수 decision TTL은 원래 로컬 query 시작 시점부터 suspend를 포함하는
+BOOTTIME으로 차감합니다. 연결·대기열·RPC·응답 body 읽기 시간도 포함합니다.
+캐시 hit는 같은 원래 capture를 공유하며 TTL을 새로 시작하지 않습니다. 시계 읽기
+실패나 역행이 확인된 capture는 이후 정상 읽기로 복구되지 않습니다. 소스의
+밀리초 양자화 오차 1ms는 제외합니다. 캐시는 기존처럼
+`min(configured_cache_ms, reply.ttl_ms)`로 최대 5초이며, native request evidence는
+추가로 원래 query부터 최대 1초 및 정확한 client owner·정규화 IP·현재 revision에
+묶입니다. 외부 절대 시각과 비교하지 않습니다. 다른 플랫폼은 기존 Instant 동작을
+유지하며 Linux observed 계약을 충족한다고 간주하지 않습니다.
+
+Classic 프로토콜 TTL은 제한된 캐시/재사용 힌트이며 원격 철회 lease나 이후 모든
+proxy transport 쓰기를 보장하는 계약이 아닙니다. TTL 0은 timed rule의 마지막
+1초 등에서 발생하는 유효한 단발 결정이며 캐시나 재사용 증거를 만들지 않습니다.
+로컬 cache 비활성화도 authority TTL을 바꾸지 않습니다. 공개 numeric authorization
+결과는 이 호환성을 유지하며 보존 가능한 증명으로 취급하면 안 됩니다. transport
+이후 원래 양수 예산이 이미 만료된 응답은 unavailable입니다(admission은 설정한
+failure mode 적용, mandatory fresh authorization은 unavailable 유지). 기존 legacy
+연결 pooling과 단발 dispatch 동작은 유지합니다. 명시적인 observed native chain은
+별도의 로컬 authority/output/transport fence를 사용하며, 이번 캐시 보강이 모든
+legacy socket 쓰기를 network evidence로 검사한다는 의미는 아닙니다.
+Native guard owner가 취소되면 캐시 및 보존된 capture도 철회되며, query admission은
+해당 owner의 캐시를 재사용하거나 새 증거를 만들지 않습니다.
