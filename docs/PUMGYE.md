@@ -652,3 +652,23 @@ gates, and the native network evaluator cannot turn an API assignment into an
 HTTP route grant. Remote authorities independently enforce the same separation.
 An authenticated API-server adapter and its own transport/revocation qualification
 are required before adopting this context for Kubernetes authorization.
+
+### Native Human assignment matrix
+
+The console offers a distinct **Human** assignment kind backed by
+`services.<service>.human_users`. A subject is exactly `human1:` followed by 64
+lowercase hexadecimal characters; the editor preserves the identifier without
+trimming or substituting an email. These stable subjects come from Hopae's native
+authentication authority. The same string in `users` is an independent legacy
+assignment, and deleting a Human assignment leaves that legacy entry unchanged.
+Human, Workload, network and resource/AAL rules survive the same revision-checked
+policy publication. Kubernetes API services do not accept Human assignments;
+source-managed policies remain read-only.
+
+This editor manages policy metadata. It does not authenticate people, establish
+AAL, issue proofs or activate an observed Human route. Native Human enforcement
+accepts actual AAL1/2 and requires the separate typed authentication/permission
+chain. Unassigned and guest subjects have no permissions. Upgrade every strict
+policy reader and the owning Pumgye authority before publishing a nonempty
+`human_users` map; older readers reject the field. Do not remove the field to
+force an older runtime to load an active authorization policy.

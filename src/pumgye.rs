@@ -1044,3 +1044,59 @@ mod kubernetes_api_context_tests {
         assert!(resource.validate(&policy).is_err());
     }
 }
+
+#[cfg(test)]
+mod human_policy_context_tests {
+    #[test]
+    fn human_policy_roundtrip_preserves_class_and_never_grants_legacy_users() {
+        let subject = format!("human1:{}", "b".repeat(64));
+        let value = serde_json::json!({
+            "version":1,"information_classes":["internal"],
+            "services":{"orders":{"permissions":["read"],
+                "roles":{"reader":{"permissions":["read"],"information_classes":["internal"],"minimum_aal":1}},
+                "users":{},"human_users":{&subject:["reader"]},
+                "networks":[{"cidr":"192.0.2.0/24","roles":["reader"]}],"require_guard":true}},
+            "resources":{"db:orders":{"service":"orders","information_class":"internal","actions":{"select":"read"},"minimum_aal":2}}
+        });
+        let policy: pumgye_core::Policy = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            encoded["services"]["orders"]["human_users"],
+            value["services"]["orders"]["human_users"]
+        );
+        assert_eq!(encoded["resources"], value["resources"]);
+        let compiled = policy.compile().unwrap();
+        let ip = "192.0.2.10".parse().unwrap();
+        let guard = pumgye_core::GuardEvidence::EnforcedAllow;
+        assert_eq!(
+            compiled.evaluate_scoped_human_resource(
+                "orders",
+                "db:orders",
+                "select",
+                &subject,
+                ip,
+                2,
+                guard
+            ),
+            pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow)
+        );
+        for aal in [0, 1, 3] {
+            assert_ne!(
+                compiled.evaluate_scoped_human_resource(
+                    "orders",
+                    "db:orders",
+                    "select",
+                    &subject,
+                    ip,
+                    aal,
+                    guard
+                ),
+                pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow)
+            );
+        }
+        assert_ne!(
+            compiled.evaluate_resource("db:orders", "select", &subject, ip, 2, guard),
+            pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow)
+        );
+    }
+}

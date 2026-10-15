@@ -74,12 +74,12 @@ function renderMatrix() {
   const kinds = $('pumgye-kind');
   for (const option of kinds.options) option.disabled = api ? option.value !== 'kubernetes_api' : !ordinary || option.value === 'kubernetes_api';
   if (kinds.selectedOptions[0]?.disabled) kinds.value = api ? 'kubernetes_api' : ordinary ? 'user' : '';
-  const requirement = service ? (api ? 'Kubernetes API context: only mapped API subjects apply. Network and Workload assignments are not accepted. API identities carry AAL0; mapping labels are not authentication.' : !ordinary ? 'Unsupported authorization context. Edit the policy JSON before changing assignments.' : service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
+  const requirement = service ? (api ? 'Kubernetes API context: only mapped API subjects apply. Human, Network and Workload assignments are not accepted. API identities carry AAL0; mapping labels are not authentication.' : !ordinary ? 'Unsupported authorization context. Edit the policy JSON before changing assignments.' : service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
   $('pumgye-guard-requirement').textContent = requirement ? t(requirement) : '';
   if (requirement) $('pumgye-guard-requirement').dataset.i18n = requirement;
   else delete $('pumgye-guard-requirement').dataset.i18n;
   if (!service) return;
-  for (const [kind, rows] of [[api ? 'Kubernetes API' : 'User', Object.entries(service.users || {})], ['Workload', Object.entries(service.workload_users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
+  for (const [kind, rows] of [[api ? 'Kubernetes API' : 'User', Object.entries(service.users || {})], ['Human', Object.entries(service.human_users || {})], ['Workload', Object.entries(service.workload_users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
     for (const [id, roles] of rows) {
       const tr = window.document.createElement('tr'); tr.dataset.assignmentKind = kind === 'Kubernetes API' ? 'kubernetes_api' : kind.toLowerCase();
       for (const [column, value] of [t(kind), id, roles.join(', ')].entries()) { const td = window.document.createElement('td'); if (column === 0) td.dataset.i18n = kind; td.append(text(value)); tr.append(td); }
@@ -88,11 +88,11 @@ function renderMatrix() {
         if (sourceManaged || own !== generation || matrix !== matrixGeneration) return;
         const current = assignmentDraft(); if (!current) return;
         const active = current.services?.[serviceId]; if (!active) return;
-        if (kind === 'User' || kind === 'Workload' || kind === 'Kubernetes API') {
-          const field = kind === 'Workload' ? 'workload_users' : 'users';
+        if (kind === 'User' || kind === 'Human' || kind === 'Workload' || kind === 'Kubernetes API') {
+          const field = kind === 'Human' ? 'human_users' : kind === 'Workload' ? 'workload_users' : 'users';
           if (!assignmentMap(active[field]) || !Object.hasOwn(active[field], id)) return;
           delete active[field][id];
-          if (kind === 'Workload' && !Object.keys(active[field]).length) delete active[field];
+          if ((kind === 'Human' || kind === 'Workload') && !Object.keys(active[field]).length) delete active[field];
         } else { if (!Array.isArray(active.networks)) return; active.networks = active.networks.filter(n => n.cidr !== id); }
         draft = current; dirty = true; render();
       }); td.append(button); tr.append(td); table.append(tr);
@@ -156,20 +156,21 @@ $('pumgye-service-form').addEventListener('submit', (event) => {
 $('pumgye-assignment-form').addEventListener('submit', event => {
   event.preventDefault(); if (sourceManaged) return;
   const kind = $('pumgye-kind').value;
-  if (!['user', 'workload', 'network', 'kubernetes_api'].includes(kind)) return message(t('Choose a supported assignment kind.'));
+  if (!['user', 'human', 'workload', 'network', 'kubernetes_api'].includes(kind)) return message(t('Choose a supported assignment kind.'));
   // Never replace invalid raw editor work with the last valid structured draft.
   const current = assignmentDraft(); if (!current) return;
   const service = current?.services?.[$('pumgye-service').value]; if (!service) return;
   if (apiContext(service) ? kind !== 'kubernetes_api' : !ordinaryContext(service) || kind === 'kubernetes_api') return message(t('Choose an assignment kind supported by this service authorization context.'));
   const raw = $('pumgye-subject').value;
-  const id = kind === 'workload' || kind === 'kubernetes_api' ? raw : raw.trim();
+  const id = kind === 'human' || kind === 'workload' || kind === 'kubernetes_api' ? raw : raw.trim();
   if (kind === 'kubernetes_api' && (id.length > 128 || !/^k8sapi:[A-Za-z0-9_.:-]+$/.test(id))) return message(t('Kubernetes API subject must start with k8sapi: and use at most 128 ASCII letters, digits, dots, colons, underscores or hyphens.'));
   if (kind === 'workload' && (id.length !== 50 || !/^s_[0-9a-f]{48}$/.test(id))) return message(t('Workload subject must be s_ followed by exactly 48 lowercase hexadecimal characters.'));
+  if (kind === 'human' && (id.length !== 71 || !/^human1:[0-9a-f]{64}$/.test(id))) return message(t('Human subject must be human1: followed by exactly 64 lowercase hexadecimal characters.'));
   const roles = $('pumgye-assignment-roles').value.split(',').map(x => x.trim()).filter(Boolean);
   if (!id || !roles.length || roles.some(role => role !== 'guest' && !Object.hasOwn(service.roles || {}, role))) return message(t('Use an existing role or guest.'));
   draft = current;
-  if (kind === 'user' || kind === 'workload' || kind === 'kubernetes_api') {
-    const field = kind === 'workload' ? 'workload_users' : 'users';
+  if (kind === 'user' || kind === 'human' || kind === 'workload' || kind === 'kubernetes_api') {
+    const field = kind === 'human' ? 'human_users' : kind === 'workload' ? 'workload_users' : 'users';
     if (!Object.hasOwn(service, field)) Object.defineProperty(service, field, { value: {}, enumerable: true, writable: true, configurable: true });
     if (!assignmentMap(service[field])) return message(t('Correct the authorization policy JSON before changing assignments.'));
     Object.defineProperty(service[field], id, { value: roles, enumerable: true, writable: true, configurable: true });
