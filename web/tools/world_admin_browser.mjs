@@ -1,5 +1,6 @@
 // Actual owned Kubernetes console: no intercepted API responses or fixture UI server.
 import fs from 'node:fs';
+import {applicationAuthorization,redact} from './world_admin_credentials.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import { execFile } from 'node:child_process';
@@ -9,6 +10,9 @@ import { randomBytes } from 'node:crypto';
 import { chromium, expect } from '@playwright/test';
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const password=randomBytes(24).toString('hex');
+const sensitive=[config.token,password,config.application?.key,...(config.redactionSecrets??[])];
+let authorization;
+try{if(config.application)authorization=applicationAuthorization(config.application);}catch(error){console.error(redact(String(error),sensitive));process.exit(1);}
 function exchange(transport,options){
   return new Promise((resolve,reject)=>{
     const req=transport.get(options,res=>{let body='';res.setEncoding('utf8');res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve({status:res.statusCode,body}));});
@@ -17,7 +21,7 @@ function exchange(transport,options){
 }
 async function protectedStatus(expected){
   const before=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
-  const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:'Bearer '+config.application.key}});
+  const response=await exchange(https,{hostname:'127.0.0.1',port:config.application.gatewayPort,servername:'app.example.test',ca:fs.readFileSync(config.application.ca),path:'/secure',headers:{Host:'app.example.test',Authorization:authorization}});
   const after=JSON.parse((await exchange(http,{hostname:'127.0.0.1',port:config.application.backendPort,path:'/__count'})).body).count;
   expect(after).toBe(before+(response.status===200?1:0));
   if(expected!==null)expect(response.status).toBe(expected);
@@ -175,4 +179,4 @@ try {
   await expect(page.locator('#login-dialog')).toBeVisible();
   await expect(page.locator('#pumgye-document')).toHaveValue('');
   console.log('PASS: actual browser first-administrator bootstrap and ID/password login, owning Pumgye guest publication, real Sumunjang menu and owning policy block/unblock, and logout clearing');
-} catch(error) { console.error(String(error).replaceAll(config.token,'[redacted]').replaceAll(password,'[redacted]').replaceAll(config.application?.key??'unused-secret-placeholder','[redacted]')); process.exitCode=1; } finally {await browser.close();}
+} catch(error) { console.error(redact(String(error),sensitive)); process.exitCode=1; } finally {await browser.close();}
