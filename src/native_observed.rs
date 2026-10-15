@@ -1,15 +1,31 @@
 //! Separate native observed chain. Each source contributes only a receiver-local
 //! deadline; no source absolute expiry is compared with another clock domain.
 use anyhow::{Result, ensure};
-use hopae_grpc::{observed_client as sdk, receipt_time};
+use hopae_grpc::{observed_client as sdk, receipt_time, workload_observed_client as workload};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 
+/// Native route configuration selects the endpoint; request fields cannot select it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticationClass {
+    #[default]
+    Service,
+    Workload,
+}
+impl AuthenticationClass {
+    fn is_service(&self) -> bool {
+        *self == Self::Service
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    #[serde(default, skip_serializing_if = "AuthenticationClass::is_service")]
+    pub authentication_class: AuthenticationClass,
     pub identity_authority: String,
     pub minimum_profile_revision: u64,
     pub minimum_application_generation: u64,
@@ -28,7 +44,7 @@ pub(crate) struct Owner {
     epoch: u64,
     public: [u8; 32],
     scope: sdk::ServiceScope,
-    client: OnceLock<(Arc<()>, Arc<sdk::Client>)>,
+    client: OnceLock<(Arc<()>, Arc<ObservedClient>)>,
     active: AtomicBool,
 }
 impl Owner {
@@ -63,6 +79,11 @@ impl Owner {
             (4096..=1_048_576).contains(&configuration.maximum_final_header_bytes),
             "invalid observed final header budget"
         );
+        ensure!(
+            configuration.authentication_class != AuthenticationClass::Workload
+                || configuration.identity_authority.len() <= 40,
+            "invalid Workload observed identity authority"
+        );
         receipt_time::ClockRates::new(
             configuration.source_error_ppm,
             configuration.receiver_error_ppm,
@@ -88,7 +109,7 @@ impl Owner {
     pub(crate) fn client(
         &self,
         transport: &crate::hopae_native::Client,
-    ) -> Result<Arc<sdk::Client>> {
+    ) -> Result<Arc<ObservedClient>> {
         ensure!(
             self.active.load(Ordering::Acquire),
             "observed route owner retired"
@@ -115,7 +136,30 @@ impl Owner {
             self.configuration.receiver_error_ppm,
         )
         .map_err(|_| anyhow::anyhow!("invalid observed clock rates"))?;
-        let client = Arc::new(transport.observed_client(policy, self.clock.clone(), rates)?);
+        let client = Arc::new(match self.configuration.authentication_class {
+            AuthenticationClass::Service => ObservedClient::Service(Arc::new(
+                transport.observed_client(policy, self.clock.clone(), rates)?,
+            )),
+            AuthenticationClass::Workload => {
+                ObservedClient::Workload(Arc::new(transport.workload_observed_client(
+                    workload::WorkloadTrustPolicy {
+                        issuer_ref: policy.issuer_ref,
+                        key_epoch: policy.key_epoch,
+                        verifying_key: policy.verifying_key,
+                        identity_authority: policy.identity_authority,
+                        scopes: vec![workload::WorkloadScope {
+                            service: self.scope.service.clone(),
+                            audience: self.scope.audience.clone(),
+                        }],
+                        minimum_profile_revision: policy.minimum_profile_revision,
+                        minimum_application_generation: policy.minimum_application_generation,
+                        minimum_key_registry_revision: policy.minimum_key_registry_revision,
+                    },
+                    self.clock.clone(),
+                    rates,
+                )?))
+            }
+        });
         // A racing first request may construct an unused client, but only the
         // published persistent client may issue or observe any proof.
         let _ = self.client.set((transport.observed_owner.clone(), client));
@@ -146,49 +190,141 @@ impl Owner {
                 value: v.as_bytes().to_vec(),
             })
             .collect();
-        let request = client
-            .prepare_issue_digest(self.scope.clone(), prepared.digest(), headers)
-            .map_err(|_| anyhow::anyhow!("observed request preparation refused"))?;
-        let evidence = client
-            .issue(request)
-            .await
-            .map_err(|_| anyhow::anyhow!("observed authentication refused"))?;
+        let authentication = match client.as_ref() {
+            ObservedClient::Service(client) => {
+                let request = client
+                    .prepare_issue_digest(self.scope.clone(), prepared.digest(), headers)
+                    .map_err(|_| anyhow::anyhow!("observed request preparation refused"))?;
+                let evidence = client
+                    .issue(request)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("observed authentication refused"))?;
+                Authentication::Service {
+                    client: client.clone(),
+                    evidence,
+                }
+            }
+            ObservedClient::Workload(client) => {
+                let request = client
+                    .prepare_issue_digest(
+                        workload::WorkloadScope {
+                            service: self.scope.service.clone(),
+                            audience: self.scope.audience.clone(),
+                        },
+                        prepared.digest(),
+                        headers,
+                    )
+                    .map_err(|_| anyhow::anyhow!("observed request preparation refused"))?;
+                let evidence = client
+                    .issue(request)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("observed authentication refused"))?;
+                Authentication::Workload {
+                    client: client.clone(),
+                    evidence,
+                }
+            }
+        };
         ensure!(
             self.active.load(Ordering::Acquire),
             "observed route owner retired"
         );
-        Ok(Authentication { client, evidence })
+        Ok(authentication)
     }
 }
-pub(crate) struct Authentication {
-    client: Arc<sdk::Client>,
-    evidence: sdk::Observation,
+pub(crate) enum ObservedClient {
+    Service(Arc<sdk::Client>),
+    Workload(Arc<workload::Client>),
+}
+impl ObservedClient {
+    fn retire(&self) {
+        match self {
+            Self::Service(c) => c.retire(),
+            Self::Workload(c) => c.retire(),
+        }
+    }
+}
+/// Each variant retains its opaque SDK capability and exact creating owner.
+pub(crate) enum Authentication {
+    Service {
+        client: Arc<sdk::Client>,
+        evidence: sdk::Observation,
+    },
+    Workload {
+        client: Arc<workload::Client>,
+        evidence: workload::Observation,
+    },
 }
 impl Authentication {
+    pub(crate) fn class(&self) -> AuthenticationClass {
+        match self {
+            Self::Service { .. } => AuthenticationClass::Service,
+            Self::Workload { .. } => AuthenticationClass::Workload,
+        }
+    }
+    pub(crate) fn principal_kind(&self) -> hopae_grpc::PrincipalKind {
+        match self {
+            Self::Service { .. } => hopae_grpc::PrincipalKind::Service,
+            Self::Workload { .. } => hopae_grpc::PrincipalKind::Workload,
+        }
+    }
+    pub(crate) fn wire_kind(&self) -> u32 {
+        match self {
+            Self::Service { .. } => 2,
+            Self::Workload { .. } => 3,
+        }
+    }
     pub(crate) fn remaining(&self) -> Result<std::time::Duration> {
-        self.client
-            .check(&self.evidence, self.evidence.request())
-            .map_err(|_| anyhow::anyhow!("observed authentication expired or retired"))
+        match self {
+            Self::Service { client, evidence } => client
+                .check(evidence, evidence.request())
+                .map_err(|_| anyhow::anyhow!("observed authentication expired or retired")),
+            Self::Workload { client, evidence } => client
+                .check(evidence, evidence.request())
+                .map_err(|_| anyhow::anyhow!("observed authentication expired or retired")),
+        }
     }
     pub(crate) fn context(&self) -> &hopae_grpc::v1::AuthenticationReceiptContext {
-        self.evidence.context()
+        match self {
+            Self::Service { evidence, .. } => evidence.context(),
+            Self::Workload { evidence, .. } => evidence.context(),
+        }
     }
     pub(crate) fn sha256(&self) -> &[u8; 32] {
-        self.evidence.evidence().sha256()
+        match self {
+            Self::Service { evidence, .. } => evidence.evidence().sha256(),
+            Self::Workload { evidence, .. } => evidence.evidence().sha256(),
+        }
     }
     pub(crate) fn receipt(&self) -> &[u8] {
-        self.evidence.receipt()
+        match self {
+            Self::Service { evidence, .. } => evidence.receipt(),
+            Self::Workload { evidence, .. } => evidence.receipt(),
+        }
+    }
+    pub(crate) fn key_registry_revision(&self) -> u64 {
+        match self {
+            Self::Service { evidence, .. } => evidence.key_registry_revision(),
+            Self::Workload { evidence, .. } => evidence.key_registry_revision(),
+        }
     }
     pub(crate) async fn refresh(self) -> Result<Self> {
-        let evidence = self
-            .client
-            .refresh(self.evidence)
-            .await
-            .map_err(|_| anyhow::anyhow!("observed authentication refresh refused"))?;
-        Ok(Self {
-            client: self.client,
-            evidence,
-        })
+        match self {
+            Self::Service { client, evidence } => {
+                let evidence = client
+                    .refresh(evidence)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("observed authentication refresh refused"))?;
+                Ok(Self::Service { client, evidence })
+            }
+            Self::Workload { client, evidence } => {
+                let evidence = client
+                    .refresh(evidence)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("observed authentication refresh refused"))?;
+                Ok(Self::Workload { client, evidence })
+            }
+        }
     }
 }
 
@@ -446,7 +582,9 @@ impl Owner {
             .clock
             .begin_exchange()
             .map_err(|_| anyhow::anyhow!("receiver clock unavailable"))?;
-        let (reply, chain_sha256) = hopae.project_observed(query, timeout).await?;
+        let (reply, chain_sha256) = hopae
+            .project_observed(query, authentication.class(), timeout)
+            .await?;
         let sample = self
             .clock
             .finish_exchange(before)
@@ -491,10 +629,25 @@ impl Owner {
         rates: &receipt_time::ClockRates,
     ) -> Result<Output> {
         let value = zeroize::Zeroizing::new(std::mem::take(&mut reply.header_value));
-        let epoch = hopae_grpc::service_epoch::decode_clock(
-            &authentication.context().identity_authority_epoch,
-        )
-        .map_err(|_| anyhow::anyhow!("observed authentication epoch refused"))?;
+        let (profile_revision, application_generation) = match authentication.class() {
+            AuthenticationClass::Service => {
+                let epoch = hopae_grpc::service_epoch::decode_clock(
+                    &authentication.context().identity_authority_epoch,
+                )
+                .map_err(|_| anyhow::anyhow!("observed authentication epoch refused"))?;
+                (
+                    epoch.epoch.profile_revision,
+                    epoch.epoch.application_generation,
+                )
+            }
+            AuthenticationClass::Workload => {
+                let epoch = hopae_grpc::workload_epoch::decode(
+                    &authentication.context().identity_authority_epoch,
+                )
+                .map_err(|_| anyhow::anyhow!("observed authentication epoch refused"))?;
+                (epoch.profile_revision, epoch.application_generation)
+            }
+        };
         ensure!(
             reply.service == self.scope.service
                 && reply.audience == self.scope.audience
@@ -503,9 +656,9 @@ impl Owner {
                 && reply.cache_ttl_ms == 0
                 && valid_domain(&reply.output_clock_domain, "hproj1:", false)
                 && reply.owner_now_ms > 0
-                && reply.profile_revision == epoch.epoch.profile_revision
-                && reply.application_generation == epoch.epoch.application_generation
-                && reply.key_registry_revision == authentication.evidence.key_registry_revision()
+                && reply.profile_revision == profile_revision
+                && reply.application_generation == application_generation
+                && reply.key_registry_revision == authentication.key_registry_revision()
                 && reply.plan_revision == permit.wire.binding.as_ref().unwrap().plan_revision
                 && !value.is_empty()
                 && value.len() <= 4103,

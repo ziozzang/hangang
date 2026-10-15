@@ -597,3 +597,35 @@ HTTP pooling and throughput qualification remain open optimization work.
 Observed mode requires Linux BOOTTIME and refuses unsupported receiver clocks.
 Other platforms retain the separate legacy strict route timer; they do not obtain
 observed evidence through an Instant or wall-clock fallback.
+
+
+### Workload observed dispatch integration
+
+Status: implementation in progress, not yet qualified or released. Current public
+0.3.8 supports the Service chain described above; this section defines the typed
+Workload extension and must not be read as an operating activation claim.
+
+Set `auth.native_resource.observed.authentication_class` to `"workload"` for an
+explicit Workload route. Omission defaults to Service and does not add a field to
+legacy serialized configuration. Unknown classes and numeric kinds are rejected.
+Workload authority identifiers are limited to 40 ASCII identifier bytes by their
+canonical epoch contract. Configure all existing observed prerequisites; there is
+no Workload strict/UTC path, endpoint fallback or request-header class selection.
+
+The route retains the opaque public Workload SDK observation and selects the
+Workload permission RPC and projection contract 3. Service selects its existing
+RPCs and contract 2. The signed identity must be kind3/AAL0 for Workload, and
+Pumgye grants come only from the same policy's `workload_users`, never `users`.
+The same subject text can exist in both maps with independent rights. Nonzero
+minimum assurance requirements deny Workload; no client-supplied AAL promotes it.
+Hopae authentication activation alone does not enable output: its explicit
+Workload output scope and exact plan, as well as an actual Pumgye permit, must allow
+it. All output classes share the same paired replay consumption ledger.
+
+The final transformed HTTP entity, request digest, route/transport ownership,
+conservative source-age conversions and below-TLS final transport gates remain
+shared. Independent epochs are parsed by their configured class. A refusal never
+converts a Workload receipt into Service or retries another authority. Full-chain
+qualification requires actual TokenReview, policy, output and backend-effect
+checks, including grant/source/route withdrawal, expiry and replay. Typed source
+code and fixture peers alone do not establish that qualification.

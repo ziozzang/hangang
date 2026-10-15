@@ -143,7 +143,9 @@ impl Pin {
             || context.key_epoch != self.epoch
             || context.identity_authority_epoch != auth.identity_authority_epoch
             || identity.subject_ref != auth_identity.subject_ref
-            || identity.kind != 2
+            || identity.kind != authentication.wire_kind()
+            || auth_identity.kind != authentication.wire_kind()
+            || auth_identity.aal != 0
             || identity.aal != 0
             || identity.revision != auth_identity.revision
             || identity.credential_generation != auth_identity.credential_generation
@@ -166,7 +168,7 @@ impl Pin {
             identity_authority_epoch: &context.identity_authority_epoch,
             identity: receipt_binding::Identity {
                 subject_ref: &identity.subject_ref,
-                kind: hopae_grpc::PrincipalKind::Service,
+                kind: authentication.principal_kind(),
                 aal: 0,
                 revision: identity.revision,
                 credential_generation: identity.credential_generation,

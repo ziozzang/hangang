@@ -57,6 +57,7 @@ impl Client {
     pub(super) async fn project_observed(
         &self,
         mut query: pumgye_grpc::v1::PermitValidationRequest,
+        class: crate::native_observed::AuthenticationClass,
         timeout: Duration,
     ) -> io::Result<(hopae_grpc::v1::ObservedProjectionReply, [u8; 32])> {
         let _slot = self.slots.try_acquire().map_err(|_| invalid())?;
@@ -80,16 +81,27 @@ impl Client {
         let timeout = timeout.min(Duration::from_secs(1));
         let mut request = tonic::Request::new(hopae_grpc::v1::ProjectionRequest {
             request_id,
-            permission_contract: 2,
+            permission_contract: match class {
+                crate::native_observed::AuthenticationClass::Service => 2,
+                crate::native_observed::AuthenticationClass::Workload => 3,
+            },
             permission_query: query,
         });
         request.set_timeout(timeout);
         request
             .metadata_mut()
             .insert("authorization", self.key.clone());
-        let mut client = hopae_grpc::v1::observed_credential_projection_client::ObservedCredentialProjectionClient::new(self.channel.clone()).max_encoding_message_size(8448).max_decoding_message_size(8192);
-        let reply = tokio::time::timeout(timeout, client.project(request))
-            .await
+        let response = match class {
+            crate::native_observed::AuthenticationClass::Service => {
+                let mut client = hopae_grpc::v1::observed_credential_projection_client::ObservedCredentialProjectionClient::new(self.channel.clone()).max_encoding_message_size(8448).max_decoding_message_size(8192);
+                tokio::time::timeout(timeout, client.project(request)).await
+            }
+            crate::native_observed::AuthenticationClass::Workload => {
+                let mut client = hopae_grpc::v1::workload_observed_credential_projection_client::WorkloadObservedCredentialProjectionClient::new(self.channel.clone()).max_encoding_message_size(8448).max_decoding_message_size(8192);
+                tokio::time::timeout(timeout, client.project(request)).await
+            }
+        };
+        let reply = response
             .map_err(|_| invalid())?
             .map_err(|_| invalid())?
             .into_inner();

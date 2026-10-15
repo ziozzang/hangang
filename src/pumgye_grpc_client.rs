@@ -129,12 +129,20 @@ impl Client {
         request
             .metadata_mut()
             .insert("authorization", self.token.clone());
-        let mut client = pumgye_grpc::v1::observed_projection_permits_client::ObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
         let start = clock
             .begin_exchange()
             .map_err(|_| anyhow::anyhow!("receiver clock unavailable"))?;
-        let reply = tokio::time::timeout(timeout, client.issue(request))
-            .await
+        let response = match authentication.class() {
+            crate::native_observed::AuthenticationClass::Service => {
+                let mut client = pumgye_grpc::v1::observed_projection_permits_client::ObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
+                tokio::time::timeout(timeout, client.issue(request)).await
+            }
+            crate::native_observed::AuthenticationClass::Workload => {
+                let mut client = pumgye_grpc::v1::workload_observed_projection_permits_client::WorkloadObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
+                tokio::time::timeout(timeout, client.issue(request)).await
+            }
+        };
+        let reply = response
             .map_err(|_| anyhow::anyhow!("observed permit deadline"))?
             .map_err(|status| {
                 if status.code() == tonic::Code::PermissionDenied {

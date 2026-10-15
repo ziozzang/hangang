@@ -450,6 +450,7 @@ mod tests {
     fn observed_configuration_requires_the_entire_chain_and_explicit_bounded_clocks() {
         let mut config = configuration();
         config.observed = Some(crate::native_observed::Configuration {
+            authentication_class: crate::native_observed::AuthenticationClass::Service,
             identity_authority: "profiles".into(),
             minimum_profile_revision: 1,
             minimum_application_generation: 1,
@@ -501,5 +502,43 @@ mod tests {
             Err(projection_entity::Refused::TooLarge)
         ));
         assert_eq!(admission.available_permits(), 1);
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workload_configuration_requires_complete_observed_chain_and_canonical_authority_limit() {
+        let mut config = configuration();
+        config.observed = Some(crate::native_observed::Configuration {
+            authentication_class: crate::native_observed::AuthenticationClass::Workload,
+            identity_authority: "w".repeat(40),
+            minimum_profile_revision: 1,
+            minimum_application_generation: 1,
+            minimum_key_registry_revision: 1,
+            source_error_ppm: 100,
+            receiver_error_ppm: 100,
+            maximum_final_header_bytes: 32768,
+        });
+        assert!(config.compile(gate()).is_err());
+        config.project_credentials = true;
+        assert!(config.compile(gate()).is_err());
+        config.permission_permit = Some(crate::projection_permit::Configuration {
+            issuer_ref: "pum-owned".into(),
+            key_epoch: 1,
+            public_key: base64::engine::general_purpose::STANDARD.encode(
+                ed25519_dalek::SigningKey::from_bytes(&[8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+        });
+        assert!(config.compile(gate()).is_ok());
+        config
+            .observed
+            .as_mut()
+            .unwrap()
+            .identity_authority
+            .push('w');
+        assert!(config.compile(gate()).is_err());
+        config.observed.as_mut().unwrap().authentication_class =
+            crate::native_observed::AuthenticationClass::Service;
+        assert!(config.compile(gate()).is_ok());
     }
 }

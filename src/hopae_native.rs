@@ -145,6 +145,43 @@ impl Client {
         )
         .map_err(|_| anyhow::anyhow!("observed native client configuration refused"))
     }
+    pub(crate) fn workload_observed_client(
+        &self,
+        policy: hopae_grpc::workload_observed_client::WorkloadTrustPolicy,
+        clock: std::sync::Arc<hangang_runtime::time::ReceiverClock>,
+        rates: hopae_grpc::receipt_time::ClockRates,
+    ) -> anyhow::Result<hopae_grpc::workload_observed_client::Client> {
+        use hopae_grpc::workload_observed_client::{Client, EndpointConfig, Limits};
+        let settings = self
+            .observed_settings
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("observed authentication requires gRPC"))?;
+        let tls = settings
+            .tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("observed authentication requires mTLS"))?;
+        let ca = crate::tls::read_bounded(&tls.ca)?;
+        let certificate = crate::tls::read_bounded(&tls.certificate)?;
+        let private_key = zeroize::Zeroizing::new(crate::tls::read_bounded(&tls.key)?);
+        Client::new_workload(
+            EndpointConfig {
+                address: &format!("https://{}", settings.address),
+                server_name: &tls.server_name,
+                ca: &ca,
+                certificate: &certificate,
+                private_key: &private_key,
+                caller_key: self.key.to_str()?,
+            },
+            policy,
+            clock,
+            rates,
+            Limits {
+                concurrent: settings.pool_size,
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("observed native client configuration refused"))
+    }
     /// Separate native receipt phase. Unsupported transports refuse without fallback.
     pub async fn issue_service_receipt(
         &self,
@@ -175,12 +212,13 @@ impl Client {
     pub(crate) async fn project_observed(
         &self,
         query: pumgye_grpc::v1::PermitValidationRequest,
+        class: crate::native_observed::AuthenticationClass,
         timeout: Duration,
     ) -> io::Result<(hopae_grpc::v1::ObservedProjectionReply, [u8; 32])> {
         self.grpc
             .as_ref()
             .ok_or_else(invalid)?
-            .project_observed(query, timeout)
+            .project_observed(query, class, timeout)
             .await
     }
     pub(crate) async fn project_credential(

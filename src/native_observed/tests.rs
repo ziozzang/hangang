@@ -1,3 +1,5 @@
+// Authenticated fixture peers exercise Root public SDK and native transport boundaries.
+// They do not replace actual Hop TokenReview/Pum policy/consuming-ledger full-chain tests.
 use super::*;
 use hopae_grpc::{receipt, receipt_binding as rb, v1 as h};
 use pumgye_grpc::v1 as p;
@@ -10,6 +12,11 @@ use tonic::{Request, Response, Status};
 const TOKEN: &str = "owned-observed-native-caller-token-0001";
 #[derive(Clone)]
 struct Sources {
+    class: AuthenticationClass,
+    auth_calls: Arc<AtomicU64>,
+    permit_calls: Arc<AtomicU64>,
+    output_calls: Arc<AtomicU64>,
+    wrong_endpoints: Arc<AtomicU64>,
     started: Instant,
     attack: Arc<AtomicU8>,
     auth_key: ed25519_dalek::SigningKey,
@@ -24,8 +31,12 @@ fn digest(c: &h::AuthenticationReceiptContext, p: Option<&p::PermitBinding>) -> 
         identity_authority_epoch: &c.identity_authority_epoch,
         identity: rb::Identity {
             subject_ref: &i.subject_ref,
-            kind: hopae_grpc::PrincipalKind::Service,
-            aal: 0,
+            kind: match i.kind {
+                2 => hopae_grpc::PrincipalKind::Service,
+                3 => hopae_grpc::PrincipalKind::Workload,
+                _ => panic!("fixture kind"),
+            },
+            aal: i.aal.try_into().expect("fixture assurance fits signed u8"),
             revision: i.revision,
             credential_generation: i.credential_generation,
         },
@@ -52,76 +63,55 @@ fn digest(c: &h::AuthenticationReceiptContext, p: Option<&p::PermitBinding>) -> 
     rb::digest(&context, permit.as_ref()).unwrap()
 }
 impl Sources {
-    fn auth_now(&self) -> u64 {
-        10_000 + self.started.elapsed().as_millis() as u64
+    fn wire_kind(&self) -> u32 {
+        match self.class {
+            AuthenticationClass::Service => 2,
+            AuthenticationClass::Workload => 3,
+        }
     }
-    fn permit_now(&self) -> u64 {
-        5_000_000_000_000 + self.started.elapsed().as_millis() as u64
-    }
-    fn authorize<T>(&self, r: &Request<T>) -> Result<(), Status> {
-        if r.metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            != Some(&format!("Bearer {TOKEN}"))
-        {
-            return Err(Status::unauthenticated("native caller"));
+    fn endpoint(&self, class: AuthenticationClass) -> Result<(), Status> {
+        if self.class != class {
+            self.wrong_endpoints.fetch_add(1, Ordering::AcqRel);
+            return Err(Status::permission_denied("wrong typed fixture endpoint"));
         }
         Ok(())
     }
-    fn auth_report(&self, id: u64, receipt: &[u8]) -> h::ServiceReceiptTimeReply {
-        let expiry = u64::from_be_bytes(receipt[10..18].try_into().unwrap());
-        let now = self.auth_now();
-        h::ServiceReceiptTimeReply {
-            request_id: id,
-            owner_now_ms: now,
-            remaining_ms: expiry.saturating_sub(now).min(1000) as u32,
-            receipt_sha256: Sha256::digest(receipt).to_vec(),
-            clock_domain: if self.attack.load(Ordering::Acquire) == 8 {
-                "9".repeat(32)
-            } else {
-                "1".repeat(32)
-            },
-            profile_revision: 2,
-            application_generation: 3,
-            key_registry_revision: 4,
-            cache_ttl_ms: 0,
-        }
-    }
-}
-#[tonic::async_trait]
-impl h::authentication_receipts_server::AuthenticationReceipts for Sources {
-    async fn issue_service(
+    fn issue_auth(
         &self,
-        _: Request<h::ServiceReceiptRequest>,
-    ) -> Result<Response<h::ServiceReceiptReply>, Status> {
-        Err(Status::unimplemented("strict forbidden"))
-    }
-    async fn validate_service(
-        &self,
-        _: Request<h::ServiceReceiptValidationRequest>,
-    ) -> Result<Response<h::ServiceReceiptValidationReply>, Status> {
-        Err(Status::unimplemented("strict forbidden"))
-    }
-    async fn issue_service_observed(
-        &self,
-        r: Request<h::ServiceReceiptRequest>,
+        q: h::ServiceReceiptRequest,
     ) -> Result<Response<h::ServiceReceiptObservedReply>, Status> {
-        self.authorize(&r)?;
-        let q = r.into_inner();
         let id = q.verification.unwrap().request_id;
-        let c = h::AuthenticationReceiptContext {
+        self.auth_calls.fetch_add(1, Ordering::AcqRel);
+        let mut c = h::AuthenticationReceiptContext {
             issuer_ref: "hop-owned".into(),
             key_epoch: 1,
-            identity_authority_epoch: hopae_grpc::service_epoch::encode_clock(
-                "profiles",
-                2,
-                3,
-                "11111111111111111111111111111111",
-            )
-            .unwrap(),
+            identity_authority_epoch: match self.class {
+                AuthenticationClass::Service => hopae_grpc::service_epoch::encode_clock(
+                    "profiles",
+                    2,
+                    3,
+                    "11111111111111111111111111111111",
+                )
+                .unwrap(),
+                AuthenticationClass::Workload => hopae_grpc::workload_epoch::encode(
+                    "profiles",
+                    2,
+                    3,
+                    "11111111111111111111111111111111",
+                )
+                .unwrap(),
+            },
             identity: Some(h::ReceiptIdentity {
                 subject_ref: format!("s_{:048x}", self.next.fetch_add(1, Ordering::Relaxed)),
-                kind: 2,
+                kind: if self.attack.load(Ordering::Acquire) == 13 {
+                    if self.class == AuthenticationClass::Service {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    self.wire_kind()
+                },
                 aal: 0,
                 revision: 2,
                 credential_generation: 2,
@@ -136,13 +126,24 @@ impl h::authentication_receipts_server::AuthenticationReceipts for Sources {
             &receipt::Claims {
                 purpose: receipt::Purpose::Authentication,
                 issued_ms: now,
-                expires_ms: now + 950,
+                expires_ms: now
+                    + if self.attack.load(Ordering::Acquire) == 18 {
+                        1
+                    } else {
+                        950
+                    },
                 binding: digest(&c, None),
                 nonce: [1; 32],
             },
         )
         .unwrap()
         .to_vec();
+        // Native signing deliberately cannot mint nonzero-AAL Service/Workload.
+        // Exercise hostile wire context AFTER signing a valid fixture receipt,
+        // rather than panicking in the detached server's binding helper.
+        if self.attack.load(Ordering::Acquire) == 14 {
+            c.identity.as_mut().unwrap().aal = 1;
+        }
         let observation = self.auth_report(id, &receipt);
         Ok(Response::new(h::ServiceReceiptObservedReply {
             receipt: Some(h::ServiceReceiptReply {
@@ -153,24 +154,18 @@ impl h::authentication_receipts_server::AuthenticationReceipts for Sources {
             observation: Some(observation),
         }))
     }
-    async fn observe_service_time(
+    fn issue_permit(
         &self,
-        r: Request<h::ServiceReceiptValidationRequest>,
-    ) -> Result<Response<h::ServiceReceiptTimeReply>, Status> {
-        self.authorize(&r)?;
-        let q = r.into_inner();
-        Ok(Response::new(self.auth_report(q.request_id, &q.receipt)))
-    }
-}
-#[tonic::async_trait]
-impl p::observed_projection_permits_server::ObservedProjectionPermits for Sources {
-    async fn issue(
-        &self,
-        r: Request<p::AuthenticatedResourceRequest>,
+        q: p::AuthenticatedResourceRequest,
     ) -> Result<Response<p::ObservedProjectionPermitReply>, Status> {
-        self.authorize(&r)?;
-        let q = r.into_inner();
+        self.permit_calls.fetch_add(1, Ordering::AcqRel);
         let mut c = q.context.unwrap();
+        if c.identity.as_ref().unwrap().kind != self.wire_kind() {
+            return Err(Status::permission_denied("fixture permission kind"));
+        }
+        if self.attack.load(Ordering::Acquire) == 17 {
+            c.identity.as_mut().unwrap().kind = if self.wire_kind() == 2 { 3 } else { 2 };
+        }
         c.issuer_ref = "pum-owned".into();
         let binding = p::PermitBinding {
             authentication_receipt_sha256: Sha256::digest(q.receipt).to_vec(),
@@ -226,29 +221,28 @@ impl p::observed_projection_permits_server::ObservedProjectionPermits for Source
             observation: Some(observation),
         }))
     }
-    async fn observe(
+    fn project_output(
         &self,
-        _: Request<p::PermitValidationRequest>,
-    ) -> Result<Response<p::ObservedPermitTimeReply>, Status> {
-        Err(Status::unimplemented("fixture root issues only"))
-    }
-}
-#[tonic::async_trait]
-impl h::observed_credential_projection_server::ObservedCredentialProjection for Sources {
-    async fn project(
-        &self,
-        r: Request<h::ProjectionRequest>,
+        q: h::ProjectionRequest,
     ) -> Result<Response<h::ObservedProjectionReply>, Status> {
         use prost::Message;
-        self.authorize(&r)?;
-        let q = r.into_inner();
-        if q.permission_contract != 2 {
+        self.output_calls.fetch_add(1, Ordering::AcqRel);
+        if q.permission_contract
+            != match self.class {
+                AuthenticationClass::Service => 2,
+                AuthenticationClass::Workload => 3,
+            }
+            || self.attack.load(Ordering::Acquire) == 16
+        {
             return Err(Status::invalid_argument("contract"));
         }
         let chain_sha256 = Sha256::digest(&q.permission_query).to_vec();
         let query = p::PermitValidationRequest::decode(q.permission_query.as_slice()).unwrap();
         assert_eq!(query.request_id, q.request_id);
         let c = query.request.unwrap().context.unwrap();
+        if c.identity.as_ref().unwrap().kind != self.wire_kind() {
+            return Err(Status::permission_denied("fixture output kind"));
+        }
         let mut reply = h::ObservedProjectionReply {
             request_id: q.request_id,
             service: c.service,
@@ -280,6 +274,187 @@ impl h::observed_credential_projection_server::ObservedCredentialProjection for 
         }
         Ok(Response::new(reply))
     }
+    fn auth_now(&self) -> u64 {
+        10_000 + self.started.elapsed().as_millis() as u64
+    }
+    fn permit_now(&self) -> u64 {
+        5_000_000_000_000 + self.started.elapsed().as_millis() as u64
+    }
+    fn authorize<T>(&self, r: &Request<T>) -> Result<(), Status> {
+        if r.metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            != Some(&format!("Bearer {TOKEN}"))
+        {
+            return Err(Status::unauthenticated("native caller"));
+        }
+        Ok(())
+    }
+    fn auth_report(&self, id: u64, receipt: &[u8]) -> h::ServiceReceiptTimeReply {
+        let expiry = u64::from_be_bytes(receipt[10..18].try_into().unwrap());
+        let now = self.auth_now();
+        h::ServiceReceiptTimeReply {
+            request_id: id,
+            owner_now_ms: now,
+            remaining_ms: expiry.saturating_sub(now).min(1000) as u32,
+            receipt_sha256: Sha256::digest(receipt).to_vec(),
+            clock_domain: if self.attack.load(Ordering::Acquire) == 8 {
+                "9".repeat(32)
+            } else {
+                "1".repeat(32)
+            },
+            profile_revision: 2,
+            application_generation: 3,
+            key_registry_revision: 4,
+            cache_ttl_ms: 0,
+        }
+    }
+}
+#[tonic::async_trait]
+impl h::authentication_receipts_server::AuthenticationReceipts for Sources {
+    async fn issue_service(
+        &self,
+        _: Request<h::ServiceReceiptRequest>,
+    ) -> Result<Response<h::ServiceReceiptReply>, Status> {
+        Err(Status::unimplemented("strict forbidden"))
+    }
+    async fn validate_service(
+        &self,
+        _: Request<h::ServiceReceiptValidationRequest>,
+    ) -> Result<Response<h::ServiceReceiptValidationReply>, Status> {
+        Err(Status::unimplemented("strict forbidden"))
+    }
+    async fn issue_service_observed(
+        &self,
+        r: Request<h::ServiceReceiptRequest>,
+    ) -> Result<Response<h::ServiceReceiptObservedReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Service)?;
+        self.issue_auth(r.into_inner())
+    }
+
+    async fn observe_service_time(
+        &self,
+        r: Request<h::ServiceReceiptValidationRequest>,
+    ) -> Result<Response<h::ServiceReceiptTimeReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Service)?;
+        let q = r.into_inner();
+        Ok(Response::new(self.auth_report(q.request_id, &q.receipt)))
+    }
+}
+#[tonic::async_trait]
+impl p::observed_projection_permits_server::ObservedProjectionPermits for Sources {
+    async fn issue(
+        &self,
+        r: Request<p::AuthenticatedResourceRequest>,
+    ) -> Result<Response<p::ObservedProjectionPermitReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Service)?;
+        self.issue_permit(r.into_inner())
+    }
+
+    async fn observe(
+        &self,
+        _: Request<p::PermitValidationRequest>,
+    ) -> Result<Response<p::ObservedPermitTimeReply>, Status> {
+        Err(Status::unimplemented("fixture root issues only"))
+    }
+}
+#[tonic::async_trait]
+impl h::observed_credential_projection_server::ObservedCredentialProjection for Sources {
+    async fn project(
+        &self,
+        r: Request<h::ProjectionRequest>,
+    ) -> Result<Response<h::ObservedProjectionReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Service)?;
+        self.project_output(r.into_inner())
+    }
+}
+
+#[tonic::async_trait]
+impl h::workload_authentication_receipts_server::WorkloadAuthenticationReceipts for Sources {
+    async fn issue_observed(
+        &self,
+        r: Request<h::WorkloadReceiptRequest>,
+    ) -> Result<Response<h::WorkloadReceiptObservedReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Workload)?;
+        let q = r.into_inner();
+        let response = self
+            .issue_auth(h::ServiceReceiptRequest {
+                verification: q.verification,
+                service: q.service,
+                audience: q.audience,
+                request_sha256: q.request_sha256,
+            })?
+            .into_inner();
+        let proof = response.receipt.unwrap();
+        let report = response.observation.unwrap();
+        Ok(Response::new(h::WorkloadReceiptObservedReply {
+            receipt: Some(h::WorkloadReceiptReply {
+                request_id: proof.request_id,
+                context: proof.context,
+                receipt: proof.receipt,
+            }),
+            observation: Some(workload_report(report)),
+        }))
+    }
+    async fn observe_time(
+        &self,
+        r: Request<h::WorkloadReceiptObservationRequest>,
+    ) -> Result<Response<h::WorkloadReceiptTimeReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Workload)?;
+        let q = r.into_inner();
+        Ok(Response::new(workload_report(
+            self.auth_report(q.request_id, &q.receipt),
+        )))
+    }
+}
+fn workload_report(r: h::ServiceReceiptTimeReply) -> h::WorkloadReceiptTimeReply {
+    h::WorkloadReceiptTimeReply {
+        request_id: r.request_id,
+        owner_now_ms: r.owner_now_ms,
+        remaining_ms: r.remaining_ms,
+        receipt_sha256: r.receipt_sha256,
+        clock_domain: r.clock_domain,
+        profile_revision: r.profile_revision,
+        application_generation: r.application_generation,
+        key_registry_revision: r.key_registry_revision,
+        cache_ttl_ms: r.cache_ttl_ms,
+    }
+}
+#[tonic::async_trait]
+impl p::workload_observed_projection_permits_server::WorkloadObservedProjectionPermits for Sources {
+    async fn issue(
+        &self,
+        r: Request<p::AuthenticatedResourceRequest>,
+    ) -> Result<Response<p::ObservedProjectionPermitReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Workload)?;
+        self.issue_permit(r.into_inner())
+    }
+    async fn observe(
+        &self,
+        _: Request<p::PermitValidationRequest>,
+    ) -> Result<Response<p::ObservedPermitTimeReply>, Status> {
+        Err(Status::unimplemented("fixture root issues only"))
+    }
+}
+#[tonic::async_trait]
+impl h::workload_observed_credential_projection_server::WorkloadObservedCredentialProjection
+    for Sources
+{
+    async fn project(
+        &self,
+        r: Request<h::ProjectionRequest>,
+    ) -> Result<Response<h::ObservedProjectionReply>, Status> {
+        self.authorize(&r)?;
+        self.endpoint(AuthenticationClass::Workload)?;
+        self.project_output(r.into_inner())
+    }
 }
 
 fn certificates(root: &std::path::Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -310,11 +485,23 @@ fn certificates(root: &std::path::Path) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 #[tokio::test]
 async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_before_backend_effects()
  {
+    typed_dispatch_fixture(AuthenticationClass::Service).await;
+}
+#[tokio::test]
+async fn workload_dispatch_public_sdk_dedicated_endpoints_and_backend_nondispatch() {
+    typed_dispatch_fixture(AuthenticationClass::Workload).await;
+}
+async fn typed_dispatch_fixture(class: AuthenticationClass) {
     use base64::Engine;
     use http_body_util::BodyExt;
     let root = tempfile::tempdir().unwrap();
     let (ca, cert, key) = certificates(root.path());
     let source = Sources {
+        class,
+        auth_calls: Arc::new(AtomicU64::new(0)),
+        permit_calls: Arc::new(AtomicU64::new(0)),
+        output_calls: Arc::new(AtomicU64::new(0)),
+        wrong_endpoints: Arc::new(AtomicU64::new(0)),
         started: Instant::now(),
         attack: Arc::new(AtomicU8::new(0)),
         auth_key: ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
@@ -346,6 +533,10 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
                 source.clone(),
             ),
         );
+    let server = server
+        .add_service(h::workload_authentication_receipts_server::WorkloadAuthenticationReceiptsServer::new(source.clone()))
+        .add_service(p::workload_observed_projection_permits_server::WorkloadObservedProjectionPermitsServer::new(source.clone()))
+        .add_service(h::workload_observed_credential_projection_server::WorkloadObservedCredentialProjectionServer::new(source.clone()));
     let serving = tokio::spawn(server.serve_with_incoming(incoming));
     let hop_settings = crate::config::HopaeNative {
         transport: crate::config::HopaeTransport::Grpc,
@@ -364,7 +555,11 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
         transport: crate::pumgye::DecisionTransport::Grpc,
         decision_address: address.to_string().parse().unwrap(),
         management_address: address.to_string().parse().unwrap(),
-        decision_token_env: "OWNED_OBSERVED_DISPATCH_TOKEN".into(),
+        decision_token_env: match class {
+            AuthenticationClass::Service => "OWNED_OBSERVED_SERVICE_DISPATCH_TOKEN",
+            AuthenticationClass::Workload => "OWNED_OBSERVED_WORKLOAD_DISPATCH_TOKEN",
+        }
+        .into(),
         admin_token_env: "OWNED_OBSERVED_DISPATCH_ADMIN_UNSET".into(),
         tls: Some(crate::pumgye::AuthorityTls {
             server_name: "native.example.test".into(),
@@ -378,7 +573,7 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
     };
     // Unique fixture environment reference; never reads an operating credential.
     unsafe {
-        std::env::set_var("OWNED_OBSERVED_DISPATCH_TOKEN", TOKEN);
+        std::env::set_var(&authority_config.decision_token_env, TOKEN);
     }
     let authority = crate::pumgye::AuthorityRuntime::prepare(&authority_config).unwrap();
     let configuration = crate::native_resource::Configuration {
@@ -395,6 +590,7 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
         }),
         project_credentials: true,
         observed: Some(Configuration {
+            authentication_class: class,
             identity_authority: "profiles".into(),
             minimum_profile_revision: 1,
             minimum_application_generation: 1,
@@ -466,8 +662,18 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
             });
         }
     });
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build_http::<crate::proxy::Body>();
+    let endpoint = format!("http://{backend_address}");
+    let transport_config: crate::config::Config = serde_json::from_value(
+        serde_json::json!({"http":[{"id":"typed-native-fixture","backends":[endpoint.clone()]}]}),
+    )
+    .unwrap();
+    let transport_runtime = crate::config::Snapshot::new(transport_config).unwrap().http[0].clone();
+    let pools = crate::http_outbound::Pools::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        4,
+    );
     {
         let attack = 0;
         source.attack.store(attack, Ordering::Release);
@@ -491,7 +697,7 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
                 Some(&route),
             )
             .await;
-        let observation = result.unwrap();
+        let observation = Arc::new(result.unwrap());
         assert!(observation.local_fences_hold(&authority));
         let replacement_authority =
             crate::pumgye::AuthorityRuntime::prepare(&authority_config).unwrap();
@@ -509,6 +715,21 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
             .install_credential(outgoing.headers_mut())
             .unwrap();
         assert!(observation.local_fences_hold(&authority));
+        let gate_observation = observation.clone();
+        let gate_authority = authority.clone();
+        let gate: crate::http_outbound::DispatchGate =
+            Arc::new(move || gate_observation.local_fences_hold(&gate_authority));
+        let client = pools
+            .gated_client(
+                &transport_runtime,
+                &endpoint,
+                &endpoint,
+                0,
+                None,
+                None,
+                gate,
+            )
+            .unwrap();
         assert_eq!(client.request(outgoing).await.unwrap().status(), 200);
         binding.retire();
         assert!(!observation.local_fences_hold(&authority));
@@ -521,7 +742,7 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
             actions: [("POST".into(), "write".into())].into(),
         })
         .unwrap();
-    for attack in 1..=12 {
+    for attack in (1..=14).chain([16, 17, 18]) {
         source.attack.store(attack, Ordering::Release);
         let prepared = binding
             .prepare(
@@ -550,6 +771,121 @@ async fn native_dispatch_uses_independent_sources_and_refuses_output_attacks_bef
         );
     }
     assert_eq!(effects.load(Ordering::Acquire), 1);
+    assert!(source.auth_calls.load(Ordering::Acquire) > 0);
+    assert!(source.permit_calls.load(Ordering::Acquire) > 0);
+    assert!(source.output_calls.load(Ordering::Acquire) > 0);
+    assert_eq!(source.wrong_endpoints.load(Ordering::Acquire), 0);
+    // Capture through public RPCs, install the checked secret, then let output
+    // expire before the real raw-gated HTTP transport can emit any request.
+    source.attack.store(0, Ordering::Release);
+    let prepared = binding
+        .prepare(
+            hyper::Request::post(format!("http://{backend_address}/orders"))
+                .body(crate::proxy::full_body(bytes::Bytes::from_static(
+                    b"materialized once",
+                )))
+                .unwrap(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
+    let observation = Arc::new(
+        binding
+            .observe_with_route(
+                &prepared,
+                &hyper::HeaderMap::new(),
+                &hopae,
+                &authority,
+                "127.0.0.1".parse().unwrap(),
+                Some(&route),
+            )
+            .await
+            .unwrap(),
+    );
+    let mut outgoing = prepared.into_dispatch();
+    observation
+        .install_credential(outgoing.headers_mut())
+        .unwrap();
+    let gate_observation = observation.clone();
+    let gate_authority = authority.clone();
+    let client = pools
+        .gated_client(
+            &transport_runtime,
+            &endpoint,
+            &endpoint,
+            0,
+            None,
+            None,
+            Arc::new(move || gate_observation.local_fences_hold(&gate_authority)),
+        )
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    assert!(!observation.local_fences_hold(&authority));
+    assert!(client.request(outgoing).await.is_err());
+    assert_eq!(effects.load(Ordering::Acquire), 1);
+    // Wrong native configured class selects the opposite PUBLIC endpoint and
+    // fails closed; no private Authentication/Observation constructors are used.
+    source.attack.store(0, Ordering::Release);
+    let mut wrong = configuration.clone();
+    wrong.observed.as_mut().unwrap().authentication_class = match class {
+        AuthenticationClass::Service => AuthenticationClass::Workload,
+        AuthenticationClass::Workload => AuthenticationClass::Service,
+    };
+    let wrong = wrong
+        .compile(crate::pumgye::ResourceGate {
+            service_id: "orders".into(),
+            resource: "db:orders".into(),
+            actions: [("POST".into(), "write".into())].into(),
+        })
+        .unwrap();
+    let prepared = wrong
+        .prepare(
+            hyper::Request::post(format!("http://{backend_address}/orders"))
+                .body(crate::proxy::full_body(bytes::Bytes::from_static(
+                    b"materialized once",
+                )))
+                .unwrap(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrong
+            .observe_with_route(
+                &prepared,
+                &hyper::HeaderMap::new(),
+                &hopae,
+                &authority,
+                "127.0.0.1".parse().unwrap(),
+                Some(&route)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(source.wrong_endpoints.load(Ordering::Acquire), 1);
+    assert_eq!(effects.load(Ordering::Acquire), 1);
     backend_task.abort();
     serving.abort();
+}
+
+#[test]
+fn route_authentication_class_is_explicit_and_preserves_legacy_service_json() {
+    let legacy = serde_json::json!({
+        "identity_authority":"profiles",
+        "minimum_profile_revision":1,"minimum_application_generation":1,
+        "minimum_key_registry_revision":1,"source_error_ppm":100,
+        "receiver_error_ppm":100,"maximum_final_header_bytes":32768
+    });
+    let service: Configuration = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(service.authentication_class, AuthenticationClass::Service);
+    assert_eq!(serde_json::to_value(&service).unwrap(), legacy);
+    let mut explicit = legacy;
+    explicit["authentication_class"] = "workload".into();
+    let workload: Configuration = serde_json::from_value(explicit.clone()).unwrap();
+    assert_eq!(workload.authentication_class, AuthenticationClass::Workload);
+    assert_eq!(serde_json::to_value(&workload).unwrap(), explicit);
+    explicit["authentication_class"] = "human".into();
+    assert!(serde_json::from_value::<Configuration>(explicit.clone()).is_err());
+    explicit["authentication_class"] = 3.into();
+    assert!(serde_json::from_value::<Configuration>(explicit).is_err());
 }

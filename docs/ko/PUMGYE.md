@@ -519,3 +519,27 @@ Observed HTTP 공유 풀과 처리량 검증은 후속 최적화 과제로 남�
 Observed 모드는 Linux BOOTTIME이 필요하며 지원하지 않는 수신기 클록은 거부합니다.
 다른 플랫폼의 기존 strict 라우트 타이머는 별도로 유지하며, Instant나 wall clock으로
 대체하여 observed 증거를 만들지 않습니다.
+
+
+### Workload observed 전달 통합
+
+상태: 구현 중이며 아직 검증·릴리즈 완료가 아니다. 공개 0.3.8은 위의 Service 경로를
+지원한다. 이 절은 개발 중 확장 계약이며 운영 활성화 완료를 뜻하지 않는다.
+
+`auth.native_resource.observed.authentication_class`를 `"workload"`로 설정해 명시적으로
+선택한다. 생략하면 기존 Service이며 직렬화에 새 필드도 넣지 않는다. 알 수 없는 종류나
+숫자는 거부한다. Workload authority는 canonical epoch 규약상 ASCII identifier 최대
+40바이트다. 기존 observed 전제 전체가 필요하며 strict/UTC·다른 endpoint 우회나 요청
+헤더에 의한 종류 선택은 없다.
+
+공개 SDK의 opaque Workload 관측 타입을 유지하고 전용 품계 RPC·출력 contract3을
+사용한다. Service는 기존 RPC·contract2다. Workload 신원은 kind3/AAL0이며 동일 정책의
+workload_users만 사용하고 users로 우회하지 않는다. 같은 주체 문자열이라도 두 맵의
+권한은 독립이다. 높은 minimum AAL은 Workload를 거부하며 입력으로 승격하지 않는다.
+호패 인증 설정만으로 출력은 활성화되지 않는다. 명시적인 Workload 출력 scope·정확한
+plan과 실제 품계 허가를 모두 요구하고 출력 종류들은 동일 paired replay ledger를 쓴다.
+
+최종 변환 HTTP 본문·해시·라우트/전송 소유권·원천 age 변환·TLS 아래 최종 전송 검사는
+공유한다. epoch는 설정한 종류에 맞춰 파싱하며 거부 후 Service 변환·다른 판정 경로
+재시도는 없다. 실제 TokenReview·품계·출력·백엔드 영향, 회수·만료·replay를 검증해야
+전체 경로 완료라고 할 수 있다. 소스 코드나 fixture peer만으로 이를 주장하지 않는다.
