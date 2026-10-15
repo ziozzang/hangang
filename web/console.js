@@ -673,7 +673,7 @@ function renderSecuritySummary() {
 
 function renderCommands() {
   const query = $('#command-search').value.toLowerCase().trim();
-  const links = [...document.querySelectorAll('.nav-link')].filter(link => !link.hidden && `${link.textContent} ${link.querySelector('[data-i18n]')?.dataset.i18n || ''}`.toLowerCase().includes(query));
+  const links = [...document.querySelectorAll('.nav-link, [data-command-route]')].filter(link => !link.hidden && `${link.textContent} ${link.dataset.searchAliases || ''} ${link.querySelector('[data-i18n]')?.dataset.i18n || ''}`.toLowerCase().includes(query));
   commandSelection = Math.max(0, Math.min(commandSelection, links.length - 1));
   $('#command-results').replaceChildren(...links.map((link,index) => {
     const button = document.createElement('button'); button.type = 'button'; button.className = `command-result${index === commandSelection ? ' is-selected' : ''}`;
