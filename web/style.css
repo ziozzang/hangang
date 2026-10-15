@@ -286,3 +286,34 @@ dialog::backdrop { background: #10232165; backdrop-filter: blur(3px); }.login-di
   .metric .metric-label { font-size: 11px; }
   .metric .metric-note, .section-heading p { font-size: 10px; }
 }
+
+/* Pumgye uses the host form tokens; wide policy data scrolls within its panel. */
+#view-pumgye { min-width: 0; }
+#view-pumgye .pumgye-panel { min-width: 0; padding: clamp(14px, 2vw, 24px); margin-bottom: 16px; }
+#view-pumgye .pumgye-panel h2 { margin-top: 0; font-size: 17px; }
+#view-pumgye .pumgye-panel p { overflow-wrap: anywhere; }
+#view-pumgye .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 18px 0; align-items: end; }
+#view-pumgye .field { display: grid; gap: 6px; min-width: 0; }
+#view-pumgye .field > label { color: var(--muted); font-size: 11px; font-weight: 650; }
+#view-pumgye input, #view-pumgye select, #view-pumgye textarea { min-width: 0; max-width: 100%; }
+#view-pumgye .pumgye-service-field { margin: 18px 0; }
+#view-pumgye .pumgye-authority { padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+#view-pumgye .advanced-editor { min-width: 0; }
+#view-pumgye .advanced-editor summary { overflow-wrap: anywhere; }
+#view-pumgye pre { max-width: 100%; overflow: auto; font: 11px/1.6 var(--mono); }
+#view-pumgye .pumgye-table-wrap { max-width: 100%; overflow-x: auto; margin-top: 18px; }
+#view-pumgye table { width: 100%; min-width: 36rem; }
+#view-pumgye th, #view-pumgye td { white-space: normal; overflow-wrap: anywhere; max-width: 24rem; }
+#view-pumgye .pumgye-policy-editor { margin-top: 0; }
+#view-pumgye .pumgye-policy-editor .field { margin-top: 14px; }
+#view-pumgye textarea { resize: vertical; font: 12px/1.6 var(--mono); }
+#view-pumgye .button { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  #view-pumgye .form-grid { grid-template-columns: minmax(0, 1fr); }
+  #view-pumgye .page-head { flex-wrap: wrap; gap: 12px; }
+  #view-pumgye .page-head > div { min-width: 0; }
+  #view-pumgye .page-head h1 { overflow-wrap: anywhere; }
+}
+
+#view-pumgye .section-heading { padding: 0; }
+#view-pumgye th { position: static; }

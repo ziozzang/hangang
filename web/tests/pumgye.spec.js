@@ -266,3 +266,40 @@ test('late publish result cannot restore draft or mutation state after logout', 
   await expect(page.locator('#pumgye-matrix tr')).toHaveCount(0);
   await expect(page.locator('#pumgye-subject')).toHaveValue('');
 });
+
+// Reserved fixture data only. CSS viewport/DPR emulate browser zoom reflow.
+// Mobile 200% is a separately labelled host-min320 stress case, not 195px support.
+for (const width of [390, 1280]) for (const zoom of [1, 2]) for (const locale of ['en', 'ko']) for (const theme of ['light', 'dark']) {
+  test(`policy layout ${width}px ${zoom * 100}% ${width / zoom < 320 ? "host-min320" : "reflow"} ${locale} ${theme}`, async ({ browser }, testInfo) => {
+    const context = await browser.newContext({ baseURL: testInfo.project.use.baseURL,
+      viewport: { width: Math.max(320, Math.floor(width / zoom)), height: 900 }, deviceScaleFactor: zoom });
+    const page = await context.newPage();
+    try {
+      await setup(page);
+      await page.locator('#locale-select').selectOption(locale);
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme);
+      await expect(page.locator('#pumgye-source-summary')).toBeVisible();
+      await expect(page.locator('#pumgye-document')).toBeVisible();
+      await expect(page.locator('#pumgye-authority-status')).not.toBeVisible();
+      await page.locator('#pumgye-authority-status').locator('..').locator('summary').click();
+      const bounds = await page.evaluate(() => ({ viewport: document.documentElement.clientWidth, width: document.documentElement.scrollWidth,
+        controls: [...document.querySelectorAll('#view-pumgye .pumgye-table-wrap, #view-pumgye input, #view-pumgye select, #view-pumgye textarea, #view-pumgye button')].filter(el => el.getClientRects().length && (el.classList.contains('pumgye-table-wrap') || !el.closest('.pumgye-table-wrap'))).map(el => { const r = el.getBoundingClientRect(); return { id: el.id, left: r.left, right: r.right }; }),
+        tables: [...document.querySelectorAll('#view-pumgye .pumgye-table-wrap')].map(el => ({ width: el.clientWidth, scroll: el.scrollWidth })) }));
+      expect(bounds.width).toBeLessThanOrEqual(bounds.viewport);
+      for (const control of bounds.controls) { expect(control.left, control.id).toBeGreaterThanOrEqual(0); expect(control.right, control.id).toBeLessThanOrEqual(bounds.viewport + 1); }
+      if (width / zoom < 600) for (const table of bounds.tables) expect(table.scroll).toBeGreaterThan(table.width);
+      if (width / zoom < 600) {
+        const table = page.getByRole('region', { name: locale === 'ko' ? '권한 할당 표' : 'Authorization matrix', exact: true });
+        await table.focus();
+        await page.keyboard.press('ArrowRight');
+        await expect.poll(() => table.evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
+        await table.evaluate(el => el.scrollLeft = 0);
+      }
+      await page.locator('#pumgye-subject').fill('fixture-layout-user-' + 'x'.repeat(100));
+      await page.locator('#pumgye-assignment-form button').click();
+      await expect(page.locator('#pumgye-matrix')).toContainText('fixture-layout-user');
+      await page.evaluate(() => { document.activeElement?.blur(); window.scrollTo(0, 0); });
+      await page.screenshot({ path: `/tmp/hangang-pumgye-layout-after/${width}-${zoom}-${locale}-${theme}.png`, fullPage: true });
+    } finally { await context.close(); }
+  });
+}

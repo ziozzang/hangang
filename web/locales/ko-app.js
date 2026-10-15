@@ -1,6 +1,16 @@
 // English source strings emitted by the application layer. Keep route IDs,
 // credentials, hostnames and API-provided data out of this dictionary.
 export default {
+  "User": "사용자",
+  "Kind": "종류",
+  "Subject": "대상",
+  "Roles": "역할",
+  "Actions": "작업",
+  "Authority diagnostics": "권한 원천 진단",
+  "Assignment kind": "할당 종류",
+  "Authorization matrix": "권한 할당 표",
+  "Role definitions": "역할 정의",
+  "Advanced policy editor": "고급 정책 편집기",
   "Policy source ownership is unreported. Native editing is disabled.": "정책 원천 소유권이 보고되지 않았습니다. 자체 편집을 비활성화합니다.",
   "Status at last refresh": "마지막 새로고침 시점의 상태",
   "Native policy source": "자체 정책 원천",
