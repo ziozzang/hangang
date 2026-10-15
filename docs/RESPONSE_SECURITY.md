@@ -39,3 +39,37 @@ The preset never adds CSP. Existing origin CSP remains intact unless the operato
 ## Metadata and file exposure
 
 Response security headers do not remove application content. Use [URL blocks](PATH_BLOCKS.md) for known metadata endpoints or unnecessary files, scoped to the affected domains: for example `/readme.html` or `/license.txt` for a WordPress deployment. Verify the application's actual paths before adding DSM or other product-specific blocks. Blocks match an exact directory and slash-delimited descendants; they do not imply suffix, regular-expression or product-name matching. Preserve required authentication, health and integration endpoints.
+
+
+## Status-page pentest acceptance
+
+Apply HSTS at Hangang's TLS response boundary, rather than only in the status-page
+origin: authentication denials and gateway errors can bypass that origin. After
+reviewing TLS coverage for the selected host and its descendants, an explicit
+long-lived profile may use:
+
+```json
+{"hosts":["status.example.test","monitor.example.test"],"headers":{"strict-transport-security":"max-age=31536000; includeSubDomains"}}
+```
+
+`includeSubDomains` covers descendants of each selected hostname, not its siblings
+or parent domain. This does not enroll a host in a browser preload list or protect
+a first HTTP visit before the browser learns the policy. Keep the plaintext HTTPS
+redirect; HSTS is not emitted on plaintext responses. See [RFC6797](https://www.rfc-editor.org/rfc/rfc6797).
+
+Back up the active configuration, validate the complete candidate, publish using
+the current quoted `If-Match` revision, and read back the acknowledged successor.
+Verify public200, authentication401/403, missing-path/error responses and redirects
+on every alias. Expect exactly one HSTS value on verified HTTPS; an untrusted
+`X-Forwarded-Proto: http` must not suppress it on a TLS request. Preserve existing
+CSP, cookie policy and reporting-token authentication. Do not test subscription
+mail submission against production merely to verify headers.
+
+For status/history/incidents with mixed public/authenticated/group visibility,
+configure trusted auth identity outputs explicitly. Hangang reserves their names
+across the entire configuration snapshot and strips client-supplied copies even
+on public fallback routes, before routing/auth/Lua. Forward an identity only after
+authentication establishes it. Test this with restricted fixture items, duplicate
+and mixed-case forged headers, and a public route sharing the same origin; a
+public-only production dataset cannot establish restricted-data isolation. Direct
+origin access must remain restricted to the trusted proxy.
