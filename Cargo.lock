@@ -1222,7 +1222,7 @@ dependencies = [
 [[package]]
 name = "hopae-grpc"
 version = "0.0.3"
-source = "git+https://github.com/ziozzang/hopae?rev=b08e105666de99f2ae957cff16ca9f3c75d3f7c5#b08e105666de99f2ae957cff16ca9f3c75d3f7c5"
+source = "git+https://github.com/ziozzang/hopae?rev=e1dd9728e184eb4975fbe1ce8dae0505571f4ff1#e1dd9728e184eb4975fbe1ce8dae0505571f4ff1"
 dependencies = [
  "ed25519-dalek",
  "hangang-runtime",
@@ -2324,7 +2324,7 @@ dependencies = [
 [[package]]
 name = "pumgye-client"
 version = "0.1.9"
-source = "git+https://github.com/ziozzang/pumgye?rev=f6fb7d9a7e92b615d3c2525999b55a66e7a491ac#f6fb7d9a7e92b615d3c2525999b55a66e7a491ac"
+source = "git+https://github.com/ziozzang/pumgye?rev=98ecfcd5f319c203b35d2e37aee9ce95a040d874#98ecfcd5f319c203b35d2e37aee9ce95a040d874"
 dependencies = [
  "anyhow",
  "pumgye-protocol",
@@ -2338,7 +2338,7 @@ dependencies = [
 [[package]]
 name = "pumgye-core"
 version = "0.1.9"
-source = "git+https://github.com/ziozzang/pumgye?rev=f6fb7d9a7e92b615d3c2525999b55a66e7a491ac#f6fb7d9a7e92b615d3c2525999b55a66e7a491ac"
+source = "git+https://github.com/ziozzang/pumgye?rev=98ecfcd5f319c203b35d2e37aee9ce95a040d874#98ecfcd5f319c203b35d2e37aee9ce95a040d874"
 dependencies = [
  "anyhow",
  "guard-core",
@@ -2349,7 +2349,7 @@ dependencies = [
 [[package]]
 name = "pumgye-grpc"
 version = "0.1.9"
-source = "git+https://github.com/ziozzang/pumgye?rev=f6fb7d9a7e92b615d3c2525999b55a66e7a491ac#f6fb7d9a7e92b615d3c2525999b55a66e7a491ac"
+source = "git+https://github.com/ziozzang/pumgye?rev=98ecfcd5f319c203b35d2e37aee9ce95a040d874#98ecfcd5f319c203b35d2e37aee9ce95a040d874"
 dependencies = [
  "hopae-grpc",
  "prost",
@@ -2361,7 +2361,7 @@ dependencies = [
 [[package]]
 name = "pumgye-protocol"
 version = "0.1.9"
-source = "git+https://github.com/ziozzang/pumgye?rev=f6fb7d9a7e92b615d3c2525999b55a66e7a491ac#f6fb7d9a7e92b615d3c2525999b55a66e7a491ac"
+source = "git+https://github.com/ziozzang/pumgye?rev=98ecfcd5f319c203b35d2e37aee9ce95a040d874#98ecfcd5f319c203b35d2e37aee9ce95a040d874"
 dependencies = [
  "anyhow",
  "pumgye-core",

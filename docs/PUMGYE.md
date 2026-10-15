@@ -676,11 +676,12 @@ force an older runtime to load an active authorization policy.
 
 ### Private native Human dispatch candidate (not operating support)
 
-This source checkpoint prepares the Human path; it does **not** enable complete
-Human dispatch. Its final Human projection adapter returns `Unsupported` until a
-qualified public Hopae contract4 RPC is integrated. Do not deploy a Human route
-from this example as an operationally supported configuration. Existing Service,
-Workload and strict modes retain their separate contracts.
+This source candidate wires the public Human contract4 generated RPC. The earlier
+private `f369c52` checkpoint deliberately returned `Unsupported`; that checkpoint
+and its evidence remain unchanged. The integration requires unified qualified
+Hopae/Pumgye SDK pins and actual four-core qualification before adoption. Do not
+deploy a Human route from this example as an operationally supported configuration.
+Existing Service, Workload and strict modes retain their separate contracts.
 
 Under `auth.native_resource`, the following **fragment** supplements the existing
 fixed authentication public pin, independent `permission_permit` public pin,
@@ -749,6 +750,6 @@ Current qualification covers origin vectors, fixed scopes, fragmented actual-bod
 preparation, request seals, configuration refusal and actual HTTP pre-Lua class
 mismatch/backend-zero controls, plus existing Service/Workload regressions. It
 does not establish Human contract4 output, a four-core backend success, operating
-adoption, distributed freshness snapshots or a 100k throughput claim. Public H4
-integration and exact end-to-end current/revocation/replay/backend-zero-or-one
-qualification remain required before publication/adoption under existing authority.
+adoption, distributed freshness snapshots or a 100k throughput claim. Exact end-to-end current/revocation/replay/backend-zero-or-one qualification of
+the public H4 integration remains required before publication/adoption under
+existing authority.

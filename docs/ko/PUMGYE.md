@@ -584,10 +584,11 @@ API-server 아답터와 전송·철회 검증을 별도로 완료해야 한다.
 
 ### 비공개 네이티브 사람 dispatch 후보 (운영 지원 아님)
 
-이 소스 체크포인트는 사람 경로를 준비하지만 완전한 dispatch를 활성화하지 않는다.
-검증된 공개 호패 contract4 RPC를 통합하기 전에는 마지막 사람 projection 아답터가
-`Unsupported`를 반환한다. 아래 예를 운영 지원 설정으로 배포하지 않는다. 기존
-Service·Workload·strict 경로는 각 계약을 유지한다.
+이 소스 후보는 공개 사람 contract4 generated RPC를 연결한다. 이전 비공개
+`f369c52` 체크포인트는 의도적으로 `Unsupported`를 반환했으며 해당 소스·근거는
+변경하지 않는다. 반영 전 검증된 호패·품계 SDK pin의 통일과 실제 4개 코어 검증이
+필요하다. 아래 예를 운영 지원 설정으로 배포하지 않는다. 기존 Service·Workload·
+strict 경로는 각 계약을 유지한다.
 
 `auth.native_resource`의 다음 **설정 조각**은 기존 고정 인증 공개키 pin, 독립적인
 `permission_permit` 공개키 pin, `project_credentials: true`, native mTLS 전송과
@@ -650,4 +651,4 @@ framing만 바꿀 수 있다. 중복 credential, Host/cookie 재삽입, URI·hea
 설정 거부와 실제 HTTP의 Lua 이전 class 불일치/backend 0 검사 및 기존 Service/
 Workload 회귀 범위다. 사람 contract4 출력·4개 코어 backend 성공·운영 반영·분산
 freshness snapshot·100k 처리량을 입증하지 않는다. 기존 권한 범위 안의 게시/반영
-전에 공개 H4 통합과 정확한 현재성·철회·replay·backend 0/1 전 경로 검증이 필요하다.
+전에 공개 H4 통합의 정확한 현재성·철회·replay·backend 0/1 전 경로 검증이 필요하다.
