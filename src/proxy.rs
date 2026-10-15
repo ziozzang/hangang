@@ -232,6 +232,35 @@ impl Renewal {
     }
 }
 
+/// Fixed native route context. Only the selected immutable runtime supplies it.
+#[derive(Clone, Copy)]
+struct NativeAuthorization<'a> {
+    class: crate::native_observed::AuthenticationClass,
+    issuer: &'a str,
+    route_id: &'a str,
+    canonical_path: Option<&'a str>,
+}
+impl NativeAuthorization<'_> {
+    fn apply(self, headers: &mut HeaderMap) -> Result<(), u16> {
+        if self.class != crate::native_observed::AuthenticationClass::Human {
+            return Ok(());
+        }
+        let path = self.canonical_path.ok_or(503u16)?;
+        // AFTER configured/static headers: client or configured lookalikes
+        // cannot override the exact selected route or canonical ingress path.
+        headers.insert("x-hopae-contract", HeaderValue::from_static("1"));
+        headers.insert(
+            "x-hangang-route-id",
+            HeaderValue::from_str(self.route_id).map_err(|_| 503u16)?,
+        );
+        headers.insert(
+            "x-hangang-canonical-path",
+            HeaderValue::from_str(path).map_err(|_| 503u16)?,
+        );
+        Ok(())
+    }
+}
+
 /// Result of an external authorization call.
 enum AuthOutcome {
     /// 2xx: forward the request, injecting these copied response headers.
@@ -908,11 +937,11 @@ impl Proxy {
         auth: &crate::config::ExternalAuth,
         static_headers: &[(HeaderName, HeaderValue)],
         native: Option<&Arc<crate::hopae_native::Client>>,
-        expected: Option<(crate::native_observed::AuthenticationClass, &str)>,
+        expected: Option<NativeAuthorization<'_>>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
-        let expected_class = expected.map(|(class, _)| class);
+        let expected_class = expected.map(|scope| scope.class);
         let started = std::time::Instant::now();
         let operation = async move {
             let mut request = Request::builder()
@@ -921,6 +950,9 @@ impl Proxy {
                 .body(full_body(Bytes::new()))
                 .map_err(|_| 503u16)?;
             *request.headers_mut() = auth_request_headers(auth, static_headers, original, edge)?;
+            if let Some(scope) = expected {
+                scope.apply(request.headers_mut())?;
+            }
             let renewal_context = auth
                 .renew_native_evidence
                 .then(|| request.headers().clone());
@@ -962,7 +994,7 @@ impl Proxy {
                 if class == crate::native_observed::AuthenticationClass::Human {
                     if native_human_policy_identity(
                         &parts.headers,
-                        expected.map(|(_, issuer)| issuer).ok_or(503u16)?,
+                        expected.map(|scope| scope.issuer).ok_or(503u16)?,
                     )
                     .is_none()
                     {
@@ -982,7 +1014,7 @@ impl Proxy {
                 if class == crate::native_observed::AuthenticationClass::Human {
                     return native_human_policy_identity(
                         &parts.headers,
-                        expected.map(|(_, issuer)| issuer)?,
+                        expected.map(|scope| scope.issuer)?,
                     )
                     .map(|(subject, aal)| (subject.to_owned(), aal));
                 }
@@ -2606,11 +2638,31 @@ impl Proxy {
             for name in &auth.response_headers {
                 request.headers_mut().remove(name);
             }
+            let native_authorization = runtime
+                .native_resource
+                .as_ref()
+                .and_then(|binding| binding.observed_authentication())
+                .map(|(class, issuer)| NativeAuthorization {
+                    class,
+                    issuer,
+                    route_id: &runtime.route.id,
+                    canonical_path: canonical_resource_path.as_deref(),
+                });
             if runtime.native_resource.is_some() {
                 native_auth_context =
                     match auth_request_headers(auth, &runtime.auth_static_headers, &request, &edge)
                     {
-                        Ok(headers) => Some(headers),
+                        Ok(mut headers) => {
+                            if native_authorization
+                                .is_some_and(|scope| scope.apply(&mut headers).is_err())
+                            {
+                                return Ok(response(
+                                    503,
+                                    "native Human ingress context unavailable",
+                                ));
+                            }
+                            Some(headers)
+                        }
                         Err(_) => {
                             return Ok(response(503, "native authentication context unavailable"));
                         }
@@ -2622,7 +2674,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), runtime.native_resource.as_ref().and_then(|binding| binding.observed_authentication()), &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), native_authorization, &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);

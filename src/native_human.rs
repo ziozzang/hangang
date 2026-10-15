@@ -43,6 +43,9 @@ impl Scopes {
             "x-hopae-service-id",
             "x-hopae-human-policy-subject",
             "x-hopae-human-policy-issuer",
+            "x-hopae-contract",
+            "x-hangang-route-id",
+            "x-hangang-canonical-path",
         ]
         .into_iter()
         .map(str::to_owned)
