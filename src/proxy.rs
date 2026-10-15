@@ -744,6 +744,20 @@ impl Proxy {
         }
     }
 
+    /// Prepare an independent read-only native route observation listener.
+    /// Runtime/supervisor ownership of the returned server remains explicit.
+    pub async fn bind_route_owner(
+        &self,
+        configuration: crate::route_owner_grpc::Configuration,
+        forbidden_credentials: &[&str],
+    ) -> anyhow::Result<crate::route_owner_grpc::Server> {
+        crate::route_owner_grpc::Server::bind(
+            configuration,
+            self.native_routes.clone(),
+            forbidden_credentials,
+        )
+        .await
+    }
     pub fn with_guard(mut self, guard: Option<Arc<crate::guard::GuardClient>>) -> Self {
         self.guard = guard;
         self
@@ -3319,10 +3333,14 @@ impl Proxy {
                         Err(_) => return Ok(response(503, "native entity unavailable")),
                     }
                 };
-                let route_owner = match self.native_routes.capture(&snapshot, &runtime, &prepared) {
-                    Ok(owner) => owner,
-                    Err(_) => return Ok(response(503, "native route owner unavailable")),
-                };
+                let route_owner =
+                    match self
+                        .native_routes
+                        .capture(&snapshot, &runtime, &prepared, edge.client_ip)
+                    {
+                        Ok(owner) => owner,
+                        Err(_) => return Ok(response(503, "native route owner unavailable")),
+                    };
                 let observation = tokio::select! {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
@@ -3379,7 +3397,8 @@ impl Proxy {
             if native_observation
                 .as_ref()
                 .is_some_and(|(observation, authority, route_owner)| {
-                    !route_owner.current() || !observation.local_fences_hold(authority)
+                    !route_owner.current_for(edge.client_ip)
+                        || !observation.local_fences_hold(authority)
                 })
             {
                 return Ok(response(503, "native resource observation retired"));

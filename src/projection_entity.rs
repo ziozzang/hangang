@@ -25,6 +25,9 @@ pub struct Scope {
     audience: String,
 }
 impl Scope {
+    pub(crate) fn audience(&self) -> &str {
+        &self.audience
+    }
     pub fn new(service: String, audience: String) -> Result<Arc<Self>, Refused> {
         if [&service, &audience].iter().any(|value| {
             value.is_empty()

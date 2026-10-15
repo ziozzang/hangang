@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Add an independent `hangang-route-grpc` observation contract and bounded
+  mandatory-mTLS server library using the shared Hangang Runtime. Dedicated-role
+  authentication precedes lookup; native owners supply client IP and resource
+  context. Startup/supervisor and Pumgye request wiring remain open.
 - Bind native final admission to bounded, request-scoped random route references.
   Exact route/snapshot, absolute URI, method and prepared digest must still agree;
   expiry, cancellation and capacity exhaustion refuse without upstream effects.

@@ -1,0 +1,14 @@
+[package]
+name = "hangang-route-grpc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded Hangang request-scoped route observation contract"
+
+[dependencies]
+prost = "0.14"
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

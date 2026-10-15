@@ -7,6 +7,7 @@ use crate::{
 use arc_swap::ArcSwap;
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -16,10 +17,13 @@ const SHARDS: usize = 16;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Refused;
 struct Entry {
+    runtime: Arc<HttpRuntime>,
+    client_ip: IpAddr,
     snapshot: Arc<Snapshot>,
     digest: [u8; 32],
     uri: hyper::Uri,
     method: hyper::Method,
+    destination_sha256: [u8; 32],
     expires: Instant,
 }
 pub(crate) struct Registry {
@@ -36,7 +40,24 @@ pub(crate) struct Capture {
     entry: Arc<Entry>,
     _capacity: OwnedSemaphorePermit,
 }
+fn destination_digest(uri: &hyper::Uri) -> [u8; 32] {
+    use sha2::Digest;
+    struct Writer(sha2::Sha256);
+    impl std::fmt::Write for Writer {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            self.0.update(value.as_bytes());
+            Ok(())
+        }
+    }
+    let mut writer = Writer(sha2::Sha256::new());
+    std::fmt::write(&mut writer, format_args!("{uri}")).expect("digest writer is infallible");
+    writer.0.finalize().into()
+}
 impl Registry {
+    #[cfg(test)]
+    pub(crate) fn active_for_test(&self) -> &Arc<ArcSwap<Snapshot>> {
+        &self.active
+    }
     pub(crate) fn new(
         active: Arc<ArcSwap<Snapshot>>,
         capacity: usize,
@@ -59,8 +80,10 @@ impl Registry {
         snapshot: &Arc<Snapshot>,
         runtime: &Arc<HttpRuntime>,
         prepared: &Prepared,
+        client_ip: IpAddr,
     ) -> Result<Capture, Refused> {
-        if !Arc::ptr_eq(&self.active.load(), snapshot)
+        if !runtime.route.enabled
+            || !Arc::ptr_eq(&self.active.load(), snapshot)
             || snapshot
                 .http_route_indices
                 .get(&runtime.route.id)
@@ -81,10 +104,13 @@ impl Registry {
         let mut reference = [0; 32];
         self.random.fill(&mut reference).map_err(|_| Refused)?;
         let entry = Arc::new(Entry {
+            runtime: runtime.clone(),
+            client_ip,
             snapshot: snapshot.clone(),
             digest: prepared.digest(),
             uri: prepared.request().uri().clone(),
             method: prepared.request().method().clone(),
+            destination_sha256: destination_digest(prepared.request().uri()),
             expires: Instant::now()
                 .checked_add(Duration::from_secs(1))
                 .ok_or(Refused)?,
@@ -105,6 +131,70 @@ impl Registry {
             _capacity: capacity,
         })
     }
+    /// Server-only owner observation. Caller role/mTLS must be checked before
+    /// lookup. Response fields come exclusively from retained native state.
+    pub(crate) fn observe(
+        &self,
+        reference: &[u8; 32],
+        request_sha256: &[u8; 32],
+        destination_sha256: &[u8; 32],
+        request_id: u64,
+    ) -> Option<hangang_route_grpc::v1::RouteReply> {
+        let shard = self.entries[Self::shard(reference)].lock().ok()?;
+        let entry = shard.get(reference)?;
+        if entry.digest != *request_sha256
+            || entry.destination_sha256 != *destination_sha256
+            || !entry.runtime.route.enabled
+            || !Arc::ptr_eq(&self.active.load(), &entry.snapshot)
+        {
+            return None;
+        }
+        let binding = entry.runtime.native_resource.as_ref()?;
+        let scope = binding.owner_scope(&entry.method)?;
+        if [
+            &entry.runtime.route.id,
+            scope.service,
+            scope.audience,
+            scope.resource,
+            scope.action,
+        ]
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 128)
+        {
+            return None;
+        }
+        let client_ip = match entry.client_ip {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        let remaining_ms = u32::try_from(
+            entry
+                .expires
+                .checked_duration_since(Instant::now())?
+                .as_millis(),
+        )
+        .ok()?;
+        if !(1..=1000).contains(&remaining_ms) {
+            return None;
+        }
+        let reply = hangang_route_grpc::v1::RouteReply {
+            request_id,
+            configuration_revision: entry.snapshot.config.revision,
+            route_id: entry.runtime.route.id.clone(),
+            service: scope.service.into(),
+            audience: scope.audience.into(),
+            resource: scope.resource.into(),
+            action: scope.action.into(),
+            client_ip,
+            request_sha256: entry.digest.to_vec(),
+            destination_sha256: entry.destination_sha256.to_vec(),
+            remaining_ms,
+        };
+        if Instant::now() >= entry.expires || !Arc::ptr_eq(&self.active.load(), &entry.snapshot) {
+            return None;
+        }
+        Some(reply)
+    }
     fn check(
         &self,
         reference: &[u8; 32],
@@ -118,7 +208,8 @@ impl Registry {
         let Some(entry) = shard.get(reference) else {
             return false;
         };
-        entry.digest == *digest
+        entry.runtime.route.enabled
+            && entry.digest == *digest
             && entry.uri == *uri
             && entry.method == *method
             && Instant::now() < entry.expires
@@ -126,6 +217,18 @@ impl Registry {
     }
 }
 impl Capture {
+    #[cfg(test)]
+    pub(crate) fn request(&self, request_id: u64) -> hangang_route_grpc::v1::RouteRequest {
+        hangang_route_grpc::v1::RouteRequest {
+            request_id,
+            reference: self.reference.to_vec(),
+            request_sha256: self.entry.digest.to_vec(),
+            destination_sha256: self.entry.destination_sha256.to_vec(),
+        }
+    }
+    pub(crate) fn current_for(&self, client_ip: IpAddr) -> bool {
+        self.entry.client_ip == client_ip && self.current()
+    }
     pub(crate) fn current(&self) -> bool {
         self.registry.check(
             &self.reference,
@@ -146,14 +249,17 @@ impl Drop for Capture {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         config::Config, native_resource::Binding, projection_receipt::IssuerPin,
         pumgye::ResourceGate,
     };
     use http_body_util::{BodyExt, Full};
-    async fn fixture(
+    fn ip() -> IpAddr {
+        "192.0.2.9".parse().unwrap()
+    }
+    pub(crate) async fn fixture(
         capacity: usize,
     ) -> (Arc<Registry>, Arc<Snapshot>, Arc<HttpRuntime>, Prepared) {
         let config: Config = serde_json::from_value(serde_json::json!({"revision":7,"http":[{
@@ -201,11 +307,30 @@ mod tests {
             .unwrap();
         (registry, snapshot, runtime, prepared)
     }
+    #[test]
+    fn final_absolute_uri_digest_matches_an_independent_vector() {
+        assert_eq!(
+            destination_digest(
+                &"https://orders.example.test/api/secure?x=1"
+                    .parse()
+                    .unwrap()
+            ),
+            [
+                67, 50, 122, 47, 193, 210, 120, 71, 252, 126, 87, 81, 59, 31, 86, 200, 179, 217,
+                238, 123, 41, 122, 0, 91, 61, 147, 2, 208, 163, 82, 180, 197
+            ]
+        );
+    }
     #[tokio::test]
     async fn reference_binds_final_request_and_cancellation_removes_it() {
         let (registry, snapshot, runtime, prepared) = fixture(1).await;
-        let capture = registry.capture(&snapshot, &runtime, &prepared).unwrap();
+        let capture = registry
+            .capture(&snapshot, &runtime, &prepared, ip())
+            .unwrap();
         assert!(capture.current());
+        assert!(capture.current_for(ip()));
+        assert!(!capture.current_for("192.0.2.10".parse().unwrap()));
+        assert!(Arc::ptr_eq(&capture.entry.runtime, &runtime));
         let reference = capture.reference;
         let digest = prepared.digest();
         let uri = prepared.request().uri();
@@ -234,14 +359,18 @@ mod tests {
         let mut wrong = reference;
         wrong[0] ^= 1;
         assert!(!registry.check(&wrong, &digest, uri, method));
-        assert!(registry.capture(&snapshot, &runtime, &prepared).is_err());
+        assert!(
+            registry
+                .capture(&snapshot, &runtime, &prepared, ip())
+                .is_err()
+        );
         let retained_entry = capture.entry.clone();
         drop(capture);
         assert!(!registry.check(&reference, &digest, uri, method));
         assert!(Arc::ptr_eq(&retained_entry.snapshot, &snapshot));
         assert!(
             registry
-                .capture(&snapshot, &runtime, &prepared)
+                .capture(&snapshot, &runtime, &prepared, ip())
                 .unwrap()
                 .current()
         );
@@ -256,7 +385,7 @@ mod tests {
         let task_registry = registry.clone();
         let task = tokio::spawn(async move {
             let capture = task_registry
-                .capture(&snapshot, &runtime, &prepared)
+                .capture(&snapshot, &runtime, &prepared, ip())
                 .unwrap();
             sender
                 .send((
@@ -284,25 +413,33 @@ mod tests {
         let (_, _, foreign_runtime, foreign_prepared) = fixture(1).await;
         assert!(
             registry
-                .capture(&snapshot, &foreign_runtime, &prepared)
+                .capture(&snapshot, &foreign_runtime, &prepared, ip())
                 .is_err()
         );
         assert!(
             registry
-                .capture(&snapshot, &runtime, &foreign_prepared)
+                .capture(&snapshot, &runtime, &foreign_prepared, ip())
                 .is_err()
         );
-        let capture = registry.capture(&snapshot, &runtime, &prepared).unwrap();
+        let capture = registry
+            .capture(&snapshot, &runtime, &prepared, ip())
+            .unwrap();
         registry
             .active
             .store(Arc::new(Snapshot::new(snapshot.config.clone()).unwrap()));
         assert!(!capture.current());
-        assert!(registry.capture(&snapshot, &runtime, &prepared).is_err());
+        assert!(
+            registry
+                .capture(&snapshot, &runtime, &prepared, ip())
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn expiry_refuses_even_while_the_native_request_remains_held() {
         let (registry, snapshot, runtime, prepared) = fixture(1).await;
-        let capture = registry.capture(&snapshot, &runtime, &prepared).unwrap();
+        let capture = registry
+            .capture(&snapshot, &runtime, &prepared, ip())
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(1050)).await;
         assert!(!capture.current());
         assert_eq!(registry.capacity.available_permits(), 0);
@@ -324,7 +461,7 @@ mod tests {
                 barrier.clone(),
             );
             tasks.push(tokio::spawn(async move {
-                let capture = registry.capture(&snapshot, &runtime, &prepared);
+                let capture = registry.capture(&snapshot, &runtime, &prepared, ip());
                 barrier.wait().await;
                 capture.is_ok()
             }));

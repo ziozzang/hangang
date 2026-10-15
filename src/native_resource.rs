@@ -49,6 +49,12 @@ impl Configuration {
     }
 }
 
+pub(crate) struct OwnerScope<'a> {
+    pub(crate) service: &'a str,
+    pub(crate) audience: &'a str,
+    pub(crate) resource: &'a str,
+    pub(crate) action: &'a str,
+}
 /// Immutable route-owned binding, compiled before request processing.
 pub struct Binding {
     scope: Arc<projection_entity::Scope>,
@@ -100,6 +106,14 @@ impl Binding {
             gate,
             maximum_body_bytes: default_body_limit(),
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
+        })
+    }
+    pub(crate) fn owner_scope(&self, method: &hyper::Method) -> Option<OwnerScope<'_>> {
+        Some(OwnerScope {
+            service: &self.gate.service_id,
+            audience: self.scope.audience(),
+            resource: &self.gate.resource,
+            action: self.gate.actions.get(method.as_str())?,
         })
     }
     pub(crate) fn owns(&self, prepared: &projection_entity::Prepared) -> bool {

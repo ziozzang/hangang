@@ -126,3 +126,5 @@ pub mod projection_entity;
 pub mod projection_receipt;
 
 mod native_route_owner;
+
+pub mod route_owner_grpc;

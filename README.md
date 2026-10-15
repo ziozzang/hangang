@@ -214,11 +214,16 @@ flowchart LR
 
 Native requests also retain a bounded process-local route reference while the
 authority phase and upstream admission are pending. It captures the actual route
-runtime, snapshot, final absolute URI, method and prepared digest. Opaque random
+runtime, trusted ingress client IP, snapshot, final absolute URI, method and prepared digest. Opaque random
 references expire after one second; cancellation removes them and a fresh
 registry never inherits them. The gateway caps registrations at 128 globally,
 uses 16 lock shards and checks route membership through a snapshot-built index.
 It copies neither request entities nor credential fields; owner snapshots stay
 shared and no request-time SQL is performed.
-The current source uses these references for local final-admission checks; no
-remote lookup RPC, signed permission or replay-consumption endpoint is exposed.
+The current source uses these references for local final-admission checks and
+adds a separate mandatory-mTLS route observation server library. Its independent
+[contract crate](crates/hangang-route-grpc/README.md) contains no policy logic.
+Server replies derive client IP/service/resource/action from native owners;
+request fields cannot supply classification or an allow verdict. The server is
+not yet wired into gateway process startup/supervisor handover or outbound Pumgye
+requests. Signed permission, projection and replay consumption remain separate work.

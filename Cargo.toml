@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/hangang-route-grpc"]
+resolver = "3"
+
 [package]
 name = "hangang"
 version = "0.3.5"
@@ -9,6 +13,8 @@ description = "A dynamically configured asynchronous L4/L7 reverse proxy"
 repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
+hangang-route-grpc = { path = "crates/hangang-route-grpc" }
+hangang-runtime = { git = "https://github.com/ziozzang/hangang-runtime", rev = "819177c631acb43dcdac8662403e80a13bb6c636" }
 hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "73796eea0466636acfd771964ac40f02328b22af" }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
 tonic = { version = "0.14.6", features = ["tls-ring"] }

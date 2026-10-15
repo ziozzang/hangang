@@ -1,0 +1,25 @@
+syntax = "proto3";
+package hangang.route.v1;
+
+// Requires mTLS plus a dedicated decision-role credential, never a browser or
+// administrator session. Unknown/stale references disclose no owner metadata.
+service RouteOwnership { rpc Observe(RouteRequest) returns (RouteReply); }
+message RouteRequest {
+  uint64 request_id = 1;
+  bytes reference = 2; // Exact 32-byte native request reference.
+  bytes request_sha256 = 3; // Exact prepared service/audience/path/entity binding.
+  bytes destination_sha256 = 4; // SHA256 of the complete final absolute URI.
+}
+message RouteReply {
+  uint64 request_id = 1;
+  uint64 configuration_revision = 2; // Diagnostic; not an owner incarnation.
+  string route_id = 3;
+  string service = 4;
+  string audience = 5;
+  string resource = 6;
+  string action = 7;
+  bytes client_ip = 8; // Exactly 4 or 16 network-order bytes, from trusted ingress.
+  bytes request_sha256 = 9;
+  bytes destination_sha256 = 10;
+  uint32 remaining_ms = 11; // 1..1000, observation only; not a distributed lease.
+}
