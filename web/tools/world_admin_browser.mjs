@@ -88,10 +88,17 @@ try {
       await expect(staleEditor).toHaveValue(original);
       const staleRevision=await staleHop.locator('p').filter({hasText:/^Revision: /}).innerText();
       const publish=async value=>{
-        const revision=await hop.locator('p').filter({hasText:/^Revision: /}).innerText();
+        const status=hop.getByRole('status');
+        const base=Number((await status.innerText()).match(/Base revision: ([1-9]\d*)/)?.[1]);
+        expect(Number.isSafeInteger(base)&&base>0).toBe(true);
         await editor.fill(value);
+        const published=page.waitForResponse(response=>response.url().endsWith('/authentication/profiles/publish')&&response.request().method()==='POST');
         await hop.getByRole('button',{name:'Save profiles',exact:true}).click();
-        await expect(hop.locator('p').filter({hasText:/^Revision: /})).not.toHaveText(revision);
+        const response=await published;
+        expect(response.status()).toBe(200);
+        expect(response.request().postDataJSON().revision).toBe(base);
+        expect((await response.json()).revision).toBe(base+1);
+        await expect(status).toHaveText('Saved revision: '+(base+1)+' · Base revision: '+(base+1));
         await expect(hop.locator('.error')).toHaveText('');
       };
       await publish('null');
@@ -100,7 +107,9 @@ try {
       const conflict=stalePage.waitForResponse(response=>response.url().endsWith('/authentication/profiles/publish')&&response.request().method()==='POST');
       await staleHop.getByRole('button',{name:'Save profiles',exact:true}).click();
       expect((await conflict).status()).toBe(409);
-      await expect(staleHop.locator('.error')).not.toHaveText('');
+      await expect(staleHop.getByRole('status')).toContainText('Revision conflict; refresh to compare with the latest revision. Draft retained.');
+      await expect(staleEditor).toHaveValue(original);
+      await expect(staleHop.locator('.error')).toHaveText('');
       await expect(staleHop.locator('p').filter({hasText:/^Revision: /})).toHaveText(staleRevision);
       await protectedStatus(401);
       await staleContext.close();
