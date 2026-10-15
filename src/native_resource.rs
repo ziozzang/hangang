@@ -102,6 +102,13 @@ impl Binding {
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
         })
     }
+    pub(crate) fn owns(&self, prepared: &projection_entity::Prepared) -> bool {
+        prepared.belongs_to(&self.scope)
+            && self
+                .gate
+                .actions
+                .contains_key(prepared.request().method().as_str())
+    }
     pub fn scope(&self) -> Arc<projection_entity::Scope> {
         self.scope.clone()
     }

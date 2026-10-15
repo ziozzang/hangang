@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Bind native final admission to bounded, request-scoped random route references.
+  Exact route/snapshot, absolute URI, method and prepared digest must still agree;
+  expiry, cancellation and capacity exhaustion refuse without upstream effects.
+  Remote lookup, permit and replay protocols remain separate work.
 - Fence native receipt requests with the exact activated snapshot identity,
   including equal-revision replacement. Apply the fence to pending authority
   work, final upstream admission and guarded request/response bodies.

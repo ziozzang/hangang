@@ -312,6 +312,7 @@ pub struct Proxy {
     guard: Option<Arc<crate::guard::GuardClient>>,
     request_inspectors: Arc<tokio::sync::Semaphore>,
     native_bodies: Arc<tokio::sync::Semaphore>,
+    native_routes: Arc<crate::native_route_owner::Registry>,
     request_spools: Arc<crate::request_block_spool::Pool>,
     acme_http01: Arc<crate::acme_http01::Admission>,
     active: Arc<ArcSwap<Snapshot>>,
@@ -708,11 +709,14 @@ impl Proxy {
             discovery.clone(),
             shutdown.clone(),
         );
+        let native_routes = crate::native_route_owner::Registry::new(active.clone(), 128)
+            .expect("fixed native route capacity");
         Self {
             active,
             guard: None,
             request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
             native_bodies: Arc::new(tokio::sync::Semaphore::new(128)),
+            native_routes,
             request_spools: Arc::new(crate::request_block_spool::Pool::new()),
             acme_http01: Arc::new(crate::acme_http01::Admission::new()),
             policy,
@@ -3315,6 +3319,10 @@ impl Proxy {
                         Err(_) => return Ok(response(503, "native entity unavailable")),
                     }
                 };
+                let route_owner = match self.native_routes.capture(&snapshot, &runtime, &prepared) {
+                    Ok(owner) => owner,
+                    Err(_) => return Ok(response(503, "native route owner unavailable")),
+                };
                 let observation = tokio::select! {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
@@ -3331,7 +3339,7 @@ impl Proxy {
                 }
                 outgoing = prepared.into_dispatch();
                 outgoing.headers_mut().remove(header::AUTHORIZATION);
-                native_observation = Some((observation, authority.clone()));
+                native_observation = Some((observation, authority.clone(), route_owner));
             }
             // Raw request bodies already carry the guard installed before
             // external auth/Lua/transform buffering. A transformed body is a
@@ -3370,7 +3378,9 @@ impl Proxy {
             }
             if native_observation
                 .as_ref()
-                .is_some_and(|(observation, authority)| !observation.local_fences_hold(authority))
+                .is_some_and(|(observation, authority, route_owner)| {
+                    !route_owner.current() || !observation.local_fences_hold(authority)
+                })
             {
                 return Ok(response(503, "native resource observation retired"));
             }

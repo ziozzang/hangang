@@ -2274,6 +2274,7 @@ pub struct Snapshot {
     pub admissions:
         std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     pub http: Vec<std::sync::Arc<HttpRuntime>>,
+    pub(crate) http_route_indices: std::collections::HashMap<String, usize>,
     pub resource_guards: Vec<std::sync::Arc<HttpRuntime>>,
     /// Authentication-bearing routes impose an unambiguous path/authority
     /// profile on their host, including requests selecting a public fallback.
@@ -2777,6 +2778,11 @@ impl Snapshot {
             })
             .collect();
         http.sort_by_key(|runtime| std::cmp::Reverse(runtime.route.priority));
+        let http_route_indices = http
+            .iter()
+            .enumerate()
+            .map(|(index, runtime)| (runtime.route.id.clone(), index))
+            .collect();
         let previous_tcp_routes: std::collections::HashMap<_, _> = previous
             .into_iter()
             .flat_map(|old| old.config.tcp.iter())
@@ -3123,6 +3129,7 @@ impl Snapshot {
                 .cloned()
                 .collect(),
             http,
+            http_route_indices,
             tcp_health,
             tcp_member_activity,
             tcp_member_admissions,
