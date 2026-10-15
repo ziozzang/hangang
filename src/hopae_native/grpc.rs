@@ -54,6 +54,63 @@ impl Client {
             receipt_started,
         })
     }
+    pub(super) async fn project_credential(
+        &self,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        permit: &crate::projection_permit::CheckedPermit,
+    ) -> io::Result<crate::projected_credential::Credential> {
+        use prost::Message;
+        let _slot = self.slots.try_acquire().map_err(|_| invalid())?;
+        let before = current_wall_ms()?;
+        if !permit.valid_at(before) || !receipt.authentication().valid_at(before) {
+            return Err(invalid());
+        }
+        let begun = std::time::Instant::now();
+        let id = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v < 9_007_199_254_740_991).then(|| v + 1)
+            })
+            .map_err(|_| invalid())?;
+        let query = pumgye_grpc::v1::PermitValidationRequest {
+            request_id: id,
+            request: Some(permit.original().ok_or_else(invalid)?.clone()),
+            permit: Some(permit.wire().clone()),
+        }
+        .encode_to_vec();
+        if query.len() > 8192 {
+            return Err(invalid());
+        }
+        let timeout = Duration::from_millis(permit.expires_ms().saturating_sub(before).min(1000));
+        let mut request = tonic::Request::new(hopae_grpc::v1::ProjectionRequest {
+            request_id: id,
+            permission_contract: 1,
+            permission_query: query,
+        });
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.key.clone());
+        let mut client =
+            hopae_grpc::v1::credential_projection_client::CredentialProjectionClient::new(
+                self.channel.clone(),
+            )
+            .max_encoding_message_size(8448)
+            .max_decoding_message_size(8192);
+        let reply = tokio::time::timeout(timeout, client.project(request))
+            .await
+            .map_err(|_| invalid())?
+            .map_err(|_| invalid())?
+            .into_inner();
+        let after = current_wall_ms()?;
+        if after < before {
+            return Err(invalid());
+        }
+        let now = after
+            .max(before.saturating_add(begun.elapsed().as_millis().min(u64::MAX as u128) as u64));
+        crate::projected_credential::Credential::check(reply, id, receipt, permit, now)
+    }
+
     pub(super) async fn issue_service_receipt(
         &self,
         headers: &HeaderMap,

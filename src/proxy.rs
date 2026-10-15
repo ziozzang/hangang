@@ -3376,6 +3376,13 @@ impl Proxy {
                 }
                 outgoing = prepared.into_dispatch();
                 outgoing.headers_mut().remove(header::AUTHORIZATION);
+                outgoing.headers_mut().remove("x-hopae-subject");
+                if observation
+                    .install_credential(outgoing.headers_mut())
+                    .is_err()
+                {
+                    return Ok(response(503, "native credential expired"));
+                }
                 native_observation = Some((observation, authority.clone(), route_owner));
             }
             // Raw request bodies already carry the guard installed before

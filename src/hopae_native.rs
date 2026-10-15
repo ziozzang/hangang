@@ -35,7 +35,7 @@ pub struct Client {
     slots: Semaphore,
     next: AtomicU64,
 }
-fn invalid() -> io::Error {
+pub(crate) fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid Hopae native exchange")
 }
 async fn read<S: AsyncRead + Unpin + ?Sized>(socket: &mut S) -> io::Result<(u64, Vec<u8>)> {
@@ -127,6 +127,18 @@ impl Client {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "receipt requires gRPC"))?
             .validate_service_receipt(receipt)
+            .await
+    }
+
+    pub(crate) async fn project_credential(
+        &self,
+        receipt: &crate::projection_receipt::CheckedServiceReceipt,
+        permit: &crate::projection_permit::CheckedPermit,
+    ) -> io::Result<crate::projected_credential::Credential> {
+        self.grpc
+            .as_ref()
+            .ok_or_else(invalid)?
+            .project_credential(receipt, permit)
             .await
     }
 

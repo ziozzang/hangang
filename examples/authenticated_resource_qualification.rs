@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
         key_epoch: config.key_epoch,
         public_key: config.public_key.clone(),
         permission_permit: None,
+        project_credentials: false,
         maximum_body_bytes: 1024 * 1024,
         body_timeout_ms: 1000,
     };

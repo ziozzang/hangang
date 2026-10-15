@@ -1033,6 +1033,7 @@ dependencies = [
  "memchr",
  "mlua",
  "p256",
+ "prost",
  "pumgye-client",
  "pumgye-core",
  "pumgye-grpc",
@@ -1065,6 +1066,7 @@ dependencies = [
  "tracing-subscriber",
  "webpki-roots",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1219,7 +1221,7 @@ dependencies = [
 [[package]]
 name = "hopae-grpc"
 version = "0.0.3"
-source = "git+https://github.com/ziozzang/hopae?rev=fd0605361165235086df70e9105ca276327ccb27#fd0605361165235086df70e9105ca276327ccb27"
+source = "git+https://github.com/ziozzang/hopae?rev=96c9af6bc0af1a81cdb42eea3da05f14c763a647#96c9af6bc0af1a81cdb42eea3da05f14c763a647"
 dependencies = [
  "ed25519-dalek",
  "prost",
@@ -2319,7 +2321,7 @@ dependencies = [
 [[package]]
 name = "pumgye-client"
 version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=b4b7f18210f61c9e2f3bfce804cb87591746389b#b4b7f18210f61c9e2f3bfce804cb87591746389b"
+source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
 dependencies = [
  "anyhow",
  "pumgye-protocol",
@@ -2333,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "pumgye-core"
 version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=b4b7f18210f61c9e2f3bfce804cb87591746389b#b4b7f18210f61c9e2f3bfce804cb87591746389b"
+source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
 dependencies = [
  "anyhow",
  "guard-core",
@@ -2344,7 +2346,7 @@ dependencies = [
 [[package]]
 name = "pumgye-grpc"
 version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=b4b7f18210f61c9e2f3bfce804cb87591746389b#b4b7f18210f61c9e2f3bfce804cb87591746389b"
+source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
 dependencies = [
  "hopae-grpc",
  "prost",
@@ -2356,7 +2358,7 @@ dependencies = [
 [[package]]
 name = "pumgye-protocol"
 version = "0.1.6"
-source = "git+https://github.com/ziozzang/pumgye?rev=b4b7f18210f61c9e2f3bfce804cb87591746389b#b4b7f18210f61c9e2f3bfce804cb87591746389b"
+source = "git+https://github.com/ziozzang/pumgye?rev=63414b436f94bb27301ba939ee67eeb80d7b6364#63414b436f94bb27301ba939ee67eeb80d7b6364"
 dependencies = [
  "anyhow",
  "pumgye-core",

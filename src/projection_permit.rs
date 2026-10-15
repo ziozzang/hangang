@@ -28,9 +28,11 @@ pub struct Pin {
 /// Private constructor, no Clone/Debug/serde. A receiver still must consume replay.
 pub struct CheckedPermit {
     wire: ProjectionPermitReply,
+    original: Option<pumgye_grpc::v1::AuthenticatedResourceRequest>,
     checked_ms: u64,
     begun: std::time::Instant,
     expires_ms: u64,
+    signed_expires_ms: u64,
 }
 impl Configuration {
     pub fn compile(&self) -> Result<Pin, Refused> {
@@ -62,12 +64,22 @@ impl Configuration {
     }
 }
 impl CheckedPermit {
+    pub(crate) fn bind_original(&mut self, request: pumgye_grpc::v1::AuthenticatedResourceRequest) {
+        self.original = Some(request);
+    }
+    pub(crate) fn original(&self) -> Option<&pumgye_grpc::v1::AuthenticatedResourceRequest> {
+        self.original.as_ref()
+    }
+
     pub fn valid_at(&self, now: u64) -> bool {
         now >= self.checked_ms
             && now.max(
                 self.checked_ms
                     .saturating_add(self.begun.elapsed().as_millis().min(u64::MAX as u128) as u64),
             ) < self.expires_ms
+    }
+    pub(crate) fn signed_expires_ms(&self) -> u64 {
+        self.signed_expires_ms
     }
     pub fn expires_ms(&self) -> u64 {
         self.expires_ms
@@ -194,6 +206,8 @@ impl Pin {
         }
         let expires_ms = checked.claims().expires_ms;
         Ok(CheckedPermit {
+            original: None,
+            signed_expires_ms: expires_ms,
             wire,
             checked_ms: now,
             begun: std::time::Instant::now(),
@@ -337,6 +351,76 @@ mod tests {
         };
         (pin, authentication, wire)
     }
+    #[test]
+    fn projected_credential_rejects_scope_header_and_deadline_attacks() {
+        use crate::projected_credential::Credential;
+        let (pin, auth, wire) = fixture();
+        let checked = pin
+            .verify(7, "db:orders", "select", 2, 3, &auth, wire, 103)
+            .unwrap();
+        let valid = || hopae_grpc::v1::ProjectionReply {
+            request_id: 9,
+            service: "orders".into(),
+            audience: "orders-api".into(),
+            request_sha256: vec![3; 32],
+            plan_revision: 5,
+            expires_ms: 700,
+            header_name: "authorization".into(),
+            header_value: b"Bearer owned-origin".to_vec(),
+        };
+        for attack in 0..13 {
+            let mut reply = valid();
+            match attack {
+                0 => reply.request_id += 1,
+                1 => reply.service = "other".into(),
+                2 => reply.audience = "other".into(),
+                3 => reply.request_sha256[0] ^= 1,
+                4 => reply.plan_revision += 1,
+                5 => reply.expires_ms = 801,
+                6 => reply.expires_ms = 104,
+                7 => reply.header_name = "host".into(),
+                8 => reply.header_value = b"Bearer injected\r\nX-Test: true".to_vec(),
+                9 => reply.header_value = b"Basic owned".to_vec(),
+                10 => reply.header_value = b"Bearer =a".to_vec(),
+                11 => reply.header_value = vec![b'a'; 4104],
+                _ => {
+                    reply.header_name = "x-hopae-subject".into();
+                    reply.header_value = b"forged".to_vec();
+                }
+            }
+            assert!(
+                Credential::check(reply, 9, &auth, &checked, 104).is_err(),
+                "attack {attack}"
+            );
+        }
+        let mut checked = checked;
+        checked
+            .accept_owner_reply(
+                9,
+                pumgye_grpc::v1::PermitValidationReply {
+                    request_id: 9,
+                    expires_ms: 650,
+                    cache_ttl_ms: 0,
+                },
+                104,
+            )
+            .unwrap();
+        // Independent live observations may conservatively differ. Their
+        // intersection must never extend this gateway's previously accepted bound.
+        let output = Credential::check(valid(), 9, &auth, &checked, 104).unwrap();
+        assert!(output.header(650).is_err());
+        assert_eq!(checked.signed_expires_ms(), 800);
+        let (name, value) = output.header(105).unwrap();
+        assert_eq!(name, "authorization");
+        assert!(value.is_sensitive());
+        assert!(output.header(103).is_err());
+        assert!(output.header(700).is_err());
+        let mut identity = valid();
+        identity.header_name = "x-hopae-subject".into();
+        identity.header_value = b"s_owned".to_vec();
+        assert!(Credential::check(identity, 9, &auth, &checked, 104).is_ok());
+    }
+
     #[test]
     fn checked_permit_retains_native_binding_time_and_revision_fences() {
         let (pin, auth, wire) = fixture();

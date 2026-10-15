@@ -14,6 +14,8 @@ pub struct Configuration {
     pub public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_permit: Option<crate::projection_permit::Configuration>,
+    #[serde(default)]
+    pub project_credentials: bool,
     #[serde(default = "default_body_limit")]
     pub maximum_body_bytes: usize,
     #[serde(default = "default_body_timeout")]
@@ -51,6 +53,11 @@ impl Configuration {
                 .is_none_or(|permit| permit.public_key != self.public_key),
             "authentication and permit purpose keys must be independent"
         );
+        ensure!(
+            !self.project_credentials || self.permission_permit.is_some(),
+            "credential projection requires signed permission permits"
+        );
+        binding.project_credentials = self.project_credentials;
         binding.permit_pin = self
             .permission_permit
             .as_ref()
@@ -77,11 +84,13 @@ pub struct Binding {
     scope: Arc<projection_entity::Scope>,
     pin: projection_receipt::IssuerPin,
     permit_pin: Option<crate::projection_permit::Pin>,
+    project_credentials: bool,
     gate: pumgye::ResourceGate,
     maximum_body_bytes: usize,
     body_timeout: std::time::Duration,
 }
 pub struct Observation {
+    credential: Option<crate::projected_credential::Credential>,
     permit: Option<crate::projection_permit::CheckedPermit>,
     receipt: projection_receipt::CheckedServiceReceipt,
     reply: crate::pumgye_grpc_client::AuthenticatedReply,
@@ -96,6 +105,9 @@ impl Observation {
             return false;
         };
         self.reply.allow
+            && self.credential.as_ref().is_none_or(|credential| {
+                credential.valid_at(now.as_millis().min(u64::MAX as u128) as u64)
+            })
             && self
                 .permit
                 .as_ref()
@@ -105,6 +117,18 @@ impl Observation {
                 .authentication()
                 .valid_at(now.as_millis().min(u64::MAX as u128) as u64)
             && authority.authenticated_observation_current(&self.reply)
+    }
+    pub(crate) fn install_credential(&self, headers: &mut hyper::HeaderMap) -> Result<()> {
+        if let Some(credential) = &self.credential {
+            let now = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis(),
+            )?;
+            let (name, value) = credential.header(now)?;
+            headers.insert(name, value);
+        }
+        Ok(())
     }
     pub fn receipt(&self) -> &projection_receipt::CheckedServiceReceipt {
         &self.receipt
@@ -127,6 +151,7 @@ impl Binding {
             scope,
             pin,
             permit_pin: None,
+            project_credentials: false,
             gate,
             maximum_body_bytes: default_body_limit(),
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
@@ -237,7 +262,26 @@ impl Binding {
                 "native authority observation superseded or expired"
             );
         }
+        let credential = if reply.allow && self.project_credentials {
+            ensure!(
+                route.is_some(),
+                "credential projection requires native route ownership"
+            );
+            Some(
+                hopae
+                    .project_credential(
+                        &receipt,
+                        permit
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("signed permission missing"))?,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         Ok(Observation {
+            credential,
             receipt,
             reply,
             permit,
@@ -260,6 +304,7 @@ mod tests {
                     .to_bytes(),
             ),
             permission_permit: None,
+            project_credentials: false,
             maximum_body_bytes: default_body_limit(),
             body_timeout_ms: default_body_timeout(),
         }

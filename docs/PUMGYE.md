@@ -485,3 +485,42 @@ withdrawal and authority outages. The no-permit mode passes separately. Workspac
 1,301 tests (58 existing explicit ignores), strict Clippy and 942 documentation
 links pass. Receiver replay/projection, fleet/restore fences, static release,
 Kubernetes/operating adoption and throughput remain separate qualifications.
+
+
+### Opt-in final credential projection (source implementation)
+
+Set `auth.native_resource.project_credentials: true` together with
+`permission_permit` and native route-owner queries. The gateway retains the
+original native permission request, then sends it and the checked permit to the
+fixed Hopae mTLS `CredentialProjection/Project` endpoint on its existing bounded
+channel. Contract 1 embeds Pumgye's protobuf rather than duplicating its schema.
+Unsupported transports and missing route ownership refuse without fallback.
+
+The private result validates request correlation, service, audience, final request
+hash, signed plan revision and a deadline within the original signed permit.
+Independent live observations can differ because remaining durations are anchored
+before each RPC; the final credential uses the minimum of the reply deadline and
+the gateway's already accepted deadline. This never extends prior authority. Only
+`authorization` with a bounded RFC 6750 bearer or `x-hopae-subject` matching the
+checked subject is accepted. Credential bytes have zeroizing storage and no
+Debug/Clone/serde, and the installed header is sensitive. The gateway strips
+incoming authorization and subject headers before installing the result. Existing
+route/snapshot/authority fences and the result's monotonic deadline still apply
+at final dispatch. This mode is disabled by default.
+
+Compilation, strict Clippy and the real four-server origin-delivery fixture pass.
+An initial restoration refusal was traced to independent conservative live
+deadlines differing by one millisecond. The result now intersects deadlines
+instead of rejecting a still-signed reply that is later than an earlier live
+observation. A regression shortens accepted permission to 650, accepts a reply
+ending at 700 within the signed 800 limit, and confirms the final header refuses
+at 650. Replies exceeding the signed limit remain rejected.
+
+The corrected full four-server fixture passes twice consecutively, including
+configuration/information-class restoration, wrong keys/issuer/audience/peer/
+caller refusal without origin effects, durable withdrawal and restart tombstones.
+Every successful fixture request asserts the separate referenced origin bearer
+and absence of the incoming API credential. The earlier full regression passed
+1,301 tests (58 existing exclusions); four focused permit/projection tests and
+strict Clippy pass after the correction. The corrected final full workspace passes 1,302 tests (58 existing exclusions);
+no-permit/no-projection compatibility and 942 local documentation links pass. This is not a release or operating-adoption claim.

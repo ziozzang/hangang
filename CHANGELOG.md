@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Add opt-in native credential projection through Hopae's authenticated mTLS RPC.
+  Retain the exact permission request, verify the response scope and signed plan,
+  remove incoming credentials and install only a bounded sensitive origin header.
+  Intersect independent live deadlines without extending earlier authority.
+- Issue and verify independent Pumgye permission receipts, then require live
+  validation of current permission, network, route and projection-plan owners.
+  Missing or incompatible RPCs refuse without fallback or backend dispatch.
+
 - Deliver native request references and destination digests to route-aware
   Pumgye; require acknowledgement of live route checks and reject legacy
   downgrade without backend dispatch. Existing no-owner mode stays explicit.

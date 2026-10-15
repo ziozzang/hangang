@@ -123,6 +123,7 @@ pub mod native_resource;
 pub mod projection_binding;
 pub mod projection_entity;
 
+mod projected_credential;
 pub mod projection_permit;
 pub mod projection_receipt;
 

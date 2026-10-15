@@ -272,7 +272,7 @@ impl Client {
                 .ok_or_else(|| anyhow::anyhow!("native permit validation deadline"))?;
             let mut request = tonic::Request::new(pumgye_grpc::v1::PermitValidationRequest {
                 request_id: validation_id,
-                request: validation_input,
+                request: validation_input.clone(),
                 permit: Some(permit.wire().clone()),
             });
             request
@@ -300,6 +300,10 @@ impl Client {
             permit
                 .accept_owner_reply(validation_id, validation, final_validation)
                 .map_err(|_| anyhow::anyhow!("native permit owner validation refused"))?;
+            permit.bind_original(
+                validation_input
+                    .ok_or_else(|| anyhow::anyhow!("native original request missing"))?,
+            );
         }
         let reply = if let Some(permit) = &permit {
             AuthenticatedReply {
