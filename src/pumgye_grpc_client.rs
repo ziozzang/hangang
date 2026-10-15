@@ -214,6 +214,7 @@ impl Client {
         request
             .metadata_mut()
             .insert("authorization", self.token.clone());
+        let validation_input = pin.is_some().then(|| request.get_ref().clone());
         let (decision, issued) = if pin.is_some() {
             let mut client =
                 pumgye_grpc::v1::projection_permits_client::ProjectionPermitsClient::new(
@@ -241,7 +242,7 @@ impl Client {
             after >= before && receipt.authentication().valid_at(final_ms),
             "authenticated response expired or clock reversed"
         );
-        let permit = match (pin, issued) {
+        let mut permit = match (pin, issued) {
             (Some(pin), Some(wire)) => Some(
                 pin.verify(
                     request_id,
@@ -258,6 +259,48 @@ impl Client {
             (None, None) => None,
             _ => anyhow::bail!("native permit mode mismatch"),
         };
+        if let Some(permit) = permit.as_mut() {
+            let validation_id = self
+                .sequence
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    (value < 9_007_199_254_740_991).then(|| value + 1)
+                })
+                .map_err(|_| anyhow::anyhow!("gRPC request sequence exhausted"))?;
+            let remaining = timeout
+                .checked_sub(begun.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| anyhow::anyhow!("native permit validation deadline"))?;
+            let mut request = tonic::Request::new(pumgye_grpc::v1::PermitValidationRequest {
+                request_id: validation_id,
+                request: validation_input,
+                permit: Some(permit.wire().clone()),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", self.token.clone());
+            request.set_timeout(remaining);
+            let mut client =
+                pumgye_grpc::v1::projection_permits_client::ProjectionPermitsClient::new(
+                    self.channel.clone(),
+                )
+                .max_encoding_message_size(8192)
+                .max_decoding_message_size(128);
+            let validation = tokio::time::timeout(remaining, client.validate(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("native permit validation deadline"))??
+                .into_inner();
+            let after_validation = clock()?;
+            let final_validation = after_validation.max(
+                before.saturating_add(begun.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            );
+            ensure!(
+                after_validation >= after && receipt.authentication().valid_at(final_validation),
+                "native permit validation expired or clock reversed"
+            );
+            permit
+                .accept_owner_reply(validation_id, validation, final_validation)
+                .map_err(|_| anyhow::anyhow!("native permit owner validation refused"))?;
+        }
         let reply = if let Some(permit) = &permit {
             AuthenticatedReply {
                 revision: permit.revision(),

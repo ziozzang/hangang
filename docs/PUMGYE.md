@@ -467,3 +467,21 @@ key/issuer/epoch refusal and restoration, durable permission/profile withdrawal,
 route/plan trust failures and authority outages. This qualifies issuance and
 gateway verification, not receiver replay/projection, static release, Kubernetes,
 operating adoption, multi-owner epoch retirement or throughput.
+
+The permit mode also calls `ProjectionPermits/Validate` on the same admitted
+persistent mTLS channel after signature checks. It sends the original native
+request and exact signed proof; the configured server rechecks its current
+incarnation, native identities/network/route/plan and policy snapshot. A missing
+validation RPC or failed validation refuses without fallback. Validation shares
+the original request's elapsed timeout budget, uses 8192/128-byte request/reply
+limits and requires exact correlation, zero cache TTL and an expiry no later
+than the signed permit. The final checked evidence adopts the shorter deadline.
+This is still a point-in-time owner observation; Hopae must independently check
+its receiver owners and consume paired replay before projection.
+
+The current local four-server permit fixture passes with mandatory live
+validation, wrong pin/owner refusal, restoration, durable permission/profile
+withdrawal and authority outages. The no-permit mode passes separately. Workspace
+1,301 tests (58 existing explicit ignores), strict Clippy and 942 documentation
+links pass. Receiver replay/projection, fleet/restore fences, static release,
+Kubernetes/operating adoption and throughput remain separate qualifications.

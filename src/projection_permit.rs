@@ -69,6 +69,26 @@ impl CheckedPermit {
                     .saturating_add(self.begun.elapsed().as_millis().min(u64::MAX as u128) as u64),
             ) < self.expires_ms
     }
+    pub fn expires_ms(&self) -> u64 {
+        self.expires_ms
+    }
+    pub(crate) fn accept_owner_reply(
+        &mut self,
+        request_id: u64,
+        reply: pumgye_grpc::v1::PermitValidationReply,
+        now: u64,
+    ) -> Result<(), Refused> {
+        if reply.request_id != request_id
+            || reply.cache_ttl_ms != 0
+            || !self.valid_at(now)
+            || reply.expires_ms <= now
+            || reply.expires_ms > self.expires_ms
+        {
+            return Err(Refused);
+        }
+        self.expires_ms = reply.expires_ms;
+        Ok(())
+    }
     pub fn revision(&self) -> u64 {
         self.wire
             .binding
@@ -327,6 +347,42 @@ mod tests {
         assert!(checked.valid_at(104));
         assert!(!checked.valid_at(102));
         assert!(!checked.valid_at(800));
+    }
+    #[test]
+    fn live_owner_reply_cannot_extend_or_cache_a_checked_permit() {
+        let (pin, auth, wire) = fixture();
+        let mut checked = pin
+            .verify(7, "db:orders", "select", 2, 3, &auth, wire, 103)
+            .unwrap();
+        let reply = |request_id, expires_ms, cache_ttl_ms| pumgye_grpc::v1::PermitValidationReply {
+            request_id,
+            expires_ms,
+            cache_ttl_ms,
+        };
+        for bad in [
+            reply(8, 700, 0),
+            reply(7, 801, 0),
+            reply(7, 104, 0),
+            reply(7, 700, 1),
+        ] {
+            assert!(checked.accept_owner_reply(7, bad, 104).is_err());
+        }
+        checked
+            .accept_owner_reply(7, reply(7, 700, 0), 104)
+            .unwrap();
+        assert_eq!(checked.expires_ms(), 700);
+        assert!(checked.valid_at(105));
+        assert!(!checked.valid_at(700));
+        assert!(
+            checked
+                .accept_owner_reply(7, reply(7, 701, 0), 105)
+                .is_err()
+        );
+        assert!(
+            checked
+                .accept_owner_reply(7, reply(7, 650, 0), 102)
+                .is_err()
+        );
     }
     #[test]
     fn scope_chain_purpose_signature_and_retirement_refuse_hostile_replies() {
