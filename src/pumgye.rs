@@ -38,6 +38,14 @@ impl ResourceGate {
     }
     pub fn validate(&self, policy: &pumgye_core::Policy) -> Result<()> {
         self.validate_remote()?;
+        ensure!(
+            policy
+                .services
+                .get(&self.service_id)
+                .is_some_and(|service| service.authorization_context
+                    == pumgye_core::AuthorizationContext::NetworkAndGuard),
+            "gateway routes require network-and-guard authorization context"
+        );
         let resource = policy
             .resources
             .get(&self.resource)
@@ -68,6 +76,10 @@ impl Gate {
             .services
             .get(&self.service_id)
             .ok_or_else(|| anyhow::anyhow!("unknown Pumgye service"))?;
+        ensure!(
+            service.authorization_context == pumgye_core::AuthorizationContext::NetworkAndGuard,
+            "gateway routes require network-and-guard authorization context"
+        );
         ensure!(
             policy.information_classes.contains(&self.information_class),
             "unknown information class"
@@ -983,3 +995,52 @@ impl std::fmt::Display for AuthorityScopeChanged {
     }
 }
 impl std::error::Error for AuthorityScopeChanged {}
+
+#[cfg(test)]
+mod kubernetes_api_context_tests {
+    use super::*;
+    #[test]
+    fn api_policy_roundtrips_without_becoming_a_gateway_network_grant() {
+        let value = serde_json::json!({
+            "version":1,"information_classes":["internal"],
+            "kubernetes_authorization":{"version":1,"principals":[],"routes":[]},
+            "services":{"cluster-api":{"authorization_context":"kubernetes_api","permissions":["read"],"roles":{"reader":{"permissions":["read"],"information_classes":["internal"],"minimum_aal":0}},"users":{"k8sapi:owned-reader":["reader"]},"networks":[],"require_guard":false}},
+            "resources":{"api:settings":{"service":"cluster-api","information_class":"internal","actions":{"get":"read"},"minimum_aal":0}}
+        });
+        let policy: pumgye_core::Policy = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            encoded["kubernetes_authorization"],
+            value["kubernetes_authorization"]
+        );
+        assert_eq!(
+            encoded["services"]["cluster-api"]["authorization_context"],
+            "kubernetes_api"
+        );
+        let compiled = policy.compile().unwrap();
+        assert_ne!(
+            compiled.evaluate(
+                "cluster-api",
+                "k8sapi:owned-reader",
+                "192.0.2.10".parse().unwrap(),
+                "read",
+                "internal",
+                0,
+                pumgye_core::GuardEvidence::EnforcedAllow
+            ),
+            pumgye_core::Decision::Allow
+        );
+        let gate = Gate {
+            service_id: "cluster-api".into(),
+            information_class: "internal".into(),
+            permissions: BTreeMap::from([("GET".into(), vec!["read".into()])]),
+        };
+        assert!(gate.validate(&policy).is_err());
+        let resource = ResourceGate {
+            service_id: "cluster-api".into(),
+            resource: "api:settings".into(),
+            actions: BTreeMap::from([("GET".into(), "get".into())]),
+        };
+        assert!(resource.validate(&policy).is_err());
+    }
+}

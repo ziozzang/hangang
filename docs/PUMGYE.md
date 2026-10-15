@@ -629,3 +629,26 @@ converts a Workload receipt into Service or retries another authority. Full-chai
 qualification requires actual TokenReview, policy, output and backend-effect
 checks, including grant/source/route withdrawal, expiry and replay. Typed source
 code and fixture peers alone do not establish that qualification.
+
+## Kubernetes API authorization context
+
+Services explicitly marked `authorization_context: "kubernetes_api"` use Pumgye's
+API-server mapping and authorization path. The integrated console labels their
+assignments as Kubernetes API subjects, accepts only bounded `k8sapi:` names,
+and disables network/Workload assignment choices. These names are mapping
+metadata, not authenticated Hopae identities. API subjects carry AAL0; roles and
+resources requiring higher assurance cannot grant them access.
+
+Choose **Kubernetes API** when adding an API service. Its draft has no network
+requirements, `require_guard: false`, AAL0 role defaults and the first configured
+information class. Existing mapping and resource JSON is preserved. Configure
+exact caller-cluster/principal/attribute mappings in the policy JSON; adding a
+service or assignment does not activate a webhook or authenticate a caller.
+Source-owned policies remain read-only.
+
+Ordinary services retain the default network-and-guard context. Local gateway
+route validation rejects API-only services for both permission and resource
+gates, and the native network evaluator cannot turn an API assignment into an
+HTTP route grant. Remote authorities independently enforce the same separation.
+An authenticated API-server adapter and its own transport/revocation qualification
+are required before adopting this context for Kubernetes authorization.

@@ -1,5 +1,16 @@
 // English source text is the key. Technical identifiers and user data remain untranslated.
 export default {
+  "Authorization context": "권한 판정 컨텍스트",
+  "Network and Guard": "네트워크·수문장",
+  "User, Workload, Kubernetes API subject, or network CIDR": "사용자·워크로드·Kubernetes API 주체 또는 네트워크 CIDR",
+
+  "Kubernetes API": "Kubernetes API",
+  "Unassigned subjects are guests with no permissions. The service authorization context determines which evidence applies.": "할당되지 않은 주체는 권한 없는 guest입니다. 서비스의 권한 판정 컨텍스트에 따라 필요한 근거가 달라집니다.",
+  "Kubernetes API context: only mapped API subjects apply. Network and Workload assignments are not accepted. API identities carry AAL0; mapping labels are not authentication.": "Kubernetes API 컨텍스트: 매핑된 API 주체만 적용하며 네트워크·워크로드 할당은 받지 않습니다. API 신원은 AAL0이며 매핑 이름 자체는 인증이 아닙니다.",
+  "Unsupported authorization context. Edit the policy JSON before changing assignments.": "지원하지 않는 권한 판정 컨텍스트입니다. 할당 전에 정책 JSON을 수정하세요.",
+  "Choose an assignment kind supported by this service authorization context.": "이 서비스의 권한 판정 컨텍스트에서 지원하는 할당 종류를 선택하세요.",
+  "Kubernetes API subject must start with k8sapi: and use at most 128 ASCII letters, digits, dots, colons, underscores or hyphens.": "Kubernetes API 주체는 k8sapi:로 시작하고 ASCII 영문·숫자·점·콜론·밑줄·하이픈만 사용해 128자 이하여야 합니다.",
+
   "Workload": "워크로드",
   "Hopae user ID, Workload subject, or network CIDR": "호패 사용자 ID, 워크로드 주체 또는 네트워크 CIDR",
   "Choose a supported assignment kind.": "지원하는 할당 종류를 선택하세요.",

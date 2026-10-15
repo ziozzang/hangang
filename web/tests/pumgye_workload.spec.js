@@ -1,7 +1,8 @@
 import {test,expect} from '@playwright/test';
 const subject='s_'+'a'.repeat(48);
-async function setup(page,{source='native',workload=false,conflict=false}={}){
+async function setup(page,{source='native',workload=false,conflict=false,api=false}={}){
   const calls=[];let document={revision:7,policy:{version:1,information_classes:['internal'],services:{orders:{permissions:['read'],roles:{reader:{permissions:['read'],information_classes:['internal'],minimum_aal:1}},users:{[subject]:['reader']},...(workload?{workload_users:{[subject]:['reader']}}:{}),networks:[{cidr:'192.0.2.0/24',roles:['reader']}],require_guard:true}},resources:{'db:orders':{service:'orders',information_class:'internal',actions:{select:'read'},minimum_aal:2}}}};
+  if(api){const v=document.policy.services.orders;v.authorization_context='kubernetes_api';v.users={'k8sapi:owned-reader':['reader']};v.networks=[];v.require_guard=false;v.roles.reader.minimum_aal=0;document.policy.kubernetes_authorization={version:1,principals:[],routes:[]};}
   await page.route('**/*',async route=>{
     const request=route.request(),path=new URL(request.url()).pathname;
     if(path.startsWith('/ui/'))return route.continue();
@@ -22,7 +23,7 @@ async function setup(page,{source='native',workload=false,conflict=false}={}){
     if(path==='/v1/pumgye/audit')return route.fulfill({json:[]});
     return route.fulfill({status:404,body:''});
   });
-  await page.goto('/ui/');await page.getByLabel('Administrator token').fill('fixture-admin');await page.getByRole('button',{name:'Connect',exact:true}).click();await expect(page.locator('#login-dialog')).toBeHidden();await page.locator('.sidebar [data-view="pumgye"]').click();await expect(page.locator('#pumgye-matrix tr')).toHaveCount(workload?3:2);
+  await page.goto('/ui/');await page.getByLabel('Administrator token').fill('fixture-admin');await page.getByRole('button',{name:'Connect',exact:true}).click();await expect(page.locator('#login-dialog')).toBeHidden();await page.locator('.sidebar [data-view="pumgye"]').click();await expect(page.locator('#pumgye-matrix tr')).toHaveCount(api?1:workload?3:2);
   return {calls,writes:()=>calls.filter(c=>c.path==='/v1/pumgye/policy'&&c.method==='PUT')};
 }
 async function assign(page,id=subject,roles='reader'){
@@ -66,4 +67,37 @@ test('ordinary User edits leave the optional empty Workload map absent',async({p
 test('detached Workload row callbacks cannot mutate a newer render or a new session',async({page})=>{
   await setup(page,{workload:true});await page.evaluate(()=>window.oldRenderButton=document.querySelector('[data-assignment-kind="workload"] button'));await assign(page,subject,'guest');let before=await page.locator('#pumgye-document').inputValue();await page.evaluate(()=>window.oldRenderButton.click());expect(await page.locator('#pumgye-document').inputValue()).toBe(before);
   await page.evaluate(()=>window.oldSessionButton=document.querySelector('[data-assignment-kind="workload"] button'));await page.locator('#logout-button').click();await expect(page.locator('#login-dialog')).toBeVisible();await page.locator('#token-input').fill('fixture-next-admin');await page.getByRole('button',{name:'Connect',exact:true}).click();await expect(page.locator('#login-dialog')).toBeHidden();await page.locator('.sidebar [data-view="pumgye"]').click();await expect(page.locator('[data-assignment-kind="workload"]')).toHaveCount(1);before=await page.locator('#pumgye-document').inputValue();await page.evaluate(()=>window.oldSessionButton.click());expect(await page.locator('#pumgye-document').inputValue()).toBe(before);
+});
+
+
+test('API context preserves native mapping and uses typed API assignments through owning CAS',async({page})=>{
+  const {writes}=await setup(page,{api:true});
+  await expect(page.locator('#pumgye-kind')).toHaveValue('kubernetes_api');
+  await expect(page.locator('#pumgye-kind option[value="network"]')).toBeDisabled();
+  await expect(page.locator('#pumgye-kind option[value="workload"]')).toBeDisabled();
+  await expect(page.locator('#pumgye-guard-requirement')).toContainText('API identities carry AAL0');
+  await expect(page.locator('[data-assignment-kind="kubernetes_api"]')).toContainText('k8sapi:owned-reader');
+  await page.locator('#pumgye-subject').fill('k8sapi:owned-new');await page.locator('#pumgye-assignment-roles').fill('guest');await page.locator('#pumgye-assignment-form button').click();
+  await page.locator('#pumgye-publish').click();await expect.poll(()=>writes().length).toBe(1);
+  const w=writes()[0];expect(w.headers['if-match']).toBe('"7"');expect(w.body.policy.kubernetes_authorization).toEqual({version:1,principals:[],routes:[]});expect(w.body.policy.services.orders.users['k8sapi:owned-new']).toEqual(['guest']);expect(w.body.policy.services.orders.authorization_context).toBe('kubernetes_api');expect(w.body.policy.services.orders).not.toHaveProperty('workload_users');expect(w.body.policy.services.orders.networks).toEqual([]);
+  await page.locator('[data-assignment-kind="kubernetes_api"]').filter({hasText:'k8sapi:owned-new'}).getByRole('button').click();expect((await policy(page)).services.orders.users).not.toHaveProperty('k8sapi:owned-new');
+});
+test('API context rejects forged assignment kinds and invalid API subjects without rewriting draft',async({page})=>{
+  await setup(page,{api:true});const original=await page.locator('#pumgye-document').inputValue();
+  for(const kind of ['network','workload','user']){
+    await page.evaluate(kind=>{const s=document.querySelector('#pumgye-kind');s.value=kind;document.querySelector('#pumgye-assignment-form').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));},kind);
+    await expect(page.locator('#pumgye-message')).toContainText('supported by this service');await expect(page.locator('#pumgye-document')).toHaveValue(original);
+  }
+  for(const subject of ['reader','k8sapi:',' k8sapi:reader','k8sapi:'+ 'a'.repeat(122),'k8sapi:한글']){
+    await page.evaluate(()=>document.querySelector('#pumgye-kind').value='kubernetes_api');await page.evaluate(subject=>document.querySelector('#pumgye-subject').value=subject,subject);await page.locator('#pumgye-assignment-roles').fill('reader');await page.locator('#pumgye-assignment-form button').click();await expect(page.locator('#pumgye-message')).toContainText('must start with k8sapi:');await expect(page.locator('#pumgye-document')).toHaveValue(original);
+  }
+});
+for(const locale of ['en','ko'])test(`API context remains typed and bounded in ${locale}`,async({page})=>{
+  await page.setViewportSize({width:390,height:900});await setup(page,{api:true});await page.locator('#locale-select').selectOption(locale);await expect(page.locator('#pumgye-guard-requirement')).toContainText(locale==='ko'?'매핑된 API 주체':'only mapped API subjects');await expect(page.locator('#pumgye-kind')).toHaveValue('kubernetes_api');expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+});
+
+test('create API service with explicit context and current class without losing raw editor work',async({page})=>{
+  await setup(page,{api:true});const current=await policy(page);current.resources['api:preserved']={service:'orders',information_class:'internal',actions:{get:'read'},minimum_aal:0};await page.locator('#pumgye-document').fill(JSON.stringify(current));
+  await page.locator('#pumgye-new-service').fill('cluster-api');await page.locator('#pumgye-new-context').selectOption('kubernetes_api');await page.locator('#pumgye-service-form button').click();
+  const updated=await policy(page);expect(updated.resources['api:preserved']).toEqual(current.resources['api:preserved']);expect(updated.kubernetes_authorization).toEqual(current.kubernetes_authorization);expect(updated.services['cluster-api']).toMatchObject({authorization_context:'kubernetes_api',networks:[],users:{},require_guard:false,roles:{reader:{minimum_aal:0,information_classes:['internal']},writer:{minimum_aal:0,information_classes:['internal']}}});await expect(page.locator('#pumgye-kind')).toHaveValue('kubernetes_api');
 });

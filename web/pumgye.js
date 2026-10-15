@@ -28,6 +28,8 @@ function assignmentDraft() {
     return current;
   } catch { message(t('Correct the authorization policy JSON before changing assignments.')); return null; }
 }
+const apiContext = service => service?.authorization_context === 'kubernetes_api';
+const ordinaryContext = service => service?.authorization_context === undefined || service.authorization_context === 'network_and_guard';
 const assignmentMap = value => value && typeof value === 'object' && !Array.isArray(value);
 
 function sourceSummary(status) {
@@ -68,21 +70,25 @@ function renderMatrix() {
   const matrix = ++matrixGeneration, own = generation, serviceId = $('pumgye-service').value;
   const table = $('pumgye-matrix'); table.replaceChildren();
   const service = draft?.services?.[serviceId];
-  const requirement = service ? (service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
+  const api = apiContext(service), ordinary = ordinaryContext(service);
+  const kinds = $('pumgye-kind');
+  for (const option of kinds.options) option.disabled = api ? option.value !== 'kubernetes_api' : !ordinary || option.value === 'kubernetes_api';
+  if (kinds.selectedOptions[0]?.disabled) kinds.value = api ? 'kubernetes_api' : ordinary ? 'user' : '';
+  const requirement = service ? (api ? 'Kubernetes API context: only mapped API subjects apply. Network and Workload assignments are not accepted. API identities carry AAL0; mapping labels are not authentication.' : !ordinary ? 'Unsupported authorization context. Edit the policy JSON before changing assignments.' : service.require_guard ? 'Enforced Sumunjang allow evidence is required. Observe mode or unavailable evidence refuses access.' : 'Enforced Sumunjang allow evidence is not required. User and network permissions still apply; an explicit network denial refuses access.') : '';
   $('pumgye-guard-requirement').textContent = requirement ? t(requirement) : '';
   if (requirement) $('pumgye-guard-requirement').dataset.i18n = requirement;
   else delete $('pumgye-guard-requirement').dataset.i18n;
   if (!service) return;
-  for (const [kind, rows] of [['User', Object.entries(service.users || {})], ['Workload', Object.entries(service.workload_users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
+  for (const [kind, rows] of [[api ? 'Kubernetes API' : 'User', Object.entries(service.users || {})], ['Workload', Object.entries(service.workload_users || {})], ['Network', (service.networks || []).map(n => [n.cidr, n.roles])]]) {
     for (const [id, roles] of rows) {
-      const tr = window.document.createElement('tr'); tr.dataset.assignmentKind = kind.toLowerCase();
+      const tr = window.document.createElement('tr'); tr.dataset.assignmentKind = kind === 'Kubernetes API' ? 'kubernetes_api' : kind.toLowerCase();
       for (const [column, value] of [t(kind), id, roles.join(', ')].entries()) { const td = window.document.createElement('td'); if (column === 0) td.dataset.i18n = kind; td.append(text(value)); tr.append(td); }
       const td = window.document.createElement('td'); const button = window.document.createElement('button'); button.type = 'button'; button.className = 'button button-quiet'; button.textContent = t('Remove'); button.dataset.i18n = 'Remove'; button.disabled = sourceManaged;
       button.addEventListener('click', () => {
         if (sourceManaged || own !== generation || matrix !== matrixGeneration) return;
         const current = assignmentDraft(); if (!current) return;
         const active = current.services?.[serviceId]; if (!active) return;
-        if (kind === 'User' || kind === 'Workload') {
+        if (kind === 'User' || kind === 'Workload' || kind === 'Kubernetes API') {
           const field = kind === 'Workload' ? 'workload_users' : 'users';
           if (!assignmentMap(active[field]) || !Object.hasOwn(active[field], id)) return;
           delete active[field][id];
@@ -94,7 +100,7 @@ function renderMatrix() {
   }
   $('pumgye-roles').textContent = JSON.stringify(service.roles, null, 2);
 }
-export function resetPumgye() { publishing = false; outcomeUnknown = false; sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-kind')) $('pumgye-kind').value='user'; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject','pumgye-new-service','pumgye-assignment-roles']) if ($(id)) $(id).value=''; if ($('pumgye-service')) $('pumgye-service').replaceChildren(); if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit','pumgye-message']) if ($(id)) $(id).textContent=''; }
+export function resetPumgye() { publishing = false; outcomeUnknown = false; sourceOwner = 'native'; sourceManaged = false; sourceControls(); generation++; context = null; document = null; etag = null; draft = null; dirty = false; independent=false; authorityRevision=null; if ($('pumgye-kind')) $('pumgye-kind').value='user'; if ($('pumgye-new-context')) $('pumgye-new-context').value='network_and_guard'; if ($('pumgye-authority-panel')) $('pumgye-authority-panel').hidden=true; for (const id of ['pumgye-document','pumgye-subject','pumgye-new-service','pumgye-assignment-roles']) if ($(id)) $(id).value=''; if ($('pumgye-service')) $('pumgye-service').replaceChildren(); if ($('pumgye-matrix')) $('pumgye-matrix').replaceChildren(); if ($('pumgye-resources')) $('pumgye-resources').replaceChildren(); if ($('pumgye-roles')) $('pumgye-roles').textContent=''; if ($('pumgye-guard-requirement')) { $('pumgye-guard-requirement').textContent=''; delete $('pumgye-guard-requirement').dataset.i18n; } for (const id of ['pumgye-source-summary','pumgye-authority-status','pumgye-audit','pumgye-message']) if ($(id)) $(id).textContent=''; }
 export async function loadPumgye(host, { resume = false } = {}) {
   // A navigation resume retains the exact draft and its base revisions in memory.
   // Only explicit Refresh may replace it, including invalid raw JSON.
@@ -127,31 +133,42 @@ export async function loadPumgye(host, { resume = false } = {}) {
     $('pumgye-authority-status').textContent=JSON.stringify(status.data,null,2);
     $('pumgye-audit').textContent=JSON.stringify(audit.data,null,2);
   } else { sourceOwner = 'native'; sourceManaged = false; document = result.data; etag = result.etag || `"${document.revision}"`; authorityRevision=null; }
-  draft = structuredClone((independent?document.policy:document.pumgye) || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; outcomeUnknown=false; sourceControls(); render(); message(sourceManaged ? t(sourceOwner === 'kubernetes' ? 'Kubernetes owns this policy. Change the source RBAC or its mapping, then refresh.' : 'Policy source ownership is unreported. Native editing is disabled.') : t('Unassigned users are guests with no permissions. User and network rights must both allow access.'));
+  draft = structuredClone((independent?document.policy:document.pumgye) || { version:1, information_classes:['public','internal','confidential','restricted'], services:{} }); dirty=false; outcomeUnknown=false; sourceControls(); render(); message(sourceManaged ? t(sourceOwner === 'kubernetes' ? 'Kubernetes owns this policy. Change the source RBAC or its mapping, then refresh.' : 'Policy source ownership is unreported. Native editing is disabled.') : t('Unassigned subjects are guests with no permissions. The service authorization context determines which evidence applies.'));
 }
 $('pumgye-service').addEventListener('change', renderMatrix);
 $('pumgye-document').addEventListener('input', () => { if (!sourceManaged) dirty = true; });
 $('pumgye-document').addEventListener('change', () => { try { edit(); message(t('Draft updated. Publish to apply.')); } catch (e) { dirty=true; message(e.message); } });
 $('pumgye-refresh').addEventListener('click', () => { if (dirty && !confirm(t('Discard unsaved authorization changes?'))) return; if (context) loadPumgye(context).catch(e=>message(e.message)); });
 $('pumgye-service-form').addEventListener('submit', (event) => {
-  event.preventDefault(); if (sourceManaged || !draft) return; const id=$('pumgye-new-service').value.trim(); if (!id || draft.services[id]) return message(t('Choose a new service ID.'));
-  draft.services[id]={ permissions:['read','write'], roles:{reader:{permissions:['read'],information_classes:['public'],inherits:[],minimum_aal:1},writer:{permissions:['write'],information_classes:['public'],inherits:['reader'],minimum_aal:2}},users:{},networks:[],require_guard:true };
+  event.preventDefault(); if (sourceManaged || !draft) return;
+  const current = assignmentDraft(); if (!current) return;
+  const id=$('pumgye-new-service').value.trim(), selectedContext=$('pumgye-new-context').value;
+  if (!assignmentMap(current.services) || !id || Object.hasOwn(current.services,id)) return message(t('Choose a new service ID.'));
+  if (!['network_and_guard','kubernetes_api'].includes(selectedContext)) return message(t('Choose an assignment kind supported by this service authorization context.'));
+  const api = selectedContext === 'kubernetes_api', informationClass = current.information_classes?.[0];
+  if (typeof informationClass !== 'string') return message(t('Correct the authorization policy JSON before changing assignments.'));
+  const service={ permissions:['read','write'], roles:{reader:{permissions:['read'],information_classes:[informationClass],inherits:[],minimum_aal:api?0:1},writer:{permissions:['write'],information_classes:[informationClass],inherits:['reader'],minimum_aal:api?0:2}},users:{},networks:[],require_guard:!api };
+  if (api) service.authorization_context='kubernetes_api';
+  Object.defineProperty(current.services,id,{value:service,enumerable:true,writable:true,configurable:true});
+  draft=current;
   dirty=true; render(); $('pumgye-service').value=id; renderMatrix();
 });
 $('pumgye-assignment-form').addEventListener('submit', event => {
   event.preventDefault(); if (sourceManaged) return;
   const kind = $('pumgye-kind').value;
-  if (!['user', 'workload', 'network'].includes(kind)) return message(t('Choose a supported assignment kind.'));
+  if (!['user', 'workload', 'network', 'kubernetes_api'].includes(kind)) return message(t('Choose a supported assignment kind.'));
   // Never replace invalid raw editor work with the last valid structured draft.
   const current = assignmentDraft(); if (!current) return;
   const service = current?.services?.[$('pumgye-service').value]; if (!service) return;
+  if (apiContext(service) ? kind !== 'kubernetes_api' : !ordinaryContext(service) || kind === 'kubernetes_api') return message(t('Choose an assignment kind supported by this service authorization context.'));
   const raw = $('pumgye-subject').value;
-  const id = kind === 'workload' ? raw : raw.trim();
+  const id = kind === 'workload' || kind === 'kubernetes_api' ? raw : raw.trim();
+  if (kind === 'kubernetes_api' && (id.length > 128 || !/^k8sapi:[A-Za-z0-9_.:-]+$/.test(id))) return message(t('Kubernetes API subject must start with k8sapi: and use at most 128 ASCII letters, digits, dots, colons, underscores or hyphens.'));
   if (kind === 'workload' && (id.length !== 50 || !/^s_[0-9a-f]{48}$/.test(id))) return message(t('Workload subject must be s_ followed by exactly 48 lowercase hexadecimal characters.'));
   const roles = $('pumgye-assignment-roles').value.split(',').map(x => x.trim()).filter(Boolean);
   if (!id || !roles.length || roles.some(role => role !== 'guest' && !Object.hasOwn(service.roles || {}, role))) return message(t('Use an existing role or guest.'));
   draft = current;
-  if (kind === 'user' || kind === 'workload') {
+  if (kind === 'user' || kind === 'workload' || kind === 'kubernetes_api') {
     const field = kind === 'workload' ? 'workload_users' : 'users';
     if (!Object.hasOwn(service, field)) Object.defineProperty(service, field, { value: {}, enumerable: true, writable: true, configurable: true });
     if (!assignmentMap(service[field])) return message(t('Correct the authorization policy JSON before changing assignments.'));
