@@ -120,6 +120,28 @@ impl CheckedPermit {
         &self.wire
     }
 }
+// Canonical signature data only: this does not construct authentication evidence.
+fn observed_binding_identity(
+    identity: &hopae_grpc::v1::ReceiptIdentity,
+    kind: hopae_grpc::PrincipalKind,
+) -> Result<receipt_binding::Identity<'_>, Refused> {
+    let aal = u8::try_from(identity.aal).map_err(|_| Refused)?;
+    if if kind == hopae_grpc::PrincipalKind::Human {
+        !matches!(aal, 1 | 2)
+    } else {
+        aal != 0
+    } {
+        return Err(Refused);
+    }
+    Ok(receipt_binding::Identity {
+        subject_ref: &identity.subject_ref,
+        kind,
+        aal,
+        revision: identity.revision,
+        credential_generation: identity.credential_generation,
+    })
+}
+
 impl Pin {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_observed_signature(
@@ -170,13 +192,7 @@ impl Pin {
             issuer_ref: &context.issuer_ref,
             key_epoch: context.key_epoch,
             identity_authority_epoch: &context.identity_authority_epoch,
-            identity: receipt_binding::Identity {
-                subject_ref: &identity.subject_ref,
-                kind: authentication.principal_kind(),
-                aal: 0,
-                revision: identity.revision,
-                credential_generation: identity.credential_generation,
-            },
+            identity: observed_binding_identity(identity, authentication.principal_kind())?,
             service: &context.service,
             audience: &context.audience,
             request_sha256: auth
