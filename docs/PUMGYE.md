@@ -672,3 +672,83 @@ chain. Unassigned and guest subjects have no permissions. Upgrade every strict
 policy reader and the owning Pumgye authority before publishing a nonempty
 `human_users` map; older readers reject the field. Do not remove the field to
 force an older runtime to load an active authorization policy.
+
+
+### Private native Human dispatch candidate (not operating support)
+
+This source checkpoint prepares the Human path; it does **not** enable complete
+Human dispatch. Its final Human projection adapter returns `Unsupported` until a
+qualified public Hopae contract4 RPC is integrated. Do not deploy a Human route
+from this example as an operationally supported configuration. Existing Service,
+Workload and strict modes retain their separate contracts.
+
+Under `auth.native_resource`, the following **fragment** supplements the existing
+fixed authentication public pin, independent `permission_permit` public pin,
+`project_credentials: true`, native mTLS transport and enforced remote resource
+gate. It is not a complete route or a source of identity:
+
+```json
+{
+  "observed": {
+    "authentication_class": "human",
+    "identity_authority": "owned-human",
+    "minimum_profile_revision": 7,
+    "minimum_application_generation": 1,
+    "minimum_key_registry_revision": 1,
+    "source_error_ppm": 500,
+    "receiver_error_ppm": 500,
+    "maximum_final_header_bytes": 32768
+  },
+  "human_binding": {
+    "app_id": "native-app",
+    "header_policy_revision": 13,
+    "header_names": ["x-tenant"]
+  }
+}
+```
+
+`human_binding` is required exactly for explicit Human observed routes. The
+actual route ID, positive published configuration revision, selected pool origin,
+service and audience determine the fixed SDK scopes. Every distinct configured
+HTTP(S) pool origin is compiled in advance; an unknown or symbolic discovery
+origin refuses rather than becoming trusted from a request. Dynamic discovery
+requires a later qualified fixed-origin publication mechanism. Hopae must publish
+matching application/route/revision/destination/header-policy scope fingerprints.
+`minimum_profile_revision` is the Human **source-scope** revision floor, never a
+global floor for individual users. Clock-rate bounds are explicit operator claims
+about the source and receiver; the gateway does not infer them.
+
+Before Lua or body transforms, an authenticated native Verify response must supply
+unique `x-hopae-human-policy-subject` and `x-hopae-human-policy-issuer` metadata,
+with the pinned issuer, canonical `human1:` subject and actual AAL1 or AAL2. The
+legacy raw user ID is not converted locally. Typed HumanResourceAuthorization
+checks the actual Guard evidence and `human_users`; absent authority, guest,
+Service/Workload metadata and legacy `users` do not substitute for this decision.
+These metadata are not proofs. Final opaque Human SDK authentication must agree
+with that same subject and AAL; native current-owner checks and a signed typed
+permission chain remain mandatory. AAL2 requires actual supported factor evidence,
+not a configured label or an assurance-3 fallback.
+
+The SDK preparation binds actual collected final body bytes (up to 16 MiB), method,
+path/query and configured header presence/values with H1v2. Human destination is
+`SHA256("hangang-human-origin-v1\0" || LP32(scheme) || LP32(host) || BE16(port))`
+for the **selected connection origin**, never incoming Host. DNS case/default
+ports and IPv6 are canonicalized; userinfo, invalid ports and ambiguous numeric
+hosts refuse. Service/Workload destination meanings are unchanged. Forwarded
+Host/authority, forwarding headers and TLS policy remain separately sealed by the
+per-request route owner; Host is excluded from H1v2, not free to change afterward.
+
+Original frontend cookie/IP/UA/host verification context is retained for native
+H0 authentication. Cookies, submitted Authorization, private caller headers and
+identity metadata are stripped from the final upstream request. After preparation,
+only the validated declared projection credential and deterministic Content-Length
+framing may change; duplicate credentials, Host/cookie reintroduction and routing
+or header mutation refuse. No proof cache keyed only by H1v2 digest is introduced.
+
+Current qualification covers origin vectors, fixed scopes, fragmented actual-body
+preparation, request seals, configuration refusal and actual HTTP pre-Lua class
+mismatch/backend-zero controls, plus existing Service/Workload regressions. It
+does not establish Human contract4 output, a four-core backend success, operating
+adoption, distributed freshness snapshots or a 100k throughput claim. Public H4
+integration and exact end-to-end current/revocation/replay/backend-zero-or-one
+qualification remain required before publication/adoption under existing authority.

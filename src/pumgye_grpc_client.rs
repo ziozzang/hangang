@@ -12,6 +12,12 @@ use std::{
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// Native resource/action scope; classification remains owned by Pumgye.
+#[derive(Clone, Copy)]
+pub(crate) enum ResourceClass {
+    Legacy,
+    Workload,
+    Human,
+}
 pub struct ResourceQuery<'a> {
     pub service_id: &'a str,
     pub minimum_revision: u64,
@@ -139,6 +145,10 @@ impl Client {
             }
             crate::native_observed::AuthenticationClass::Workload => {
                 let mut client = pumgye_grpc::v1::workload_observed_projection_permits_client::WorkloadObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
+                tokio::time::timeout(timeout, client.issue(request)).await
+            }
+            crate::native_observed::AuthenticationClass::Human => {
+                let mut client=pumgye_grpc::v1::human_observed_projection_permits_client::HumanObservedProjectionPermitsClient::new(self.channel.clone()).max_encoding_message_size(8192).max_decoding_message_size(4096);
                 tokio::time::timeout(timeout, client.issue(request)).await
             }
         };
@@ -429,19 +439,32 @@ impl Client {
         Ok((reply, permit))
     }
     pub async fn decide_resource(&self, query: &ResourceQuery<'_>) -> Result<ResourceReply> {
-        self.decide_resource_typed(query, false).await
+        self.decide_resource_typed(query, ResourceClass::Legacy)
+            .await
     }
     pub(crate) async fn decide_workload_resource(
         &self,
         query: &ResourceQuery<'_>,
     ) -> Result<ResourceReply> {
         ensure!(query.aal == 0, "Workload point decision requires AAL0");
-        self.decide_resource_typed(query, true).await
+        self.decide_resource_typed(query, ResourceClass::Workload)
+            .await
+    }
+    pub(crate) async fn decide_human_resource(
+        &self,
+        query: &ResourceQuery<'_>,
+    ) -> Result<ResourceReply> {
+        ensure!(
+            matches!(query.aal, 1 | 2) && pumgye_core::HumanSubject::parse(query.subject).is_ok(),
+            "Human point decision scope refused"
+        );
+        self.decide_resource_typed(query, ResourceClass::Human)
+            .await
     }
     async fn decide_resource_typed(
         &self,
         query: &ResourceQuery<'_>,
-        workload: bool,
+        class: ResourceClass,
     ) -> Result<ResourceReply> {
         ensure!(
             query.aal <= 3
@@ -492,9 +515,12 @@ impl Client {
         request
             .metadata_mut()
             .insert("authorization", self.token.clone());
-        let response = if workload {
+        let response = if matches!(class,ResourceClass::Workload) {
             let mut client = pumgye_grpc::v1::workload_resource_authorization_client::WorkloadResourceAuthorizationClient::new(self.channel.clone()).max_decoding_message_size(1024).max_encoding_message_size(2048);
             tokio::time::timeout(self.timeout, client.decide(request)).await
+        } else if matches!(class,ResourceClass::Human) {
+            let mut client=pumgye_grpc::v1::human_resource_authorization_client::HumanResourceAuthorizationClient::new(self.channel.clone()).max_decoding_message_size(1024).max_encoding_message_size(2048);
+            tokio::time::timeout(self.timeout,client.decide(request)).await
         } else {
             let mut client = pumgye_grpc::v1::resource_authorization_client::ResourceAuthorizationClient::new(self.channel.clone()).max_decoding_message_size(1024).max_encoding_message_size(2048);
             tokio::time::timeout(self.timeout, client.decide(request)).await

@@ -1,7 +1,10 @@
 //! Separate native observed chain. Each source contributes only a receiver-local
 //! deadline; no source absolute expiry is compared with another clock domain.
 use anyhow::{Result, ensure};
-use hopae_grpc::{observed_client as sdk, receipt_time, workload_observed_client as workload};
+use hopae_grpc::{
+    human_observed_client as human, observed_client as sdk, receipt_time,
+    workload_observed_client as workload,
+};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -14,6 +17,7 @@ pub enum AuthenticationClass {
     #[default]
     Service,
     Workload,
+    Human,
 }
 impl AuthenticationClass {
     fn is_service(&self) -> bool {
@@ -44,6 +48,7 @@ pub(crate) struct Owner {
     epoch: u64,
     public: [u8; 32],
     scope: sdk::ServiceScope,
+    human_scopes: Option<Arc<crate::native_human::Scopes>>,
     client: OnceLock<(Arc<()>, Arc<ObservedClient>)>,
     active: AtomicBool,
 }
@@ -96,9 +101,26 @@ impl Owner {
             epoch,
             public,
             scope: sdk::ServiceScope { service, audience },
+            human_scopes: None,
             client: OnceLock::new(),
             active: AtomicBool::new(true),
         })
+    }
+    pub(crate) fn set_human_scopes(
+        &mut self,
+        scopes: Arc<crate::native_human::Scopes>,
+    ) -> Result<()> {
+        ensure!(
+            self.configuration.authentication_class == AuthenticationClass::Human
+                && self.client.get().is_none()
+                && self.human_scopes.is_none(),
+            "Human scope publication mismatch"
+        );
+        self.human_scopes = Some(scopes);
+        Ok(())
+    }
+    pub(crate) fn issuer_ref(&self) -> &str {
+        &self.issuer
     }
     pub(crate) fn configured_class(&self) -> AuthenticationClass {
         self.configuration.authentication_class
@@ -162,6 +184,26 @@ impl Owner {
                     rates,
                 )?))
             }
+            AuthenticationClass::Human => ObservedClient::Human(Arc::new(
+                transport.human_observed_client(
+                    human::HumanTrustPolicy {
+                        issuer_ref: policy.issuer_ref,
+                        key_epoch: policy.key_epoch,
+                        verifying_key: policy.verifying_key,
+                        identity_authority: policy.identity_authority,
+                        scopes: self
+                            .human_scopes
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("Human route scopes unprepared"))?
+                            .all(),
+                        minimum_source_revision: policy.minimum_profile_revision,
+                        minimum_application_generation: policy.minimum_application_generation,
+                        minimum_key_registry_revision: policy.minimum_key_registry_revision,
+                    },
+                    self.clock.clone(),
+                    rates,
+                )?,
+            )),
         });
         // A racing first request may construct an unused client, but only the
         // published persistent client may issue or observe any proof.
@@ -227,6 +269,47 @@ impl Owner {
                     evidence,
                 }
             }
+            ObservedClient::Human(client) => {
+                let scope = prepared
+                    .human_scope()
+                    .ok_or_else(|| anyhow::anyhow!("Human final v2 preparation required"))?;
+                let scopes = self
+                    .human_scopes
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Human scope owner unavailable"))?;
+                ensure!(
+                    scopes.digest(scope, prepared.request())? == prepared.digest(),
+                    "Human final bytes changed"
+                );
+                let bound =
+                    crate::native_human::bound_headers(scope, prepared.request().headers())?;
+                let request = client
+                    .prepare(
+                        scope,
+                        &crate::native_human::actual(scope, prepared.request(), &bound),
+                        headers,
+                    )
+                    .map_err(|_| anyhow::anyhow!("Human actual-body SDK preparation refused"))?;
+                let evidence = client
+                    .issue(request)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Human native authentication refused"))?;
+                ensure!(
+                    evidence.context().request_sha256.as_slice() == prepared.digest()
+                        && evidence
+                            .scope()
+                            .fingerprint()
+                            .map_err(|_| anyhow::anyhow!("Human source scope refused"))?
+                            == scope
+                                .fingerprint()
+                                .map_err(|_| anyhow::anyhow!("Human route scope refused"))?,
+                    "Human actual-source binding differs"
+                );
+                Authentication::Human {
+                    client: client.clone(),
+                    evidence,
+                }
+            }
         };
         ensure!(
             self.active.load(Ordering::Acquire),
@@ -238,12 +321,14 @@ impl Owner {
 pub(crate) enum ObservedClient {
     Service(Arc<sdk::Client>),
     Workload(Arc<workload::Client>),
+    Human(Arc<human::Client>),
 }
 impl ObservedClient {
     fn retire(&self) {
         match self {
             Self::Service(c) => c.retire(),
             Self::Workload(c) => c.retire(),
+            Self::Human(c) => c.retire(),
         }
     }
 }
@@ -257,24 +342,31 @@ pub(crate) enum Authentication {
         client: Arc<workload::Client>,
         evidence: workload::Observation,
     },
+    Human {
+        client: Arc<human::Client>,
+        evidence: human::Observation,
+    },
 }
 impl Authentication {
     pub(crate) fn class(&self) -> AuthenticationClass {
         match self {
             Self::Service { .. } => AuthenticationClass::Service,
             Self::Workload { .. } => AuthenticationClass::Workload,
+            Self::Human { .. } => AuthenticationClass::Human,
         }
     }
     pub(crate) fn principal_kind(&self) -> hopae_grpc::PrincipalKind {
         match self {
             Self::Service { .. } => hopae_grpc::PrincipalKind::Service,
             Self::Workload { .. } => hopae_grpc::PrincipalKind::Workload,
+            Self::Human { .. } => hopae_grpc::PrincipalKind::Human,
         }
     }
     pub(crate) fn wire_kind(&self) -> u32 {
         match self {
             Self::Service { .. } => 2,
             Self::Workload { .. } => 3,
+            Self::Human { .. } => 1,
         }
     }
     pub(crate) fn remaining(&self) -> Result<std::time::Duration> {
@@ -285,30 +377,37 @@ impl Authentication {
             Self::Workload { client, evidence } => client
                 .check(evidence, evidence.request())
                 .map_err(|_| anyhow::anyhow!("observed authentication expired or retired")),
+            Self::Human { client, evidence } => client
+                .check(evidence, evidence.request())
+                .map_err(|_| anyhow::anyhow!("observed Human authentication expired or retired")),
         }
     }
     pub(crate) fn context(&self) -> &hopae_grpc::v1::AuthenticationReceiptContext {
         match self {
             Self::Service { evidence, .. } => evidence.context(),
             Self::Workload { evidence, .. } => evidence.context(),
+            Self::Human { evidence, .. } => evidence.context(),
         }
     }
     pub(crate) fn sha256(&self) -> &[u8; 32] {
         match self {
             Self::Service { evidence, .. } => evidence.evidence().sha256(),
             Self::Workload { evidence, .. } => evidence.evidence().sha256(),
+            Self::Human { evidence, .. } => evidence.evidence().sha256(),
         }
     }
     pub(crate) fn receipt(&self) -> &[u8] {
         match self {
             Self::Service { evidence, .. } => evidence.receipt(),
             Self::Workload { evidence, .. } => evidence.receipt(),
+            Self::Human { evidence, .. } => evidence.receipt(),
         }
     }
     pub(crate) fn key_registry_revision(&self) -> u64 {
         match self {
             Self::Service { evidence, .. } => evidence.key_registry_revision(),
             Self::Workload { evidence, .. } => evidence.key_registry_revision(),
+            Self::Human { evidence, .. } => evidence.key_registry_revision(),
         }
     }
     pub(crate) async fn refresh(self) -> Result<Self> {
@@ -326,6 +425,12 @@ impl Authentication {
                     .await
                     .map_err(|_| anyhow::anyhow!("observed authentication refresh refused"))?;
                 Ok(Self::Workload { client, evidence })
+            }
+            Self::Human { client, evidence } => {
+                let evidence = client.refresh(evidence).await.map_err(|_| {
+                    anyhow::anyhow!("observed Human authentication refresh refused")
+                })?;
+                Ok(Self::Human { client, evidence })
             }
         }
     }
@@ -508,6 +613,9 @@ impl Dispatch {
             && authority.authenticated_observation_current(&self.authority)
             && authority.observed_permit_current(&self.permit)
     }
+    pub(crate) fn projected_slot(&self) -> &hyper::header::HeaderName {
+        &self.credential.name
+    }
     pub(crate) fn install(&self, headers: &mut hyper::HeaderMap) -> Result<()> {
         self.authentication.remaining()?;
         self.permit.remaining()?;
@@ -566,7 +674,11 @@ impl Owner {
                     && context.audience == self.scope.audience
                     && identity.subject_ref == subject
                     && identity.aal == u32::from(aal)
-                    && aal == 0
+                    && if authentication.class() == AuthenticationClass::Human {
+                        matches!(aal, 1 | 2)
+                    } else {
+                        aal == 0
+                    }
                     && identity.kind == authentication.wire_kind(),
                 "observed identity differs from authenticated preliminary principal"
             );
@@ -667,6 +779,13 @@ impl Owner {
                 )
                 .map_err(|_| anyhow::anyhow!("observed authentication epoch refused"))?;
                 (epoch.profile_revision, epoch.application_generation)
+            }
+            AuthenticationClass::Human => {
+                let epoch = hopae_grpc::human_epoch::decode(
+                    &authentication.context().identity_authority_epoch,
+                )
+                .map_err(|_| anyhow::anyhow!("Human source epoch refused"))?;
+                (epoch.source_scope_revision, epoch.application_generation)
             }
         };
         ensure!(

@@ -70,6 +70,9 @@ impl Sources {
         match self.class {
             AuthenticationClass::Service => 2,
             AuthenticationClass::Workload => 3,
+            AuthenticationClass::Human => {
+                panic!("legacy fixture cannot manufacture Human authentication")
+            }
         }
     }
     fn endpoint(&self, class: AuthenticationClass) -> Result<(), Status> {
@@ -103,6 +106,9 @@ impl Sources {
                     "11111111111111111111111111111111",
                 )
                 .unwrap(),
+                AuthenticationClass::Human => {
+                    panic!("legacy fixture cannot manufacture Human authentication")
+                }
             },
             identity: Some(h::ReceiptIdentity {
                 subject_ref: format!(
@@ -242,6 +248,9 @@ impl Sources {
             != match self.class {
                 AuthenticationClass::Service => 2,
                 AuthenticationClass::Workload => 3,
+                AuthenticationClass::Human => {
+                    panic!("legacy fixture cannot manufacture Human authentication")
+                }
             }
             || self.attack.load(Ordering::Acquire) == 16
         {
@@ -758,6 +767,9 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
         decision_token_env: match class {
             AuthenticationClass::Service => "OWNED_OBSERVED_SERVICE_DISPATCH_TOKEN",
             AuthenticationClass::Workload => "OWNED_OBSERVED_WORKLOAD_DISPATCH_TOKEN",
+            AuthenticationClass::Human => {
+                panic!("legacy fixture cannot manufacture Human authentication")
+            }
         }
         .into(),
         admin_token_env: "OWNED_OBSERVED_DISPATCH_ADMIN_UNSET".into(),
@@ -789,6 +801,7 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
                 .encode(source.permit_key.verifying_key().to_bytes()),
         }),
         project_credentials: true,
+        human_binding: None,
         observed: Some(Configuration {
             authentication_class: class,
             identity_authority: "profiles".into(),
@@ -1044,6 +1057,9 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
     wrong.observed.as_mut().unwrap().authentication_class = match class {
         AuthenticationClass::Service => AuthenticationClass::Workload,
         AuthenticationClass::Workload => AuthenticationClass::Service,
+        AuthenticationClass::Human => {
+            panic!("legacy fixture cannot manufacture Human authentication")
+        }
     };
     let wrong = wrong
         .compile(crate::pumgye::ResourceGate {
@@ -1113,6 +1129,8 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
             "x-hopae-subject",
             "x-hopae-evidence-ttl-ms",
             "x-hopae-principal-kind",
+            "x-hopae-human-policy-subject",
+            "x-hopae-human-policy-issuer",
         ] {
             assert!(
                 snapshot
@@ -1180,6 +1198,7 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
             (20, 403),
             (21, 503),
             (23, 503),
+            (25, 503),
         ] {
             if attack == 22 {
                 let mut next = active.load_full().config.clone();
@@ -1194,6 +1213,26 @@ async fn typed_dispatch_fixture(class: AuthenticationClass) {
             if attack == 20 {
                 let mut next = active.load_full().config.clone();
                 next.http[0].lua = Some("return {allow = true}".into());
+                active.store(Arc::new(crate::config::Snapshot::new(next).unwrap()));
+            }
+            if attack == 25 {
+                // Real proxy ingress: a configured Human route cannot reuse an
+                // authenticated Service/Workload response or execute Lua first.
+                let mut next = active.load_full().config.clone();
+                next.revision = 1;
+                let native = next.http[0]
+                    .auth
+                    .as_mut()
+                    .unwrap()
+                    .native_resource
+                    .as_mut()
+                    .unwrap();
+                native.observed.as_mut().unwrap().authentication_class = AuthenticationClass::Human;
+                native.human_binding = Some(crate::native_resource::HumanBinding {
+                    app_id: "native-app".into(),
+                    header_policy_revision: 1,
+                    header_names: Vec::new(),
+                });
                 active.store(Arc::new(crate::config::Snapshot::new(next).unwrap()));
             }
             source.attack.store(attack, Ordering::Release);
@@ -1308,6 +1347,10 @@ fn route_authentication_class_is_explicit_and_preserves_legacy_service_json() {
     assert_eq!(workload.authentication_class, AuthenticationClass::Workload);
     assert_eq!(serde_json::to_value(&workload).unwrap(), explicit);
     explicit["authentication_class"] = "human".into();
+    let human: Configuration = serde_json::from_value(explicit.clone()).unwrap();
+    assert_eq!(human.authentication_class, AuthenticationClass::Human);
+    assert_eq!(serde_json::to_value(&human).unwrap(), explicit);
+    explicit["authentication_class"] = "other".into();
     assert!(serde_json::from_value::<Configuration>(explicit.clone()).is_err());
     explicit["authentication_class"] = 3.into();
     assert!(serde_json::from_value::<Configuration>(explicit).is_err());

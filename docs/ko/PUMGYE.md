@@ -580,3 +580,74 @@ API-server 아답터와 전송·철회 검증을 별도로 완료해야 한다.
 비어 있지 않은 `human_users`를 게시하기 전에 소유 품계 서버와 모든 엄격한 정책
 리더를 업그레이드해야 한다. 이전 리더는 이 필드를 거부한다. 운영 권한 정책에서
 필드를 제거해 이전 런타임에 강제로 맞추지 않는다.
+
+
+### 비공개 네이티브 사람 dispatch 후보 (운영 지원 아님)
+
+이 소스 체크포인트는 사람 경로를 준비하지만 완전한 dispatch를 활성화하지 않는다.
+검증된 공개 호패 contract4 RPC를 통합하기 전에는 마지막 사람 projection 아답터가
+`Unsupported`를 반환한다. 아래 예를 운영 지원 설정으로 배포하지 않는다. 기존
+Service·Workload·strict 경로는 각 계약을 유지한다.
+
+`auth.native_resource`의 다음 **설정 조각**은 기존 고정 인증 공개키 pin, 독립적인
+`permission_permit` 공개키 pin, `project_credentials: true`, native mTLS 전송과
+강제 원격 resource gate에 추가한다. 완전한 라우트나 신원 원천이 아니다.
+
+```json
+{
+  "observed": {
+    "authentication_class": "human",
+    "identity_authority": "owned-human",
+    "minimum_profile_revision": 7,
+    "minimum_application_generation": 1,
+    "minimum_key_registry_revision": 1,
+    "source_error_ppm": 500,
+    "receiver_error_ppm": 500,
+    "maximum_final_header_bytes": 32768
+  },
+  "human_binding": {
+    "app_id": "native-app",
+    "header_policy_revision": 13,
+    "header_names": ["x-tenant"]
+  }
+}
+```
+
+`human_binding`은 명시적인 Human observed 라우트에만 반드시 필요하다. 실제
+라우트 ID, 양수인 게시 설정 리비전, 선택된 pool origin, service·audience로 SDK의
+고정 scope를 만든다. 설정된 각 HTTP(S) origin을 미리 컴파일하며, 알 수 없는 origin이나
+상징적 discovery 주소를 요청에서 채택하지 않고 거부한다. 동적 discovery에는 후속
+검증된 고정 origin 게시 절차가 필요하다. 호패의 application/route/revision/destination/
+header-policy fingerprint가 일치해야 한다. `minimum_profile_revision`은 사람 원천
+scope의 리비전 하한이며 개인별 리비전의 전역 하한이 아니다. clock-rate 오차 범위는
+운영자가 명시하는 원천·수신 clock 계약이며 게이트웨이가 추정하지 않는다.
+
+Lua·본문 변환 전 인증된 native Verify 응답의 고유한
+`x-hopae-human-policy-subject`·`x-hopae-human-policy-issuer`가 고정 issuer,
+정규 `human1:` 주체, 실제 AAL1 또는 AAL2와 일치해야 한다. 기존 raw user ID를
+로컬에서 변환하지 않는다. HumanResourceAuthorization이 실제 Guard 증거와
+`human_users`를 검사한다. 원격 authority 부재, guest, Service/Workload 메타데이터나
+기존 `users`는 이 판정을 대체하지 않는다. 이 메타데이터는 증명이 아니다. 마지막의
+불투명 Human SDK 인증이 같은 주체·AAL과 일치해야 하며 실제 native 현재 owner와
+서명된 타입별 권한 체인을 계속 요구한다. AAL2는 지원되는 실제 factor 증거를
+요구하고 설정 라벨이나 assurance 3으로 승격하지 않는다.
+
+SDK 준비는 실제 수집한 최종 본문(최대 16 MiB), method, path/query와 설정된
+header의 부재/값을 H1v2로 결속한다. 사람 destination은 선택된 **연결 origin**의
+`SHA256("hangang-human-origin-v1\0" || LP32(scheme) || LP32(host) || BE16(port))`
+이며 incoming Host가 아니다. DNS 대소문자·기본 port·IPv6를 정규화하고 userinfo,
+잘못된 port와 모호한 숫자 host를 거부한다. Service/Workload 의미는 유지한다.
+H1v2에서 Host가 제외되어도 임의 변경이 허용되지는 않는다. 전달 authority/Host,
+forwarding header와 TLS 정책은 별도 요청별 route owner·봉인이 유지한다.
+
+원래 frontend cookie/IP/UA/host 인증 문맥은 native H0용으로 보존한다. cookie,
+입력 Authorization, 비공개 caller header와 신원 메타데이터는 최종 upstream에서
+제거한다. 준비 뒤에는 검증된 지정 projection credential과 결정적인 Content-Length
+framing만 바꿀 수 있다. 중복 credential, Host/cookie 재삽입, URI·header 변경은
+거부한다. H1v2 digest만 키로 쓰는 요청 간 증명 캐시를 도입하지 않는다.
+
+현재 검증은 origin vector, 고정 scope, 분할 본문의 실제 바이트 준비, 요청 봉인,
+설정 거부와 실제 HTTP의 Lua 이전 class 불일치/backend 0 검사 및 기존 Service/
+Workload 회귀 범위다. 사람 contract4 출력·4개 코어 backend 성공·운영 반영·분산
+freshness snapshot·100k 처리량을 입증하지 않는다. 기존 권한 범위 안의 게시/반영
+전에 공개 H4 통합과 정확한 현재성·철회·replay·backend 0/1 전 경로 검증이 필요하다.

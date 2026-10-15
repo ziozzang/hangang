@@ -84,6 +84,7 @@ impl Client {
             permission_contract: match class {
                 crate::native_observed::AuthenticationClass::Service => 2,
                 crate::native_observed::AuthenticationClass::Workload => 3,
+                crate::native_observed::AuthenticationClass::Human => 4,
             },
             permission_query: query,
         });
@@ -99,6 +100,12 @@ impl Client {
             crate::native_observed::AuthenticationClass::Workload => {
                 let mut client = hopae_grpc::v1::workload_observed_credential_projection_client::WorkloadObservedCredentialProjectionClient::new(self.channel.clone()).max_encoding_message_size(8448).max_decoding_message_size(8192);
                 tokio::time::timeout(timeout, client.project(request)).await
+            }
+            crate::native_observed::AuthenticationClass::Human => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "qualified public Human projection protocol pending",
+                ));
             }
         };
         let reply = response

@@ -908,10 +908,11 @@ impl Proxy {
         auth: &crate::config::ExternalAuth,
         static_headers: &[(HeaderName, HeaderValue)],
         native: Option<&Arc<crate::hopae_native::Client>>,
-        expected_class: Option<crate::native_observed::AuthenticationClass>,
+        expected: Option<(crate::native_observed::AuthenticationClass, &str)>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
     ) -> AuthOutcome {
+        let expected_class = expected.map(|(class, _)| class);
         let started = std::time::Instant::now();
         let operation = async move {
             let mut request = Request::builder()
@@ -953,24 +954,44 @@ impl Proxy {
                 if native.is_none() {
                     return Err(503);
                 }
-                let expected = match class {
+                let expected_kind = match class {
                     crate::native_observed::AuthenticationClass::Service => "service",
                     crate::native_observed::AuthenticationClass::Workload => "workload",
+                    crate::native_observed::AuthenticationClass::Human => "human",
                 };
-                let mut kinds = parts.headers.get_all("x-hopae-principal-kind").iter();
-                if kinds.next().and_then(|v| v.to_str().ok()) != Some(expected)
-                    || kinds.next().is_some()
-                    || crate::pumgye::identity(&parts.headers).is_none_or(|(_, aal)| aal != 0)
-                {
-                    return Err(503);
+                if class == crate::native_observed::AuthenticationClass::Human {
+                    if native_human_policy_identity(
+                        &parts.headers,
+                        expected.map(|(_, issuer)| issuer).ok_or(503u16)?,
+                    )
+                    .is_none()
+                    {
+                        return Err(503);
+                    }
+                } else {
+                    let mut kinds = parts.headers.get_all("x-hopae-principal-kind").iter();
+                    if kinds.next().and_then(|v| v.to_str().ok()) != Some(expected_kind)
+                        || kinds.next().is_some()
+                        || crate::pumgye::identity(&parts.headers).is_none_or(|(_, aal)| aal != 0)
+                    {
+                        return Err(503);
+                    }
                 }
             }
-            let typed_identity = expected_class.and_then(|_| {
+            let typed_identity = expected_class.and_then(|class| {
+                if class == crate::native_observed::AuthenticationClass::Human {
+                    return native_human_policy_identity(
+                        &parts.headers,
+                        expected.map(|(_, issuer)| issuer)?,
+                    )
+                    .map(|(subject, aal)| (subject.to_owned(), aal));
+                }
                 crate::pumgye::identity(&parts.headers)
                     .map(|(subject, aal)| (subject.to_owned(), aal))
             });
             let service_identity = if native.is_some()
                 && status.is_success()
+                && expected_class != Some(crate::native_observed::AuthenticationClass::Human)
                 && (parts.headers.contains_key("x-hopae-principal-kind")
                     || parts
                         .headers
@@ -2601,7 +2622,7 @@ impl Proxy {
                     retired.record(&self.metrics);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), runtime.native_resource.as_ref().and_then(|binding| binding.observed_class()), &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), runtime.native_resource.as_ref().and_then(|binding| binding.observed_authentication()), &mut request, &edge) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 return Ok(denied);
@@ -2619,6 +2640,10 @@ impl Proxy {
                         .as_ref()
                         .and_then(|binding| binding.observed_class())
                         == Some(crate::native_observed::AuthenticationClass::Workload);
+                    let human_preliminary = runtime
+                        .native_resource
+                        .as_ref()
+                        .is_some_and(|b| b.human_mode());
                     if let Some(expiry) = evidence_expires {
                         let lease = auth_route_lease.get_or_insert_with(Default::default);
                         match expiry {
@@ -2669,7 +2694,18 @@ impl Proxy {
                             if snapshot.config.pumgye_authority.is_some() {
                                 match (snapshot.pumgye_remote.as_ref(), identity) {
                                     (Some(remote), Some((subject, aal))) => {
-                                        match if workload_preliminary {
+                                        match if human_preliminary {
+                                            remote
+                                                .authorize_human_resource(
+                                                    gate,
+                                                    request.method().as_str(),
+                                                    subject,
+                                                    edge.client_ip,
+                                                    aal,
+                                                    evidence,
+                                                )
+                                                .await
+                                        } else if workload_preliminary {
                                             remote
                                                 .authorize_workload_resource(
                                                     gate,
@@ -2713,10 +2749,10 @@ impl Proxy {
                                     }
                                     _ => false,
                                 }
-                            } else if workload_preliminary {
+                            } else if workload_preliminary || human_preliminary {
                                 return Ok(response(
                                     503,
-                                    "Workload resource authority requires typed remote decision",
+                                    "native resource authority requires typed remote decision",
                                 ));
                             } else {
                                 match (
@@ -3389,22 +3425,33 @@ impl Proxy {
                     return Ok(response(503, "native resource authority unavailable"));
                 };
                 let mut context = context.clone();
-                for (name, value) in forward_auth_context(&outgoing, &edge) {
-                    let Ok(value) = HeaderValue::from_str(&value) else {
-                        return Ok(response(400, "native request context refused"));
-                    };
-                    context.insert(HeaderName::from_static(name), value);
+                if !binding.human_mode() {
+                    for (name, value) in forward_auth_context(&outgoing, &edge) {
+                        let Ok(value) = HeaderValue::from_str(&value) else {
+                            return Ok(response(400, "native request context refused"));
+                        };
+                        context.insert(HeaderName::from_static(name), value);
+                    }
+                    for (name, value) in &runtime.auth_static_headers {
+                        context.insert(name.clone(), value.clone());
+                    }
                 }
-                for (name, value) in &runtime.auth_static_headers {
-                    context.insert(name.clone(), value.clone());
-                }
+                binding.strip_human_credentials(outgoing.headers_mut());
+                let selected_origin: Uri = match docker_target
+                    .as_ref()
+                    .map_or(backend.as_str(), |(_, target, _)| target.endpoint.as_str())
+                    .parse()
+                {
+                    Ok(uri) => uri,
+                    Err(_) => return Ok(response(503, "native selected origin invalid")),
+                };
                 let prepared = tokio::select! {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
                         retired.record(&self.metrics);
                         return Ok(response(503, "route authorization retired"));
                     }
-                    result = binding.prepare(outgoing, self.native_bodies.clone()) => match result {
+                    result = binding.prepare_for_origin(outgoing, self.native_bodies.clone(),&selected_origin) => match result {
                         Ok(prepared) => prepared,
                         Err(crate::projection_entity::Refused::TooLarge) => return Ok(response(413, "native entity too large")),
                         Err(crate::projection_entity::Refused::Length | crate::projection_entity::Refused::Trailers | crate::projection_entity::Refused::Target) => return Ok(response(400, "native entity refused")),
@@ -3435,7 +3482,8 @@ impl Proxy {
                 if !observation.allowed() {
                     return Ok(response(403, "native resource permission denied"));
                 }
-                outgoing = prepared.into_dispatch();
+                let (dispatch, seal) = prepared.into_dispatch_sealed();
+                outgoing = dispatch;
                 outgoing.headers_mut().remove(header::AUTHORIZATION);
                 outgoing.headers_mut().remove("x-hopae-subject");
                 if observation
@@ -3443,6 +3491,14 @@ impl Proxy {
                     .is_err()
                 {
                     return Ok(response(503, "native credential expired"));
+                }
+                if let Some(seal) = seal {
+                    let Some(slot) = observation.projected_slot() else {
+                        return Ok(response(503, "Human projection slot unavailable"));
+                    };
+                    if seal.check(&outgoing, slot).is_err() {
+                        return Ok(response(503, "Human final headers changed"));
+                    }
                 }
                 native_observation = Some((
                     Arc::new(observation),
@@ -4461,6 +4517,33 @@ fn set_forwarding_headers(
 /// Request context sent to an external authorization service, in the order
 /// the headers are inserted. `x-original-uri`/`x-forwarded-uri` are always
 /// origin-form (path and query), independent of the client's HTTP version.
+/// Trusted native response metadata only; actual SDK/H0 proof remains mandatory.
+fn native_human_policy_identity<'a>(headers: &'a HeaderMap, issuer: &str) -> Option<(&'a str, u8)> {
+    let unique = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        let first = values.next()?;
+        if values.next().is_some() {
+            None
+        } else {
+            first.to_str().ok()
+        }
+    };
+    if unique("x-hopae-human-policy-issuer")? != issuer {
+        return None;
+    }
+    let subject = unique("x-hopae-human-policy-subject")?;
+    pumgye_core::HumanSubject::parse(subject).ok()?;
+    let mut kinds = headers.get_all("x-hopae-principal-kind").iter();
+    if kinds.next().is_some_and(|v| v.as_bytes() != b"human") || kinds.next().is_some() {
+        return None;
+    }
+    let aal = match unique("x-hopae-aal")? {
+        "1" => 1,
+        "2" => 2,
+        _ => return None,
+    };
+    Some((subject, aal))
+}
 fn auth_request_headers(
     auth: &crate::config::ExternalAuth,
     static_headers: &[(HeaderName, HeaderValue)],
@@ -4989,6 +5072,58 @@ impl hyper::body::Body for RequestBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_human_policy_metadata_requires_pinned_unique_canonical_subject() {
+        use hyper::{HeaderMap, header::HeaderValue};
+        let subject = format!("human1:{}", "a".repeat(64));
+        let good = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-hopae-human-policy-subject",
+                HeaderValue::from_str(&subject).unwrap(),
+            );
+            headers.insert(
+                "x-hopae-human-policy-issuer",
+                HeaderValue::from_static("native-human"),
+            );
+            headers.insert("x-hopae-aal", HeaderValue::from_static("2"));
+            headers
+        };
+        assert_eq!(
+            super::native_human_policy_identity(&good(), "native-human"),
+            Some((subject.as_str(), 2))
+        );
+        assert!(super::native_human_policy_identity(&good(), "other-issuer").is_none());
+        for (name, value) in [
+            ("x-hopae-human-policy-subject", "u_legacy"),
+            ("x-hopae-aal", "0"),
+            ("x-hopae-aal", "3"),
+            ("x-hopae-principal-kind", "service"),
+            ("x-hopae-principal-kind", "workload"),
+        ] {
+            let mut headers = good();
+            headers.insert(name, HeaderValue::from_static(value));
+            assert!(super::native_human_policy_identity(&headers, "native-human").is_none());
+        }
+        for name in [
+            "x-hopae-human-policy-subject",
+            "x-hopae-human-policy-issuer",
+            "x-hopae-aal",
+        ] {
+            let mut headers = good();
+            let value = headers[name].clone();
+            headers.append(name, value);
+            assert!(super::native_human_policy_identity(&headers, "native-human").is_none());
+            let mut headers = good();
+            headers.remove(name);
+            assert!(super::native_human_policy_identity(&headers, "native-human").is_none());
+        }
+        let mut headers = good();
+        headers.append("x-hopae-principal-kind", HeaderValue::from_static("human"));
+        assert!(super::native_human_policy_identity(&headers, "native-human").is_some());
+        headers.append("x-hopae-principal-kind", HeaderValue::from_static("human"));
+        assert!(super::native_human_policy_identity(&headers, "native-human").is_none());
+    }
     #[test]
     fn sacho_security_response_authority_checks_both_sources_without_trusting_scheme() {
         use hyper::header::HeaderValue;

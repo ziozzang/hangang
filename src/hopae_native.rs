@@ -182,6 +182,42 @@ impl Client {
         )
         .map_err(|_| anyhow::anyhow!("observed native client configuration refused"))
     }
+    pub(crate) fn human_observed_client(
+        &self,
+        policy: hopae_grpc::human_observed_client::HumanTrustPolicy,
+        clock: std::sync::Arc<hangang_runtime::time::ReceiverClock>,
+        rates: hopae_grpc::receipt_time::ClockRates,
+    ) -> anyhow::Result<hopae_grpc::human_observed_client::Client> {
+        let settings = self
+            .observed_settings
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Human authentication requires gRPC"))?;
+        let tls = settings
+            .tls
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Human authentication requires mTLS"))?;
+        let ca = crate::tls::read_bounded(&tls.ca)?;
+        let cert = crate::tls::read_bounded(&tls.certificate)?;
+        let key = zeroize::Zeroizing::new(crate::tls::read_bounded(&tls.key)?);
+        hopae_grpc::human_observed_client::Client::new_human(
+            hopae_grpc::human_observed_client::EndpointConfig {
+                address: &format!("https://{}", settings.address),
+                server_name: &tls.server_name,
+                ca: &ca,
+                certificate: &cert,
+                private_key: &key,
+                caller_key: self.key.to_str()?,
+            },
+            policy,
+            clock,
+            rates,
+            hopae_grpc::human_observed_client::Limits {
+                concurrent: settings.pool_size,
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("Human native client configuration refused"))
+    }
     /// Separate native receipt phase. Unsupported transports refuse without fallback.
     pub async fn issue_service_receipt(
         &self,

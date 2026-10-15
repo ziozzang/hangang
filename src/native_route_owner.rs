@@ -167,7 +167,10 @@ impl Registry {
             digest: prepared.digest(),
             uri: prepared.request().uri().clone(),
             method: prepared.request().method().clone(),
-            destination_sha256: destination_digest(prepared.request().uri()),
+            destination_sha256: prepared.human_scope().map_or_else(
+                || destination_digest(prepared.request().uri()),
+                |scope| scope.destination_sha256,
+            ),
             lifetime: Mutex::new(Lifetime {
                 started: SourceStamp::new(
                     runtime

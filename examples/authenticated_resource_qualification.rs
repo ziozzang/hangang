@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         permission_permit: None,
         project_credentials: false,
         observed: None,
+        human_binding: None,
         maximum_body_bytes: 1024 * 1024,
         body_timeout_ms: 1000,
     };

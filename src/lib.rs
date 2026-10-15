@@ -119,6 +119,8 @@ pub mod pumgye;
 
 pub mod pumgye_grpc_client;
 
+mod human_destination;
+mod native_human;
 pub mod native_observed;
 pub mod native_resource;
 pub mod projection_binding;

@@ -1,5 +1,6 @@
 //! Native authority phase for an immutable final request. Observations are not
 //! dispatch/projection permits; the gateway still owns final routing/effect fences.
+pub use crate::native_human::Configuration as HumanBinding;
 use crate::{hopae_native, projection_entity, projection_receipt, pumgye};
 use anyhow::{Result, ensure};
 use std::sync::Arc;
@@ -18,6 +19,8 @@ pub struct Configuration {
     pub project_credentials: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed: Option<crate::native_observed::Configuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_binding: Option<HumanBinding>,
     #[serde(default = "default_body_limit")]
     pub maximum_body_bytes: usize,
     #[serde(default = "default_body_timeout")]
@@ -31,6 +34,15 @@ fn default_body_timeout() -> u64 {
 }
 impl Configuration {
     pub fn compile(&self, gate: pumgye::ResourceGate) -> Result<Binding> {
+        ensure!(
+            self.human_binding.is_some()
+                == self
+                    .observed
+                    .as_ref()
+                    .is_some_and(|c| c.authentication_class
+                        == crate::native_observed::AuthenticationClass::Human),
+            "Human binding requires explicit Human observed class"
+        );
         use base64::Engine;
         ensure!(
             (1..=16 * 1024 * 1024).contains(&self.maximum_body_bytes)
@@ -87,6 +99,36 @@ impl Configuration {
         binding.body_timeout = std::time::Duration::from_millis(self.body_timeout_ms);
         Ok(binding)
     }
+    pub(crate) fn compile_for_route(
+        &self,
+        gate: pumgye::ResourceGate,
+        route: &crate::config::HttpRoute,
+        revision: u64,
+    ) -> Result<Binding> {
+        let mut binding = self.compile(gate)?;
+        if let Some(config) = &self.human_binding {
+            let scopes = crate::native_human::Scopes::compile(
+                config,
+                route,
+                revision,
+                &binding.gate.service_id,
+                &self.audience,
+            )?;
+            binding
+                .observed
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Human observed owner required"))?
+                .set_human_scopes(scopes.clone())?;
+            binding.scope = projection_entity::Scope::with_human(
+                binding.gate.service_id.clone(),
+                self.audience.clone(),
+                scopes.clone(),
+            )
+            .map_err(|_| anyhow::anyhow!("invalid Human body scope"))?;
+            binding.human = Some(scopes);
+        }
+        Ok(binding)
+    }
 }
 
 pub(crate) struct OwnerScope<'a> {
@@ -102,6 +144,7 @@ pub struct Binding {
     permit_pin: Option<crate::projection_permit::Pin>,
     project_credentials: bool,
     observed: Option<crate::native_observed::Owner>,
+    human: Option<Arc<crate::native_human::Scopes>>,
     gate: pumgye::ResourceGate,
     maximum_body_bytes: usize,
     body_timeout: std::time::Duration,
@@ -178,6 +221,12 @@ impl DispatchObservation {
             Self::Observed(v) => v.current(authority),
         }
     }
+    pub(crate) fn projected_slot(&self) -> Option<&hyper::header::HeaderName> {
+        match self {
+            Self::Strict(_) => None,
+            Self::Observed(v) => Some(v.projected_slot()),
+        }
+    }
     pub(crate) fn install_credential(&self, headers: &mut hyper::HeaderMap) -> Result<()> {
         match self {
             Self::Strict(v) => v.install_credential(headers),
@@ -200,6 +249,7 @@ impl Binding {
             permit_pin: None,
             project_credentials: false,
             observed: None,
+            human: None,
             gate,
             maximum_body_bytes: default_body_limit(),
             body_timeout: std::time::Duration::from_millis(default_body_timeout()),
@@ -207,6 +257,25 @@ impl Binding {
     }
     /// Native configuration selects this metadata; no response or caller header
     /// can choose the principal class or a different permission endpoint.
+    pub(crate) fn observed_authentication(
+        &self,
+    ) -> Option<(crate::native_observed::AuthenticationClass, &str)> {
+        self.observed
+            .as_ref()
+            .map(|o| (o.configured_class(), o.issuer_ref()))
+    }
+    pub(crate) fn human_mode(&self) -> bool {
+        self.human.is_some()
+    }
+    pub(crate) fn strip_human_credentials(&self, headers: &mut hyper::HeaderMap) {
+        if let Some(scopes) = &self.human {
+            for name in scopes.reserved() {
+                headers.remove(name);
+            }
+            headers.remove(hyper::header::COOKIE);
+            headers.remove(hyper::header::AUTHORIZATION);
+        }
+    }
     pub(crate) fn observed_class(&self) -> Option<crate::native_observed::AuthenticationClass> {
         self.observed.as_ref().map(|owner| owner.configured_class())
     }
@@ -254,6 +323,22 @@ impl Binding {
             admission,
             self.maximum_body_bytes,
             self.body_timeout,
+        )
+        .await
+    }
+    pub(crate) async fn prepare_for_origin(
+        &self,
+        request: hyper::Request<crate::proxy::Body>,
+        admission: Arc<tokio::sync::Semaphore>,
+        origin: &hyper::Uri,
+    ) -> Result<projection_entity::Prepared, projection_entity::Refused> {
+        projection_entity::prepare_selected(
+            request,
+            self.scope.clone(),
+            admission,
+            self.maximum_body_bytes,
+            self.body_timeout,
+            origin,
         )
         .await
     }
@@ -421,6 +506,7 @@ mod tests {
             permission_permit: None,
             project_credentials: false,
             observed: None,
+            human_binding: None,
             maximum_body_bytes: default_body_limit(),
             body_timeout_ms: default_body_timeout(),
         }
@@ -560,5 +646,30 @@ mod tests {
         config.observed.as_mut().unwrap().authentication_class =
             crate::native_observed::AuthenticationClass::Service;
         assert!(config.compile(gate()).is_ok());
+        config.observed.as_mut().unwrap().authentication_class =
+            crate::native_observed::AuthenticationClass::Human;
+        assert!(
+            config.compile(gate()).is_err(),
+            "Human must declare its fixed binding"
+        );
+        config.human_binding = Some(HumanBinding {
+            app_id: "native-app".into(),
+            header_policy_revision: 13,
+            header_names: vec!["x-tenant".into()],
+        });
+        assert!(config.compile(gate()).is_ok());
+        let route: crate::config::HttpRoute = serde_json::from_value(serde_json::json!({
+            "id":"owned-route", "host":"frontend.test", "backends":["https://one.test", "https://two.test"]
+        })).unwrap();
+        assert!(config.compile_for_route(gate(), &route, 11).is_ok());
+        assert!(config.compile_for_route(gate(), &route, 0).is_err());
+        config.human_binding.as_mut().unwrap().header_names = vec!["cookie".into()];
+        assert!(config.compile_for_route(gate(), &route, 11).is_err());
+        config.observed.as_mut().unwrap().authentication_class =
+            crate::native_observed::AuthenticationClass::Service;
+        assert!(
+            config.compile(gate()).is_err(),
+            "non-Human must not silently ignore Human binding"
+        );
     }
 }

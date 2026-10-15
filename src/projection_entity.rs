@@ -17,16 +17,27 @@ pub enum Refused {
     Body,
     Trailers,
     Target,
+    Scope,
 }
 
 /// Compile once from the owning route; reuse across requests without string copies.
 pub struct Scope {
     service: String,
     audience: String,
+    human: Option<Arc<crate::native_human::Scopes>>,
 }
 impl Scope {
     pub(crate) fn audience(&self) -> &str {
         &self.audience
+    }
+    pub(crate) fn with_human(
+        service: String,
+        audience: String,
+        human: Arc<crate::native_human::Scopes>,
+    ) -> Result<Arc<Self>, Refused> {
+        let mut scope = Self::new(service, audience)?;
+        Arc::get_mut(&mut scope).ok_or(Refused::Scope)?.human = Some(human);
+        Ok(scope)
     }
     pub fn new(service: String, audience: String) -> Result<Arc<Self>, Refused> {
         if [&service, &audience].iter().any(|value| {
@@ -38,7 +49,11 @@ impl Scope {
         }) {
             return Err(Refused::Target);
         }
-        Ok(Arc::new(Self { service, audience }))
+        Ok(Arc::new(Self {
+            service,
+            audience,
+            human: None,
+        }))
     }
 }
 
@@ -49,8 +64,15 @@ pub struct Prepared {
     scope: Arc<Scope>,
     digest: [u8; 32],
     admission: OwnedSemaphorePermit,
+    human: Option<Arc<hopae_grpc::human_observed_client::HumanScope>>,
+    seal: Option<crate::native_human::Seal>,
 }
 impl Prepared {
+    pub(crate) fn human_scope(
+        &self,
+    ) -> Option<&Arc<hopae_grpc::human_observed_client::HumanScope>> {
+        self.human.as_ref()
+    }
     pub fn request(&self) -> &Request<Bytes> {
         &self.request
     }
@@ -68,6 +90,15 @@ impl Prepared {
         Arc::ptr_eq(&self.scope, scope)
     }
     /// The caller must finish native authorization and final owner checks first.
+    pub(crate) fn into_dispatch_sealed(
+        mut self,
+    ) -> (
+        Request<crate::proxy::Body>,
+        Option<crate::native_human::Seal>,
+    ) {
+        let seal = self.seal.take();
+        (self.into_dispatch(), seal)
+    }
     pub fn into_dispatch(self) -> Request<crate::proxy::Body> {
         let (mut parts, bytes) = self.request.into_parts();
         parts.headers.remove(header::TRANSFER_ENCODING);
@@ -160,6 +191,34 @@ pub async fn prepare_scoped(
     maximum_bytes: usize,
     deadline: Duration,
 ) -> Result<Prepared, Refused> {
+    prepare_inner(request, scope, admission, maximum_bytes, deadline, None).await
+}
+pub(crate) async fn prepare_selected(
+    request: Request<crate::proxy::Body>,
+    scope: Arc<Scope>,
+    admission: Arc<Semaphore>,
+    maximum_bytes: usize,
+    deadline: Duration,
+    origin: &hyper::Uri,
+) -> Result<Prepared, Refused> {
+    prepare_inner(
+        request,
+        scope,
+        admission,
+        maximum_bytes,
+        deadline,
+        Some(origin),
+    )
+    .await
+}
+async fn prepare_inner(
+    request: Request<crate::proxy::Body>,
+    scope: Arc<Scope>,
+    admission: Arc<Semaphore>,
+    maximum_bytes: usize,
+    deadline: Duration,
+    origin: Option<&hyper::Uri>,
+) -> Result<Prepared, Refused> {
     use hyper::body::Body as _;
     if maximum_bytes == 0
         || maximum_bytes > 16 * 1024 * 1024
@@ -250,14 +309,30 @@ pub async fn prepare_scoped(
         return Err(Refused::Length);
     }
     let request = Request::from_parts(parts, bytes);
-    let digest =
-        crate::projection_binding::digest_upstream(&scope.service, &scope.audience, &request)
+    let (digest, human, seal) = if let Some(scopes) = &scope.human {
+        let selected = scopes
+            .actual_origin(origin.ok_or(Refused::Scope)?)
+            .map_err(|_| Refused::Scope)?;
+        let digest = scopes
+            .digest(&selected, &request)
             .map_err(|_| Refused::Target)?;
+        let seal = crate::native_human::Seal::new(&request).map_err(|_| Refused::Target)?;
+        (digest, Some(selected), Some(seal))
+    } else {
+        (
+            crate::projection_binding::digest_upstream(&scope.service, &scope.audience, &request)
+                .map_err(|_| Refused::Target)?,
+            None,
+            None,
+        )
+    };
     Ok(Prepared {
         request,
         scope,
         digest,
         admission: permit,
+        human,
+        seal,
     })
 }
 
@@ -554,6 +629,70 @@ mod tests {
                 Err(Refused::TooLarge)
             );
         }
+    }
+    #[tokio::test]
+    async fn human_fragmented_entity_binds_actual_selected_origin_and_dispatch_bytes() {
+        let route: crate::config::HttpRoute = serde_json::from_value(serde_json::json!({
+            "id":"owned-route", "host":"frontend.test", "backends":["https://origin.test"]
+        }))
+        .unwrap();
+        let scopes = crate::native_human::Scopes::compile(
+            &crate::native_human::Configuration {
+                app_id: "app".into(),
+                header_policy_revision: 13,
+                header_names: vec!["x-tenant".into()],
+            },
+            &route,
+            11,
+            "orders",
+            "orders-api",
+        )
+        .unwrap();
+        let scope =
+            Scope::with_human("orders".into(), "orders-api".into(), scopes.clone()).unwrap();
+        let origin: hyper::Uri = "https://origin.test".parse().unwrap();
+        let selected = scopes.actual_origin(&origin).unwrap();
+        let (mut request, _) = input(
+            vec![
+                Ok(Frame::data(Bytes::from_static(b"actual "))),
+                Ok(Frame::data(Bytes::from_static(b"entity"))),
+            ],
+            false,
+        );
+        // Forwarded authority differs from the actual selected connection origin.
+        request
+            .headers_mut()
+            .insert("x-tenant", "one".parse().unwrap());
+        let admission = Arc::new(Semaphore::new(1));
+        let prepared = prepare_selected(
+            request,
+            scope,
+            admission.clone(),
+            16,
+            Duration::from_secs(1),
+            &origin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.request().body(), b"actual entity".as_slice());
+        assert!(Arc::ptr_eq(prepared.human_scope().unwrap(), &selected));
+        assert_eq!(
+            prepared.digest(),
+            scopes.digest(&selected, prepared.request()).unwrap()
+        );
+        let (mut dispatch, seal) = prepared.into_dispatch_sealed();
+        dispatch
+            .headers_mut()
+            .insert("authorization", "Bearer output".parse().unwrap());
+        seal.unwrap()
+            .check(&dispatch, &header::AUTHORIZATION)
+            .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(
+            dispatch.into_body().collect().await.unwrap().to_bytes(),
+            "actual entity"
+        );
+        assert_eq!(admission.available_permits(), 1);
     }
     #[tokio::test]
     async fn compiled_scope_identity_and_receipt_fields_survive_preparation() {

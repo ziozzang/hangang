@@ -981,7 +981,7 @@ impl Config {
                 let gate = policy.pumgye_resource.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("native resource requires owner resource/action gate")
                 })?;
-                native.compile(gate.clone())?;
+                native.compile_for_route(gate.clone(), route, self.revision)?;
             }
         }
         ensure!(
@@ -2708,7 +2708,7 @@ impl Snapshot {
                 .as_ref()
                 .and_then(|auth| auth.native_resource.as_ref())
             {
-                let binding = native.compile(
+                let binding = native.compile_for_route(
                     route
                         .resource_policy
                         .as_ref()
@@ -2717,6 +2717,8 @@ impl Snapshot {
                         .as_ref()
                         .unwrap()
                         .clone(),
+                    route,
+                    config.revision,
                 )?;
                 if let Some(transport) = native_clients.get(&route.id) {
                     binding.prepare_transport(transport)?;
@@ -3182,6 +3184,8 @@ fn authentication_identity_headers(
                     "x-hopae-service-id",
                     "x-hopae-evidence-ttl-ms",
                     "x-hopae-subject",
+                    "x-hopae-human-policy-subject",
+                    "x-hopae-human-policy-issuer",
                 ]
                 .into_iter()
                 .map(str::to_owned),

@@ -145,8 +145,12 @@ impl Pin {
             || identity.subject_ref != auth_identity.subject_ref
             || identity.kind != authentication.wire_kind()
             || auth_identity.kind != authentication.wire_kind()
-            || auth_identity.aal != 0
-            || identity.aal != 0
+            || if authentication.class() == crate::native_observed::AuthenticationClass::Human {
+                !matches!(auth_identity.aal, 1 | 2)
+            } else {
+                auth_identity.aal != 0
+            }
+            || identity.aal != auth_identity.aal
             || identity.revision != auth_identity.revision
             || identity.credential_generation != auth_identity.credential_generation
             || context.service != auth.service

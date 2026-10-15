@@ -746,8 +746,16 @@ impl AuthorityRuntime {
         aal: u8,
         guard: pumgye_core::GuardEvidence,
     ) -> Result<Option<u64>> {
-        self.authorize_resource_typed(gate, method, subject, ip, aal, guard, false)
-            .await
+        self.authorize_resource_typed(
+            gate,
+            method,
+            subject,
+            ip,
+            aal,
+            guard,
+            crate::pumgye_grpc_client::ResourceClass::Legacy,
+        )
+        .await
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn authorize_workload_resource(
@@ -760,8 +768,41 @@ impl AuthorityRuntime {
         guard: pumgye_core::GuardEvidence,
     ) -> Result<Option<u64>> {
         anyhow::ensure!(aal == 0, "Workload point decision requires AAL0");
-        self.authorize_resource_typed(gate, method, subject, ip, aal, guard, true)
-            .await
+        self.authorize_resource_typed(
+            gate,
+            method,
+            subject,
+            ip,
+            aal,
+            guard,
+            crate::pumgye_grpc_client::ResourceClass::Workload,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn authorize_human_resource(
+        self: &std::sync::Arc<Self>,
+        gate: &ResourceGate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+    ) -> Result<Option<u64>> {
+        anyhow::ensure!(
+            matches!(aal, 1 | 2) && pumgye_core::HumanSubject::parse(subject).is_ok(),
+            "Human point decision requires canonical subject/AAL1-or2"
+        );
+        self.authorize_resource_typed(
+            gate,
+            method,
+            subject,
+            ip,
+            aal,
+            guard,
+            crate::pumgye_grpc_client::ResourceClass::Human,
+        )
+        .await
     }
     #[allow(clippy::too_many_arguments)]
     async fn authorize_resource_typed(
@@ -772,7 +813,7 @@ impl AuthorityRuntime {
         ip: std::net::IpAddr,
         aal: u8,
         guard: pumgye_core::GuardEvidence,
-        workload: bool,
+        class: crate::pumgye_grpc_client::ResourceClass,
     ) -> Result<Option<u64>> {
         let Some(action) = gate.actions.get(method) else {
             return Ok(None);
@@ -791,10 +832,16 @@ impl AuthorityRuntime {
             guard,
             minimum_revision: 0,
         };
-        let reply = if workload {
-            client.decide_workload_resource(&query).await?
-        } else {
-            client.decide_resource(&query).await?
+        let reply = match class {
+            crate::pumgye_grpc_client::ResourceClass::Legacy => {
+                client.decide_resource(&query).await?
+            }
+            crate::pumgye_grpc_client::ResourceClass::Workload => {
+                client.decide_workload_resource(&query).await?
+            }
+            crate::pumgye_grpc_client::ResourceClass::Human => {
+                client.decide_human_resource(&query).await?
+            }
         };
         self.success();
         Ok(
