@@ -217,3 +217,8 @@ flowchart LR
 감독 소켓 인계를 지원합니다. 이 모드에서는 실제 참조/대상 digest를 품계에 전달하고
 품계가 판정 전후에 설정된 mTLS 소유자를 조회합니다. 조회 확인 응답이 없으면
 구버전 원천도 거부합니다. 서명 권한·투영·replay 소비는 계속 연결해야 합니다.
+
+## 0.3.11 후보
+
+[후보 릴리스 계약](docs/ko/VERSION_0_3_11.md)에 Pumgye 문맥 인식 관리와 기존 native/runtime
+경계, artifact/API-server/적용 gate를 기록했습니다. 운영 적용을 뜻하지 않습니다.

@@ -231,3 +231,9 @@ reference and destination digest to route-aware Pumgye, which checks the configu
 mTLS owner before and after evaluation. Missing route-observation acknowledgement
 fails closed, including a legacy authority. Signed permission, projection and
 replay consumption remain separate work.
+
+## 0.3.11 candidate
+
+The [candidate release contract](docs/VERSION_0_3_11.md) describes context-aware
+Pumgye policy administration, unchanged native/runtime boundaries and required
+artifact/API-server/adoption gates. This is preparation, not an operating rollout.
