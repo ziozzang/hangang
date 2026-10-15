@@ -32,6 +32,8 @@ Header names are case-insensitive and restricted to `strict-transport-security`,
 
 HSTS is emitted only for verified HTTPS, including trusted forwarding evidence where configured. Start with the short host-only `max-age=300` preset; it includes neither `includeSubDomains` nor `preload`. Review TLS coverage and application behavior before increasing retention. The gateway does not automatically extend a policy to other domains.
 
+When the administrator console is published through a gateway route, explicitly include its public hostname in a response-security rule too. A rule for an application or status-page hostname does not cover a sibling console hostname. Verify the console's redirects and unauthenticated API denials as well as its login page; these responses are protected at the gateway boundary even though the separate administrator listener does not apply these rules itself.
+
 The downgrade checkbox changes an absolute `http://` Location only when the request was verified HTTPS, the destination hostname is the same and its HTTP port is the default 80. External hosts, relative redirects and explicit nondefault ports are preserved. This does not replace **Require TLS** or canonical-domain configuration for inbound plaintext requests.
 
 The preset never adds CSP. Existing origin CSP remains intact unless the operator explicitly configures CSP here, which replaces that header. Review policies against the actual application content; frame restrictions, disabled browser permissions and referrer suppression can also affect integrations. The preset applies only to the selected domain rule and retains a CSP already entered in that rule.
