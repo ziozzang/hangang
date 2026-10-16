@@ -189,6 +189,19 @@ test('IP detail: GeoIP, risk, block with expiry, explain trace and enforce previ
   await expect(view.locator('.zt-guard-trace .is-deciding')).toHaveAttribute('data-stage', 'blocklist');
   await expect(view.locator('.zt-guard-trace [data-stage="rules"]')).toContainText('Winning rule watch-hosting only observes; block evaluation continues.');
   await expect(view.locator('.zt-guard-trace [data-stage="rules"] .is-expired')).toContainText('old-deny');
+  // The Risk card and the trace read the same explain evaluation.
+  const card = view.locator('.zt-matched-rules');
+  await expect(card).toHaveAttribute('data-source', 'explain');
+  const traceRules = await view.locator('.zt-guard-trace [data-stage="rules"] .zt-trace-rules a').allTextContents();
+  const cardRules = await card.locator('a[data-rule]').evaluateAll(links => links.map(link => link.dataset.rule));
+  expect(cardRules).toEqual(traceRules);
+  await expect(card.locator('.is-winner')).toHaveText('watch-hosting');
+  await expect(card.locator('.is-expired')).toHaveText('old-deny');
+  await expect(card).not.toContainText('deny-tor-asn');
+  // Empty tables show only the empty state, no orphaned header row.
+  const decisions = view.locator('.zt-panel', { hasText: 'Recent decisions' });
+  await expect(decisions.locator('.kit-empty')).toBeVisible();
+  await expect(decisions.locator('table.kit-table')).toBeHidden();
   await expect(view.locator('.zt-guard-trace [data-stage="blocklist"]')).toContainText('Active block 203.0.113.7/32 covers this address.');
   await expect(view.getByRole('button', { name: 'Remove block' })).toBeVisible();
   await expectNoSnakeCase(view);

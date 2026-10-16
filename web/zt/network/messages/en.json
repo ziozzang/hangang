@@ -200,6 +200,8 @@
   "network.ip.not_blocked": "No active block covers this address.",
   "network.ip.owner": "Address evaluated by Sumunjang with GeoIP, evidence, rules and blocks",
   "network.ip.risk": "Risk",
+  "network.ip.rules_not_reached": "Rules were not reached in this evaluation",
+  "network.ip.rules_snapshot": "from the scoring snapshot",
   "network.ip.score": "Score",
   "network.ip.score_value": "{total} (signals {signal} + rules {rules})",
   "network.ip.status": "Block and allow status",

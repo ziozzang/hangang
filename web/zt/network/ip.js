@@ -41,6 +41,19 @@ export async function renderIpDetail(cx, root, ip) {
   const allowStage = result?.stages?.find(stage => stage.stage === 'allowlist');
   const allowEntry = allowStage?.matched ? allowStage.network : (policy.ok ? (policy.value.policy?.allow || []).find(network => contains(network, ip)) : null);
   const mode = policy.ok ? policy.value.policy?.mode : result?.evaluated?.mode;
+  // Matched rules come from the same explain evaluation as the trace (the
+  // enforce view while observing); the lookup snapshot is only a fallback.
+  const evaluation = result?.enforce_preview || result;
+  const rulesStage = evaluation?.stages?.find(stage => stage.stage === 'rules');
+  const ruleChip = (rule, extra) => ui.el('a', { class: `kit-tag${extra ? ` ${extra}` : ''}`, href: `#network/rules?rule=${encodeURIComponent(rule.id)}`, text: rule.id, dataset: { rule: rule.id } });
+  const matchedRules = rulesStage
+    ? ui.el('span', { class: 'zt-chips zt-matched-rules', dataset: { source: 'explain' } },
+      (rulesStage.matched || []).map(rule => ruleChip(rule, rule.winner ? 'is-winner' : '')),
+      (rulesStage.expired || []).map(rule => ui.el('span', { class: 'zt-chips' }, ruleChip(rule, 'is-expired'), ui.el('span', { class: 'kit-tag kit-tag-warn', text: t('network.expiry.expired') }))),
+      !(rulesStage.matched || []).length && !(rulesStage.expired || []).length ? ui.el('span', { class: 'kit-muted', text: t('network.none') }) : null)
+    : result
+      ? ui.el('span', { class: 'kit-muted', text: t('network.ip.rules_not_reached') })
+      : ui.el('span', { class: 'zt-chips zt-matched-rules', dataset: { source: 'lookup' } }, (inspection.matched_rules || []).map(id => ruleChip({ id })), ui.el('span', { class: 'kit-muted', text: t('network.ip.rules_snapshot') }));
   // Header verdict.
   const verdict = result ? ui.el('div', { class: 'zt-verdict' }, verdictBadge(cx, result.verdict), ui.el('span', { text: codeText(t, result.reason_code, result.params) }),
     result.enforce_preview ? ui.el('span', { class: 'zt-preview-verdict' }, ui.el('span', { class: 'kit-muted', text: t('network.ip.enforce_would') }), ' ', verdictBadge(cx, result.enforce_preview.verdict === 'observe' ? (result.enforce_preview.decision?.action || 'allow') : result.enforce_preview.verdict)) : null) : null;
@@ -59,7 +72,7 @@ export async function renderIpDetail(cx, root, ip) {
       ['network.ip.score', t('network.ip.score_value', { total: number(inspection.score ?? 0), signal: number(inspection.signal_score ?? 0), rules: number(inspection.static_rule_score ?? 0) })],
       ['network.ip.threshold', policy.ok ? number(policy.value.policy?.threshold) : null],
       ['network.ip.events', candidate ? t('network.ip.events_value', { count: number(candidate.events), first: ui.formatFullTime((candidate.first_seen || 0) * 1000), last: ui.formatFullTime((candidate.last_seen || 0) * 1000) }) : t('network.ip.no_events')],
-      ['network.ip.matched_rules', inspection.matched_rules?.length ? ui.el('span', { class: 'zt-chips' }, inspection.matched_rules.map(id => ui.el('a', { class: 'kit-tag', href: `#network/rules?rule=${encodeURIComponent(id)}`, text: id }))) : t('network.none')],
+      ['network.ip.matched_rules', matchedRules],
     ]), { actions: [] }),
     panel(cx, 'network.ip.status', ui.el('div', { class: 'zt-content' }, ui.el('h3', { class: 'zt-subhead', text: t('network.ip.blocks') }), blockRows, ui.el('h3', { class: 'zt-subhead', text: t('network.ip.allowlist') }), allowRow)));
   const history = ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('network.gap.history') }));

@@ -194,6 +194,8 @@
   "network.ip.not_blocked": "이 주소를 덮는 활성 차단이 없습니다.",
   "network.ip.owner": "수문장이 GeoIP, 근거, 규칙, 차단으로 평가한 주소",
   "network.ip.risk": "위험",
+  "network.ip.rules_not_reached": "이 평가에서는 규칙 단계에 도달하지 않았습니다",
+  "network.ip.rules_snapshot": "점수 스냅숏 기준",
   "network.ip.score": "점수",
   "network.ip.score_value": "{total}(신호 {signal} + 규칙 {rules})",
   "network.ip.status": "차단·허용 상태",

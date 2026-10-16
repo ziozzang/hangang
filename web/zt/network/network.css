@@ -216,3 +216,5 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 .zt-rules-table th:nth-child(10) { width: 4.5rem; }
 .zt-rules-table select, .zt-rules-table input { min-width: 0; }
 @media (max-width: 720px) { .zt-rules-table { table-layout: auto; } .zt-rules-table th { width: auto !important; } }
+.zt-matched-rules .is-winner { outline: 1px solid var(--cyan); }
+.zt-matched-rules .is-expired { text-decoration: line-through; opacity: .75; }

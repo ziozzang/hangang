@@ -234,7 +234,7 @@ a.zt-card:hover, a.zt-kpi:hover { border-color: var(--cyan); }
 .kit-dense .kit-col-result { width: 8%; }
 .kit-dense .kit-col-user { width: 14%; }
 .kit-dense .kit-col-target { width: 18%; }
-.kit-dense .kit-col-stage { width: 7.5rem; }
+.kit-dense .kit-col-stage { width: 9.5rem; }
 .kit-dense .kit-col-source { width: 9%; }
 .kit-dense .kit-col-reason .kit-cell { max-width: 34rem; }
 #view-audit .kit-dense .kit-col-time { width: 8.75rem; }
@@ -247,3 +247,5 @@ a.zt-card:hover, a.zt-kpi:hover { border-color: var(--cyan); }
 .kit-chip-full .kit-mono { overflow-wrap: anywhere; }
 .kit-dense .kit-col-user { width: 13%; }
 .kit-dense .kit-col-source { width: 11%; }
+/* Headers never truncate: long labels wrap instead of being clipped. */
+.kit-dense th { white-space: normal; overflow-wrap: normal; vertical-align: bottom; line-height: 1.2; }
