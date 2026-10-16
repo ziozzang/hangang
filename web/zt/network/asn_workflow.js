@@ -136,6 +136,13 @@ export async function renderAsnBundle(cx, root) {
 // ---------------------------------------------------------------- impact
 
 /** Impact of a scope (preview or stored proposal); counts and samples only. */
+// One sentence over the same three verdicts as the samples table (now, after
+// activation in the current mode, with enforcement), from the complete counts.
+function impactSummary(cx, mode, preview) {
+  const current = preview.current_mode || {}, already = current.already_denied ?? 0, change = current.allow_to_deny ?? 0, kept = current.unchanged_allow ?? 0;
+  return cx.t('network.proposal.impact.mode', { mode: cx.t(`network.mode.${mode === 'enforce' ? 'enforce' : 'observe'}`), total: number(already + change + kept), already: number(already), change: number(change), kept: number(kept), enforce: number(preview.enforce?.allow_to_deny ?? 0) });
+}
+
 export function impactView(cx, impact, { decisionLog = null } = {}) {
   const { t, ui } = cx;
   if (!impact || typeof impact !== 'object') return ui.emptyState(t, { title: 'network.proposal.impact.none' });
@@ -157,7 +164,7 @@ export function impactView(cx, impact, { decisionLog = null } = {}) {
   return ui.el('div', { class: 'zt-content zt-impact-view' },
     warnings.length ? ui.el('ul', { class: 'zt-warnings', attrs: { role: 'note' } }, warnings.map(text => ui.el('li', {}, ui.el('span', { class: 'kit-tag kit-tag-warn', text: '!' }), ' ', ui.el('span', { text })))) : null,
     tiles,
-    ui.el('p', { class: 'kit-muted', text: t('network.proposal.impact.mode', { mode: t(`network.mode.${impact.mode === 'enforce' ? 'enforce' : 'observe'}`), already: number(preview.current_mode?.already_denied ?? 0), unchanged: number(preview.current_mode?.unchanged_allow ?? 0) }) }),
+    ui.el('p', { class: 'kit-muted', text: impactSummary(cx, impact.mode, preview) }),
     ui.el('div', { class: 'zt-grid' },
       panel(cx, 'network.proposal.impact.samples', sampleTable),
       panel(cx, 'network.proposal.impact.evidence', ui.el('div', { class: 'zt-content' },

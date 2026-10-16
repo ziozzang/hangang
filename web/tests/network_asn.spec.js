@@ -17,7 +17,7 @@ const IMPACT = {
   estimated: { ipv4_addresses: 65920, ipv6_slash64s: 0 },
   tracked: { addresses: 2, eligible: 2, signals: { honeypot: 3, scanner: 8, auth_failure: 3, invalid_request: 0 }, top: [{ ip: '203.0.113.7', score: 64, suspicion: 'high', events: 9 }, { ip: '198.18.4.2', score: 24, suspicion: 'suspicious', events: 5 }] },
   history: { addresses: 2, score: 110, events: 14 },
-  preview: { current_mode: { allow_to_deny: 0, already_denied: 1, unchanged_allow: 1 }, enforce: { allow_to_deny: 1, unchanged_allow: 0 }, samples: [{ ip: '203.0.113.7', score: 64, before: 'allow', after: 'allow', enforce_after: 'deny', reason_after: 'sumunjang.deny.block_asn' }, { ip: '198.18.4.2', score: 24, before: 'allow', after: 'allow', enforce_after: 'deny', reason_after: 'sumunjang.deny.block_asn' }] },
+  preview: { current_mode: { allow_to_deny: 0, already_denied: 0, unchanged_allow: 2 }, enforce: { allow_to_deny: 2, unchanged_allow: 0 }, samples: [{ ip: '203.0.113.7', score: 64, before: 'allow', after: 'allow', enforce_after: 'deny', reason_after: 'sumunjang.deny.block_asn' }, { ip: '198.18.4.2', score: 24, before: 'allow', after: 'allow', enforce_after: 'deny', reason_after: 'sumunjang.deny.block_asn' }] },
   collisions: { allowlist: [{ allow: '203.0.113.200/32', network: '203.0.113.0/24', expires_at: NOW + 86400 }], zones: [{ zone: 'partner.acme', overlapping_prefixes: 1 }], existing_blocks: ['203.0.113.7/32'] },
   warnings: ['observe mode: activation records blocks but does not deny until enforce mode', 'allowlist entries overlap the scope; allowlisted addresses stay allowed', 'network zones overlap the scope; review zone owners'],
   decision_log: { available: false },
@@ -194,6 +194,7 @@ test('proposal detail: impact, collisions, timeline; two-person rule for the pro
   const impact = view.getByRole('region', { name: 'Impact analysis' });
   await expect(impact).toContainText('65,920');
   await expect(impact).toContainText('Observe mode: activation records blocks');
+  await expect(impact).toContainText('Of 2 tracked addresses, 0 are denied now, 0 change from allow to deny on activation and 2 stay allowed after activation; with enforcement, 2 change from allow to deny.');
   await expect(impact.getByRole('region', { name: 'Collisions' })).toContainText('partner.acme');
   await expect(impact.getByRole('region', { name: 'Collisions' })).toContainText('203.0.113.200/32');
   await expect(impact.locator('.zt-impact-samples tbody tr')).toHaveCount(2);
