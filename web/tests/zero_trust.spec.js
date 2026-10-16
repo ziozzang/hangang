@@ -55,7 +55,19 @@ async function setup(page, { disabled = false, resolve = 'ok', auditFailure = fa
     if (p.startsWith('/v1/observability/requests/')) return route.fulfill({ json: { state: 'enabled', request_id: decodeURIComponent(p.split('/').pop()), events: [event(0)] } });
     if (p === '/v1/plugins/hopae/subjects/resolve') {
       if (resolve === 'missing') return route.fulfill({ status: 404, json: { detail: 'unknown operation' } });
-      return route.fulfill({ json: { subjects: [{ id: 'u_kim', display_name: 'Kim Analyst', principal_kind: 'human', status: 'active', providers: ['oidc-corp'] }] } });
+      const directory = {
+        u_kim: { status: 'active', reason: null, kind: 'human', user_id: 'u_kim', display_name: 'Kim Analyst', email: 'k***@corp.example', providers: ['oidc-corp'], created_at: 1760000000, last_login_at: 1760600000, last_seen_at: 1760605000 },
+        u_gone: { status: 'deleted', reason: null, kind: 'human', user_id: 'u_gone' },
+        u_never: { status: 'unknown', reason: 'not_found', kind: null },
+      };
+      const blank = { kind: null, user_id: null, human_subject: null, display_name: null, email: null, providers: [], created_at: null, last_login_at: null, last_seen_at: null, service_id: null, realm: null, expires_at: null };
+      const ids = JSON.parse(request.postData()).ids;
+      const items = ids.map(id => ({ ...blank, id, ...(directory[id] || { status: 'unknown', reason: 'unrecognized' }) }));
+      return route.fulfill({ json: { items, resolved: items.filter(i => i.status !== 'unknown').length, unknown: items.filter(i => i.status === 'unknown').length, complete: true, privacy_profile: 'standard' } });
+    }
+    if (p === '/v1/plugins/hopae/subjects/search') {
+      const body = JSON.parse(request.postData());
+      return route.fulfill({ json: { items: body.q === 'kim' ? [{ id: 'u_kim', status: 'active', reason: null, kind: 'human', user_id: 'u_kim', human_subject: null, display_name: 'Kim Analyst', email: 'k***@corp.example', providers: ['oidc-corp'], created_at: 1, last_login_at: null, last_seen_at: null, service_id: null, realm: null, expires_at: null }, { id: 'u_kimold', status: 'disabled', reason: null, kind: 'human', user_id: 'u_kimold', human_subject: null, display_name: 'Kim Former', email: null, providers: [], created_at: 1, last_login_at: null, last_seen_at: null, service_id: null, realm: null, expires_at: null }] : [], next_cursor: null, privacy_profile: 'standard' } });
     }
     if (p === '/v1/audit/users') return auditFailure ? route.fulfill({ status: 503, json: { detail: 'store down' } }) : route.fulfill({ json: { records: [{ id: 5, time_unix_ms: Date.UTC(2026, 9, 16, 8), action: 'update', actor_kind: 'account', actor_user_id: 1, target_user_id: 2, before: { role: 'viewer', enabled: true }, after: { role: 'admin', enabled: true } }] } });
     if (p === '/v1/users') return route.fulfill({ json: { users: [{ id: 1, username: 'operator' }, { id: 2, username: 'kim' }] } });
@@ -190,20 +202,51 @@ test('account audit shows a structured before/after diff', async ({ page }) => {
   await expect(view.locator('.kit-diff-change')).toContainText('"viewer" → "admin"');
 });
 
-test('subject resolution shows people first and degrades to the opaque ID', async ({ page }) => {
+test('subject resolution follows the Hopae directory contract and shows each state distinctly', async ({ page }) => {
   const calls = await setup(page);
   await page.goto('/ui/#identities/users/u_kim');
-  await expect(page.locator('#view-identities h1')).toHaveText('Kim Analyst');
-  await expect(page.locator('#view-identities')).toContainText('u_kim');
-  expect(calls.find(c => c.path === '/v1/plugins/hopae/subjects/resolve').body).toBe('{"ids":["u_kim"]}');
+  const view = page.locator('#view-identities');
+  await expect(view.locator('h1')).toHaveText('Kim Analyst');
+  await expect(view.locator('[data-subject-state="active"]')).toContainText('Active');
+  await expect(view).toContainText('k***@corp.example');
+  await expect(view).toContainText('oidc-corp');
+  expect(JSON.parse(calls.find(c => c.path === '/v1/plugins/hopae/subjects/resolve').body)).toEqual({ ids: ['u_kim'], privacy_profile: 'standard' });
   expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('subject=u_kim');
+  await page.evaluate(() => { location.hash = '#identities/users/u_gone'; });
+  await expect(view.locator('[data-subject-state="deleted"]')).toContainText('Deleted (tombstone)');
+  await expect(view.locator('h1')).toHaveText('u_gone');
+  await expect(view).toContainText('no personal data');
+  await page.evaluate(() => { location.hash = '#identities/users/u_never'; });
+  await expect(view.locator('[data-subject-state="unknown"]')).toContainText('Unknown subject');
+  await expect(view).toContainText('Hopae never issued this ID.');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(view.locator('[data-subject-state="unknown"]')).toContainText('알 수 없는 주체');
 });
 
-test('unavailable subject resolution keeps the opaque ID', async ({ page }) => {
+test('unavailable subject directory keeps the opaque ID', async ({ page }) => {
   await setup(page, { resolve: 'missing' });
   await page.goto('/ui/#identities/users/u_kim');
   await expect(page.locator('#view-identities h1')).toHaveText('u_kim');
-  await expect(page.locator('#view-identities')).toContainText('Subject resolution is unavailable');
+  await expect(page.locator('#view-identities [data-subject-state="unavailable"]')).toContainText('showing the opaque ID');
+});
+
+test('subject picker searches Hopae and is keyboard operable', async ({ page }) => {
+  const calls = await setup(page);
+  await page.goto('/ui/#access/decisions');
+  const view = page.locator('#view-access');
+  await expect(view.locator('tbody tr')).toHaveCount(4);
+  const input = view.locator('input[name="subject"][role="combobox"]');
+  await input.fill('kim');
+  await expect(view.locator('.kit-picker [role="option"]')).toHaveCount(2);
+  await expect(view.locator('.kit-picker [role="option"]').nth(1)).toContainText('Disabled');
+  expect(JSON.parse(calls.find(c => c.path === '/v1/plugins/hopae/subjects/search').body)).toEqual({ q: 'kim', kind: 'human', limit: 10, cursor: null, privacy_profile: 'standard' });
+  await input.press('ArrowDown');
+  await expect(input).toHaveAttribute('aria-activedescendant', /-0$/);
+  await input.press('Enter');
+  await expect(input).toHaveValue('u_kim');
+  await expect(input).toHaveAttribute('aria-expanded', 'false');
+  await input.press('Enter');
+  await expect(page).toHaveURL(/subject=u_kim/);
 });
 
 test('raw JSON appears only in System behind a disclosure', async ({ page }) => {

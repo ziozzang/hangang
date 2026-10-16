@@ -58,8 +58,16 @@ npx playwright test tests/zero_trust.spec.js
 
 ## 제한 사항
 
-주체 확인은 호패 패키지가 콘솔 브로커를 통해 `subjects/resolve`를 제공해야
-동작하며, 그 전까지 사용자 페이지는 불투명 ID를 표시합니다. 호패 관리 이벤트와
+주체 표시는 호패 주체 디렉터리 계약(호패 `docs/SUBJECT_DIRECTORY.md`)을
+따릅니다. `subjects/resolve`(최대 100개 ID)와 주체 선택기용 `subjects/search`를
+사용하며, `active`, `disabled`, `deleted`(흔적만 남고 개인정보 없음),
+`unknown`(사유 포함)을 서로 구분해 표시합니다. 호패 콘솔 패키지는
+`subjects/resolve`, `subjects/search`, `subjects/lifecycle`,
+`subjects/lifecycle/snapshot`, `explain/authentication`을 `"mutation": false`인
+`POST` 경로로 선언해야 합니다. 그러면 브로커가 정확한 본문에 대한 서명된 수행자
+주장과 함께 `/v1/<path>`로 전달하고, 변경 작업으로 기록하지 않으며, 호패의 위임
+검증기가 JSON API 규칙을 적용합니다. 이 경로가 없거나 호패가 요청 한도에 걸리면
+사용자 페이지는 불투명 ID를 표시합니다. 호패 관리 이벤트와
 수문장 정책 변경은 아직 연결되지 않은 감사 출처로 표시됩니다. 시뮬레이터, 영향 분석,
 봉인 해제, 저장된 보기, CSV 내보내기는 ADR 0020 P1·P2에서 제공됩니다. 기존
 페이지는 이전될 때까지 영어 문장 기반 사전을 유지합니다.

@@ -61,8 +61,17 @@ npx playwright test tests/zero_trust.spec.js
 
 ## Limitations
 
-Subject resolution depends on the Hopae package exposing `subjects/resolve`
-through the console broker; until then user pages show the opaque ID. Hopae
+Subject display follows the Hopae subject directory contract (Hopae
+`docs/SUBJECT_DIRECTORY.md`): `subjects/resolve` (at most 100 IDs) and
+`subjects/search` for the subject picker, with `active`, `disabled`, `deleted`
+(tombstone, no personal data) and `unknown` (with its reason) shown distinctly.
+The Hopae console package must list `subjects/resolve`, `subjects/search`,
+`subjects/lifecycle`, `subjects/lifecycle/snapshot` and
+`explain/authentication` as `POST` routes with `"mutation": false`; the broker
+then forwards them to `/v1/<path>` with the signed actor assertion over the
+exact body, does not record them as mutations, and Hopae's delegation verifier
+applies its JSON API rule. Without those routes, or when Hopae is rate limited,
+user pages show the opaque ID. Hopae
 administration events and Sumunjang policy changes are listed as audit sources
 that are not yet connected. The simulator, impact analysis, reveal, saved views
 and CSV export arrive with ADR 0020 P1 and P2. Legacy pages keep their

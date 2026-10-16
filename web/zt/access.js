@@ -114,7 +114,7 @@ function filterForm(cx, params, apply) {
     ui.field(t, { label: 'access.filter.route', name: 'route', value: params.get('route') || '', pattern: IDENT.source.slice(1, -1) }),
     ui.field(t, { label: 'access.filter.service', name: 'service', value: params.get('service') || '', pattern: IDENT.source.slice(1, -1) }),
     ui.field(t, { label: 'access.filter.class', name: 'class', value: params.get('class') || '', pattern: IDENT.source.slice(1, -1) }),
-    ui.field(t, { label: 'access.filter.subject', name: 'subject', value: params.get('subject') || '', help: 'access.filter.subject.help', maxLength: 1024 }),
+    ui.subjectPicker(t, cx.api, { label: 'access.filter.subject', name: 'subject', value: params.get('subject') || '', help: 'access.filter.subject.help' }),
     ui.field(t, { label: 'access.filter.ip', name: 'ip', value: params.get('ip') || '', maxLength: 45 }),
     ui.field(t, { label: 'access.filter.country', name: 'country', value: params.get('country') || '', pattern: '[A-Z]{2}', maxLength: 2 }),
     ui.el('div', { class: 'button-row zt-filter-actions' },

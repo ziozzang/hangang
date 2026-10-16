@@ -313,35 +313,64 @@ export function confirmDialog(t, { title, effect, target, confirmLabel = 'ui.con
   });
 }
 
+const SUBJECT_STATUSES = Object.freeze(['active', 'disabled', 'deleted', 'unknown']);
+const SUBJECT_KINDS = Object.freeze(['human', 'service', 'workload']);
+const SUBJECT_REASONS = Object.freeze(['credential_expired', 'not_found', 'unrecognized', 'human_subjects_not_configured', 'index_incomplete', 'not_enumerable']);
+const textOrNull = value => (typeof value === 'string' && value ? value : null);
+const numberOrNull = value => (Number.isFinite(value) ? value : null);
+
 /**
- * Batches subject IDs per view into Hopae `subjects/resolve` (≤100 IDs, read
- * only). Unavailable resolution degrades to the opaque ID; an ID Hopae does
- * not know is reported as unknown.
+ * One item of Hopae `subjects/resolve` or `subjects/search` (Hopae
+ * docs/SUBJECT_DIRECTORY.md). Returns null for anything outside the contract.
  */
-export function subjectResolver(api, path = '/v1/plugins/hopae/subjects/resolve') {
+export function parseSubject(item) {
+  if (!item || typeof item !== 'object' || typeof item.id !== 'string' || !SUBJECT_STATUSES.includes(item.status)) return null;
+  if (item.reason !== null && !SUBJECT_REASONS.includes(item.reason)) return null;
+  return Object.freeze({
+    id: item.id, status: item.status, reason: item.reason,
+    kind: SUBJECT_KINDS.includes(item.kind) ? item.kind : null,
+    userId: textOrNull(item.user_id), humanSubject: textOrNull(item.human_subject),
+    displayName: textOrNull(item.display_name), email: textOrNull(item.email),
+    providers: Array.isArray(item.providers) ? item.providers.filter(value => typeof value === 'string') : [],
+    createdAt: numberOrNull(item.created_at), lastLoginAt: numberOrNull(item.last_login_at), lastSeenAt: numberOrNull(item.last_seen_at),
+    serviceId: textOrNull(item.service_id), realm: textOrNull(item.realm), expiresAt: numberOrNull(item.expires_at),
+  });
+}
+
+/**
+ * Batches subject references per view into Hopae `subjects/resolve`
+ * (≤100 IDs per request, read only, audited by Hopae). Resolves each ID to
+ * `{state: 'resolved', subject}` (subject.status is active, disabled, deleted
+ * or unknown with its reason), or `{state: 'unavailable', retry}` when the
+ * directory cannot answer, in which case callers show the opaque ID.
+ */
+export function subjectResolver(api, { path = '/v1/plugins/hopae/subjects/resolve', privacyProfile = 'standard' } = {}) {
   const cache = new Map();
-  let pending = new Map(), timer = null, available = true;
+  let pending = new Map(), timer = null, installed = true;
   async function flush() {
     timer = null;
     const batch = pending; pending = new Map();
     const ids = [...batch.keys()];
     for (let start = 0; start < ids.length; start += 100) {
       const slice = ids.slice(start, start + 100);
-      let resolved = new Map();
-      if (available) {
+      let answer = null, retry = false;
+      if (installed) {
         try {
-          const { data } = await api(path, { method: 'POST', json: { ids: slice } });
-          const records = Array.isArray(data) ? data : Array.isArray(data?.subjects) ? data.subjects : Array.isArray(data?.items) ? data.items : Object.entries(data?.subjects || {}).map(([id, value]) => ({ id, ...value }));
-          for (const record of records) if (record && typeof record.id === 'string') resolved.set(record.id, record);
+          const { data } = await api(path, { method: 'POST', json: { ids: slice, privacy_profile: privacyProfile } });
+          if (data && Array.isArray(data.items)) {
+            answer = new Map();
+            for (const item of data.items) { const subject = parseSubject(item); if (subject) answer.set(subject.id, subject); }
+          }
         } catch (error) {
-          if (error?.status === 404 || error?.status === 403 || error?.status === 501) available = false;
-          resolved = null;
+          if (error?.status === 404) installed = false;
+          retry = error?.status === 429 || error?.status === 503;
         }
       }
       for (const id of slice) {
-        const record = resolved?.get(id);
-        const value = resolved === null || !available ? { state: 'unavailable' } : record ? { state: 'resolved', display: typeof record.display_name === 'string' ? record.display_name : null, principal: record.principal_kind || record.kind || null, status: record.status || null, provider: record.provider || (Array.isArray(record.providers) ? record.providers[0] : null) } : { state: 'unknown' };
-        cache.set(id, Promise.resolve(value));
+        const subject = answer?.get(id);
+        const value = subject ? { state: 'resolved', subject } : { state: 'unavailable', retry };
+        // Unavailable answers are not cached: the next view asks again.
+        if (subject) cache.set(id, Promise.resolve(value)); else cache.delete(id);
         batch.get(id)(value);
       }
     }
@@ -354,8 +383,71 @@ export function subjectResolver(api, path = '/v1/plugins/hopae/subjects/resolve'
       if (!timer) timer = setTimeout(flush, 0);
       return promise;
     },
-    get available() { return available; },
+    get installed() { return installed; },
   };
 }
 
-export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, confirmDialog, subjectResolver });
+/** Human label of a resolved subject: display name, else masked e-mail, else null. */
+export function subjectLabel(subject) { return subject?.displayName || subject?.email || null; }
+
+/**
+ * Accessible subject picker (combobox) backed by Hopae `subjects/search`.
+ * Without the directory it remains a plain ID input.
+ */
+export function subjectPicker(t, api, { label, name, value = '', kind = 'human', help = 'ui.picker.help', path = '/v1/plugins/hopae/subjects/search', privacyProfile = 'standard' }) {
+  const wrapper = field(t, { label, name, value, maxLength: 1024, help });
+  const input = wrapper.querySelector('input');
+  const list = el('ul', { class: 'kit-picker', hidden: true, attrs: { role: 'listbox' } });
+  list.id = `${input.id}-list`;
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
+  input.setAttribute('aria-controls', list.id);
+  wrapper.append(list);
+  let timer = null, sequence = 0, active = -1, items = [], available = true;
+  const close = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); active = -1; };
+  const choose = subject => { input.value = subject.id; close(); input.dispatchEvent(new Event('change', { bubbles: true })); };
+  const highlight = index => {
+    active = index;
+    [...list.children].forEach((option, position) => option.setAttribute('aria-selected', String(position === index)));
+    if (index >= 0) input.setAttribute('aria-activedescendant', list.children[index].id); else input.removeAttribute('aria-activedescendant');
+  };
+  async function search(query) {
+    const current = ++sequence;
+    try {
+      const { data } = await api(path, { method: 'POST', json: { q: query, kind, limit: 10, cursor: null, privacy_profile: privacyProfile } });
+      if (current !== sequence) return;
+      items = (Array.isArray(data?.items) ? data.items : []).map(parseSubject).filter(subject => subject && subject.status !== 'unknown');
+      list.replaceChildren(...items.map((subject, index) => {
+        const option = el('li', { id: `${list.id}-${index}`, class: `kit-picker-option kit-subject-${subject.status}`, attrs: { role: 'option', 'aria-selected': 'false' } },
+          el('span', { class: 'kit-entity-label', text: subjectLabel(subject) || subject.id }),
+          el('span', { class: 'kit-entity-id', text: subject.id }),
+          subject.status !== 'active' ? el('span', { class: 'kit-tag', text: t(`ui.subject.status.${subject.status}`) }) : null);
+        option.addEventListener('mousedown', event => { event.preventDefault(); choose(subject); });
+        return option;
+      }));
+      if (!items.length) list.append(el('li', { class: 'kit-picker-empty', text: t('ui.picker.none'), attrs: { role: 'option', 'aria-disabled': 'true' } }));
+      list.hidden = false; input.setAttribute('aria-expanded', 'true'); highlight(-1);
+    } catch (error) {
+      if (error?.status === 404) available = false;
+      close();
+    }
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const query = input.value.trim();
+    if (!available || query.length < 2 || query.length > 128) return close();
+    timer = setTimeout(() => search(query), 250);
+  });
+  input.addEventListener('keydown', event => {
+    if (list.hidden || !items.length) return;
+    if (event.key === 'ArrowDown') { event.preventDefault(); highlight(Math.min(items.length - 1, active + 1)); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); highlight(Math.max(0, active - 1)); }
+    else if (event.key === 'Enter' && active >= 0) { event.preventDefault(); choose(items[active]); }
+    else if (event.key === 'Escape') { event.preventDefault(); close(); }
+  });
+  input.addEventListener('blur', () => setTimeout(close, 100));
+  return wrapper;
+}
+
+export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, confirmDialog, subjectResolver, subjectPicker, subjectLabel, parseSubject });

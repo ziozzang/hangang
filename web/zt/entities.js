@@ -22,6 +22,15 @@ function recentDecisions(cx, params, caption) {
   return { section: ui.el('section', { class: 'panel zt-panel' }, ui.el('div', { class: 'zt-panel-head' }, ui.el('h2', { text: t('entity.decisions.title') }), all), table.element), table };
 }
 
+const SUBJECT_BADGE = Object.freeze({ active: 'healthy', disabled: 'disabled', deleted: 'stale', unknown: 'unknown' });
+
+function subjectTime(value) {
+  if (!Number.isFinite(value)) return null;
+  // Hopae reports Unix seconds, except service credential expiry in milliseconds.
+  const date = new Date(value > 1e12 ? value : value * 1000);
+  return new Intl.DateTimeFormat(document.documentElement.lang || undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+}
+
 export async function renderUser(cx, root, id) {
   const { t, ui } = cx;
   const { content, heading } = cx.page(root, { crumbs: [{ label: t('nav.identities'), href: '#identities' }, { label: t('entity.user.crumb') }, { label: id }], title: id, owner: t('entity.user.owner') });
@@ -31,16 +40,29 @@ export async function renderUser(cx, root, id) {
   content.append(summary, ui.el('nav', { class: 'button-row', attrs: { 'aria-label': t('entity.user.related') } }, ui.el('a', { class: 'button button-quiet', href: '#plugin-hopae', text: t('entity.user.hopae') })), section);
   const [resolved] = await Promise.all([cx.resolver.resolve(id), table.reload()]);
   if (cx.signal.aborted) return;
-  const lines = [];
-  if (resolved.state === 'resolved') {
-    if (resolved.display) heading.textContent = resolved.display;
-    lines.push([t('entity.user.principal'), resolved.principal ? t(`decision.principal.${resolved.principal}`) : '—'], [t('entity.user.status'), resolved.status || '—'], [t('entity.user.provider'), resolved.provider || '—']);
-  } else {
-    lines.push([t('entity.user.resolution'), t(resolved.state === 'unknown' ? 'entity.user.unknown' : 'entity.user.unresolved')]);
+  const idLine = ui.el('p', { class: 'kit-muted' }, ui.el('span', { text: t('entity.user.id') }), ' ', ui.el('code', { text: id }), ui.copyButton(t, id));
+  const lookup = ui.el('p', { class: 'kit-muted', text: t('entity.user.forward_lookup') });
+  if (resolved.state !== 'resolved') {
+    ui.clear(summary, ui.el('p', { class: 'zt-banner', dataset: { subjectState: 'unavailable' }, text: t(resolved.retry ? 'entity.user.retry' : 'entity.user.unresolved') }), idLine, lookup);
+    return;
   }
-  ui.clear(summary, ui.el('dl', { class: 'zt-dl' }, lines.map(([key, value]) => [ui.el('dt', { text: key }), ui.el('dd', { text: value })])),
-    ui.el('p', { class: 'kit-muted' }, ui.el('span', { text: t('entity.user.id') }), ' ', ui.el('code', { text: id }), ui.copyButton(t, id)),
-    ui.el('p', { class: 'kit-muted', text: t('entity.user.forward_lookup') }));
+  const subject = resolved.subject;
+  const label = ui.subjectLabel(subject);
+  if (label && subject.status !== 'deleted') heading.textContent = label;
+  const state = ui.el('div', { class: 'zt-subject-state', dataset: { subjectState: subject.status } },
+    ui.statusBadge(t, SUBJECT_BADGE[subject.status], `ui.subject.status.${subject.status}`),
+    subject.reason ? ui.el('span', { text: t(`ui.subject.reason.${subject.reason}`) }) : null);
+  const rows = subject.status === 'unknown' ? [] : [
+    ['entity.user.principal', subject.kind ? t(`decision.principal.${subject.kind}`) : null],
+    ['entity.user.email', subject.email], ['entity.user.provider', subject.providers.join(', ') || null],
+    ['entity.user.service', subject.serviceId], ['entity.user.realm', subject.realm],
+    ['entity.user.created', subjectTime(subject.createdAt)], ['entity.user.last_login', subjectTime(subject.lastLoginAt)],
+    ['entity.user.last_seen', subjectTime(subject.lastSeenAt)], ['entity.user.expires', subjectTime(subject.expiresAt)],
+  ].filter(([, value]) => value);
+  ui.clear(summary, state,
+    subject.status === 'deleted' ? ui.el('p', { class: 'zt-banner', text: t('entity.user.tombstone') }) : null,
+    rows.length ? ui.el('dl', { class: 'zt-dl' }, rows.map(([key, value]) => [ui.el('dt', { text: t(key) }), ui.el('dd', { text: value })])) : null,
+    idLine, lookup);
 }
 
 export async function renderIp(cx, root, ip) {
@@ -75,7 +97,7 @@ export async function renderSection(cx, root, name) {
   const opener = OPENERS[name];
   if (opener) {
     const form = ui.el('form', { class: 'zt-search', attrs: { role: 'search' } });
-    const control = ui.field(t, { label: opener.label, name: 'id', pattern: opener.pattern, maxLength: 1024 });
+    const control = name === 'identities' ? ui.subjectPicker(t, cx.api, { label: opener.label, name: 'id' }) : ui.field(t, { label: opener.label, name: 'id', pattern: opener.pattern, maxLength: 1024 });
     form.append(control, ui.el('button', { type: 'submit', class: 'button', text: t('section.open') }));
     form.addEventListener('submit', event => { event.preventDefault(); if (!form.reportValidity()) return; const value = form.elements.id.value.trim(); if (value) cx.navigate(cx.hashFor(name, [...opener.route, value])); });
     content.append(form);

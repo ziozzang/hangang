@@ -45,7 +45,7 @@ for (const file of sources) {
     for (const pattern of forbidden) {
       const hit = line.match(pattern);
       // ARIA state tokens are not prose.
-      if (hit && !/^['"`](true|false|polite|assertive|page|location)['"`]$/.test(hit[0].slice(hit[0].search(/['"`][^'"`]*['"`]$/)))) failures.push(`${file}:${index + 1}: literal UI text; use a message key`);
+      if (hit && !/^['"`](true|false|polite|assertive|page|location|list|both|none|listbox)['"`]$/.test(hit[0].slice(hit[0].search(/['"`][^'"`]*['"`]$/)))) failures.push(`${file}:${index + 1}: literal UI text; use a message key`);
     }
     for (const match of line.matchAll(literal)) {
       const value = match[2];
@@ -72,6 +72,8 @@ const families = {
   'audit.source': ['accounts', 'plugins', 'pumgye', 'hopae', 'sumunjang'],
   'audit.actor': ['system', 'account', 'unknown'],
   'system.profile': ['off', 'strict', 'standard'],
+  'ui.subject.status': ['active', 'disabled', 'deleted', 'unknown'],
+  'ui.subject.reason': ['credential_expired', 'not_found', 'unrecognized', 'human_subjects_not_configured', 'index_incomplete', 'not_enumerable'],
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],
 };
 for (const name of ['identities', 'policies', 'network', 'workloads']) families[`section.${name}`] = ['owner', 'planned', 'body'];
