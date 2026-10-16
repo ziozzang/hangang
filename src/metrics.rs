@@ -29,6 +29,10 @@ pub struct Metrics {
     pub config_updates: AtomicU64,
     /// Kubernetes ProtectionPolicy outcome of the published snapshot.
     pub kubernetes_protection: crate::protection::Diagnostics,
+    /// Bounded staleness of the Kubernetes snapshot (controller mode).
+    pub kubernetes_freshness: std::sync::Arc<crate::kubernetes::Freshness>,
+    /// Certificate hot-reload outcomes per material set.
+    pub tls_reload: std::sync::Arc<crate::tls_reload::Registry>,
 }
 impl Metrics {
     pub fn render(&self) -> String {
@@ -117,6 +121,8 @@ impl Metrics {
         }
         self.geoip.render(&mut out);
         self.kubernetes_protection.render(&mut out);
+        self.kubernetes_freshness.render(&mut out);
+        self.tls_reload.render(&mut out);
         out
     }
 }

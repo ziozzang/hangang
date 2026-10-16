@@ -283,7 +283,7 @@ async fn admin_kubernetes_protection_report_is_admin_only_and_follows_the_contro
         .unwrap();
     assert_eq!(
         disabled,
-        serde_json::json!({"scope":"instance","enabled":false,"report":null})
+        serde_json::json!({"scope":"instance","enabled":false,"report":null,"freshness":null})
     );
     let mut report = hangang::protection::Report {
         require_protection: true,

@@ -187,6 +187,29 @@ impl Manager {
         })
         .await?
     }
+    /// Rebuild the active snapshot from its unchanged configuration so TLS
+    /// clients pick up rotated certificate material (the caller advanced
+    /// [`crate::tls_reload::generation`]). The revision, listeners and
+    /// served certificates stay as they are; in-flight requests finish on
+    /// the previous snapshot and its connections.
+    pub async fn refresh_tls_material(self: &Arc<Self>) -> anyhow::Result<()> {
+        let _guard = self.writes.lock().await;
+        anyhow::ensure!(!self.stopping.load(Ordering::Acquire), "server is draining");
+        let current = self.active.load_full();
+        let mut next = self.prepare_snapshot(current.config.clone(), false).await?;
+        Arc::get_mut(&mut next)
+            .expect("unpublished snapshot is exclusive")
+            .certificates = current.certificates.clone();
+        let prepared = self.tcp.prepare(&current.config).await?;
+        self.tcp
+            .commit_with_publication(prepared, || {
+                next.activated();
+                self.active.store(next);
+            })
+            .await?;
+        self.sync_route_readiness(&self.active.load());
+        Ok(())
+    }
     /// Readiness follows the published snapshot: it stays down while any
     /// enabled route fails closed here, and local-file authority restores it
     /// once a later publication clears them (drain/handoff flags are
@@ -1621,12 +1644,22 @@ impl Admin {
             // Read-only diagnostics without secrets: viewers may read them.
             let _ = &actor;
             let report = self.manager.metrics.kubernetes_protection.current();
+            let freshness = &self.manager.metrics.kubernetes_freshness;
+            let freshness = freshness.age().map(|age| {
+                serde_json::json!({
+                    "snapshot_age_seconds": age.as_secs(),
+                    "max_snapshot_staleness_seconds": freshness.max_staleness_seconds(),
+                    "protected_fail_closed": freshness.protected_fail_closed(),
+                    "stale_refusals": freshness.refusals(),
+                })
+            });
             return Ok(auth_json(
                 200,
                 &serde_json::json!({
                     "scope": "instance",
                     "enabled": report.is_some(),
                     "report": report.as_deref(),
+                    "freshness": freshness,
                 }),
             ));
         }

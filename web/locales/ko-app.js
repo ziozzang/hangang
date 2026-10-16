@@ -1274,4 +1274,6 @@ export default {
   'Sumunjang admission is not fail-closed': 'Sumunjang 승인이 실패 시 닫힘으로 동작하지 않습니다',
   'Withheld {namespace}/{name}: {reason}': '보류됨 {namespace}/{name}: {reason}',
   'Protection status unavailable: {detail}': '보호 상태를 확인할 수 없음: {detail}',
+  'Snapshot is {age}s old, beyond the {bound}s bound: protected routes fail closed.': '스냅숏이 {age}초 지나 {bound}초 한도를 넘었습니다. 보호된 경로는 실패 시 닫힙니다.',
+  'Snapshot age {age}s of {bound}s allowed.': '스냅숏 경과 {age}초 / 허용 {bound}초',
 };

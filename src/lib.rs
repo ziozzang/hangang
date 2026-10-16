@@ -54,6 +54,7 @@ pub mod ingress;
 pub mod kubernetes;
 pub mod protection;
 pub mod proxy_protocol;
+pub mod tls_reload;
 
 pub mod active_probe;
 pub mod admission;

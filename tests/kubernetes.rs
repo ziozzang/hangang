@@ -183,6 +183,10 @@ async fn harness(mode: Mode, namespace: Option<&str>) -> Result<Harness> {
         watch_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         stale_after: Duration::from_secs(60),
+        max_staleness: Duration::from_secs(300),
+        readiness: hangang::kubernetes::Readiness::Fresh,
+        list_timeout: Duration::from_secs(3),
+        freshness: None,
         protection: None,
     };
     Ok(Harness {
@@ -268,6 +272,10 @@ async fn tls_api_paginates_rotates_token_and_applies_watch_deletion() -> Result<
         watch_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         stale_after: Duration::from_secs(60),
+        max_staleness: Duration::from_secs(300),
+        readiness: hangang::kubernetes::Readiness::Fresh,
+        list_timeout: Duration::from_secs(3),
+        freshness: None,
         protection: None,
     };
     let controller = Controller::new(options, Arc::new(ChannelSink(tx)))?;
@@ -516,6 +524,7 @@ async fn publication_is_not_blocked_by_a_stalled_status_endpoint() -> Result<()>
     // A patch that blocks publication would hold it for the whole request
     // timeout; make that window much wider than the bound asserted below.
     harness.options.request_timeout = Duration::from_secs(10);
+    harness.options.list_timeout = Duration::from_secs(10);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let controller = Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx)))?;
     let (cancel, task) = spawn(controller);
@@ -651,6 +660,67 @@ async fn replicas_with_different_histories_publish_identical_snapshots() -> Resu
     cold_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(2), warm_task).await??;
     tokio::time::timeout(Duration::from_secs(2), cold_task).await??;
+    harness.stop().await
+}
+
+/// ADR 0022 bounded staleness with snapshot readiness: an API outage seen by
+/// every replica keeps them ready and serving, protected routes fail closed
+/// only beyond the bound, and recovery neither re-applies the unchanged
+/// snapshot nor flaps readiness (no traffic interruption from Hangang).
+#[tokio::test]
+async fn api_outage_keeps_readiness_and_fails_protected_routes_closed_only_beyond_the_bound()
+-> Result<()> {
+    let mut harness = harness(Mode::Stale, Some("blue")).await?;
+    harness.options.stale_after = Duration::from_millis(1500);
+    harness.options.max_staleness = Duration::from_millis(2500);
+    harness.options.readiness = hangang::kubernetes::Readiness::Snapshot;
+    let freshness = Arc::new(hangang::kubernetes::Freshness::default());
+    harness.options.freshness = Some(freshness.clone());
+    let (snapshots, mut rx) = mpsc::unbounded_channel();
+    let (authority, mut reports) = mpsc::unbounded_channel();
+    let controller = Controller::new(
+        harness.options.clone(),
+        Arc::new(ReportingSink {
+            snapshots,
+            authority,
+        }),
+    )?;
+    let (cancel, task) = spawn(controller);
+    next_snapshot(&mut rx, Duration::from_secs(4)).await?;
+    await_authority(&mut reports, true, Duration::from_secs(2)).await?;
+    assert!(!freshness.protected_fail_closed());
+    // Watches fail from here on: within the bound nothing changes.
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(!freshness.protected_fail_closed(), "inside the bound");
+    // Beyond the bound protected routes fail closed, readiness stays.
+    let started = std::time::Instant::now();
+    while !freshness.protected_fail_closed() {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bound never enforced"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(freshness.age().unwrap() >= Duration::from_millis(2500));
+    harness.state.resume.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    while freshness.protected_fail_closed() {
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "never recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok((healthy, reason)) = reports.try_recv() {
+        assert!(healthy, "readiness flapped: {reason}");
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "the unchanged snapshot was applied again"
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task).await??;
     harness.stop().await
 }
 
@@ -989,6 +1059,7 @@ async fn status_queue_stays_bounded_under_churn_while_patches_stall() -> Result<
     let mut harness = harness(Mode::Churn, Some("blue")).await?;
     harness.options.publish_address = Some("192.0.2.1".into());
     harness.options.request_timeout = Duration::from_secs(10);
+    harness.options.list_timeout = Duration::from_secs(10);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let controller = Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx)))?;
     let (cancel, task) = spawn(controller);
@@ -1092,6 +1163,7 @@ async fn status_retry_after_a_conflict_does_not_adopt_a_recreated_object() -> Re
 async fn staleness_is_assessed_while_a_relist_is_in_progress() -> Result<()> {
     let mut harness = harness(Mode::SlowRelist, Some("blue")).await?;
     harness.options.request_timeout = Duration::from_secs(20);
+    harness.options.list_timeout = Duration::from_secs(20);
     harness.options.stale_after = Duration::from_secs(8);
     let (snapshots, mut rx) = mpsc::unbounded_channel();
     let (authority, mut reports) = mpsc::unbounded_channel();
@@ -1126,6 +1198,7 @@ async fn staleness_is_assessed_while_a_relist_is_in_progress() -> Result<()> {
 async fn a_completed_list_confirms_each_kind_at_the_moment_it_was_read() -> Result<()> {
     let mut harness = harness(Mode::SlowIngressList, Some("blue")).await?;
     harness.options.request_timeout = Duration::from_secs(20);
+    harness.options.list_timeout = Duration::from_secs(20);
     harness.options.stale_after = Duration::from_secs(3);
     let (snapshots, mut rx) = mpsc::unbounded_channel();
     let (authority, mut reports) = mpsc::unbounded_channel();
@@ -1159,6 +1232,7 @@ async fn a_completed_list_confirms_each_kind_at_the_moment_it_was_read() -> Resu
 async fn an_accepted_watch_response_alone_does_not_restore_readiness() -> Result<()> {
     let mut harness = harness(Mode::LateWatch, Some("blue")).await?;
     harness.options.request_timeout = Duration::from_secs(10);
+    harness.options.list_timeout = Duration::from_secs(10);
     harness.options.stale_after = Duration::from_secs(2);
     let (snapshots, mut rx) = mpsc::unbounded_channel();
     let (authority, mut reports) = mpsc::unbounded_channel();

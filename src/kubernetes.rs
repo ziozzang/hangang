@@ -88,6 +88,18 @@ pub struct ControllerOptions {
     /// authoritative. Must exceed `watch_timeout`, since an idle watch only
     /// proves liveness when the server closes it.
     pub stale_after: Duration,
+    /// Bounded staleness (ADR 0022): once the cache has not been confirmed by
+    /// the API server for longer than this, protected routes fail closed.
+    /// Must be at least `stale_after`; at most one hour.
+    pub max_staleness: Duration,
+    /// What readiness reports to the load balancer.
+    pub readiness: Readiness,
+    /// Deadline of a single non-watch request (list page, status write), so
+    /// a request stuck in an API-server outage does not delay recovery for
+    /// the whole watch request timeout.
+    pub list_timeout: Duration,
+    /// Shared freshness state read by the proxy and metrics.
+    pub freshness: Option<Arc<Freshness>>,
     /// Watch `ProtectionPolicy` objects and compile them into the routes of
     /// the Ingresses they attach to (ADR 0022). `None` keeps the historical
     /// unprotected Ingress semantics.
@@ -123,6 +135,10 @@ impl ControllerOptions {
             watch_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(40),
             stale_after: Duration::from_secs(60),
+            max_staleness: Duration::from_secs(300),
+            readiness: Readiness::Snapshot,
+            list_timeout: Duration::from_secs(15),
+            freshness: None,
             protection: None,
         })
     }
@@ -172,10 +188,108 @@ impl ControllerOptions {
         if let Some(address) = &self.publish_address {
             ensure!(valid_publish_address(address), "invalid publish address");
         }
+        ensure!(
+            self.max_staleness >= self.stale_after
+                && self.max_staleness <= Duration::from_secs(3600),
+            "max staleness must be at least the stale threshold and at most 3600 seconds"
+        );
+        ensure!(
+            self.list_timeout >= Duration::from_secs(1)
+                && self.list_timeout <= self.request_timeout,
+            "list timeout must be 1 second up to the request timeout"
+        );
         if let Some(protection) = &self.protection {
             protection.validate()?;
         }
         Ok(())
+    }
+}
+
+/// Readiness semantics of a controller replica.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Readiness {
+    /// ADR 0022: ready while a snapshot is published and its activation
+    /// succeeded. Staleness is enforced per request (protected routes fail
+    /// closed beyond `max_staleness`), so a control-plane outage that every
+    /// replica sees alike does not withdraw the whole fleet from rotation.
+    #[default]
+    Snapshot,
+    /// Legacy: not ready as soon as any watched kind is stale for
+    /// `stale_after`, a cache is incomplete, or activation failed.
+    Fresh,
+}
+
+/// Freshness of the published Kubernetes snapshot, shared with the request
+/// path and metrics. Times are wall-clock milliseconds for reporting only;
+/// decisions are made by the controller on its monotonic clock.
+#[derive(Debug, Default)]
+pub struct Freshness {
+    confirmed_unix_ms: AtomicU64,
+    max_staleness_ms: AtomicU64,
+    fail_closed: std::sync::atomic::AtomicBool,
+    refusals: AtomicU64,
+}
+impl Freshness {
+    /// Whether protected routes must fail closed now.
+    pub fn protected_fail_closed(&self) -> bool {
+        self.fail_closed.load(Ordering::Acquire)
+    }
+    /// Force the fail-closed state (tests and diagnostics tooling); the
+    /// controller overwrites it on its next assessment.
+    #[doc(hidden)]
+    pub fn set_protected_fail_closed(&self, value: bool) {
+        self.fail_closed.store(value, Ordering::Release);
+    }
+    pub fn record_refusal(&self) {
+        self.refusals.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
+    }
+    pub fn max_staleness_seconds(&self) -> u64 {
+        self.max_staleness_ms.load(Ordering::Relaxed) / 1000
+    }
+    /// Age of the oldest per-kind confirmation, `None` before the first list.
+    pub fn age(&self) -> Option<Duration> {
+        let confirmed = self.confirmed_unix_ms.load(Ordering::Relaxed);
+        (confirmed > 0).then(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Duration::from_millis(now.saturating_sub(confirmed))
+        })
+    }
+    fn update(&self, confirmed: Option<Instant>, bound: Duration, fail_closed: bool) {
+        let unix = confirmed.map_or(0, |at| {
+            let wall = std::time::SystemTime::now() - Instant::now().saturating_duration_since(at);
+            wall.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
+        self.confirmed_unix_ms.store(unix, Ordering::Relaxed);
+        self.max_staleness_ms
+            .store(bound.as_millis() as u64, Ordering::Relaxed);
+        self.fail_closed.store(fail_closed, Ordering::Release);
+    }
+    pub fn render(&self, out: &mut String) {
+        let Some(age) = self.age() else { return };
+        out.push_str(&format!(
+            "# HELP hangang_kubernetes_snapshot_age_seconds Age of the oldest Kubernetes API confirmation behind the published snapshot.\n# TYPE hangang_kubernetes_snapshot_age_seconds gauge\nhangang_kubernetes_snapshot_age_seconds {:.3}\n",
+            age.as_secs_f64()
+        ));
+        out.push_str(&format!(
+            "# HELP hangang_kubernetes_max_snapshot_staleness_seconds Bounded staleness (ADR 0022).\n# TYPE hangang_kubernetes_max_snapshot_staleness_seconds gauge\nhangang_kubernetes_max_snapshot_staleness_seconds {}\n",
+            self.max_staleness_seconds()
+        ));
+        out.push_str(&format!(
+            "# HELP hangang_kubernetes_protected_fail_closed 1 while protected routes fail closed because the snapshot is older than the bound.\n# TYPE hangang_kubernetes_protected_fail_closed gauge\nhangang_kubernetes_protected_fail_closed {}\n",
+            u8::from(self.protected_fail_closed())
+        ));
+        out.push_str(&format!(
+            "# HELP hangang_kubernetes_stale_refusals_total Protected requests refused because the snapshot exceeded the bound.\n# TYPE hangang_kubernetes_stale_refusals_total counter\nhangang_kubernetes_stale_refusals_total {}\n",
+            self.refusals()
+        ));
     }
 }
 
@@ -249,6 +363,10 @@ enum Outcome {
 /// authority state last reported to the sink.
 struct Health {
     stale_after: Duration,
+    max_staleness: Duration,
+    /// Last authority state logged (independent of reported readiness).
+    authoritative: bool,
+    fail_closed: bool,
     kinds: Vec<ResourceKind>,
     fresh_at: BTreeMap<ResourceKind, Instant>,
     activation_failed: bool,
@@ -258,6 +376,9 @@ impl Health {
     fn new(options: &ControllerOptions) -> Self {
         Self {
             stale_after: options.stale_after,
+            max_staleness: options.max_staleness,
+            authoritative: false,
+            fail_closed: false,
             kinds: options.kinds(),
             fresh_at: BTreeMap::new(),
             activation_failed: false,
@@ -302,13 +423,28 @@ impl Health {
         }
         None
     }
-    /// The earliest moment at which a currently fresh kind becomes stale.
+    /// The oldest per-kind confirmation, `None` until every kind was listed.
+    fn confirmed(&self) -> Option<Instant> {
+        self.kinds
+            .iter()
+            .map(|kind| self.fresh_at.get(kind).copied())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
+    /// Whether the snapshot is older than the bounded staleness.
+    fn beyond_bound(&self) -> bool {
+        self.confirmed()
+            .is_some_and(|at| Instant::now().saturating_duration_since(at) > self.max_staleness)
+    }
+    /// The earliest moment at which a currently fresh kind becomes stale or
+    /// the snapshot crosses the bounded staleness.
     fn deadline(&self) -> Option<Instant> {
         let now = Instant::now();
         self.kinds
             .iter()
             .filter_map(|kind| self.fresh_at.get(kind))
-            .map(|at| *at + self.stale_after)
+            .flat_map(|at| [*at + self.stale_after, *at + self.max_staleness])
             .filter(|at| *at > now)
             .min()
     }
@@ -599,7 +735,39 @@ impl Controller {
         applied: bool,
     ) {
         let defect = health.defect(incomplete, published);
-        let healthy = defect.is_none();
+        let authoritative = defect.is_none();
+        // Bounded staleness: beyond it protected routes fail closed; within
+        // it the published snapshot keeps serving (ADR 0022 Decision 3).
+        let fail_closed = published && health.beyond_bound();
+        if let Some(freshness) = &self.options.freshness {
+            freshness.update(health.confirmed(), health.max_staleness, fail_closed);
+        }
+        if fail_closed != health.fail_closed {
+            health.fail_closed = fail_closed;
+            if fail_closed {
+                tracing::error!(
+                    bound_seconds = health.max_staleness.as_secs(),
+                    "Kubernetes snapshot exceeded its bounded staleness; protected routes fail closed"
+                );
+            } else {
+                tracing::info!(
+                    "Kubernetes snapshot is within its bounded staleness again; protected routes resume"
+                );
+            }
+        }
+        let reason = defect.unwrap_or_else(|| "every watched kind is fresh and complete".into());
+        if authoritative != health.authoritative {
+            health.authoritative = authoritative;
+            if authoritative {
+                tracing::info!(%reason, "Kubernetes cache is authoritative");
+            } else {
+                tracing::warn!(%reason, "Kubernetes cache is not authoritative");
+            }
+        }
+        let healthy = match self.options.readiness {
+            Readiness::Fresh => authoritative,
+            Readiness::Snapshot => published && !health.activation_failed,
+        };
         let changed = healthy != health.reported;
         // An apply while unhealthy flipped the sink to ready: say it again.
         let reassert = applied && !healthy;
@@ -607,15 +775,22 @@ impl Controller {
             return;
         }
         health.reported = healthy;
-        let reason = defect.unwrap_or_else(|| "every watched kind is fresh and complete".into());
-        match (healthy, changed) {
-            (true, _) => tracing::info!(%reason, "Kubernetes cache is authoritative"),
-            (false, true) => {
-                tracing::warn!(%reason, "Kubernetes cache is not authoritative; reporting not ready")
+        let reason = if healthy {
+            match self.options.readiness {
+                Readiness::Fresh => reason,
+                Readiness::Snapshot => "a snapshot is published".to_owned(),
             }
-            (false, false) => {
-                tracing::debug!(%reason, "Kubernetes cache is still not authoritative")
-            }
+        } else if self.options.readiness == Readiness::Snapshot && !published {
+            "no configuration has been published yet".to_owned()
+        } else {
+            reason
+        };
+        if healthy {
+            tracing::info!(%reason, "Kubernetes controller reports ready");
+        } else if changed {
+            tracing::warn!(%reason, "Kubernetes controller reports not ready");
+        } else {
+            tracing::debug!(%reason, "Kubernetes controller is still not ready");
         }
         self.sink.report_authority(healthy, &reason).await;
     }
@@ -776,7 +951,7 @@ impl Controller {
             let response = self
                 .authorize(self.api_client().await?.get(url))
                 .await?
-                .timeout(self.options.request_timeout)
+                .timeout(self.options.list_timeout)
                 .send()
                 .await?;
             if response.status() == StatusCode::GONE {
@@ -1110,7 +1285,7 @@ impl Controller {
                     .body(serde_json::to_vec(&body)?),
             )
             .await?
-            .timeout(self.options.request_timeout)
+            .timeout(self.options.list_timeout)
             .send()
             .await?;
         let status = response.status();
@@ -1203,7 +1378,7 @@ impl Controller {
                 .await?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Ok(None),
-                response = request.timeout(self.options.request_timeout).send() => response?,
+                response = request.timeout(self.options.list_timeout).send() => response?,
             };
             let status = response.status();
             let bytes = bounded_body(response, MAX_WATCH_EVENT_BYTES).await?;
@@ -1231,7 +1406,7 @@ impl Controller {
                 .await?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Ok(None),
-                response = request.timeout(self.options.request_timeout).send() => response?,
+                response = request.timeout(self.options.list_timeout).send() => response?,
             };
             if response.status() == StatusCode::NOT_FOUND {
                 return Ok(None);
@@ -2897,6 +3072,10 @@ mod tls_isolation_tests {
             watch_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(40),
             stale_after: Duration::from_secs(60),
+            max_staleness: Duration::from_secs(300),
+            readiness: Readiness::Fresh,
+            list_timeout: Duration::from_secs(40),
+            freshness: None,
             protection: None,
         }
     }

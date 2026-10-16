@@ -376,6 +376,9 @@ pub struct Proxy {
     // socket peer is in this set, the effective client IP/proto/host/port are
     // taken from the incoming X-Forwarded-* headers instead of the socket.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    /// Kubernetes controller freshness: protected routes fail closed once
+    /// the snapshot exceeds its bounded staleness (ADR 0022).
+    kubernetes_freshness: Option<Arc<crate::kubernetes::Freshness>>,
     // Response headers removed from every upstream response (e.g. `server`),
     // streaming-safe. Per-route rules are in the route's response_*_headers.
     remove_response_headers: Arc<Vec<HeaderName>>,
@@ -767,6 +770,7 @@ impl Proxy {
             allow_dot_segments: false,
             default_upstream_timeout: HEADER_TIMEOUT,
             trusted_proxies: Arc::new(Vec::new()),
+            kubernetes_freshness: None,
             remove_response_headers: Arc::new(Vec::new()),
             https_redirect_code: 308,
             access_log: false,
@@ -831,6 +835,13 @@ impl Proxy {
         self
     }
 
+    pub fn with_kubernetes_freshness(
+        mut self,
+        freshness: Option<Arc<crate::kubernetes::Freshness>>,
+    ) -> Self {
+        self.kubernetes_freshness = freshness;
+        self
+    }
     pub fn with_trusted_proxies(mut self, cidrs: Vec<ipnet::IpNet>) -> Self {
         self.trusted_proxies = Arc::new(cidrs);
         self
@@ -2101,6 +2112,25 @@ impl Proxy {
                 .rejected_requests
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(response(503, "route authorization unavailable"));
+        }
+        // Bounded staleness (ADR 0022): a protected route whose Kubernetes
+        // snapshot is older than the bound fails closed before any
+        // authorization call or upstream contact. Public routes keep serving
+        // the last good snapshot.
+        if runtime.route.access_mode == crate::config::AccessMode::Protected
+            && let Some(freshness) = &self.kubernetes_freshness
+            && freshness.protected_fail_closed()
+        {
+            freshness.record_refusal();
+            self.metrics
+                .rejected_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let mut refused = response(503, "kubernetes authority stale");
+            refused.headers_mut().insert(
+                "x-hangang-reason",
+                hyper::header::HeaderValue::from_static("kubernetes-authority-stale"),
+            );
+            return Ok(refused);
         }
         if protected_resource.is_some_and(|id| {
             !runtime

@@ -33,6 +33,7 @@ English is the reference language. Available Korean pages are full translations 
 ## Backends, members, and health
 
 - [Outbound connection policies](UPSTREAM.md) — backend connection and TLS settings
+- [Certificate hot reload](TLS_RELOAD.md) — polled listener, upstream and guard certificate rotation without restart
 - [Named HTTP and TCP members](NAMED_MEMBERS.md) — reusable backend members
 - [Member admission](MEMBER_ADMISSION.md) — HTTP member admission and activity
 - [Member lifecycle controls](MEMBER_LIFECYCLE.md) — member state transitions

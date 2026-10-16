@@ -35,6 +35,61 @@ async fn certificate_reload_is_atomic_and_retains_last_good_pair() {
 }
 
 #[tokio::test]
+async fn polled_reload_reports_serial_and_alerts_on_bad_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&cert, first.cert.pem()).unwrap();
+    std::fs::write(&key, first.signing_key.serialize_pem()).unwrap();
+    let tls = Arc::new(ReloadingTls::new(cert.clone(), key.clone()).unwrap());
+    let registry = Arc::new(hangang::tls_reload::Registry::default());
+    let status = registry.status("public-listener");
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(tls.clone().watch_every(
+        Duration::from_millis(50),
+        Some(status.clone()),
+        cancel.clone(),
+    ));
+    let wait = |check: Box<dyn Fn() -> bool + Send>| async move {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let initial = hangang::tls_reload::leaf_serial(first.cert.pem().as_bytes()).unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.serial() == initial)).await;
+    let good = tls.current.load_full();
+    // Bad material: the old certificate stays and the alert gauge rises.
+    std::fs::write(&cert, "not a certificate").unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.failing())).await;
+    assert!(Arc::ptr_eq(&good, &tls.current.load_full()));
+    let mut text = String::new();
+    registry.render(&mut text);
+    assert!(text.contains("hangang_tls_reload_failing{material=\"public-listener\"} 1"));
+    assert!(text.contains("hangang_tls_reload_rejected_total{material=\"public-listener\"} 1"));
+    // A valid rotation is swapped in, counted, and clears the alert.
+    let second = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&key, second.signing_key.serialize_pem()).unwrap();
+    std::fs::write(&cert, second.cert.pem()).unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.reloads() == 1)).await;
+    assert!(!status.failing());
+    assert!(!Arc::ptr_eq(&good, &tls.current.load_full()));
+    assert_eq!(
+        status.serial(),
+        hangang::tls_reload::leaf_serial(second.cert.pem().as_bytes()).unwrap()
+    );
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn identical_rejected_material_is_parsed_once() {
     // The legacy watcher polls every 500 ms. Bad material must be parsed once
     // (off the executor) and then skipped by digest until it changes, rather
@@ -210,6 +265,109 @@ async fn public_and_admin_tls_negotiate_h2_and_cleartext_h2_is_supported() {
                 "untrusted certificate accepted"
             );
         }
+    }
+}
+
+/// The administration listener configured with TLS never answers plaintext,
+/// not even to a loopback peer inside the same network namespace (a sidecar or
+/// `kubectl port-forward`), in direct and supervised mode.
+#[tokio::test]
+async fn admin_tls_listener_refuses_plaintext_even_from_loopback() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, pair.cert.pem()).unwrap();
+    std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+    let modes: &[bool] = if cfg!(target_os = "linux") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &supervised in modes {
+        let public = port();
+        let mut admin = port();
+        while admin == public {
+            admin = port();
+        }
+        let state = dir.path().join(format!("state-{supervised}.json"));
+        std::fs::write(&state, r#"{"revision":0,"http":[],"tcp":[]}"#).unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_hangang"));
+        if supervised {
+            cmd.arg("--supervised");
+        }
+        cmd.args([
+            "--config",
+            state.to_str().unwrap(),
+            "--listen",
+            &format!("127.0.0.1:{public}"),
+            // Bound on every address, as the Helm chart does for scraping.
+            "--admin",
+            &format!("0.0.0.0:{admin}"),
+            "--threads",
+            "2",
+            "--lua-workers",
+            "1",
+        ])
+        .arg("--admin-tls-cert")
+        .arg(&cert)
+        .arg("--admin-tls-key")
+        .arg(&key)
+        .env("HANGANG_ADMIN_TOKEN", "test-token-for-tls-transport")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        let mut child = Child(cmd.spawn().unwrap());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(pair.cert.pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let tls_url = format!("https://localhost:{admin}/healthz");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none(), "server exited");
+                if client.get(&tls_url).send().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for host in ["127.0.0.1", "localhost"] {
+            let plain = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{host}:{admin}/healthz"))
+                .bearer_auth("test-token-for-tls-transport")
+                .send()
+                .await;
+            assert!(
+                plain.is_err(),
+                "plaintext answered on {host} (supervised={supervised}): {plain:?}"
+            );
+        }
+        // Raw bytes: the listener never writes an HTTP response to plaintext.
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", admin))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(6), stream.read_to_end(&mut reply)).await;
+        assert!(
+            !reply.starts_with(b"HTTP/"),
+            "plaintext HTTP reply (supervised={supervised})"
+        );
+        drop(child);
     }
 }
 

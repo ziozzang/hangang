@@ -60,8 +60,9 @@ pub struct ReloadingTls {
     rejected: std::sync::atomic::AtomicU64,
 }
 enum Reload {
-    Unchanged,
-    Replaced([u8; 32], Box<ServerConfig>),
+    /// `true` when the files hold the published pair.
+    Unchanged(bool),
+    Replaced([u8; 32], Box<ServerConfig>, String),
     Rejected([u8; 32], anyhow::Error),
 }
 fn pair_digest(cert: &[u8], key: &[u8]) -> [u8; 32] {
@@ -92,15 +93,41 @@ impl ReloadingTls {
             rejected: std::sync::atomic::AtomicU64::new(0),
         }
     }
+    /// True when the configuration comes from certificate files that
+    /// [`Self::watch_every`] polls (not a dynamic SNI or ACME set).
+    pub fn file_backed(&self) -> bool {
+        self.files.is_some()
+    }
     /// Reloads rejected by parsing since start; each distinct bad pair counts once.
     pub fn rejected_reloads(&self) -> u64 {
         self.rejected.load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// Poll every 500 ms without reporting; see [`Self::watch_every`].
     pub async fn watch(self: Arc<Self>, cancel: CancellationToken) {
+        self.watch_every(Duration::from_millis(500), None, cancel)
+            .await
+    }
+    /// Poll the certificate and key contents (SHA-256, no inotify) every
+    /// `period`, swapping the rustls config atomically on change. Existing
+    /// connections keep the config they were accepted with; bad material
+    /// keeps the previous certificate and marks `status` failing.
+    pub async fn watch_every(
+        self: Arc<Self>,
+        period: Duration,
+        status: Option<Arc<crate::tls_reload::Status>>,
+        cancel: CancellationToken,
+    ) {
         let Some((cert_path, key_path)) = &self.files else {
             return;
         };
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        if let Some(status) = &status
+            && let Ok(pem) = read_bounded(cert_path)
+            && let Ok(serial) = crate::tls_reload::leaf_serial(&pem)
+        {
+            status.set_serial(&serial);
+        }
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut rejected: Option<[u8; 32]> = None;
         let mut last_error = String::new();
         loop {
@@ -114,18 +141,29 @@ impl ReloadingTls {
             let result = tokio::task::spawn_blocking(move || -> Result<Reload> {
                 let (cert, key) = (read_bounded(&cert)?, read_bounded(&key)?);
                 let digest = pair_digest(&cert, &key);
-                if Some(digest) == published || Some(digest) == rejected {
-                    return Ok(Reload::Unchanged);
+                if Some(digest) == published {
+                    return Ok(Reload::Unchanged(true));
+                }
+                if Some(digest) == rejected {
+                    return Ok(Reload::Unchanged(false));
                 }
                 Ok(match server_config(&cert, &key) {
-                    Ok(config) => Reload::Replaced(digest, Box::new(config)),
+                    Ok(config) => Reload::Replaced(
+                        digest,
+                        Box::new(config),
+                        crate::tls_reload::leaf_serial(&cert).unwrap_or_default(),
+                    ),
                     Err(error) => Reload::Rejected(digest, error),
                 })
             })
             .await;
             match result {
-                Ok(Ok(Reload::Replaced(digest, config))) => {
+                Ok(Ok(Reload::Replaced(digest, config, serial))) => {
                     self.current.store(Arc::new(*config));
+                    tracing::info!(certificate=%cert_path.display(), %serial, "TLS listener certificate reloaded");
+                    if let Some(status) = &status {
+                        status.reloaded(&serial);
+                    }
                     if let Ok(mut published) = self.published.lock() {
                         *published = Some(digest);
                     }
@@ -136,14 +174,25 @@ impl ReloadingTls {
                     rejected = Some(digest);
                     self.rejected
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(status) = &status {
+                        status.rejected();
+                    }
                     let text = error.to_string();
                     if text != last_error {
                         tracing::warn!(%error,"TLS reload rejected; keeping previous certificate");
                         last_error = text;
                     }
                 }
-                Ok(Ok(Reload::Unchanged)) => {}
+                Ok(Ok(Reload::Unchanged(published))) => {
+                    // The published pair is back on disk: clear the alert.
+                    if published && let Some(status) = &status {
+                        status.recovered();
+                    }
+                }
                 Ok(Err(error)) => {
+                    if let Some(status) = &status {
+                        status.unreadable();
+                    }
                     let text = format!("{error:?}");
                     if text != last_error {
                         tracing::warn!(error=%text,"TLS material read failed");
