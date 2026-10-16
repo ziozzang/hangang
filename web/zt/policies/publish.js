@@ -2,22 +2,54 @@
 // explain/batch against the draft as a candidate), mandatory reason, typed
 // confirmation for high impact and a three-way view on revision conflicts.
 import { policyState, publish, replaceDraft, discardDraft } from './store.js';
-import { countChanges, impactCases, touched, rebase, clone } from './model.js';
+import { countChanges, impactCases, touched, rebase, clone, describeChanges } from './model.js';
+
+/** Subject as its resolved Hopae name with the opaque id secondary. */
+export function subjectName(cx, subject, kind) {
+  const { ui } = cx;
+  const id = ui.el('code', { class: 'kit-mono zt-subject-id', text: subject });
+  const node = ui.el('span', { class: 'zt-subject' }, id);
+  if ((kind === 'user' || kind === 'human') && cx.resolver) {
+    cx.resolver.resolve(subject).then(value => {
+      if (value.state !== 'resolved') return;
+      const label = ui.subjectLabel(value.subject);
+      if (!label || label === subject) return;
+      node.prepend(ui.el('span', { class: 'zt-subject-name', text: label }));
+      id.classList.add('is-secondary');
+    }).catch(() => {});
+  }
+  return node;
+}
+
+function changeItem(cx, change) {
+  const { t, ui } = cx;
+  const sentence = ui.el('span', { class: 'zt-change-text' });
+  if (change.subject) sentence.append(subjectName(cx, change.subject, change.kind), ': ');
+  sentence.append(t(change.key, change.params));
+  return ui.el('li', { class: 'zt-change', dataset: { key: change.key } }, sentence, ui.el('code', { class: 'kit-mono zt-change-path', text: change.path }));
+}
 
 function diffSections(cx, base, draft) {
   const { t, ui } = cx;
-  const sections = [];
-  const services = new Set([...Object.keys(base.services || {}), ...Object.keys(draft.services || {})]);
-  for (const id of [...services].sort()) {
-    const before = base.services?.[id], after = draft.services?.[id];
-    if (JSON.stringify(before) === JSON.stringify(after)) continue;
-    const label = !before ? 'policies.diff.added' : !after ? 'policies.diff.removed' : 'policies.diff.changed';
-    sections.push(ui.el('section', { class: 'zt-diff-group', dataset: { service: id } }, ui.el('h3', {}, ui.el('span', { class: 'kit-mono', text: id }), ' ', ui.el('span', { class: 'kit-tag', text: t(label) })), ui.structuredDiff(t, before || {}, after || {})));
+  const changes = describeChanges(base, draft);
+  const groups = new Map();
+  for (const change of changes) {
+    const group = change.service ?? '';
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(change);
   }
-  if (JSON.stringify(base.resources || {}) !== JSON.stringify(draft.resources || {})) sections.push(ui.el('section', { class: 'zt-diff-group' }, ui.el('h3', { text: t('policies.col.resources') }), ui.structuredDiff(t, base.resources || {}, draft.resources || {})));
-  if (JSON.stringify(base.information_classes) !== JSON.stringify(draft.information_classes)) sections.push(ui.el('section', { class: 'zt-diff-group' }, ui.el('h3', { text: t('policies.classes') }), ui.structuredDiff(t, { classes: base.information_classes }, { classes: draft.information_classes })));
+  const sections = [];
+  for (const [id, list] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const before = id ? base.services?.[id] : null, after = id ? draft.services?.[id] : null;
+    const label = !id ? null : !before ? 'policies.diff.added' : !after ? 'policies.diff.removed' : 'policies.diff.changed';
+    const heading = id ? ui.el('h3', {}, ui.el('span', { class: 'kit-mono', text: id }), ' ', ui.el('span', { class: 'kit-tag', text: t(label) })) : ui.el('h3', { text: t('policies.classes') });
+    const json = id ? ui.el('details', { class: 'zt-diff-json' }, ui.el('summary', { text: t('policies.change.json') }), ui.structuredDiff(t, before || {}, after || {})) : null;
+    sections.push(ui.el('section', { class: 'zt-diff-group', dataset: id ? { service: id } : {} }, heading, ui.el('ul', { class: 'zt-change-list' }, list.map(change => changeItem(cx, change))), json));
+  }
   return sections;
 }
+
+const MAP_KIND = Object.freeze({ users: 'user', human_users: 'human', workload_users: 'workload' });
 
 function errorDetails(cx, error) {
   const { t, ui } = cx;
@@ -53,7 +85,7 @@ async function impact(cx, state) {
     if (delta.removed_information_classes?.length) parts.push(t('policies.impact.removed_classes', { list: delta.removed_information_classes.join(', ') }));
     if (Array.isArray(delta.minimum_aal) && delta.minimum_aal[0] !== delta.minimum_aal[1]) parts.push(t('policies.impact.aal', { before: delta.minimum_aal[0], after: delta.minimum_aal[1] }));
     rows.append(ui.el('tr', {}, ui.el('td', { text: t(`policies.impact.entity.${change.entity}`) }), ui.el('td', { class: 'kit-mono', text: change.service || '—' }),
-      ui.el('td', { class: 'kit-mono', text: change.subject || change.cidr || change.resource || '—' }), ui.el('td', {}, ui.statusBadge(t, change.change === 'removed' ? 'deny' : change.change === 'added' ? 'allow' : 'stale', `policies.impact.change.${change.change}`)),
+      ui.el('td', {}, change.subject ? subjectName(cx, change.subject, MAP_KIND[change.map] || 'user') : ui.el('code', { class: 'kit-mono', text: change.cidr || change.resource || '—' })), ui.el('td', {}, ui.statusBadge(t, change.change === 'removed' ? 'deny' : change.change === 'added' ? 'allow' : 'stale', `policies.impact.change.${change.change}`)),
       ui.el('td', { text: parts.join(' · ') || '—' })));
   }
   panel.append(ui.el('p', { class: 'kit-muted', text: t('policies.impact.rights', { count: diff.total ?? changes.length }) }));
@@ -72,7 +104,7 @@ async function impact(cx, state) {
         ui.el('div', { class: 'zt-kpi' }, ui.el('span', { class: 'zt-kpi-label', text: t('policies.impact.cases') }), ui.el('strong', { class: 'zt-kpi-value', text: String(summary.cases ?? cases.length) }))));
       if (examples.length) panel.append(ui.el('h3', { text: t('policies.impact.examples') }), ui.el('ul', { class: 'zt-examples' }, examples.map(entry => {
         const testCase = cases.find(item => item.label === entry.label) || {};
-        return ui.el('li', {}, ui.el('code', { class: 'kit-mono', text: `${testCase.subject?.id} · ${testCase.service} · ${testCase.permission}/${testCase.information_class}` }), ' ',
+        return ui.el('li', {}, testCase.subject ? subjectName(cx, testCase.subject.id, testCase.subject.kind) : null, ' · ', ui.el('code', { class: 'kit-mono', text: `${testCase.service} · ${testCase.permission}/${testCase.information_class}` }), ' ',
           ui.el('span', { text: t('policies.sim.changed', { before: entry.comparison.published?.decision ?? '—', after: entry.outcome?.decision ?? '—' }) }));
       })));
       panel.append(ui.el('p', { class: 'kit-muted', text: t('policies.impact.note') }));
@@ -124,7 +156,7 @@ export async function renderPublish(cx, root, { header }) {
   }
   const scope = touched(state.base, state.draft);
   const { content } = cx.page(root, { crumbs, title: t('policies.publish.title'), owner: t('policies.publish.owner', { revision: state.revision, next: state.revision + 1 }) });
-  const diff = ui.el('section', { class: 'panel zt-panel' }, ui.el('h2', { text: t('policies.publish.changes', { count: countChanges(state.base, state.draft) }) }), diffSections(cx, state.base, state.draft));
+  const diff = ui.el('section', { class: 'panel zt-panel' }, ui.el('h2', { text: t('policies.publish.changes', { count: describeChanges(state.base, state.draft).length || countChanges(state.base, state.draft) }) }), diffSections(cx, state.base, state.draft));
   content.append(header(cx), diff);
   const loading = ui.loadingState(t);
   content.append(loading);
@@ -147,12 +179,13 @@ export async function renderPublish(cx, root, { header }) {
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (blocked) return;
-    const text = reason.value.trim();
+    let text = reason.value.trim();
     if (!text) { error.textContent = t('policies.publish.reason.required'); reason.setAttribute('aria-invalid', 'true'); reason.focus(); return; }
     if (highImpact) {
       const target = scope.services.length === 1 ? scope.services[0] : t('policies.publish.confirm_word');
-      const accepted = await ui.confirmDialog(t, { title: 'policies.publish.confirm', effect: 'policies.publish.confirm.effect', target, confirmLabel: 'policies.publish.action' });
+      const accepted = await ui.confirmDialog(t, { title: 'policies.publish.confirm', effect: 'policies.publish.confirm.effect', target, confirmLabel: 'policies.publish.action', reason: text });
       if (!accepted) return;
+      if (accepted.reason) { text = accepted.reason; reason.value = text; }
     }
     const button = form.querySelector('button[type="submit"]');
     button.disabled = true;

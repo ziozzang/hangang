@@ -37,9 +37,11 @@ redirect to `#policies` (`#pumgye/policy` to `#policies/advanced`). It edits the
 policy version 1 document of the independent Pumgye authority (or the `pumgye`
 member of the Hangang configuration when no authority is configured).
 
-- **Draft.** Every edit (services, permissions, roles with permissions, class
-  ceiling, minimum AAL and inheritance, assignments, network rules, resources
-  and actions) changes a draft bound to the base revision. The draft survives
+- **Draft.** Every edit (services, permissions, roles with permissions, an
+  explicit information-class list, minimum AAL and inheritance, assignments,
+  network rules, resources and actions) changes a draft bound to the base
+  revision. Pumgye v1 grants exactly the listed classes; classes are not a
+  hierarchy, so the role editor shows one checkbox per class and no ceiling. The draft survives
   navigation, locale changes and page refresh in the same tab.
 - **Roles.** The editor shows effective rights through inheritance and how
   many subjects hold the role, refuses inheritance cycles and refuses deleting a
@@ -52,7 +54,10 @@ member of the Hangang configuration when no authority is configured).
   or the draft as a candidate and shows the decision, localized reason,
   remediation and the ordered evaluation trace. Pumgye validation errors are
   shown on the offending field.
-- **Review and publish.** Shows a structured diff grouped by service, the
+- **Review and publish.** Shows the changes grouped by service as sentences
+  (for example "Kim Analyst u_kim: analyst role revoked") with the JSON path
+  secondary and the raw JSON diff on demand; subjects use their Hopae display
+  names in the diff, impact table and examples. Then the
   compiled-rights diff (`/v1/explain/diff`) and an allow→deny / deny→allow
   impact over cases synthesized from changed user assignments
   (`/v1/explain/batch`). Publishing is a compare-and-swap with the Pumgye and

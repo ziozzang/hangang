@@ -191,3 +191,85 @@ export function touched(base, draft) {
   });
   return { services: [...services], restricted };
 }
+
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const setDelta = (before = [], after = []) => ({ added: after.filter(value => !before.includes(value)), removed: before.filter(value => !after.includes(value)) });
+const pathOf = (...parts) => parts.map(part => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(part) ? `.${part}` : `[${JSON.stringify(part)}]`)).join('').slice(1);
+
+/**
+ * Human-readable change records between two policy documents, in a stable
+ * order. Each record: { service?, key, params, path, subject?, kind? } where
+ * `key` is a `policies.change.*` message and `path` the JSON location.
+ */
+export function describeChanges(base, draft) {
+  const out = [];
+  if (!same(base.information_classes, draft.information_classes)) out.push({ key: 'policies.change.classes', params: { before: (base.information_classes || []).join(', '), after: (draft.information_classes || []).join(', ') }, path: 'information_classes' });
+  const ids = [...new Set([...Object.keys(base.services || {}), ...Object.keys(draft.services || {})])].sort();
+  for (const service of ids) {
+    const before = base.services?.[service], after = draft.services?.[service];
+    if (same(before, after)) continue;
+    const push = (key, params, path, extra = {}) => out.push({ service, key, params: { service, ...params }, path, ...extra });
+    if (!before) { push('policies.change.service.added', {}, pathOf('services', service)); continue; }
+    if (!after) { push('policies.change.service.removed', {}, pathOf('services', service)); continue; }
+    if (contextOf(before) !== contextOf(after)) push('policies.change.service.context', { before: contextOf(before), after: contextOf(after) }, pathOf('services', service, 'authorization_context'));
+    if (Boolean(before.require_guard) !== Boolean(after.require_guard)) push(after.require_guard ? 'policies.change.service.guard_on' : 'policies.change.service.guard_off', {}, pathOf('services', service, 'require_guard'));
+    const vocabulary = setDelta(before.permissions, after.permissions);
+    for (const permission of vocabulary.added) push('policies.change.permission.added', { permission }, pathOf('services', service, 'permissions'));
+    for (const permission of vocabulary.removed) push('policies.change.permission.removed', { permission }, pathOf('services', service, 'permissions'));
+    const roleNames = [...new Set([...Object.keys(before.roles || {}), ...Object.keys(after.roles || {})])].sort();
+    for (const role of roleNames) {
+      const was = before.roles?.[role], now = after.roles?.[role], path = pathOf('services', service, 'roles', role);
+      if (same(was, now)) continue;
+      if (!was) { push('policies.change.role.added', { role, permissions: (now.permissions || []).join(', ') || '—', classes: (now.information_classes || []).join(', ') || '—' }, path); continue; }
+      if (!now) { push('policies.change.role.removed', { role }, path); continue; }
+      const permissions = setDelta(was.permissions, now.permissions), classes = setDelta(was.information_classes, now.information_classes), inherits = setDelta(was.inherits, now.inherits);
+      for (const permission of permissions.added) push('policies.change.role.permission_added', { role, permission }, `${path}.permissions`);
+      for (const permission of permissions.removed) push('policies.change.role.permission_removed', { role, permission }, `${path}.permissions`);
+      for (const value of classes.added) push('policies.change.role.class_added', { role, class: value }, `${path}.information_classes`);
+      for (const value of classes.removed) push('policies.change.role.class_removed', { role, class: value }, `${path}.information_classes`);
+      if ((was.minimum_aal || 0) !== (now.minimum_aal || 0)) push('policies.change.role.aal', { role, before: was.minimum_aal || 0, after: now.minimum_aal || 0 }, `${path}.minimum_aal`);
+      for (const parent of inherits.added) push('policies.change.role.inherits_added', { role, parent }, `${path}.inherits`);
+      for (const parent of inherits.removed) push('policies.change.role.inherits_removed', { role, parent }, `${path}.inherits`);
+    }
+    const api = contextOf(after) === 'kubernetes_api';
+    for (const { field, kind: mapKind } of MAPS) {
+      const kind = api && field === 'users' ? 'kubernetes_api' : mapKind;
+      const subjects = [...new Set([...Object.keys(before[field] || {}), ...Object.keys(after[field] || {})])].sort();
+      for (const subject of subjects) {
+        const was = before[field]?.[subject], now = after[field]?.[subject], path = pathOf('services', service, field, subject);
+        if (same(was, now)) continue;
+        const extra = { subject, kind };
+        if (!was) { push('policies.change.assignment.added', { roles: (now || []).join(', ') }, path, extra); continue; }
+        if (!now) { if (was.length === 1) push('policies.change.assignment.revoked', { role: was[0] }, path, extra); else push('policies.change.assignment.removed', { roles: was.join(', ') }, path, extra); continue; }
+        const delta = setDelta(was, now);
+        for (const role of delta.added) push('policies.change.assignment.granted', { role }, path, extra);
+        for (const role of delta.removed) push('policies.change.assignment.revoked', { role }, path, extra);
+      }
+    }
+    const rules = list => new Map((list || []).map(rule => [rule.cidr, rule.roles || []]));
+    const wasRules = rules(before.networks), nowRules = rules(after.networks);
+    for (const cidr of [...new Set([...wasRules.keys(), ...nowRules.keys()])]) {
+      const was = wasRules.get(cidr), now = nowRules.get(cidr), path = pathOf('services', service, 'networks');
+      if (!was) push('policies.change.network.added', { cidr, roles: now.join(', ') || '—' }, path);
+      else if (!now) push('policies.change.network.removed', { cidr }, path);
+      else if (!same(was, now)) push('policies.change.network.roles', { cidr, before: was.join(', ') || '—', after: now.join(', ') || '—' }, path);
+    }
+    const known = new Set(['authorization_context', 'require_guard', 'permissions', 'roles', 'networks', ...MAPS.map(entry => entry.field)]);
+    for (const key of [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(key => !known.has(key)).sort()) {
+      if (!same(before[key], after[key])) push('policies.change.other', { field: key }, pathOf('services', service, key));
+    }
+  }
+  const resources = [...new Set([...Object.keys(base.resources || {}), ...Object.keys(draft.resources || {})])].sort();
+  for (const resource of resources) {
+    const was = base.resources?.[resource], now = draft.resources?.[resource], path = pathOf('resources', resource);
+    if (same(was, now)) continue;
+    const service = (now || was).service;
+    if (!was) out.push({ service, key: 'policies.change.resource.added', params: { resource, service, class: now.information_class }, path });
+    else if (!now) out.push({ service, key: 'policies.change.resource.removed', params: { resource, service }, path });
+    else {
+      const fields = Object.keys({ ...was, ...now }).filter(key => !same(was[key], now[key])).sort();
+      out.push({ service, key: 'policies.change.resource.changed', params: { resource, service, fields: fields.join(', ') }, path });
+    }
+  }
+  return out;
+}

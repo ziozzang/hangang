@@ -2,7 +2,7 @@
 // detail, matrix, advanced JSON and the review-and-publish flow.
 import { loadCatalogs } from '../../kit/i18n.js';
 import { policyState, loadPolicy, working, edit, discardDraft, replaceDraft, resetPolicyState } from './store.js';
-import { serviceSummary, countChanges, CONTEXTS, IDENT, assignments, effectiveRights, highestClass, clone } from './model.js';
+import { serviceSummary, describeChanges, countChanges, CONTEXTS, IDENT, assignments, effectiveRights, highestClass, clone } from './model.js';
 import { renderService } from './service.js';
 import { renderPublish } from './publish.js';
 
@@ -26,7 +26,7 @@ export function policyHeader(cx) {
   if (state.managed) parts.push(ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t(state.owner === 'kubernetes' ? 'policies.managed.kubernetes' : 'policies.managed.unknown') }));
   if (state.outcomeUnknown) parts.push(ui.el('p', { class: 'zt-banner zt-banner-warn', attrs: { role: 'alert' }, text: t('policies.publish.unknown') }));
   if (state.draft) {
-    const count = countChanges(state.base, state.draft);
+    const count = describeChanges(state.base, state.draft).length || countChanges(state.base, state.draft);
     parts.push(ui.el('div', { class: 'zt-draftbar', attrs: { role: 'status' } },
       ui.el('strong', { text: t('policies.draft.count', { count }) }),
       ui.el('span', { class: 'kit-muted', text: t('policies.draft.base', { revision: state.revision }) }),

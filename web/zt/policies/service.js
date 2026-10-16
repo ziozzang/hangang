@@ -114,17 +114,10 @@ function roleEditor(cx, id, service, policy, name) {
   const fieldset = (legend, children) => ui.el('fieldset', { class: 'zt-fieldset', disabled }, ui.el('legend', { text: t(legend) }), children);
   form.append(fieldset('policies.permissions', (service.permissions || []).map(permission => ui.el('label', { class: 'zt-check' }, ui.el('input', { type: 'checkbox', name: 'permission', value: permission, checked: role.permissions.includes(permission) }), ui.el('span', { class: 'kit-mono', text: permission })))));
   const classes = policy.information_classes || [];
-  // A ceiling is a contiguous prefix of the ordered classes; anything else is a custom selection.
-  const ceilingOf = selected => { const count = selected.length; return count && classes.slice(0, count).every(value => selected.includes(value)) ? classes[count - 1] : ''; };
-  const ceiling = ui.field(t, { label: 'policies.role.ceiling', name: 'ceiling', options: [{ value: '', label: 'policies.role.ceiling.custom' }, ...classes.map(value => ({ value, text: value }))], value: ceilingOf(role.information_classes) });
-  const classSet = ui.el('div', {}, classes.map(information => ui.el('label', { class: 'zt-check' }, ui.el('input', { type: 'checkbox', name: 'class', value: information, checked: role.information_classes.includes(information) }), ui.el('span', { class: `zt-class zt-class-${information === classes.at(-1) ? 'top' : 'normal'}`, text: information }))));
-  ceiling.querySelector('select').addEventListener('change', event => {
-    const limit = classes.indexOf(event.target.value);
-    if (limit < 0) return;
-    classSet.querySelectorAll('input').forEach(box => { box.checked = classes.indexOf(box.value) <= limit; });
-  });
-  classSet.addEventListener('change', () => { ceiling.querySelector('select').value = ceilingOf([...classSet.querySelectorAll('input')].filter(box => box.checked).map(box => box.value)); });
-  form.append(fieldset('policies.role.classes', [ceiling, classSet]));
+  // Pumgye v1 grants exactly the listed classes (a membership set, not a
+  // hierarchy): granting the top class does not imply the lower ones.
+  const classSet = ui.el('div', { class: 'zt-check-row' }, classes.map(information => ui.el('label', { class: 'zt-check' }, ui.el('input', { type: 'checkbox', name: 'class', value: information, checked: role.information_classes.includes(information) }), ui.el('span', { class: `zt-class zt-class-${information === classes.at(-1) ? 'top' : 'normal'}`, text: information }))));
+  form.append(fieldset('policies.role.classes', [classSet, ui.el('small', { class: 'kit-help zt-fieldset-help', text: t('policies.role.classes.help') })]));
   form.append(ui.el('fieldset', { class: 'zt-fieldset', disabled }, [ui.field(t, { label: 'policies.role.aal', name: 'aal', value: String(role.minimum_aal || 0), options: [0, 1, 2, 3].map(value => ({ value: String(value), label: `policies.aal.option.${value}` })) })]));
   const parents = Object.keys(service.roles).filter(other => other !== name);
   form.append(fieldset('policies.role.inherits', parents.length ? parents.map(parent => ui.el('label', { class: 'zt-check' }, ui.el('input', { type: 'checkbox', name: 'inherits', value: parent, checked: (role.inherits || []).includes(parent) }), ui.el('span', { class: 'kit-mono', text: parent }))) : ui.el('span', { class: 'kit-muted', text: t('policies.role.inherits.none') })));

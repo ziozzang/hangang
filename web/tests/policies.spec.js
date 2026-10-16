@@ -119,8 +119,7 @@ test('role editor saves to a draft, rejects cycles and reports holders', async (
   await expect(editor.locator('.kit-field-error')).toContainText('cycle');
   await editor.getByRole('checkbox', { name: 'analyst' }).uncheck();
   await editor.getByRole('checkbox', { name: 'write' }).check();
-  await editor.getByLabel('Class ceiling').selectOption('confidential');
-  await expect(editor.getByRole('checkbox', { name: 'confidential' })).toBeChecked();
+  await editor.getByRole('checkbox', { name: 'confidential' }).check();
   await editor.getByRole('button', { name: 'Save role to draft' }).click();
   await expect(view(page).locator('.zt-draftbar')).toContainText('unpublished change');
   await page.reload();
@@ -188,7 +187,11 @@ test('publish shows diff and impact, requires reason and typed confirmation, and
   await view(page).locator('tbody tr', { hasText: 'u_kim' }).getByRole('button', { name: 'Revoke' }).click();
   await view(page).getByRole('link', { name: 'Review & publish' }).click();
   await expect(page).toHaveURL(/#policies\/publish$/);
-  await expect(view(page).locator('.zt-diff-group[data-service="reports"]')).toContainText('u_kim');
+  const change = view(page).locator('.zt-diff-group[data-service="reports"] .zt-change').first();
+  await expect(change.locator('.zt-change-text')).toHaveText(/Kim Analyst\s*u_kim: analyst role revoked/);
+  await expect(change.locator('.zt-change-path')).toHaveText('services.reports.users.u_kim');
+  await expect(view(page).locator('.zt-impact tbody')).toContainText('Kim Analyst');
+  await expect(view(page).locator('.zt-examples')).toContainText('Kim Analyst');
   await expect(view(page).locator('.zt-impact')).toContainText('−permissions export');
   await expect(view(page).locator('.zt-impact .zt-kpi.is-warn')).toContainText('1');
   await view(page).getByRole('button', { name: 'Publish revision 78' }).click();
@@ -198,7 +201,7 @@ test('publish shows diff and impact, requires reason and typed confirmation, and
   const dialog = page.locator('dialog.kit-dialog');
   await expect(dialog).toContainText('Type reports to confirm');
   await dialog.locator('input').fill('reports');
-  await dialog.locator('textarea').fill('Kim moved teams');
+  await expect(dialog.locator('textarea')).toHaveValue('Kim moved teams');
   await dialog.getByRole('button', { name: 'Publish' }).click();
   await expect(page).toHaveURL(/#policies(\?refresh=1)?$/);
   const put = calls.find(call => call.path === '/v1/pumgye/policy' && call.method === 'PUT');
@@ -288,11 +291,17 @@ test('cross-section simulator entry keeps the subject and picks or redirects to 
   await expect(view(page).locator('select[name="kind"]')).toHaveValue('human');
 });
 
-test('role editor preselects the class ceiling for a contiguous selection', async ({ page }) => {
+test('role editor edits information classes as an explicit, non-hierarchical list', async ({ page }) => {
   await setup(page);
   await page.goto('/ui/#policies/services/reports?tab=roles&role=analyst');
   const editor = view(page).locator('.zt-role-editor');
-  await expect(editor.getByLabel('Class ceiling')).toHaveValue('confidential');
+  await expect(editor.locator('select[name="ceiling"]')).toHaveCount(0);
+  await expect(editor).toContainText('not a hierarchy');
   await editor.getByRole('checkbox', { name: 'internal' }).uncheck();
-  await expect(editor.getByLabel('Class ceiling')).toHaveValue('');
+  await editor.getByRole('checkbox', { name: 'restricted' }).check();
+  await expect(editor.getByRole('checkbox', { name: 'confidential' })).toBeChecked();
+  await editor.getByRole('button', { name: 'Save role to draft' }).click();
+  const stored = await page.evaluate(() => JSON.parse(sessionStorage.getItem('hangang-policies-draft')));
+  const roles = stored.draft.services.reports.roles.analyst.information_classes;
+  expect(roles).toEqual(['public', 'confidential', 'restricted']);
 });

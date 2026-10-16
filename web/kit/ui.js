@@ -404,9 +404,11 @@ export function structuredDiff(t, before, after) {
  * Confirmation naming the target and effect. The operator must type the target
  * name exactly and give a reason; resolves `{reason}` or `null` on cancel.
  */
-export function confirmDialog(t, { title, effect, target, confirmLabel = 'ui.confirm.action' }) {
+export function confirmDialog(t, { title, effect, target, confirmLabel = 'ui.confirm.action', reason: initialReason = '' }) {
   return new Promise(resolve => {
     const reason = el('textarea', { required: true, maxLength: 512, rows: 3 });
+    // Optional prefill so a reason already entered on the page is not asked twice.
+    reason.value = String(initialReason || '');
     const typed = el('input', { type: 'text', autocomplete: 'off', spellcheck: false, maxLength: 256 });
     const confirm = el('button', { type: 'submit', class: 'button button-danger', text: t(confirmLabel), disabled: true });
     const cancel = el('button', { type: 'button', class: 'button button-quiet', text: t('ui.cancel') });
