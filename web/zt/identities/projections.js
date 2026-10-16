@@ -36,11 +36,13 @@ function planRow(cx, plan, { readOnly, onChange, onRemove }) {
   credential.setAttribute('aria-label', t('identities.projection.field.credential'));
   const secret = ui.el('input', { name: 'secret_ref', value: plan.credential?.secret_ref || '', disabled: readOnly || credential.value !== 'bearer_reference', spellcheck: false, autocomplete: 'off', maxLength: 128 });
   secret.setAttribute('aria-label', t('identities.projection.field.secret_ref'));
+  secret.hidden = credential.value !== 'bearer_reference';
   row.append(input('service', plan.service, 'identities.projection.field.service'), input('audience', plan.audience, 'identities.projection.field.audience'), input('resource', plan.resource, 'identities.projection.field.resource'), input('action', plan.action, 'identities.projection.field.action'),
     ui.el('td', {}, aal), ui.el('td', {}, credential, ' ', secret),
     ui.el('td', {}, readOnly ? null : ui.el('button', { type: 'button', class: 'button button-quiet', text: t('identities.projection.remove'), on: { click: onRemove } })));
   const emit = () => {
     secret.disabled = readOnly || credential.value !== 'bearer_reference';
+    secret.hidden = credential.value !== 'bearer_reference';
     const value = name => row.querySelector(`[name=${name}]`).value.trim();
     onChange({ service: value('service'), audience: value('audience'), minimum_aal: Number(aal.value), resource: value('resource'), action: value('action'), credential: credential.value === 'bearer_reference' ? { type: 'bearer_reference', secret_ref: secret.value.trim() } : { type: 'identity_header' } });
   };

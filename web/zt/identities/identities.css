@@ -133,3 +133,5 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 #view-identities .zt-actions .button { white-space: nowrap; }
 #view-identities .zt-entity-summary { display: flex; flex-direction: column; gap: .5rem; padding: .9rem 1rem; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 #view-identities .zt-entity-summary .zt-dl { margin: 0; }
+.zt-editor > .kit-field { max-width: 28rem; }
+.zt-keys:has(tbody:empty) thead { display: none; }
