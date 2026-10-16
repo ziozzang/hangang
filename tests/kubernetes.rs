@@ -105,6 +105,11 @@ enum Mode {
     SlowIngressList,
     /// Watches are accepted late and then deliver an unparseable body.
     LateWatch,
+    /// Two Ingresses, one targeted by a ProtectionPolicy. The first policy
+    /// watch deletes the policy once its status has been written.
+    Protection,
+    /// The ProtectionPolicy CRD is not installed: its list answers 404.
+    ProtectionMissing,
 }
 struct ApiState {
     mode: Mode,
@@ -178,6 +183,7 @@ async fn harness(mode: Mode, namespace: Option<&str>) -> Result<Harness> {
         watch_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         stale_after: Duration::from_secs(60),
+        protection: None,
     };
     Ok(Harness {
         state,
@@ -262,6 +268,7 @@ async fn tls_api_paginates_rotates_token_and_applies_watch_deletion() -> Result<
         watch_timeout: Duration::from_secs(1),
         request_timeout: Duration::from_secs(3),
         stale_after: Duration::from_secs(60),
+        protection: None,
     };
     let controller = Controller::new(options, Arc::new(ChannelSink(tx)))?;
     let cancel = CancellationToken::new();
@@ -369,6 +376,104 @@ async fn stale_threshold_must_exceed_the_watch_timeout() -> Result<()> {
     assert!(Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx.clone()))).is_err());
     harness.options.stale_after = harness.options.watch_timeout + Duration::from_millis(1);
     assert!(Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx))).is_ok());
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn protection_policy_is_compiled_reported_and_fails_closed_when_removed() -> Result<()> {
+    let mut harness = harness(Mode::Protection, Some("blue")).await?;
+    harness.options.publish_address = Some("192.0.2.1".into());
+    harness.options.protection = Some(Arc::new(protection_options()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let controller = Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx)))?;
+    let (cancel, task) = spawn(controller);
+
+    // Only the targeted Ingress is published, and only with protection.
+    let first = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
+    assert_eq!(first.config.http.len(), 1);
+    let route = &first.config.http[0];
+    assert_eq!(route.host.as_deref(), Some("api.example.test"));
+    assert_eq!(route.access_mode, hangang::config::AccessMode::Protected);
+    assert!(route.auth.is_some());
+    assert_eq!(
+        route
+            .resource_policy
+            .as_ref()
+            .and_then(|p| p.pumgye_resource.as_ref())
+            .map(|g| g.service_id.as_str()),
+        Some("orders")
+    );
+    assert!(first.config.pumgye_authority.is_some());
+
+    // Once the policy is deleted, the Ingress is withheld, not downgraded.
+    let second = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
+    assert!(second.config.http.is_empty());
+
+    let log = harness.state.patch_log.lock().unwrap().clone();
+    let (_, policy_patch) = log
+        .iter()
+        .find(|(path, _)| {
+            path == "/apis/world.hangang.dev/v1alpha1/namespaces/blue/protectionpolicies/secure/status"
+        })
+        .expect("policy status was written");
+    assert_eq!(policy_patch["metadata"]["resourceVersion"], "7");
+    let status = &policy_patch["status"];
+    assert_eq!(status["observedGeneration"], 2);
+    let condition = |kind: &str| {
+        status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == kind)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(condition("Accepted")["status"], "True");
+    assert_eq!(condition("ResolvedRefs")["status"], "True");
+    assert_eq!(condition("Programmed")["status"], "True");
+    assert_eq!(status["ancestors"][0]["ancestorRef"]["name"], "main");
+    assert_eq!(
+        status["ancestors"][0]["controllerName"],
+        "hangang.dev/gateway-controller"
+    );
+    // The unprotected Ingress never receives the published address.
+    assert!(
+        log.iter()
+            .all(|(path, _)| !path.contains("/ingresses/bare/"))
+    );
+    assert!(
+        log.iter()
+            .any(|(path, _)| path.ends_with("/ingresses/main/status"))
+    );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task).await??;
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn a_missing_protection_crd_publishes_nothing_and_stays_not_ready() -> Result<()> {
+    let mut harness = harness(Mode::ProtectionMissing, Some("blue")).await?;
+    harness.options.protection = Some(Arc::new(protection_options()));
+    let (snapshots, mut rx) = mpsc::unbounded_channel();
+    let (authority, mut reports) = mpsc::unbounded_channel();
+    let controller = Controller::new(
+        harness.options.clone(),
+        Arc::new(ReportingSink {
+            snapshots,
+            authority,
+        }),
+    )?;
+    let (cancel, task) = spawn(controller);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing may be published without a complete policy list"
+    );
+    while let Ok((healthy, _)) = reports.try_recv() {
+        assert!(!healthy);
+    }
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task).await??;
     harness.stop().await
 }
 
@@ -1186,6 +1291,11 @@ async fn handle(
         if matches!(state.mode, Mode::Recreated) {
             return Ok(handle_recreated_patch(&patch));
         }
+        if matches!(state.mode, Mode::Protection) && path.contains("/protectionpolicies/") {
+            let mut object = protection_policy("8");
+            object["status"] = patch["status"].clone();
+            return Ok(json(StatusCode::OK, object));
+        }
         return Ok(response(StatusCode::OK, "{}"));
     }
     if matches!(state.mode, Mode::Conflict) && path.ends_with("/ingresses/main") {
@@ -1236,6 +1346,8 @@ async fn handle(
         Mode::SlowRelist => handle_slow_relist(&path, &query, &state),
         Mode::SlowIngressList => handle_stale(&path, &query, &state),
         Mode::LateWatch => handle_late_watch(&path, &query),
+        Mode::Protection => handle_protection(&path, &query, &state).await,
+        Mode::ProtectionMissing => handle_protection_missing(&path, &query),
     };
     Ok(response)
 }
@@ -1903,6 +2015,100 @@ fn handle_conflict_patch(body: &[u8]) -> Response<Full<Bytes>> {
             ingress_at("13", Some(serde_json::json!({"ip":"192.0.2.1"}))),
         ),
         _ => response(StatusCode::INTERNAL_SERVER_ERROR, "unexpected patch"),
+    }
+}
+
+fn protection_policy(rv: &str) -> serde_json::Value {
+    serde_json::json!({"apiVersion":"world.hangang.dev/v1alpha1","kind":"ProtectionPolicy",
+        "metadata":{"name":"secure","namespace":"blue","resourceVersion":rv,"uid":"policy-uid","generation":2,
+            "creationTimestamp":"2026-01-01T00:00:00Z"},
+        "spec":{"targetRefs":[{"group":"networking.k8s.io","kind":"Ingress","name":"main"}],
+            "identity":{"profileRef":{"name":"corp"}},
+            "network":{"enforcement":"None"},
+            "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":{"GET":"read"}}}}})
+}
+async fn handle_protection(path: &str, query: &str, state: &ApiState) -> Response<Full<Bytes>> {
+    let watch = query.contains("watch=true");
+    if path.ends_with("/protectionpolicies") {
+        if !watch {
+            return json(
+                StatusCode::OK,
+                serde_json::json!({"metadata":{"resourceVersion":"7"},"items":[protection_policy("7")]}),
+            );
+        }
+        if state.secret_watches.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Delete the policy only after its status was written.
+            for _ in 0..200 {
+                if state
+                    .patch_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(path, _)| path.contains("/protectionpolicies/"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return stream(vec![event("DELETED", protection_policy("9"))]);
+        }
+        return response(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if watch {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if path.ends_with("/services") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"10"},"items":[service()]}),
+        );
+    }
+    if path.ends_with("/ingresses") {
+        let bare = ingress_in("blue", "bare", "11", "bare.example.test", &["/"], None);
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[
+                ingress_in("blue", "main", "11", "api.example.test", &["/"], None), bare]}),
+        );
+    }
+    response(StatusCode::NOT_FOUND, "not found")
+}
+fn handle_protection_missing(path: &str, query: &str) -> Response<Full<Bytes>> {
+    if path.ends_with("/protectionpolicies") || query.contains("watch=true") {
+        return response(
+            StatusCode::NOT_FOUND,
+            "the server could not find the requested resource",
+        );
+    }
+    if path.ends_with("/services") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"10"},"items":[service()]}),
+        );
+    }
+    if path.ends_with("/ingresses") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[ingress()]}),
+        );
+    }
+    response(StatusCode::NOT_FOUND, "not found")
+}
+fn protection_options() -> hangang::protection::Options {
+    let tls = serde_json::json!({"server_name":"owned.example.test","ca":"/owned/ca.pem","certificate":"/owned/client.pem","key":"/owned/client.key"});
+    let settings: hangang::protection::Settings = serde_json::from_value(serde_json::json!({
+        "identity_profiles":{"corp":{"auth":{"url":"https://hopae.example.test/_hopae/verify",
+            "native":{"transport":"grpc","address":"127.0.0.1:9001","tls":tls},
+            "request_headers":["authorization"],
+            "response_headers":["x-forwarded-user","x-hopae-aal","x-hopae-principal-kind"],
+            "static_request_headers":{"x-hopae-gateway-key":{"env":"HOPAE_GATEWAY_KEY"}}}}},
+        "pumgye_authority":{"transport":"grpc","decision_address":"127.0.0.1:9002","management_address":"127.0.0.1:9003",
+            "tls":tls,"decision_token_env":"PUMGYE_DECISION_TOKEN","admin_token_env":"PUMGYE_ADMIN_TOKEN"}
+    }))
+    .unwrap();
+    hangang::protection::Options {
+        settings,
+        facts: Default::default(),
     }
 }
 

@@ -105,6 +105,17 @@ struct Args {
     /// watch timeout.
     #[arg(long, default_value_t = 60, requires = "kubernetes_controller")]
     kubernetes_stale_seconds: u64,
+    /// Operator protection settings (identity profiles, Pumgye authority,
+    /// client address mode). Enables `ProtectionPolicy`
+    /// (world.hangang.dev/v1alpha1) reconciliation; `require_protection`
+    /// then defaults to on and withholds unprotected Ingresses.
+    #[arg(long, requires = "kubernetes_controller")]
+    kubernetes_protection_config: Option<PathBuf>,
+    /// Require a PROXY protocol v2 header from these load balancer CIDRs on
+    /// the public listener (repeatable or comma separated). Other peers are
+    /// served as direct connections and never parsed.
+    #[arg(long, value_delimiter = ',')]
+    proxy_protocol_from: Vec<ipnet::IpNet>,
     /// Explicit override for plaintext administration outside loopback.
     #[arg(long)]
     allow_insecure_admin: bool,
@@ -827,6 +838,7 @@ async fn run(args: Args) -> Result<()> {
                 watch_timeout: Duration::from_secs(30),
                 request_timeout: Duration::from_secs(40),
                 stale_after: Duration::from_secs(args.kubernetes_stale_seconds),
+                protection: None,
             }
         } else {
             hangang::kubernetes::ControllerOptions::in_cluster(args.ingress_class.clone())?
@@ -837,6 +849,18 @@ async fn run(args: Args) -> Result<()> {
         options.namespace = args.kubernetes_namespace.clone();
         options.watch_secrets = args.kubernetes_tls;
         options.publish_address = args.kubernetes_publish_address.clone();
+        if let Some(path) = &args.kubernetes_protection_config {
+            let settings = hangang::protection::Settings::load(path)?;
+            let facts = hangang::protection::GatewayFacts {
+                guard_configured: args.guard_url.is_some(),
+                guard_enforcing: args.guard_mode == hangang::guard::TransportMode::Query
+                    && args.guard_failure_mode == hangang::guard::FailureMode::Deny,
+                proxy_protocol: !args.proxy_protocol_from.is_empty(),
+            };
+            let protection = hangang::protection::Options { settings, facts };
+            protection.validate()?;
+            options.protection = Some(Arc::new(protection));
+        }
         Some(options)
     } else {
         None
@@ -1297,6 +1321,7 @@ async fn run(args: Args) -> Result<()> {
     let watcher = if let Some(options) = controller_options {
         let sink = Arc::new(KubernetesSink {
             manager: manager.clone(),
+            metrics: metrics.clone(),
             tls: if args.kubernetes_tls {
                 public_tls.clone()
             } else {
@@ -1410,6 +1435,7 @@ async fn run(args: Args) -> Result<()> {
         cancel.clone(),
         metrics.clone(),
         ListenerPolicy {
+            proxy_protocol: hangang::proxy_protocol::Policy::new(args.proxy_protocol_from.clone())?,
             limit: args.max_connections,
             grace,
             config_tls: (args.config_tls || args.kubernetes_tls).then(|| active.clone()),
@@ -1436,6 +1462,7 @@ async fn run(args: Args) -> Result<()> {
             cancel.clone(),
             metrics.clone(),
             ListenerPolicy {
+                proxy_protocol: None,
                 limit: 64,
                 grace,
                 config_tls: None,
@@ -1453,6 +1480,7 @@ async fn run(args: Args) -> Result<()> {
             cancel.clone(),
             metrics.clone(),
             ListenerPolicy {
+                proxy_protocol: None,
                 limit: 128,
                 grace,
                 config_tls: None,
@@ -1652,6 +1680,8 @@ enum Handler {
     Acme(Arc<hangang::acme::HttpChallengeStore>),
 }
 struct ListenerPolicy {
+    /// PROXY protocol v2 trust for the public listener.
+    proxy_protocol: Option<hangang::proxy_protocol::Policy>,
     config_tls: Option<Arc<arc_swap::ArcSwap<Snapshot>>>,
     limit: usize,
     grace: Duration,
@@ -1668,6 +1698,7 @@ async fn serve(
     policy: ListenerPolicy,
 ) {
     let ListenerPolicy {
+        proxy_protocol,
         config_tls,
         limit,
         grace,
@@ -1686,7 +1717,7 @@ async fn serve(
             _=cancel.cancelled()=>break,
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Err(e)=result{tracing::warn!(error=%e,"connection task failed");}},
             accepted=listener.accept()=>{
-                let (stream,peer)=match accepted {Ok(v)=>v,Err(e)=>{tracing::warn!(error=%e,"accept failed");tokio::time::sleep(Duration::from_millis(50)).await;continue;}};
+                let (mut stream,peer)=match accepted {Ok(v)=>v,Err(e)=>{tracing::warn!(error=%e,"accept failed");tokio::time::sleep(Duration::from_millis(50)).await;continue;}};
                 let Ok(permit)=permits.clone().try_acquire_owned() else {metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);continue;};
                 let _=stream.set_nodelay(true);let handler=handler.clone();let cancel=cancel.clone();let metrics=metrics.clone();
                 let lease=Arc::new(hangang::metrics::ConnectionLease::new(permit,metrics.clone()));
@@ -1695,8 +1726,18 @@ async fn serve(
                     let Some(certificates) = &snapshot.certificates else { metrics.rejected_connections.fetch_add(1,Ordering::Relaxed); continue; };
                     Some(certificates.load_full())
                 } else { tls.as_ref().map(|tls|tls.current.load_full()) };
+                let proxy_protocol=proxy_protocol.clone();
                 tasks.spawn(async move {
                     let connection_lease=lease.clone();
+                    // The PROXY v2 header precedes TLS; a trusted load
+                    // balancer that omits it is refused.
+                    let peer=match &proxy_protocol {
+                        Some(policy)=>match tokio::select!{_=cancel.cancelled()=>return,result=policy.accept(&mut stream,peer)=>result} {
+                            Ok(source)=>source,
+                            Err(error)=>{tracing::debug!(%error,%peer,"PROXY protocol header rejected");metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return;}
+                        },
+                        None=>peer,
+                    };
                     let transport_tls=tls_config.is_some();
                     let io:Box<dyn TransportIo>=if let Some(config)=tls_config {
                         // Public handshake exhaustion must not deny the
@@ -1974,6 +2015,7 @@ fn snapshot_file() -> Result<std::fs::File> {
 
 struct KubernetesSink {
     manager: Arc<Manager>,
+    metrics: Arc<hangang::metrics::Metrics>,
     tls: Option<Arc<hangang::tls::ReloadingTls>>,
 }
 #[async_trait::async_trait]
@@ -1997,6 +2039,18 @@ impl hangang::kubernetes::ConfigSink for KubernetesSink {
         } else {
             None
         };
+        // Deleting or moving a protected Ingress is an explicit release in
+        // Kubernetes mode: first publish the released scopes disabled with
+        // enforcement off, then the desired snapshot.
+        let previous = self.manager.active.load_full();
+        if let Some(intermediate) =
+            hangang::protection::release_plan(&previous.config, &snapshot.config)
+        {
+            tracing::info!(
+                "releasing protected resource scopes before publishing the Kubernetes snapshot"
+            );
+            self.manager.apply_external(intermediate).await?;
+        }
         if let Some(config) = tls_config {
             self.manager
                 .apply_external_with_tls(snapshot.config, Arc::new(config))
@@ -2005,6 +2059,10 @@ impl hangang::kubernetes::ConfigSink for KubernetesSink {
             self.manager.apply_external(snapshot.config).await?;
         }
         Ok(())
+    }
+
+    async fn report_protection(&self, report: hangang::protection::Report) {
+        self.metrics.kubernetes_protection.publish(report);
     }
 
     /// Readiness follows the controller's authority over the API: a replica

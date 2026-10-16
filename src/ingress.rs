@@ -1,6 +1,7 @@
 //! Offline Kubernetes Ingress adapter. Cluster access and credentials stay with
 //! the operator; the resulting document uses the normal dynamic config path.
-use crate::config::{Config, HttpRoute, PathMatch};
+use crate::config::{AccessMode, Config, HttpRoute, PathMatch};
+use crate::protection::{Protections, RouteProtection};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,7 @@ pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 /// Offline adapter (`--import-ingress`): any invalid selected object fails the
 /// whole conversion so an operator sees the problem with their input.
 pub fn import(document: &Value, class: &str) -> Result<Config> {
-    build(document, class, false).map(|result| result.0)
+    build(document, class, false, None).map(|result| result.0)
 }
 
 /// Live controller conversion: a single invalid selected Ingress (bad name,
@@ -23,17 +24,23 @@ pub fn import(document: &Value, class: &str) -> Result<Config> {
 /// controller on startup. Only a malformed document or an over-limit result
 /// still fails.
 pub fn import_tolerant(document: &Value, class: &str) -> Result<Config> {
-    build(document, class, true).map(|result| result.0)
+    build(document, class, true, None).map(|result| result.0)
 }
 
 pub(crate) type IngressIdentities = BTreeSet<(String, String)>;
 pub(crate) fn import_validated(
     document: &Value,
     class: &str,
+    protections: Option<&Protections>,
 ) -> Result<(Config, IngressIdentities)> {
-    build(document, class, true)
+    build(document, class, true, protections)
 }
-fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, IngressIdentities)> {
+fn build(
+    document: &Value,
+    class: &str,
+    tolerant: bool,
+    protections: Option<&Protections>,
+) -> Result<(Config, IngressIdentities)> {
     let items = document
         .as_array()
         .or_else(|| document.get("items").and_then(Value::as_array))
@@ -99,8 +106,18 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     });
     let mut route_bytes = 0usize;
     let mut route_count = 0usize;
+    let mut any_protected = false;
     for resource in selected_ingresses {
-        match ingress_routes(resource, &services) {
+        // With protection enabled, an Ingress without a decision is withheld:
+        // it never falls back to unprotected routing.
+        let protection = match protections {
+            Some(protections) => match protections.routes.get(&ingress_identity(resource)) {
+                Some(protection) => Some((protection, protections.pumgye_authority.as_ref())),
+                None => continue,
+            },
+            None => None,
+        };
+        match ingress_routes(resource, &services, protection) {
             Ok((mut ingress_routes, default)) => {
                 let added_count = ingress_routes.len() + usize::from(default.is_some());
                 let added_bytes: usize = ingress_routes
@@ -129,6 +146,7 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
                 }
                 route_count = total_count;
                 route_bytes += added_bytes;
+                any_protected |= matches!(protection, Some((RouteProtection::Protected(_), _)));
                 accepted.insert(ingress_identity(resource));
                 routes.append(&mut ingress_routes);
                 if let Some(default) = default {
@@ -188,7 +206,11 @@ fn build(document: &Value, class: &str, tolerant: bool) -> Result<(Config, Ingre
     routes.extend(defaults);
     let config = Config {
         pumgye: None,
-        pumgye_authority: None,
+        pumgye_authority: if any_protected {
+            protections.and_then(|p| p.pumgye_authority.clone())
+        } else {
+            None
+        },
         geoip_database: None,
         certificates: vec![],
         cache: None,
@@ -262,6 +284,7 @@ fn ingress_identity(resource: &Value) -> (String, String) {
 fn ingress_routes(
     resource: &Value,
     services: &BTreeMap<(&str, &str), &Value>,
+    protection: Option<(&RouteProtection, Option<&crate::pumgye::AuthorityConfig>)>,
 ) -> Result<(Vec<HttpRoute>, Option<HttpRoute>)> {
     ensure!(
         resource["apiVersion"] == "networking.k8s.io/v1",
@@ -317,12 +340,26 @@ fn ingress_routes(
     } else {
         None
     };
+    let mut default = default;
+    let mut authority = None;
+    if let Some((protection, pumgye_authority)) = protection {
+        for route in routes.iter_mut().chain(default.iter_mut()) {
+            match protection {
+                RouteProtection::Public => route.access_mode = AccessMode::Public,
+                RouteProtection::Protected(compiled) => {
+                    compiled.protect(route);
+                    authority = pumgye_authority.cloned();
+                }
+            }
+        }
+    }
     Config {
         http: routes
             .iter()
             .cloned()
             .chain(default.iter().cloned())
             .collect(),
+        pumgye_authority: authority,
         ..Config::default()
     }
     .validate()?;
@@ -536,7 +573,7 @@ mod isolation_tests {
         ]});
         // Each object is individually valid, so only the aggregate overflows.
         assert!(import(&input, "hangang").is_err());
-        let (config, accepted) = import_validated(&input, "hangang").unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
         assert_eq!(config.http.len(), 1);
         assert_eq!(config.http[0].host.as_deref(), Some("small.example.test"));
         assert_eq!(
@@ -550,7 +587,7 @@ mod isolation_tests {
             ingress_with_paths("blue", "a-big", Some("big.example.test"), &many),
             ingress_with_paths("blue", "z-small", Some("small.example.test"), &["/"]),
         ]});
-        let (config, accepted) = import_validated(&input, "hangang").unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
         assert_eq!(config.http.len(), MAX_ROUTES);
         assert_eq!(
             accepted,
@@ -571,7 +608,7 @@ mod isolation_tests {
             ingress_with_paths("blue", "z-large", Some("large.example.test"), &long),
         ]});
         assert!(import(&input, "hangang").is_err());
-        let (config, accepted) = import_validated(&input, "hangang").unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
         assert_eq!(config.http.len(), 1);
         assert_eq!(accepted.len(), 1);
         assert!(serialized_len(&config) <= MAX_CONFIG_BYTES);

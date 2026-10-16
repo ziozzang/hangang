@@ -18,7 +18,7 @@
 //! can stop routing to this replica while it keeps serving its last snapshot.
 //! The deadline is checked while lists and snapshot preparation are in
 //! progress too, so a stalled relist cannot hold readiness past it.
-use crate::{config::Config, ingress, tls};
+use crate::{config::Config, ingress, protection, tls};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -88,9 +88,16 @@ pub struct ControllerOptions {
     /// authoritative. Must exceed `watch_timeout`, since an idle watch only
     /// proves liveness when the server closes it.
     pub stale_after: Duration,
+    /// Watch `ProtectionPolicy` objects and compile them into the routes of
+    /// the Ingresses they attach to (ADR 0022). `None` keeps the historical
+    /// unprotected Ingress semantics.
+    pub protection: Option<Arc<protection::Options>>,
 }
 
 impl ControllerOptions {
+    fn kinds(&self) -> Vec<ResourceKind> {
+        ResourceKind::enabled(self.watch_secrets, self.protection.is_some())
+    }
     pub fn in_cluster(ingress_class: impl Into<String>) -> Result<Self> {
         let host = std::env::var("KUBERNETES_SERVICE_HOST")
             .context("KUBERNETES_SERVICE_HOST is missing")?;
@@ -116,6 +123,7 @@ impl ControllerOptions {
             watch_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(40),
             stale_after: Duration::from_secs(60),
+            protection: None,
         })
     }
 
@@ -164,6 +172,9 @@ impl ControllerOptions {
         if let Some(address) = &self.publish_address {
             ensure!(valid_publish_address(address), "invalid publish address");
         }
+        if let Some(protection) = &self.protection {
+            protection.validate()?;
+        }
         Ok(())
     }
 }
@@ -194,6 +205,13 @@ pub trait ConfigSink: Send + Sync {
     async fn report_authority(&self, healthy: bool, reason: &str) {
         let _ = (healthy, reason);
     }
+
+    /// The protection outcome of the published snapshot, for the console
+    /// and metrics. Called after every successful reconciliation while
+    /// `ControllerOptions::protection` is set.
+    async fn report_protection(&self, report: protection::Report) {
+        let _ = report;
+    }
 }
 
 /// Host pattern (exact name, `*.suffix`, or the catch-all `*`) to the namespace
@@ -208,12 +226,14 @@ struct Published {
     snapshot: ControllerSnapshot,
     admitted: ingress::IngressIdentities,
     owners: HostOwners,
+    protection: Option<Arc<protection::Resolution>>,
 }
 
 /// Result of building and validating one publication.
 struct Admission {
     admitted: ingress::IngressIdentities,
     owners: HostOwners,
+    protection: Option<Arc<protection::Resolution>>,
 }
 
 enum Outcome {
@@ -238,7 +258,7 @@ impl Health {
     fn new(options: &ControllerOptions) -> Self {
         Self {
             stale_after: options.stale_after,
-            kinds: ResourceKind::enabled(options.watch_secrets),
+            kinds: options.kinds(),
             fresh_at: BTreeMap::new(),
             activation_failed: false,
             reported: false,
@@ -299,6 +319,7 @@ pub struct Controller {
     client: Arc<arc_swap::ArcSwap<Client>>,
     client_ca: Arc<std::sync::Mutex<Vec<u8>>>,
     sink: Arc<dyn ConfigSink>,
+    policy_statuses: Arc<PolicyStatusQueue>,
 }
 
 impl Controller {
@@ -306,11 +327,13 @@ impl Controller {
         options.validate()?;
         let ca = read_bounded(&options.ca_path, MAX_CA_BYTES).context("read Kubernetes API CA")?;
         let client = build_client(&ca)?;
+        let policy_statuses = Arc::new(PolicyStatusQueue::new(options.max_objects));
         Ok(Self {
             options,
             client: Arc::new(arc_swap::ArcSwap::from_pointee(client)),
             client_ca: Arc::new(std::sync::Mutex::new(ca)),
             sink,
+            policy_statuses,
         })
     }
 
@@ -331,6 +354,11 @@ impl Controller {
             let queue = statuses.clone();
             let cancel = cancel.clone();
             async move { controller.status_worker(queue, cancel).await }
+        });
+        let policy_worker = self.options.protection.is_some().then(|| {
+            let controller = self.clone_for_task();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { controller.policy_status_worker(cancel).await })
         });
         let none = BTreeSet::new();
         while !cancel.is_cancelled() {
@@ -390,7 +418,7 @@ impl Controller {
             let watch_cancel = cancel.child_token();
             let (tx, mut rx) = mpsc::channel(256);
             let mut tasks = JoinSet::new();
-            for kind in ResourceKind::enabled(self.options.watch_secrets) {
+            for kind in self.options.kinds() {
                 let tx = tx.clone();
                 let child = watch_cancel.clone();
                 let version = versions.get(&kind).cloned().unwrap_or_default();
@@ -493,8 +521,11 @@ impl Controller {
                 current = None;
             }
         }
-        // The loop only exits on cancellation, which the worker observes too.
+        // The loop only exits on cancellation, which the workers observe too.
         let _ = status_worker.await;
+        if let Some(worker) = policy_worker {
+            let _ = worker.await;
+        }
     }
 
     fn clone_for_task(&self) -> Self {
@@ -503,6 +534,7 @@ impl Controller {
             client: self.client.clone(),
             client_ca: self.client_ca.clone(),
             sink: self.sink.clone(),
+            policy_statuses: self.policy_statuses.clone(),
         }
     }
 
@@ -602,6 +634,9 @@ impl Controller {
         for ((namespace, name), current) in statuses.take_results() {
             cache.update_status(&namespace, &name, &current);
         }
+        for ((namespace, name), base, current) in self.policy_statuses.take_results() {
+            cache.update_policy_status(&namespace, &name, &base, &current);
+        }
         let published = last_good.is_some();
         let outcome = self
             .drive(
@@ -629,6 +664,21 @@ impl Controller {
                 address,
             );
         }
+        if self.options.protection.is_some()
+            && !matches!(outcome, Outcome::Rejected)
+            && let Some(published) = last_good.as_ref()
+            && let Some(resolution) = &published.protection
+        {
+            sync_policy_statuses(
+                &self.policy_statuses,
+                cache,
+                resolution,
+                &published.admitted,
+            );
+            self.sink
+                .report_protection(resolution.report(&published.admitted))
+                .await;
+        }
         self.assess(
             health,
             &cache.incomplete,
@@ -654,6 +704,7 @@ impl Controller {
                 {
                     published.admitted = admission.admitted;
                     published.owners = admission.owners;
+                    published.protection = admission.protection;
                     return Outcome::Unchanged;
                 }
                 match self.sink.apply(snapshot.clone()).await {
@@ -662,6 +713,7 @@ impl Controller {
                             snapshot,
                             admitted: admission.admitted,
                             owners: admission.owners,
+                            protection: admission.protection,
                         });
                         Outcome::Applied
                     }
@@ -680,7 +732,7 @@ impl Controller {
 
     async fn list_all(&self) -> Result<Listing> {
         let mut listing = Listing::default();
-        for kind in ResourceKind::enabled(self.options.watch_secrets) {
+        for kind in self.options.kinds() {
             let (objects, version, confirmed) = self.list_kind(kind).await?;
             listing
                 .cache
@@ -958,6 +1010,18 @@ impl Controller {
                 format!("apis/networking.k8s.io/v1/namespaces/{ns}/ingresses")
             }
             (None, ResourceKind::Ingress) => "apis/networking.k8s.io/v1/ingresses".into(),
+            (Some(ns), ResourceKind::ProtectionPolicy) => format!(
+                "apis/{}/{}/namespaces/{ns}/{}",
+                protection::GROUP,
+                protection::VERSION,
+                protection::PLURAL
+            ),
+            (None, ResourceKind::ProtectionPolicy) => format!(
+                "apis/{}/{}/{}",
+                protection::GROUP,
+                protection::VERSION,
+                protection::PLURAL
+            ),
         };
         self.options
             .api_server
@@ -973,6 +1037,92 @@ impl Controller {
             .api_server
             .join(&path)
             .context("build Kubernetes API URL")
+    }
+
+    fn policy_url(&self, namespace: &str, name: &str) -> Result<Url> {
+        let path = format!(
+            "apis/{}/{}/namespaces/{namespace}/{}/{name}/status",
+            protection::GROUP,
+            protection::VERSION,
+            protection::PLURAL
+        );
+        self.options
+            .api_server
+            .join(&path)
+            .context("build Kubernetes API URL")
+    }
+
+    /// Drain the ProtectionPolicy status queue until cancelled.
+    async fn policy_status_worker(self, cancel: CancellationToken) {
+        let queue = self.policy_statuses.clone();
+        let mut tasks = JoinSet::new();
+        loop {
+            while tasks.len() < STATUS_PATCH_CONCURRENCY {
+                let Some((key, object, status)) = queue.start() else {
+                    break;
+                };
+                let controller = self.clone_for_task();
+                let cancel = cancel.clone();
+                tasks.spawn(async move {
+                    let base = resource_version(&object);
+                    let outcome = tokio::select! {
+                        _ = cancel.cancelled() => Ok(None),
+                        outcome = controller.patch_policy_status(&key, &object, status) => outcome,
+                    };
+                    (key, base, outcome)
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = queue.notify.notified() => {}
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    match finished {
+                        Some(Ok((key, base, outcome))) => queue.complete(key, base, outcome),
+                        Some(Err(error)) => tracing::warn!(%error, "ProtectionPolicy status worker failed"),
+                        None => {}
+                    }
+                }
+            }
+        }
+        tasks.shutdown().await;
+    }
+
+    /// Write the whole controller-owned status with the cached
+    /// `resourceVersion` as precondition. `None` when the object changed
+    /// (409) or vanished (404): the watch event for that change reconciles
+    /// again from the cache.
+    async fn patch_policy_status(
+        &self,
+        (namespace, name): &ObjectKey,
+        object: &Value,
+        status: Value,
+    ) -> Result<Option<Value>> {
+        let rv = resource_version(object);
+        ensure!(!rv.is_empty(), "ProtectionPolicy resourceVersion missing");
+        let body = serde_json::json!({"metadata":{"resourceVersion":rv},"status":status});
+        let response = self
+            .authorize(
+                self.api_client()
+                    .await?
+                    .patch(self.policy_url(namespace, name)?)
+                    .header("content-type", "application/merge-patch+json")
+                    .body(serde_json::to_vec(&body)?),
+            )
+            .await?
+            .timeout(self.options.request_timeout)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = bounded_body(response, MAX_WATCH_EVENT_BYTES).await?;
+        if status.is_success() {
+            return Ok(serde_json::from_slice(&bytes).ok());
+        }
+        if status == StatusCode::CONFLICT || status == StatusCode::NOT_FOUND {
+            tracing::debug!(namespace=%namespace, name=%name, %status, "ProtectionPolicy status write dropped; the next event decides again");
+            return Ok(None);
+        }
+        bail!("ProtectionPolicy status patch returned {status}")
     }
 
     /// Drain the status queue with bounded concurrency until cancelled.
@@ -1146,6 +1296,127 @@ fn sync_statuses(
         desired.push((key, action, object.clone()));
     }
     statuses.sync(&keep, desired);
+}
+
+/// Bring the policy status queue in line with the published resolution.
+/// Only objects whose status disagrees (ignoring timestamps) are queued;
+/// work for vanished or already-correct policies is dropped.
+fn sync_policy_statuses(
+    queue: &PolicyStatusQueue,
+    cache: &ResourceCache,
+    resolution: &protection::Resolution,
+    admitted: &ingress::IngressIdentities,
+) {
+    let mut desired = Vec::new();
+    for object in cache.entries(ResourceKind::ProtectionPolicy) {
+        let Ok(key) = object_key(object) else {
+            continue;
+        };
+        let Some(status) = resolution.desired_status(object, admitted) else {
+            continue;
+        };
+        if protection::same_status(object.get("status"), &status) {
+            continue;
+        }
+        desired.push((key, object.clone(), status));
+    }
+    queue.sync(desired);
+}
+
+/// Coalescing queue of `ProtectionPolicy` status writes: at most one entry
+/// per live policy (the latest desired status wins), bounded by the object
+/// limit. A conflict or a vanished object drops the work; the watch event
+/// that caused it triggers a new reconciliation that decides again.
+struct PolicyStatusQueue {
+    state: std::sync::Mutex<PolicyStatusState>,
+    notify: tokio::sync::Notify,
+    limit: usize,
+}
+#[derive(Default)]
+struct PolicyStatusState {
+    queued: BTreeMap<ObjectKey, (Arc<Value>, Value)>,
+    in_flight: BTreeSet<ObjectKey>,
+    /// `resourceVersion` a completed patch was based on, until the cache
+    /// absorbs the result.
+    satisfied: BTreeMap<ObjectKey, String>,
+    /// (object, base `resourceVersion`, server response view).
+    results: Vec<(ObjectKey, String, Value)>,
+}
+impl PolicyStatusQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(PolicyStatusState::default()),
+            notify: tokio::sync::Notify::new(),
+            limit,
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, PolicyStatusState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn sync(&self, desired: Vec<(ObjectKey, Arc<Value>, Value)>) {
+        let mut state = self.lock();
+        let keep: BTreeSet<ObjectKey> = desired.iter().map(|(key, _, _)| key.clone()).collect();
+        state.queued.retain(|key, _| keep.contains(key));
+        let mut wake = false;
+        for (key, object, status) in desired {
+            if state.satisfied.get(&key) == Some(&resource_version(&object)) {
+                continue;
+            }
+            if state.queued.len() >= self.limit && !state.queued.contains_key(&key) {
+                tracing::warn!(namespace=%key.0, name=%key.1, "ProtectionPolicy status queue is full; the update is deferred");
+                continue;
+            }
+            state.queued.insert(key, (object, status));
+            wake = true;
+        }
+        drop(state);
+        if wake {
+            self.notify.notify_one();
+        }
+    }
+    #[cfg(test)]
+    fn queued_len(&self) -> usize {
+        self.lock().queued.len()
+    }
+    fn start(&self) -> Option<(ObjectKey, Arc<Value>, Value)> {
+        let mut state = self.lock();
+        let key = state
+            .queued
+            .keys()
+            .find(|key| !state.in_flight.contains(*key))
+            .cloned()?;
+        let (object, status) = state.queued.remove(&key)?;
+        state.in_flight.insert(key.clone());
+        Some((key, object, status))
+    }
+    fn complete(&self, key: ObjectKey, base: String, outcome: Result<Option<Value>>) {
+        let mut state = self.lock();
+        state.in_flight.remove(&key);
+        match outcome {
+            Ok(Some(current)) => {
+                state.satisfied.insert(key.clone(), base.clone());
+                let view = serde_json::json!({
+                    "metadata": {"resourceVersion": current.pointer("/metadata/resourceVersion").cloned().unwrap_or(Value::Null)},
+                    "status": current.get("status").cloned().unwrap_or(Value::Null),
+                });
+                state.results.push((key, base, view));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(namespace=%key.0, name=%key.1, %error, "ProtectionPolicy status update failed; it will be retried on the next event");
+            }
+        }
+    }
+    fn take_results(&self) -> Vec<(ObjectKey, String, Value)> {
+        let mut state = self.lock();
+        let results = std::mem::take(&mut state.results);
+        for (key, _, _) in &results {
+            state.satisfied.remove(key);
+        }
+        results
+    }
 }
 
 /// Whether a conflict re-read still describes the object a status decision
@@ -1398,12 +1669,16 @@ enum ResourceKind {
     Service,
     Ingress,
     Secret,
+    ProtectionPolicy,
 }
 impl ResourceKind {
-    fn enabled(secrets: bool) -> Vec<Self> {
+    fn enabled(secrets: bool, protection: bool) -> Vec<Self> {
         let mut kinds = vec![Self::Service, Self::Ingress];
         if secrets {
             kinds.push(Self::Secret);
+        }
+        if protection {
+            kinds.push(Self::ProtectionPolicy);
         }
         kinds
     }
@@ -1607,6 +1882,36 @@ impl ResourceCache {
         cached.bytes = bytes;
     }
 
+    /// Adopt the `resourceVersion` and status of a ProtectionPolicy the
+    /// controller just patched, unless the cache already moved past the
+    /// version the patch was based on (a watch event got there first).
+    fn update_policy_status(&mut self, namespace: &str, name: &str, base: &str, current: &Value) {
+        let key = (
+            ResourceKind::ProtectionPolicy,
+            namespace.to_owned(),
+            name.to_owned(),
+        );
+        let Some(cached) = self.values.get_mut(&key) else {
+            return;
+        };
+        if resource_version(&cached.object) != base {
+            return;
+        }
+        let Some(rv) = current.pointer("/metadata/resourceVersion").cloned() else {
+            return;
+        };
+        let object = Arc::make_mut(&mut cached.object);
+        object["metadata"]["resourceVersion"] = rv;
+        object["status"] = current.get("status").cloned().unwrap_or(Value::Null);
+        let bytes = ingress::serialized_len(&*object);
+        let usage = self
+            .usage
+            .entry(ResourceKind::ProtectionPolicy)
+            .or_default();
+        usage.bytes = usage.bytes - cached.bytes + bytes;
+        cached.bytes = bytes;
+    }
+
     /// Build the candidate snapshot, the identities of the Ingresses it
     /// admits, and the hostname ownership it implies. Every decision is a
     /// function of the cached objects alone.
@@ -1626,6 +1931,28 @@ impl ResourceCache {
             .filter(|ingress| selected(ingress, &options.ingress_class) == Some(true))
             .collect();
         let (authorized, owners) = authorize_hosts(&selected_ingresses);
+        // Protection is decided for every selected Ingress, owned or not, so
+        // status reports a withheld Ingress whatever withdrew it first.
+        let resolution = options.protection.as_ref().map(|settings| {
+            let identities: BTreeSet<ObjectKey> = selected_ingresses
+                .iter()
+                .filter_map(|ingress| object_key(ingress).ok())
+                .collect();
+            let service =
+                |namespace: &str, name: &str| self.get(ResourceKind::Service, namespace, name);
+            Arc::new(protection::resolve(
+                settings,
+                protection::Inputs {
+                    ingresses: &identities,
+                    policies: self.objects(ResourceKind::ProtectionPolicy).collect(),
+                    service: &service,
+                },
+            ))
+        });
+        let protections = resolution
+            .as_ref()
+            .zip(options.protection.as_ref())
+            .map(|(resolution, settings)| resolution.protections(settings));
         for ingress in selected_ingresses {
             let Ok(identity) = object_key(ingress) else {
                 continue;
@@ -1638,8 +1965,11 @@ impl ResourceCache {
             object["kind"] = Value::String("Ingress".into());
             resources.push(object);
         }
-        let (config, valid) =
-            ingress::import_validated(&Value::Array(resources.clone()), &options.ingress_class)?;
+        let (config, valid) = ingress::import_validated(
+            &Value::Array(resources.clone()),
+            &options.ingress_class,
+            protections.as_ref(),
+        )?;
         if !options.watch_secrets {
             return Ok((
                 ControllerSnapshot {
@@ -1649,6 +1979,7 @@ impl ResourceCache {
                 Admission {
                     admitted: valid,
                     owners,
+                    protection: resolution,
                 },
             ));
         }
@@ -1752,14 +2083,21 @@ impl ResourceCache {
         }
         resources.truncate(service_count);
         resources.extend(accepted);
-        let (config, admitted) =
-            ingress::import_validated(&Value::Array(resources), &options.ingress_class)?;
+        let (config, admitted) = ingress::import_validated(
+            &Value::Array(resources),
+            &options.ingress_class,
+            protections.as_ref(),
+        )?;
         Ok((
             ControllerSnapshot {
                 config,
                 certificates: certificates.into_values().collect(),
             },
-            Admission { admitted, owners },
+            Admission {
+                admitted,
+                owners,
+                protection: resolution,
+            },
         ))
     }
     fn certificates(&self, ingresses: &[&Value], class: &str) -> Result<Vec<TlsCertificate>> {
@@ -2020,13 +2358,16 @@ fn strip(kind: ResourceKind, object: &Value) -> Value {
         }
         ResourceKind::Service => {
             let mut spec = serde_json::Map::new();
-            for field in ["type", "ports"] {
+            // `externalTrafficPolicy` decides client address preservation
+            // for the gateway's own Service.
+            for field in ["type", "ports", "externalTrafficPolicy"] {
                 if let Some(value) = object.pointer(&format!("/spec/{field}")) {
                     spec.insert(field.to_owned(), value.clone());
                 }
             }
             stripped.insert("spec".to_owned(), Value::Object(spec));
         }
+        ResourceKind::ProtectionPolicy => {}
         ResourceKind::Ingress => {
             // Creation time and uid decide hostname ownership; uid and
             // generation bind queued status work to the object it was
@@ -2052,6 +2393,20 @@ fn strip(kind: ResourceKind, object: &Value) -> Value {
                     "status".to_owned(),
                     serde_json::json!({"loadBalancer": status}),
                 );
+            }
+        }
+    }
+    if kind == ResourceKind::ProtectionPolicy {
+        // Ownership-free, but age decides report order, and uid/generation
+        // bind status to the object incarnation it was computed for.
+        for field in ["creationTimestamp", "uid", "generation"] {
+            if let Some(value) = object.pointer(&format!("/metadata/{field}")) {
+                metadata.insert(field.to_owned(), value.clone());
+            }
+        }
+        for field in ["spec", "status"] {
+            if let Some(value) = object.get(field) {
+                stripped.insert(field.to_owned(), value.clone());
             }
         }
     }
@@ -2274,6 +2629,92 @@ mod tests {
         assert_eq!(cache.objects(ResourceKind::Ingress).count(), 1);
     }
     #[test]
+    fn protection_policies_are_cached_stripped_and_their_status_converges() {
+        let settings: protection::Settings = serde_json::from_value(serde_json::json!({
+            "identity_profiles":{"corp":{"auth":{"url":"https://hopae.example.test/_hopae/verify",
+                "native":{"transport":"grpc","address":"127.0.0.1:9001","tls":{"server_name":"h.example.test","ca":"/ca","certificate":"/c","key":"/k"}},
+                "request_headers":["authorization"],
+                "response_headers":["x-forwarded-user","x-hopae-aal"],
+                "static_request_headers":{"x-hopae-gateway-key":{"env":"HOPAE_GATEWAY_KEY"}}}}},
+            "pumgye_authority":{"transport":"grpc","decision_address":"127.0.0.1:9002","management_address":"127.0.0.1:9003",
+                "tls":{"server_name":"p.example.test","ca":"/ca","certificate":"/c","key":"/k"},
+                "decision_token_env":"D","admin_token_env":"A"}
+        }))
+        .unwrap();
+        let mut options = super::tls_isolation_tests::options_for_protection();
+        options.protection = Some(Arc::new(protection::Options {
+            settings,
+            facts: Default::default(),
+        }));
+        let mut cache = ResourceCache::default();
+        cache
+            .replace(
+                ResourceKind::Service,
+                vec![serde_json::json!({"metadata":{"name":"api","namespace":"blue","resourceVersion":"1"},
+                    "spec":{"type":"LoadBalancer","externalTrafficPolicy":"Local","ports":[{"port":80}],"selector":{"a":"b"}}})],
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            cache.get(ResourceKind::Service, "blue", "api").unwrap()["spec"],
+            serde_json::json!({"type":"LoadBalancer","externalTrafficPolicy":"Local","ports":[{"port":80}]})
+        );
+        let ingress = serde_json::json!({"metadata":{"name":"main","namespace":"blue","resourceVersion":"2","uid":"i"},
+            "spec":{"ingressClassName":"hangang","rules":[{"host":"a.example.test","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"api","port":{"number":80}}}}]}}]}});
+        cache
+            .replace(ResourceKind::Ingress, vec![ingress], 10)
+            .unwrap();
+        let policy = serde_json::json!({"metadata":{"name":"p","namespace":"blue","resourceVersion":"3","uid":"u","generation":1,
+                "annotations":{"noise":"x".repeat(2048)},"managedFields":[{"manager":"kubectl"}]},
+            "spec":{"targetRefs":[{"group":"networking.k8s.io","kind":"Ingress","name":"main"}],"network":{"enforcement":"None"},
+                "identity":{"profileRef":{"name":"corp"}},
+                "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":{"GET":"read"}}}}});
+        cache
+            .replace(ResourceKind::ProtectionPolicy, vec![policy], 10)
+            .unwrap();
+        let cached = cache
+            .get(ResourceKind::ProtectionPolicy, "blue", "p")
+            .unwrap();
+        assert!(cached["metadata"].get("annotations").is_none());
+        assert!(cached["metadata"].get("managedFields").is_none());
+        assert_eq!(cached["metadata"]["uid"], "u");
+
+        let (snapshot, admission) = cache.snapshot(&options).unwrap();
+        assert_eq!(snapshot.config.http.len(), 1);
+        assert_eq!(
+            snapshot.config.http[0].access_mode,
+            crate::config::AccessMode::Protected
+        );
+        let resolution = admission.protection.unwrap();
+        let queue = PolicyStatusQueue::new(10);
+        sync_policy_statuses(&queue, &cache, &resolution, &admission.admitted);
+        assert_eq!(queue.queued_len(), 1);
+        let (key, object, status) = queue.start().unwrap();
+        // The server's answer is folded back; the status then agrees.
+        let answer = serde_json::json!({"metadata":{"resourceVersion":"4"},"status":status});
+        queue.complete(key, resource_version(&object), Ok(Some(answer)));
+        for ((namespace, name), base, current) in queue.take_results() {
+            cache.update_policy_status(&namespace, &name, &base, &current);
+        }
+        sync_policy_statuses(&queue, &cache, &resolution, &admission.admitted);
+        assert_eq!(queue.queued_len(), 0);
+        // A stale answer never regresses a cache that already moved on.
+        cache.update_policy_status(
+            "blue",
+            "p",
+            "3",
+            &serde_json::json!({"metadata":{"resourceVersion":"99"},"status":{}}),
+        );
+        assert_eq!(
+            resource_version(
+                cache
+                    .get(ResourceKind::ProtectionPolicy, "blue", "p")
+                    .unwrap()
+            ),
+            "4"
+        );
+    }
+    #[test]
     fn secret_cache_is_stripped_and_byte_bounded() {
         let mut cache = ResourceCache::default();
         let unrelated = serde_json::json!({
@@ -2389,9 +2830,10 @@ mod tls_isolation_tests {
             client: Arc::new(arc_swap::ArcSwap::from_pointee(Client::new())),
             client_ca: Arc::new(std::sync::Mutex::new(Vec::new())),
             sink: sink.clone(),
+            policy_statuses: Arc::new(PolicyStatusQueue::new(options.max_objects)),
         };
         let mut health = Health::new(&options);
-        for kind in ResourceKind::enabled(options.watch_secrets) {
+        for kind in options.kinds() {
             health.touch(kind);
         }
         let mut cache = cache();
@@ -2435,6 +2877,12 @@ mod tls_isolation_tests {
         assert!(sink.ready.load(Ordering::Acquire));
         assert_ne!(last_good.as_ref().unwrap().snapshot, accepted);
     }
+    pub(super) fn options_for_protection() -> ControllerOptions {
+        ControllerOptions {
+            watch_secrets: false,
+            ..options()
+        }
+    }
     fn options() -> ControllerOptions {
         ControllerOptions {
             api_server: "https://localhost/".parse().unwrap(),
@@ -2449,6 +2897,7 @@ mod tls_isolation_tests {
             watch_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(40),
             stale_after: Duration::from_secs(60),
+            protection: None,
         }
     }
     fn ingress(name: &str, host: &str, secret: &str) -> Value {

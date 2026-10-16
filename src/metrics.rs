@@ -27,6 +27,8 @@ pub struct Metrics {
     pub policy_capacity_rejections: AtomicU64,
     pub body_transform_errors: AtomicU64,
     pub config_updates: AtomicU64,
+    /// Kubernetes ProtectionPolicy outcome of the published snapshot.
+    pub kubernetes_protection: crate::protection::Diagnostics,
 }
 impl Metrics {
     pub fn render(&self) -> String {
@@ -114,6 +116,7 @@ impl Metrics {
             out.push_str(&format!("# HELP hangang_{name} Hangang {name}.\n# TYPE hangang_{name} {kind}\nhangang_{name} {}\n", value.load(Ordering::Relaxed)));
         }
         self.geoip.render(&mut out);
+        self.kubernetes_protection.render(&mut out);
         out
     }
 }
