@@ -20,6 +20,15 @@ function formatTime(value, withSeconds = true) {
 }
 export { formatTime };
 
+/** Time of day for today, short date plus time otherwise; full value in the title. */
+function compactTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value || '—';
+  const locale = document.documentElement.lang || undefined;
+  const today = new Date().toDateString() === date.toDateString();
+  return new Intl.DateTimeFormat(locale, today ? { timeStyle: 'medium' } : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(date);
+}
+
 /** Decision query for the exporter broker from the URL filter state. */
 export function decisionQuery(params, { cursor, order, limit = 50, now = Date.now() } = {}) {
   const query = new URLSearchParams();
@@ -142,14 +151,18 @@ function searchBox(cx) {
 export function decisionColumns(cx) {
   const { t, ui } = cx;
   return [
-    { key: 'time', label: 'access.col.time', render: event => ui.el('a', { href: cx.hashFor('access', ['requests', event.request_id]), class: 'zt-time-link', text: formatTime(event.time) }) },
+    { key: 'time', label: 'access.col.time', render: event => ui.el('a', { href: cx.hashFor('access', ['requests', event.request_id]), class: 'zt-time-link' }, ui.el('time', { dateTime: event.time, text: compactTime(event.time) })) },
     { key: 'result', label: 'access.col.result', render: event => outcomeBadge(cx, event) },
     { key: 'user', label: 'access.col.user', render: event => subjectCell(cx, event) },
     { key: 'route', label: 'access.col.route', render: event => routeCell(cx, event) },
     { key: 'stage', label: 'access.col.stage', render: event => stageCell(cx, event) },
     { key: 'reason', label: 'access.col.reason', render: event => reasonCell(cx, event) },
     { key: 'source', label: 'access.col.source', render: event => sourceCell(cx, event) },
-    { key: 'revision', label: 'access.col.revision', render: event => ui.el('span', { class: 'kit-mono', text: Object.entries(event.revisions || {}).map(([name, value]) => `${t(`decision.authority.${name}`)} ${value}`).join(' · ') || '—' }) },
+    { key: 'revision', label: 'access.col.revision', render: event => {
+      const entries = Object.entries(event.revisions || {});
+      if (!entries.length) return '—';
+      return ui.el('ul', { class: 'zt-revision-list' }, entries.map(([name, value]) => ui.el('li', {}, ui.el('span', { class: 'kit-muted', text: t(`decision.authority.${name}`) }), ' ', ui.el('span', { class: 'kit-mono', text: String(value) }))));
+    } },
   ];
 }
 

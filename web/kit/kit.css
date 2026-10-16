@@ -130,3 +130,11 @@ a.zt-card:hover, a.zt-kpi:hover { border-color: var(--cyan); }
 .zt-sparkline { width: 100%; height: 2.5rem; }
 .zt-sparkline polyline { fill: none; stroke: var(--red); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 @media (max-width: 720px) { .zt-kpi-wide { grid-column: auto; } }
+.zt-time-link { white-space: nowrap; }
+.zt-revision-list { list-style: none; margin: 0; padding: 0; font-size: .82rem; white-space: nowrap; }
+.kit-table td { font-size: .9rem; }
+.zt-route strong, .zt-stack > strong, .kit-table th { white-space: nowrap; }
+.kit-table td:first-child { width: 1%; }
+.kit-table th:first-child { width: 1%; }
+.zt-reason { display: block; min-width: 14rem; }
+@media (max-width: 720px) { .kit-table td:first-child, .kit-table th:first-child { width: 100%; } .zt-reason { min-width: 0; } }
