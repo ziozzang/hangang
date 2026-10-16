@@ -95,9 +95,9 @@ function detail(cx, record) {
   const box = ui.el('div', { class: 'zt-audit-detail' }, ui.el('p', { text: record.summary }));
   if (record.before || record.after) box.append(ui.el('h3', { text: t('audit.diff') }), ui.structuredDiff(t, record.before, record.after));
   if (record.attrs && Object.keys(record.attrs).length) box.append(ui.el('h3', { text: t('audit.attributes') }), ui.structuredDiff(t, {}, record.attrs));
-  const facts = [[t('audit.col.source'), t(`audit.source.${record.source}`)], [t('audit.operation'), record.operation]];
-  box.append(ui.el('dl', { class: 'zt-dl' }, facts.map(([key, value]) => [ui.el('dt', { text: key }), ui.el('dd', { text: value })])));
-  if (record.digest) box.append(ui.el('p', {}, ui.el('span', { class: 'kit-muted', text: t('audit.digest') }), ' ', ui.el('code', { class: 'kit-mono', text: record.digest })));
+  const facts = [[t('audit.col.source'), t(`audit.source.${record.source}`)], [t(`audit.record_id.${record.source}`), ui.el('code', { class: 'kit-mono', text: record.operation })], [t('audit.col.time'), ui.formatFullTime(record.time)]];
+  if (record.digest) facts.push([t('audit.digest'), ui.hashChip(t, record.digest, { full: true })]);
+  box.append(ui.el('dl', { class: 'zt-dl' }, facts.map(([key, value]) => [ui.el('dt', { text: key }), ui.el('dd', {}, value)])));
   return box;
 }
 

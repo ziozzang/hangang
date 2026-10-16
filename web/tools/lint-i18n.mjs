@@ -70,6 +70,7 @@ const families = {
   'decision.fence': ['ok', 'stale_owner', 'revision_regressed', 'expired', 'unspecified'],
   'access.range': ['1h', '24h', '7d', '30d'],
   'audit.source': ['accounts', 'plugins', 'pumgye', 'hopae', 'sumunjang'],
+  'audit.record_id': ['accounts', 'plugins', 'pumgye', 'hopae', 'sumunjang'],
   'audit.actor': ['system', 'account', 'unknown'],
   'system.profile': ['off', 'strict', 'standard'],
   'audit.summary.account': ['baseline', 'bootstrap', 'prune', 'config_operations_prune', 'policy_change'],

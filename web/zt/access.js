@@ -3,6 +3,7 @@
 const RANGES = Object.freeze({ '1h': 3_600_000, '24h': 86_400_000, '7d': 7 * 86_400_000, '30d': 30 * 86_400_000 });
 const OUTCOMES = Object.freeze(['allow', 'deny', 'challenge', 'error', 'unavailable']);
 const STAGES = Object.freeze(['network', 'identity', 'authorization', 'enforcement']);
+const STAGE_ICONS = Object.freeze({ network: '◍', identity: '◉', authorization: '▤', enforcement: '⇥' });
 const PRINCIPALS = Object.freeze(['human', 'service', 'workload']);
 const FILTERS = Object.freeze(['range', 'outcome', 'stage', 'reason', 'route', 'service', 'class', 'principal', 'country', 'subject', 'ip']);
 const TAIL_LIMIT_MS = 10 * 60_000;
@@ -119,17 +120,25 @@ export function decisionColumns(cx) {
       const entry = identity(event);
       if (!entry) return ui.el('span', { class: 'kit-muted', text: t('decision.subject.none') });
       if (!entry.subject_ref) return ui.el('span', { class: 'kit-muted', text: t(`decision.verdict.${entry.verdict || 'unspecified'}`) });
-      return ui.el('span', { class: 'zt-inline' }, ui.el('code', { class: 'kit-entity-id', text: entry.subject_ref }), entry.principal && entry.principal !== 'unspecified' ? ui.el('small', { class: 'kit-muted', text: t(`decision.principal.${entry.principal}`) }) : null);
-    }, title: event => { const entry = identity(event); return entry?.subject_ref ? `${t('decision.subject.pseudonymous')} ${entry.subject_ref}` : ''; } },
+      return ui.el('code', { class: 'kit-entity-id', text: entry.subject_ref });
+    }, title: event => {
+      const entry = identity(event);
+      if (!entry?.subject_ref) return '';
+      const principal = entry.principal && entry.principal !== 'unspecified' ? ` · ${t(`decision.principal.${entry.principal}`)}` : '';
+      return `${t('decision.subject.pseudonymous')} ${entry.subject_ref}${principal}`;
+    } },
     { key: 'target', label: 'access.col.route', render: event => {
       const route = event.route || {};
-      return ui.el('span', { class: 'zt-inline' }, ui.el('strong', { text: route.service || route.route_id || t('decision.route.none') }), ui.el('span', { class: 'kit-mono kit-muted', text: [route.method, route.path_template].filter(Boolean).join(' ') }));
+      return ui.el('span', { class: 'zt-inline zt-target' }, ui.el('strong', { class: 'zt-target-name', text: route.service || route.route_id || t('decision.route.none') }), ui.el('span', { class: 'kit-mono kit-muted zt-target-path', text: [route.method, route.path_template].filter(Boolean).join(' ') }));
     }, title: event => { const route = event.route || {}; return [route.service, route.route_id, route.method, route.host, route.path_template].filter(Boolean).join(' · '); } },
     { key: 'stage', label: 'access.col.stage', render: event => {
       const name = event.outcome?.deciding_stage;
       if (!STAGES.includes(name)) return '—';
-      const decided = stage(event, name);
-      return ui.el('span', { class: 'zt-inline' }, ui.el('span', { text: t(`decision.stage.${name}`) }), decided && Number.isFinite(decided.revision) ? ui.el('small', { class: 'kit-muted', text: t('ui.revision', { revision: decided.revision }) }) : null);
+      return ui.el('span', { class: `zt-stage-badge zt-stage-${name}` }, ui.el('span', { class: 'zt-stage-icon', text: STAGE_ICONS[name], attrs: { 'aria-hidden': 'true' } }), ui.el('span', { text: t(`decision.stage.${name}`) }));
+    }, title: event => {
+      const name = event.outcome?.deciding_stage;
+      const decided = STAGES.includes(name) ? stage(event, name) : null;
+      return decided && Number.isFinite(decided.revision) ? `${t(`decision.stage.${name}`)} · ${t('ui.revision', { revision: decided.revision })}` : '';
     } },
     { key: 'reason', label: 'access.col.reason', render: event => reasonCell(cx, event) },
     { key: 'source', label: 'access.col.source', render: event => {

@@ -161,8 +161,8 @@ export function timeCell(t, value, now = Date.now()) {
 }
 
 /** Short copyable digest chip (first 12 hex characters). */
-export function hashChip(t, value) {
-  return el('span', { class: 'kit-chip', title: value }, el('span', { class: 'kit-mono', text: String(value).slice(0, 12) }), copyButton(t, value));
+export function hashChip(t, value, { full = false } = {}) {
+  return el('span', { class: `kit-chip${full ? ' kit-chip-full' : ''}`, title: value }, el('span', { class: 'kit-mono', text: full ? String(value) : String(value).slice(0, 12) }), copyButton(t, value));
 }
 
 /**
