@@ -604,6 +604,8 @@ let navigationGeneration = 0;
 async function switchView() {
   // The unified audit owns #audit (ADR 0020); keep earlier #audit-trail links working.
   if (/^#audit-trail(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#audit' + location.hash.slice('#audit-trail'.length));
+  // The Sumunjang package page became the Network section (ADR 0020).
+  if (/^#plugin-guard(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#network');
   const navigation = ++navigationGeneration;
   let name = normalizeView(location.hash);
   if (state.user && !isAdmin() && name !== 'status') {

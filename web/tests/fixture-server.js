@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Network section modules (web/zt/network).
+const NETWORK = ["index.js", "common.js", "trace.js", "actions.js", "diff.js", "overview.js", "threats.js", "ip.js", "blocks.js", "rules.js", "policy.js", "asn.js", "system.js", "network.css", "messages/en.json", "messages/ko.json"].map(name => `zt/network/${name}`);
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
 // Match src/ui.rs: fresh HTML style nonce, same-origin scripts, no unsafe-inline/eval.
 const server = http.createServer(async (request, response) => {
@@ -23,7 +25,7 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname === `/ui/locales/${name}`) return file(response, path.join('locales', name));
   }
   if (url.pathname === '/ui/style.css') return file(response, 'style.css');
-  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json']) {
+  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json', ...NETWORK]) {
     if (url.pathname === `/ui/${name}`) return file(response, name);
   }
   response.writeHead(404); response.end('fixture route missing');

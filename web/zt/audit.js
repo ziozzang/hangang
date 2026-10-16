@@ -58,7 +58,7 @@ export async function loadAuditRecords(cx) {
     for (const operation of plugins.data?.operations || []) {
       const label = t(PLUGIN_LABELS[operation.plugin] || 'ui.owner.host');
       const outcome = operation.completed_at === null ? 'uncertain' : outcomeFromStatus(operation.status);
-      records.push({ id: `plugins:${operation.id}`, source: 'plugins', time: new Date((operation.completed_at ?? operation.started_at) * 1000), actor: operation.actor_name, action: `${operation.method} ${operation.path}`, target: { type: 'plugin', id: operation.plugin }, outcome, summary: outcome === 'uncertain' ? t('audit.summary.plugin_uncertain', { owner: label, method: operation.method, path: operation.path }) : t('audit.summary.plugin', { owner: label, method: operation.method, path: operation.path, status: operation.status }), digest: operation.body_sha256, operation: String(operation.id) });
+      records.push({ id: `plugins:${operation.id}`, source: 'plugins', time: new Date((operation.completed_at ?? operation.started_at) * 1000), actor: operation.actor_name, action: `${operation.method} ${operation.path}`, target: { type: 'plugin', id: operation.plugin }, outcome, summary: outcome === 'uncertain' ? t('audit.summary.plugin_uncertain', { owner: label, method: operation.method, path: operation.path }) : t('audit.summary.plugin', { owner: label, method: operation.method, path: operation.path, status: operation.status }), digest: operation.body_sha256, facts: typeof operation.reason === 'string' && operation.reason ? [['audit.reason', operation.reason]] : [], operation: String(operation.id) });
     }
   } else failures.push('plugins');
   if (pumgye.ok) {
@@ -116,8 +116,8 @@ function target(cx, record) {
   const { t, ui } = cx;
   if (!record.target) return '—';
   if (record.target.type === 'plugin') return ui.el('a', { href: `#plugin-${record.target.id}`, text: t(PLUGIN_LABELS[record.target.id] || 'ui.owner.host') });
-  if (record.target.type === 'revision') return ui.el('a', { href: record.source === 'sumunjang' ? '#plugin-guard' : '#pumgye', text: t('ui.revision', { revision: record.target.id }) });
-  if (record.target.type === 'guard') return ui.el('a', { href: '#plugin-guard', class: 'kit-mono', text: record.target.id });
+  if (record.target.type === 'revision') return ui.el('a', { href: record.source === 'sumunjang' ? '#network/policy' : '#pumgye', text: t('ui.revision', { revision: record.target.id }) });
+  if (record.target.type === 'guard') return ui.el('a', { href: '#network/rules', class: 'kit-mono', text: record.target.id });
   if (record.target.type === 'user') return ui.el('a', { href: ui.entityHref('user', record.target.id), class: 'kit-mono', text: record.target.id });
   return ui.el('span', { text: record.target.id });
 }

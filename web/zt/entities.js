@@ -1,6 +1,7 @@
 // Entity routes (user, address, service), the System section and the task
 // sections whose full pages arrive in later phases (ADR 0020 P1/P2).
 import { decisionColumns, decisionFetcher } from './access.js';
+import { networkSystemPanels } from './network/system.js';
 
 const LINKS = Object.freeze({
   identities: [{ href: '#plugin-hopae', label: 'section.link.hopae', plugin: 'hopae' }, { href: '#users', label: 'section.link.console_accounts' }],
@@ -146,5 +147,8 @@ export async function renderSystem(cx, root) {
   } else decisions.append(ui.errorState(t, { owner: 'ui.owner.exporter', message: observability.reason?.message }));
   const raw = ui.el('details', { class: 'panel zt-raw' }, ui.el('summary', { text: t('system.raw') }),
     ui.el('pre', { class: 'kit-mono', text: JSON.stringify({ status: status.value?.data ?? null, observability: observability.value?.data ?? null }, null, 2) }));
-  content.append(components, decisions, raw);
+  content.append(components, decisions);
+  // Network authority (Sumunjang): GeoIP, updates and Kubernetes source diagnostics.
+  try { content.append(...await networkSystemPanels(cx)); } catch (error) { if (error?.status === 401) throw error; }
+  content.append(raw);
 }
