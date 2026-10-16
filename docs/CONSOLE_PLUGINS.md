@@ -64,6 +64,49 @@ already admitted operation; it grants no audit access or authority to retry. The
 private audit retains the actual backend result, which may already be committed.
 Requests refused by the authority check before dispatch do not gain a new operation reference.
 
+## Routes and route patterns
+
+A manifest lists plain routes `{"path", "method", "mutation"}`: `path` is one
+to several `/`-separated identifiers (lowercase letters, digits, `-`, each ≤ 32
+bytes, ≤ 128 bytes in total), `method` is `GET`, `POST`, `PUT` or `DELETE`;
+`GET` never mutates and `PUT`/`DELETE` always do. A package may declare up to
+**64** plain routes (32 before contract v2): lookup is a linear comparison of
+short strings and the manifest stays operator-reviewed and at most 64 KiB, so
+the larger cap keeps review practical while letting owner APIs ship complete.
+
+Contract v2 (`"api_version": 2`) adds bounded **route patterns** for owner APIs
+keyed by an identifier:
+
+```json
+"route_patterns": [
+  {"path": "zones/*", "method": "GET", "mutation": false},
+  {"path": "zones/*", "method": "DELETE", "mutation": true, "max_depth": 1}
+]
+```
+
+- `path` is a valid route name followed by `/*`; `max_depth` (1–4, default 1)
+  is how many segments the `*` may span. `zones/*` matches `zones/corp`, not
+  `zones`, `zones/a/b` (depth 1) or `zones/`.
+- Each matched segment must be a valid identifier (as above): `..`, empty
+  segments, percent-encoded characters (so no encoded `/` or `.`), upper case
+  and over-long segments never match. The broker never decodes the path.
+- Each pattern names exactly one method and its own mutation flag, validated
+  like plain routes; a request with another method is `404`. Mutating patterns
+  are journaled exactly like mutating routes, with the concrete path.
+- Plain routes are matched first. A plain route below a pattern's prefix with
+  the same method is refused at load (ambiguous), as are duplicate patterns.
+- At most 16 patterns per package and at most 64 plain routes and patterns
+  together. `api_version: 1` manifests may not declare patterns and keep their
+  exact meaning; discovery lists `route_patterns` beside `routes`.
+
+The broker forwards a matched request to exactly `<backend>/v1/<path>`. For
+delegated packages the signed actor assertion binds that exact forwarded path,
+the method and the SHA-256 of the body, so a backend verifying the assertion
+cannot be steered to another resource (security review: path confusion — identifier-only segments, no decoding, no
+normalization; method smuggling — one method per entry, `HEAD`/`OPTIONS`/other
+methods unmatched; mutation-flag bypass — the flag comes from the matched
+entry, and plain routes cannot be shadowed by a pattern).
+
 ## Mounted package locale lifecycle
 
 The host owns the locale. A mount may subscribe with
