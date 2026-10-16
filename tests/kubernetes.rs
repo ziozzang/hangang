@@ -2025,7 +2025,7 @@ fn protection_policy(rv: &str) -> serde_json::Value {
         "spec":{"targetRefs":[{"group":"networking.k8s.io","kind":"Ingress","name":"main"}],
             "identity":{"profileRef":{"name":"corp"}},
             "network":{"enforcement":"None"},
-            "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":{"GET":"read"}}}}})
+            "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":[{"method":"GET","action":"read"}]}}}})
 }
 async fn handle_protection(path: &str, query: &str, state: &ApiState) -> Response<Full<Bytes>> {
     let watch = query.contains("watch=true");
