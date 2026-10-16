@@ -17,7 +17,7 @@
 - `spec.network.enforcement`: `Required`(기본값) 또는 `None`입니다. `Required`는 Sumunjang 승인과 Pumgye 네트워크 조건이 실제 클라이언트 주소를 보아야 한다는 뜻이고, `None`은 신원과 인가만 주장합니다.
 - `spec.failureMode`: `Closed`만 있습니다.
 
-컨트롤러는 자기 클래스의 각 Ingress에 대해 이름으로 그것을 대상으로 삼은 정책을 고르고, 그런 정책이 없을 때만 네임스페이스 기본 정책을 적용합니다. 적용되는 정책이 정확히 하나일 때 Ingress가 보호됩니다. **적용되는 정책이 여러 개이면 거부합니다**: 생성 순서와 관계없이 Ingress를 보류하고 관련된 모든 정책이 `Accepted=False`, 이유 `Conflicted`를 보고합니다. Gateway API는 가장 오래된 정책을 우선하지만, 여기서는 더 새롭고 엄격한 정책이 조용히 무시되어서는 안 되므로 모호함을 나이가 아니라 운영자가 해소합니다. 네임스페이스 기본 정책 두 개도 같은 충돌입니다.
+컨트롤러는 자기 클래스의 각 Ingress에 대해 이름으로 그것을 대상으로 삼은 정책을 고르고, 그런 정책이 없을 때만 네임스페이스 기본 정책을 적용합니다. 적용되는 정책이 정확히 하나일 때 Ingress가 보호됩니다. **적용되는 정책이 여러 개이면 거부합니다**: 생성 순서와 관계없이 Ingress를 보류하고 관련된 모든 정책이 `Accepted=False`, 이유 `Conflicted`를 보고합니다. 이는 가장 오래된 정책이 우선하고 나머지를 `Conflicted`로 표시하는 Gateway API 정책 부착 규약(GEP-713)과 **의도적으로 다른** 동작입니다. 더 새롭고 엄격한 정책이 조용히 무시되어서는 안 되므로 모호함을 나이가 아니라 운영자가 해소하며, 해소될 때까지 아무것도 프로그래밍하지 않습니다. 네임스페이스 기본 정책 두 개도 같은 충돌입니다.
 
 모든 결정은 캐시된 객체와 운영자 설정만의 함수이므로, 서로 다른 이력을 관찰한 복제본도 같은 경로를 게시하고 같은 상태를 기록합니다.
 
@@ -102,7 +102,7 @@ Ingress가 생성하는 모든 경로(모든 호스트·경로 규칙과 기본 
 
 컨트롤러는 캐시된 `resourceVersion`을 전제 조건으로 `status`를 씁니다. 최상위 `conditions`에는 `Accepted`, `ResolvedRefs`, `Programmed`와, 네트워크 강제가 있는 정책이면 `ClientAddressPreserved`가 각각 `observedGeneration`과 함께 들어갑니다. `status.ancestors`는 Gateway API 정책 상태 규약을 따릅니다. 대상마다(네임스페이스 기본 정책이면 적용된 Ingress마다, 최대 16개이며 나머지는 `Programmed` 메시지에 개수로 표시) `controllerName: hangang.dev/gateway-controller`와 대상별 조건을 가진 항목 하나가 있습니다. 다른 컨트롤러가 쓴 항목은 보존합니다. `lastTransitionTime`은 조건의 status가 바뀔 때만 바뀌므로 복제본끼리 시각을 두고 다투지 않습니다. 충돌하거나 객체가 사라진 쓰기는 버리고, 그 원인이 된 감시 이벤트가 다시 조정합니다. `networking.k8s.io/v1` Ingress에는 조건 필드가 없으므로 Ingress는 게시 주소를 갖지 않는 것으로만 보류를 나타내며, 이유는 정책 상태와 아래 진단에서 확인합니다.
 
-관리 API의 `GET /v1/kubernetes/protection`(관리자 역할)은 이 인스턴스의 최신 보고서를 반환합니다. `require_protection`, 클라이언트 주소와 Sumunjang 상태, 개수, 선택된 Ingress마다 한 행(`protected`, `unprotected`, `withheld`, 게시된 스냅숏이 제공하는지, 부착된 정책, 이유와 메시지), 정책마다 한 행이 들어 있으며 각각 1,000행으로 제한됩니다. `/metrics`에는 `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted`, `hangang_kubernetes_client_address_preserved`가 추가됩니다. 배포 중에는 `withheld > 0`, 이전을 마친 뒤에는 `unprotected > 0`에 경보를 거십시오.
+관리 API의 `GET /v1/kubernetes/protection`(viewer 또는 관리자 역할, 읽기 전용, 비밀 정보 없음)은 이 인스턴스의 최신 보고서를 반환합니다. `require_protection`, 클라이언트 주소와 Sumunjang 상태, 개수, 선택된 Ingress마다 한 행(`protected`, `unprotected`, `withheld`, 게시된 스냅숏이 제공하는지, 부착된 정책, 이유와 메시지), 정책마다 한 행이 들어 있으며 각각 1,000행으로 제한됩니다. `/metrics`에는 `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted`, `hangang_kubernetes_client_address_preserved`가 추가됩니다. 배포 중에는 `withheld > 0`, 이전을 마친 뒤에는 `unprotected > 0`에 경보를 거십시오.
 
 ## 클라이언트 주소 보존
 
@@ -135,7 +135,7 @@ Ingress가 생성하는 모든 경로(모든 호스트·경로 규칙과 기본 
 
 ## 범위와 제한
 
-- ADR 0022 결정 4는 Ingress를 보호되지 않은 호환 경로로 두고 `ProtectionPolicy`를 Gateway API 경로에 둡니다. 이번 단위는 컨트롤러가 현재 조정하는 것이 Ingress이므로 정책을 Ingress에 먼저 붙입니다. HTTPRoute/Gateway 부착은 같은 스키마와 해석을 사용하며 다음 단계입니다(Gateway API 종류의 조정은 아직 구현되지 않았습니다).
+- 보호된 Ingress는 지원되는 과도기·호환 경로입니다(ADR 0022도 이에 맞게 수정). 장기 목표는 Gateway API 경로입니다. HTTPRoute/Gateway 부착은 같은 스키마와 해석을 사용하며 다음 단계입니다(Gateway API 종류의 조정은 아직 구현되지 않았습니다).
 - 동작 매핑은 HTTP 메서드 단위입니다. 경로나 RPC 단위 매핑, `GRPCRoute`, `WorldIdentityProfile` 종류, 서명된 스냅숏 배포, ADR 0022 결정 3의 컨트롤러/권한 서버 분리는 이번 단위에 포함되지 않습니다.
 - Pumgye 서비스 정책(예: 자체 네트워크 상한이나 `require_guard`)은 요청 시점에 Pumgye가 평가합니다. 게이트웨이는 `pumgye_services`가 허용하는 네임스페이스 바인딩만 검사합니다.
 - 각 복제본은 상태를 독립적으로 씁니다(리더 선출 없음). 입력이 같으면 이어받은 시각을 제외하고 상태도 같습니다.

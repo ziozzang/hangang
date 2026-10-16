@@ -12,7 +12,7 @@ This matrix compares the published operations in `docs/openapi.json` with the em
 | `GET /v1/cache` | Cache view and refresh | Admin cache policy and counters |
 | `GET /v1/certificates` | Certificates → listener selector and paged certificate inventory | Admin-only file/issuer metadata; scope-bound edits and stale-response rejection; visible-view refresh every 30 seconds |
 | `GET /v1/geoip/status` | Configuration → GeoIP database source → Refresh local GeoIP status | Admin-only, on-demand observation from this instance; readiness is separate from the configured path and other nodes |
-| `GET /v1/kubernetes/protection` | Proxy status → Kubernetes route protection → Refresh protection status | Admin-only, on-demand report of this instance's last published Kubernetes snapshot; withheld Ingresses with reasons |
+| `GET /v1/kubernetes/protection` | Proxy status → Kubernetes route protection → Refresh protection status | Viewer or admin, read-only on-demand report of this instance's last published Kubernetes snapshot; withheld Ingresses with reasons |
 | `GET /v1/geoip/lookup` | Configuration → GeoIP database source → Look up country | Admin-only, explicit IPv4/IPv6 address query against this instance's ready database; unavailable differs from unknown country |
 | `POST /v1/cache/purge` | Cache → Purge cache, confirmation | Admin mutation |
 | `GET /v1/events` | Status → live stream indicator and chart | Automatic SSE with Bearer header |

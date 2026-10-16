@@ -1618,9 +1618,8 @@ impl Admin {
                     "query parameters are not accepted",
                 ));
             }
-            if let Err(error) = self.users.authorize_admin(actor.mutation_authority()).await {
-                return Ok(account_problem(error));
-            }
+            // Read-only diagnostics without secrets: viewers may read them.
+            let _ = &actor;
             let report = self.manager.metrics.kubernetes_protection.current();
             return Ok(auth_json(
                 200,
@@ -3042,7 +3041,11 @@ fn viewer_allowed(path: &str, method: &hyper::Method) -> bool {
     *method == hyper::Method::GET
         && matches!(
             path,
-            "/v1/status" | "/v1/update/status" | "/healthz" | "/metrics"
+            "/v1/status"
+                | "/v1/update/status"
+                | "/healthz"
+                | "/metrics"
+                | "/v1/kubernetes/protection"
         )
 }
 

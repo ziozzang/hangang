@@ -681,10 +681,10 @@ function showGlobalError(text) {
 
 function ensureProtectionPanel() {
   const existing = $('#kubernetes-protection-panel');
-  if (existing) { existing.hidden = !isAdmin(); return; }
+  if (existing) { existing.hidden = !state.token; return; }
   const anchor = $('#activity-panel'); if (!anchor) return;
   const panel = document.createElement('section'); panel.id = 'kubernetes-protection-panel'; panel.className = 'panel';
-  panel.setAttribute('data-admin-only', ''); panel.hidden = !isAdmin();
+  panel.hidden = !state.token;
   const heading = document.createElement('div'); heading.className = 'section-heading';
   const text = document.createElement('div');
   const title = document.createElement('h2'); copy(title, 'Kubernetes route protection');
@@ -718,7 +718,7 @@ function renderProtection(data) {
 }
 
 async function loadProtectionStatus() {
-  if (!isAdmin() || !state.token) return;
+  if (!state.token) return;
   const button = $('#kubernetes-protection-refresh'); const output = $('#kubernetes-protection-status');
   if (!button || !output) return;
   const generation = state.authGeneration;
