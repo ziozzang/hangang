@@ -20,14 +20,6 @@ function formatTime(value, withSeconds = true) {
 }
 export { formatTime };
 
-/** Time of day for today, short date plus time otherwise; full value in the title. */
-function compactTime(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value || '—';
-  const locale = document.documentElement.lang || undefined;
-  const today = new Date().toDateString() === date.toDateString();
-  return new Intl.DateTimeFormat(locale, today ? { timeStyle: 'medium' } : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(date);
-}
 
 /** Decision query for the exporter broker from the URL filter state. */
 export function decisionQuery(params, { cursor, order, limit = 50, now = Date.now() } = {}) {
@@ -54,41 +46,9 @@ export function outcomeBadge(cx, event) {
   return badge;
 }
 
-export function subjectCell(cx, event) {
-  const { t, ui } = cx;
-  const identity = stage(event, 'identity');
-  if (!identity) return ui.el('span', { class: 'kit-muted', text: t('decision.subject.none') });
-  const wrapper = ui.el('span', { class: 'zt-subject' });
-  if (identity.subject_ref) wrapper.append(ui.el('span', { class: 'kit-tag', text: t('decision.subject.pseudonymous') }), ui.el('code', { class: 'kit-entity-id', text: identity.subject_ref }), ui.copyButton(t, identity.subject_ref));
-  else wrapper.append(ui.el('span', { class: 'kit-muted', text: t(`decision.verdict.${identity.verdict || 'unspecified'}`) }));
-  if (identity.principal && identity.principal !== 'unspecified') wrapper.append(ui.el('small', { class: 'kit-muted', text: t(`decision.principal.${identity.principal}`) }));
-  return wrapper;
-}
 
-function routeCell(cx, event) {
-  const { t, ui } = cx;
-  const route = event.route || {};
-  const cell = ui.el('span', { class: 'zt-route' });
-  if (route.service) cell.append(ui.entityLink(t, { type: 'service', id: route.service }));
-  cell.append(ui.el('span', {}, ui.el('strong', { text: route.route_id || t('decision.route.none') })),
-    ui.el('small', { class: 'kit-muted' }, [route.method, route.path_template].filter(Boolean).join(' ')));
-  return cell;
-}
 
-function stageCell(cx, event) {
-  const { t, ui } = cx;
-  const name = event.outcome?.deciding_stage;
-  if (!STAGES.includes(name)) return ui.el('span', { class: 'kit-muted', text: '—' });
-  const decided = stage(event, name);
-  return ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t(`decision.stage.${name}`) }), decided && Number.isFinite(decided.revision) ? ui.el('small', { class: 'kit-muted', text: t('ui.revision', { revision: decided.revision }) }) : null);
-}
 
-function sourceCell(cx, event) {
-  const { t, ui } = cx;
-  const client = stage(event, 'network')?.client || {};
-  const parts = [client.country, Number.isFinite(client.asn) ? t('decision.asn', { asn: client.asn }) : null].filter(Boolean);
-  return ui.el('span', { class: 'zt-stack' }, ui.el('span', {}, parts.length ? parts.join(' · ') : '—'), client.prefix_ref ? ui.el('small', { class: 'kit-entity-id', text: client.prefix_ref }) : null);
-}
 
 function reasonCell(cx, event) {
   const { t, ui } = cx;
@@ -103,7 +63,7 @@ function filterForm(cx, params, apply) {
   const option = (prefix, values, allKey) => [{ value: '', label: allKey }, ...values.map(value => ({ value, label: `${prefix}.${value}` }))];
   const form = ui.el('form', { class: 'zt-filters', attrs: { role: 'search', 'aria-label': t('access.filters') } });
   const active = FILTERS.filter(name => params.get(name)).length;
-  const sheet = ui.el('details', { class: 'zt-filter-sheet', open: active > 0 || window.matchMedia('(min-width: 721px)').matches },
+  const sheet = ui.el('details', { class: 'zt-filter-sheet', open: window.matchMedia('(min-width: 721px)').matches },
     ui.el('summary', { text: t('access.filters.summary', { count: active }) }), form);
   form.append(
     ui.field(t, { label: 'access.filter.range', name: 'range', value: params.get('range') || '24h', options: Object.keys(RANGES).map(value => ({ value, label: `access.range.${value}` })) }),
@@ -150,19 +110,33 @@ function searchBox(cx) {
 
 export function decisionColumns(cx) {
   const { t, ui } = cx;
+  const identity = event => stage(event, 'identity');
+  const client = event => stage(event, 'network')?.client || {};
   return [
-    { key: 'time', label: 'access.col.time', render: event => ui.el('a', { href: cx.hashFor('access', ['requests', event.request_id]), class: 'zt-time-link' }, ui.el('time', { dateTime: event.time, text: compactTime(event.time) })) },
+    { key: 'time', label: 'access.col.time', render: event => ui.el('a', { href: cx.hashFor('access', ['requests', event.request_id]), class: 'zt-time-link' }, ui.timeCell(t, event.time)), title: event => `${ui.formatFullTime(event.time)} · ${event.request_id}` },
     { key: 'result', label: 'access.col.result', render: event => outcomeBadge(cx, event) },
-    { key: 'user', label: 'access.col.user', render: event => subjectCell(cx, event) },
-    { key: 'route', label: 'access.col.route', render: event => routeCell(cx, event) },
-    { key: 'stage', label: 'access.col.stage', render: event => stageCell(cx, event) },
-    { key: 'reason', label: 'access.col.reason', render: event => reasonCell(cx, event) },
-    { key: 'source', label: 'access.col.source', render: event => sourceCell(cx, event) },
-    { key: 'revision', label: 'access.col.revision', render: event => {
-      const entries = Object.entries(event.revisions || {});
-      if (!entries.length) return '—';
-      return ui.el('ul', { class: 'zt-revision-list' }, entries.map(([name, value]) => ui.el('li', {}, ui.el('span', { class: 'kit-muted', text: t(`decision.authority.${name}`) }), ' ', ui.el('span', { class: 'kit-mono', text: String(value) }))));
+    { key: 'user', label: 'access.col.user', render: event => {
+      const entry = identity(event);
+      if (!entry) return ui.el('span', { class: 'kit-muted', text: t('decision.subject.none') });
+      if (!entry.subject_ref) return ui.el('span', { class: 'kit-muted', text: t(`decision.verdict.${entry.verdict || 'unspecified'}`) });
+      return ui.el('span', { class: 'zt-inline' }, ui.el('code', { class: 'kit-entity-id', text: entry.subject_ref }), entry.principal && entry.principal !== 'unspecified' ? ui.el('small', { class: 'kit-muted', text: t(`decision.principal.${entry.principal}`) }) : null);
+    }, title: event => { const entry = identity(event); return entry?.subject_ref ? `${t('decision.subject.pseudonymous')} ${entry.subject_ref}` : ''; } },
+    { key: 'target', label: 'access.col.route', render: event => {
+      const route = event.route || {};
+      return ui.el('span', { class: 'zt-inline' }, ui.el('strong', { text: route.service || route.route_id || t('decision.route.none') }), ui.el('span', { class: 'kit-mono kit-muted', text: [route.method, route.path_template].filter(Boolean).join(' ') }));
+    }, title: event => { const route = event.route || {}; return [route.service, route.route_id, route.method, route.host, route.path_template].filter(Boolean).join(' · '); } },
+    { key: 'stage', label: 'access.col.stage', render: event => {
+      const name = event.outcome?.deciding_stage;
+      if (!STAGES.includes(name)) return '—';
+      const decided = stage(event, name);
+      return ui.el('span', { class: 'zt-inline' }, ui.el('span', { text: t(`decision.stage.${name}`) }), decided && Number.isFinite(decided.revision) ? ui.el('small', { class: 'kit-muted', text: t('ui.revision', { revision: decided.revision }) }) : null);
     } },
+    { key: 'reason', label: 'access.col.reason', render: event => reasonCell(cx, event) },
+    { key: 'source', label: 'access.col.source', render: event => {
+      const c = client(event);
+      return [c.country, Number.isFinite(c.asn) ? t('decision.asn', { asn: c.asn }) : null].filter(Boolean).join(' · ') || '—';
+    }, title: event => client(event).prefix_ref || '' },
+    { key: 'revision', label: 'access.col.revision', hidden: true, render: event => ui.el('span', { class: 'kit-mono', text: Object.entries(event.revisions || {}).map(([name, value]) => `${t(`decision.authority.${name}`)} ${value}`).join(' · ') || '—' }) },
   ];
 }
 
@@ -191,7 +165,8 @@ export async function renderDecisionLog(cx, root, params) {
   const live = ui.el('input', { type: 'checkbox', name: 'live' });
   const liveLabel = ui.el('label', { class: 'zt-live' }, live, ui.el('span', { text: t('access.live') }));
   const table = ui.dataTable(t, {
-    caption: 'access.log.caption', owner: 'ui.owner.exporter', columns: decisionColumns(cx),
+    id: 'decision-log', caption: 'access.log.caption', owner: 'ui.owner.exporter', columns: decisionColumns(cx),
+    onRowOpen: event => cx.navigate(cx.hashFor('access', ['requests', event.request_id])),
     rowKey: event => event.event_id,
     empty: { title: 'access.empty.title', body: params.toString() ? 'access.empty.filtered' : 'access.empty.body' },
     fetchPage: decisionFetcher(cx, params, { onProfile: profile => {
@@ -279,9 +254,7 @@ function revisionVector(cx, event, current) {
 }
 
 function unavailableAction(cx, label, why) {
-  const { t, ui } = cx;
-  const id = `zt-why-${Math.random().toString(36).slice(2, 8)}`;
-  return ui.el('span', { class: 'zt-action-off' }, ui.el('button', { type: 'button', class: 'button button-quiet', disabled: true, text: t(label), attrs: { 'aria-describedby': id } }), ui.el('small', { id, class: 'kit-muted', text: t(why) }));
+  return cx.ui.disabledAction(cx.t, label, why);
 }
 
 export async function renderRequest(cx, root, requestId) {

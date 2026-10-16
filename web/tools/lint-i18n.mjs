@@ -72,6 +72,8 @@ const families = {
   'audit.source': ['accounts', 'plugins', 'pumgye', 'hopae', 'sumunjang'],
   'audit.actor': ['system', 'account', 'unknown'],
   'system.profile': ['off', 'strict', 'standard'],
+  'audit.summary.account': ['baseline', 'bootstrap', 'prune', 'config_operations_prune', 'policy_change'],
+  'audit.summary.admin': ['user_disable', 'user_enable', 'session_terminate', 'sessions_terminate', 'grant', 'revoke', 'denied'],
   'ui.subject.status': ['active', 'disabled', 'deleted', 'unknown'],
   'ui.subject.reason': ['credential_expired', 'not_found', 'unrecognized', 'human_subjects_not_configured', 'index_incomplete', 'not_enumerable'],
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],

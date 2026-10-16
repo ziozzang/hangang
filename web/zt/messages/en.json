@@ -49,7 +49,11 @@
  "audit.actor.account": "Account",
  "audit.actor.system": "System",
  "audit.actor.unknown": "Unknown actor",
+ "audit.attributes": "Recorded attributes",
  "audit.caption": "Administrative audit, newest first",
+ "audit.change.disabled": "disabled",
+ "audit.change.enabled": "enabled",
+ "audit.change.role": "role {before} → {after}",
  "audit.col.action": "Action",
  "audit.col.actor": "Actor",
  "audit.col.detail": "Detail",
@@ -58,6 +62,7 @@
  "audit.col.target": "Target",
  "audit.col.time": "Time",
  "audit.diff": "Before / after",
+ "audit.digest": "Request body SHA-256",
  "audit.empty.body": "Changes appear here when accounts, packages or policies change.",
  "audit.empty.title": "No administrative changes recorded",
  "audit.filter.action": "Action",
@@ -66,6 +71,7 @@
  "audit.filter.source": "Source",
  "audit.filters": "Audit filters",
  "audit.manage_accounts": "Account audit retention and policy",
+ "audit.operation": "Operation",
  "audit.owner": "Administrative changes federated from each authority's own journal",
  "audit.partial": "Some sources could not be read: {sources}. Their activity is not shown, which does not mean there was none.",
  "audit.source.accounts": "Console accounts",
@@ -75,6 +81,38 @@
  "audit.source.pumgye": "Pumgye publications",
  "audit.source.sumunjang": "Sumunjang policy",
  "audit.sources": "Audit sources",
+ "audit.summary.account.baseline": "Audit started with {count} existing accounts",
+ "audit.summary.account.bootstrap": "Bootstrapped the first administrator",
+ "audit.summary.account.config_operations_prune": {
+  "one": "Pruned {count} configuration operation",
+  "other": "Pruned {count} configuration operations"
+ },
+ "audit.summary.account.policy_change": "Changed the account audit policy (revision {revision})",
+ "audit.summary.account.prune": {
+  "one": "Pruned {count} audit record",
+  "other": "Pruned {count} audit records"
+ },
+ "audit.summary.account_create": "Created console account {target} as {role}",
+ "audit.summary.account_delete": "Deleted console account {target}",
+ "audit.summary.account_password": "Changed the password of {target}",
+ "audit.summary.account_update": "Changed {target}: {changes}",
+ "audit.summary.admin.denied": "Refused an administrative request to {endpoint}: {reason}",
+ "audit.summary.admin.grant": "Granted {role} to {user} (was {previous})",
+ "audit.summary.admin.revoke": "Revoked the console grant of {user} (was {previous})",
+ "audit.summary.admin.session_terminate": "Ended a session of {user}",
+ "audit.summary.admin.sessions_terminate": {
+  "one": "Ended {count} session of {user}",
+  "other": "Ended {count} sessions of {user}"
+ },
+ "audit.summary.admin.user_disable": {
+  "one": "Disabled user {user}; {count} session ended",
+  "other": "Disabled user {user}; {count} sessions ended"
+ },
+ "audit.summary.admin.user_enable": "Enabled user {user}",
+ "audit.summary.plugin": "{owner}: {method} {path} → HTTP {status}",
+ "audit.summary.plugin_uncertain": "{owner}: {method} {path}; outcome unknown, inspect current state",
+ "audit.summary.publish": "Published Pumgye policy revision {revision}",
+ "audit.summary.sumunjang": "Published Sumunjang policy revision {revision}",
  "decision.asn": "AS{asn}",
  "decision.authority.catalog": "Catalog",
  "decision.authority.hangang": "Hangang",
@@ -319,6 +357,7 @@
  "overview.card.pumgye": "Pumgye",
  "overview.card.sumunjang": "Sumunjang",
  "overview.changes": "Recent administrative changes",
+ "overview.changes.all": "All changes",
  "overview.changes.empty": "No recorded administrative changes",
  "overview.exporter.disabled": "Decision events disabled",
  "overview.exporter.drops": {
@@ -341,6 +380,10 @@
  "overview.source.unavailable": "Status unavailable",
  "overview.sparkline": "Deny rate over time",
  "overview.sparkline.summary": "{count} buckets · peak {peak}",
+ "overview.suppressed": {
+  "one": "{count} repeated refusal was summarized by the event rate limit ({events} summary).",
+  "other": "{count} repeated refusals were summarized by the event rate limit ({events} summaries)."
+ },
  "overview.top.countries": "Top denied countries",
  "overview.top.empty": "No denials in this window",
  "overview.top.reasons": "Top deny reasons",
@@ -413,6 +456,10 @@
  "system.rings.value": "{queued} queued · {deny} refusal slots · {allow} allow slots",
  "system.store": "Local store",
  "system.store.value": "{rows} events",
+ "ui.age.days": {
+  "one": "{count} day ago",
+  "other": "{count} days ago"
+ },
  "ui.age.hours": {
   "one": "{count} hour ago",
   "other": "{count} hours ago"
@@ -480,6 +527,7 @@
  "ui.subject.status.deleted": "Deleted (tombstone)",
  "ui.subject.status.disabled": "Disabled",
  "ui.subject.status.unknown": "Unknown subject",
+ "ui.table.columns": "Columns",
  "ui.table.next": "Next",
  "ui.table.page": {
   "one": "Page {page} · {count} row",

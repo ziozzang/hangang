@@ -48,7 +48,11 @@
  "audit.actor.account": "계정",
  "audit.actor.system": "시스템",
  "audit.actor.unknown": "알 수 없는 수행자",
+ "audit.attributes": "기록된 속성",
  "audit.caption": "관리 감사, 최신순",
+ "audit.change.disabled": "비활성화",
+ "audit.change.enabled": "활성화",
+ "audit.change.role": "역할 {before} → {after}",
  "audit.col.action": "작업",
  "audit.col.actor": "수행자",
  "audit.col.detail": "상세",
@@ -57,6 +61,7 @@
  "audit.col.target": "대상",
  "audit.col.time": "시간",
  "audit.diff": "변경 전 / 후",
+ "audit.digest": "요청 본문 SHA-256",
  "audit.empty.body": "계정, 패키지, 정책이 바뀌면 여기에 나타납니다.",
  "audit.empty.title": "기록된 관리 변경이 없습니다",
  "audit.filter.action": "작업",
@@ -65,6 +70,7 @@
  "audit.filter.source": "출처",
  "audit.filters": "감사 필터",
  "audit.manage_accounts": "계정 감사 보존과 정책",
+ "audit.operation": "작업",
  "audit.owner": "각 권한 기관 자체 기록에서 모은 관리 변경",
  "audit.partial": "일부 출처를 읽지 못했습니다: {sources}. 해당 활동이 표시되지 않을 뿐 없었다는 뜻은 아닙니다.",
  "audit.source.accounts": "콘솔 계정",
@@ -74,6 +80,34 @@
  "audit.source.pumgye": "품계 게시",
  "audit.source.sumunjang": "수문장 정책",
  "audit.sources": "감사 출처",
+ "audit.summary.account.baseline": "기존 계정 {count}개로 감사 시작",
+ "audit.summary.account.bootstrap": "첫 관리자 생성",
+ "audit.summary.account.config_operations_prune": {
+  "other": "설정 작업 기록 {count}건 정리"
+ },
+ "audit.summary.account.policy_change": "계정 감사 정책 변경(리비전 {revision})",
+ "audit.summary.account.prune": {
+  "other": "감사 기록 {count}건 정리"
+ },
+ "audit.summary.account_create": "콘솔 계정 {target}을(를) {role} 권한으로 생성",
+ "audit.summary.account_delete": "콘솔 계정 {target} 삭제",
+ "audit.summary.account_password": "{target}의 비밀번호 변경",
+ "audit.summary.account_update": "{target} 변경: {changes}",
+ "audit.summary.admin.denied": "{endpoint} 관리 요청 거부: {reason}",
+ "audit.summary.admin.grant": "{user}에게 {role} 권한 부여(이전 {previous})",
+ "audit.summary.admin.revoke": "{user}의 콘솔 권한 회수(이전 {previous})",
+ "audit.summary.admin.session_terminate": "{user}의 세션 종료",
+ "audit.summary.admin.sessions_terminate": {
+  "other": "{user}의 세션 {count}개 종료"
+ },
+ "audit.summary.admin.user_disable": {
+  "other": "사용자 {user} 비활성화, 세션 {count}개 종료"
+ },
+ "audit.summary.admin.user_enable": "사용자 {user} 활성화",
+ "audit.summary.plugin": "{owner}: {method} {path} → HTTP {status}",
+ "audit.summary.plugin_uncertain": "{owner}: {method} {path}. 결과를 알 수 없으니 현재 상태를 확인하세요",
+ "audit.summary.publish": "품계 정책 리비전 {revision} 게시",
+ "audit.summary.sumunjang": "수문장 정책 리비전 {revision} 게시",
  "decision.asn": "AS{asn}",
  "decision.authority.catalog": "카탈로그",
  "decision.authority.hangang": "한강",
@@ -316,6 +350,7 @@
  "overview.card.pumgye": "품계",
  "overview.card.sumunjang": "수문장",
  "overview.changes": "최근 관리 변경",
+ "overview.changes.all": "전체 변경",
  "overview.changes.empty": "기록된 관리 변경이 없습니다",
  "overview.exporter.disabled": "판단 이벤트 비활성",
  "overview.exporter.drops": {
@@ -337,6 +372,9 @@
  "overview.source.unavailable": "상태를 확인할 수 없음",
  "overview.sparkline": "시간별 거부율",
  "overview.sparkline.summary": "구간 {count}개 · 최고 {peak}",
+ "overview.suppressed": {
+  "other": "반복된 거부 {count}건이 이벤트 한도에 따라 요약되었습니다(요약 {events}건)."
+ },
  "overview.top.countries": "주요 거부 국가",
  "overview.top.empty": "이 기간에 거부가 없습니다",
  "overview.top.reasons": "주요 거부 사유",
@@ -409,6 +447,9 @@
  "system.rings.value": "대기 {queued} · 거부 슬롯 {deny} · 허용 슬롯 {allow}",
  "system.store": "로컬 저장소",
  "system.store.value": "이벤트 {rows}건",
+ "ui.age.days": {
+  "other": "{count}일 전"
+ },
  "ui.age.hours": {
   "other": "{count}시간 전"
  },
@@ -473,6 +514,7 @@
  "ui.subject.status.deleted": "삭제됨(흔적만 남음)",
  "ui.subject.status.disabled": "비활성화됨",
  "ui.subject.status.unknown": "알 수 없는 주체",
+ "ui.table.columns": "열",
  "ui.table.next": "다음",
  "ui.table.page": {
   "other": "{page}페이지 · {count}행"

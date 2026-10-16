@@ -283,6 +283,8 @@ fn filters_combine_and_pagination_is_complete_and_stable() {
     assert_eq!(allow["events"], 1);
     assert_eq!(allow["estimated_requests"], 100);
     assert_eq!(allow["estimate"], true);
+    let sampled = facets["facets"]["sampled"].as_array().unwrap();
+    assert!(sampled.iter().any(|entry| entry["value"] == "deny"));
     let series = query::timeseries(&conn, &filters).unwrap();
     assert!(!series["points"].as_array().unwrap().is_empty());
 }

@@ -43,7 +43,9 @@ export function relativeAge(t, ageMs) {
   if (seconds < 120) return t('ui.age.seconds', { count: seconds });
   const minutes = Math.round(seconds / 60);
   if (minutes < 120) return t('ui.age.minutes', { count: minutes });
-  return t('ui.age.hours', { count: Math.round(minutes / 60) });
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return t('ui.age.hours', { count: hours });
+  return t('ui.age.days', { count: Math.round(hours / 24) });
 }
 
 /** Fresh/stale/unknown with age; unknown is never rendered as healthy. */
@@ -130,35 +132,141 @@ export function field(t, { label, name, value = '', options, type = 'text', help
   return el('label', { class: 'kit-field', htmlFor: id }, el('span', { class: 'kit-field-label', text: t(label) }), control, helpNode);
 }
 
+function locale() { return document.documentElement.lang || undefined; }
+
+/** Full localized date and time. */
+export function formatFullTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value ?? '—');
+  return new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'medium' }).format(date);
+}
+
+/** Compact 24-hour time: time only today, month-day and time otherwise. */
+export function formatCompactTime(value, now = Date.now()) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value ?? '—');
+  const sameDay = date.toDateString() === new Date(now).toDateString();
+  const sameYear = date.getFullYear() === new Date(now).getFullYear();
+  const options = { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' };
+  if (!sameDay) Object.assign(options, { month: '2-digit', day: '2-digit' });
+  if (!sameYear) options.year = 'numeric';
+  return new Intl.DateTimeFormat(locale(), options).format(date);
+}
+
+/** `<time>` with the compact form; full date and relative age in the tooltip. */
+export function timeCell(t, value, now = Date.now()) {
+  const date = new Date(value);
+  const valid = !Number.isNaN(date.getTime());
+  return el('time', { class: 'kit-time', dateTime: valid ? date.toISOString() : undefined, text: formatCompactTime(value, now), title: valid ? `${formatFullTime(value)} · ${relativeAge(t, now - date.getTime())}` : undefined });
+}
+
+/** Short copyable digest chip (first 12 hex characters). */
+export function hashChip(t, value) {
+  return el('span', { class: 'kit-chip', title: value }, el('span', { class: 'kit-mono', text: String(value).slice(0, 12) }), copyButton(t, value));
+}
+
+/**
+ * Disabled action rendered as a real button with an info tooltip that names
+ * the reason; the wrapper stays focusable so keyboard users can read it.
+ */
+export function disabledAction(t, label, reason) {
+  const id = `kit-tip-${Math.random().toString(36).slice(2, 8)}`;
+  const button = el('button', { type: 'button', class: 'button button-quiet', disabled: true, text: t(label), attrs: { 'aria-describedby': id } });
+  return el('span', { class: 'kit-action-off', tabIndex: 0, attrs: { 'aria-label': `${t(label)}: ${t(reason)}` } }, button,
+    el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }),
+    el('span', { class: 'kit-tip', id, text: t(reason), attrs: { role: 'tooltip' } }));
+}
+
+function readHidden(id, columns) {
+  const defaults = new Set(columns.filter(column => column.hidden).map(column => column.key));
+  if (!id) return defaults;
+  try {
+    const stored = JSON.parse(localStorage.getItem(`kit-columns:${id}`) || 'null');
+    return Array.isArray(stored) ? new Set(stored.filter(key => columns.some(column => column.key === key))) : defaults;
+  } catch { return defaults; }
+}
+
+function writeHidden(id, hidden) {
+  if (!id) return;
+  try { localStorage.setItem(`kit-columns:${id}`, JSON.stringify([...hidden])); } catch { /* Preferences are optional. */ }
+}
+
 /**
  * Server-driven data table: the caller's `fetchPage({cursor, order, signal})`
  * performs search/filter/sort/pagination; the table keeps a cursor stack for
- * Back, renders loading/empty/error states and becomes cards at narrow widths.
+ * Back, renders loading/empty/error states, single-line dense rows with
+ * truncation tooltips, a sticky header, a column chooser, row activation or
+ * expansion, and becomes cards at narrow widths.
  */
-export function dataTable(t, { caption, columns, fetchPage, rowKey, empty, order = 'desc', sortable = 'time', owner, onPage }) {
+export function dataTable(t, { id, caption, columns, fetchPage, rowKey, empty, order = 'desc', sortable = 'time', owner, onPage, onRowOpen, expand }) {
   const root = el('div', { class: 'kit-table-wrap' });
   const status = el('div', { class: 'kit-table-status', attrs: { 'aria-live': 'polite' } });
-  const table = el('table', { class: 'kit-table' });
+  const table = el('table', { class: 'kit-table kit-dense' });
   const body = el('tbody');
   const pager = el('nav', { class: 'kit-pager', attrs: { 'aria-label': t('ui.table.pagination') } });
   const prev = el('button', { type: 'button', class: 'button button-quiet', text: t('ui.table.previous') });
   const next = el('button', { type: 'button', class: 'button button-quiet', text: t('ui.table.next') });
   const position = el('span', { class: 'kit-pager-position' });
   pager.append(prev, position, next);
-  let cursors = [null], page = 0, nextCursor = null, controller = null, rows = 0, destroyed = false;
-  const head = el('tr');
+  const hidden = readHidden(id, columns);
+  const chooser = el('details', { class: 'kit-columns' }, el('summary', { text: t('ui.table.columns') }));
+  const chooserList = el('div', { class: 'kit-columns-list', attrs: { role: 'group', 'aria-label': t('ui.table.columns') } });
+  chooser.append(chooserList);
   for (const column of columns) {
-    const th = el('th', { scope: 'col' });
-    if (column.key === sortable) {
-      const button = el('button', { type: 'button', class: 'kit-sort', text: t(column.label) });
-      const sync = () => { th.setAttribute('aria-sort', order === 'asc' ? 'ascending' : 'descending'); button.dataset.order = order; };
-      button.addEventListener('click', () => { order = order === 'asc' ? 'desc' : 'asc'; sync(); reset(); });
-      sync(); th.append(button);
-    } else th.textContent = t(column.label);
-    head.append(th);
+    if (column.key === sortable) continue;
+    const box = el('input', { type: 'checkbox', checked: !hidden.has(column.key) });
+    box.addEventListener('change', () => { if (box.checked) hidden.delete(column.key); else hidden.add(column.key); writeHidden(id, hidden); renderHead(); renderRows(); });
+    chooserList.append(el('label', {}, box, el('span', { text: t(column.label) })));
   }
-  table.append(el('caption', { class: 'kit-visually-hidden', text: t(caption) }), el('thead', {}, head), body);
-  root.append(status, table, pager);
+  let cursors = [null], page = 0, nextCursor = null, controller = null, rows = [], destroyed = false;
+  const visible = () => columns.filter(column => !hidden.has(column.key));
+  const thead = el('thead');
+  function renderHead() {
+    const head = el('tr');
+    for (const column of visible()) {
+      const th = el('th', { scope: 'col', class: `kit-col-${column.key}` });
+      if (column.key === sortable) {
+        const button = el('button', { type: 'button', class: 'kit-sort', text: t(column.label), dataset: { order } });
+        th.setAttribute('aria-sort', order === 'asc' ? 'ascending' : 'descending');
+        button.addEventListener('click', () => { order = order === 'asc' ? 'desc' : 'asc'; reset(); });
+        th.append(button);
+      } else th.textContent = t(column.label);
+      head.append(th);
+    }
+    thead.replaceChildren(head);
+  }
+  function renderRows() {
+    body.replaceChildren();
+    const shown = visible();
+    for (const item of rows) {
+      const tr = el('tr', { dataset: { key: rowKey(item) } });
+      for (const column of shown) {
+        const content = column.render(item);
+        const cell = el('div', { class: 'kit-cell' }, content);
+        const tip = column.title ? column.title(item) : cell.textContent;
+        if (tip) cell.title = tip;
+        tr.append(el('td', { class: `kit-col-${column.key}`, dataset: { label: t(column.label) } }, cell));
+      }
+      if (onRowOpen || expand) {
+        tr.classList.add('is-interactive');
+        tr.tabIndex = 0;
+        if (expand) tr.setAttribute('aria-expanded', 'false');
+        const activate = () => {
+          if (onRowOpen) return onRowOpen(item);
+          const open = tr.getAttribute('aria-expanded') === 'true';
+          tr.setAttribute('aria-expanded', String(!open));
+          if (open) tr.nextElementSibling?.classList.contains('kit-expansion') && tr.nextElementSibling.remove();
+          else tr.after(el('tr', { class: 'kit-expansion' }, el('td', { colSpan: shown.length }, expand(item))));
+        };
+        tr.addEventListener('click', event => { if (!event.target.closest('a, button, input, select, textarea, summary')) activate(); });
+        tr.addEventListener('keydown', event => { if ((event.key === 'Enter' || event.key === ' ') && event.target === tr) { event.preventDefault(); activate(); } });
+      }
+      body.append(tr);
+    }
+  }
+  renderHead();
+  table.append(el('caption', { class: 'kit-visually-hidden', text: t(caption) }), thead, body);
+  root.append(el('div', { class: 'kit-table-tools' }, chooser), status, table, pager);
   async function load() {
     controller?.abort();
     controller = new AbortController();
@@ -169,22 +277,14 @@ export function dataTable(t, { caption, columns, fetchPage, rowKey, empty, order
     try {
       const result = await fetchPage({ cursor: cursors[page], order, signal });
       if (signal.aborted || destroyed) return;
-      body.replaceChildren();
-      if (result.replace) { clear(status, result.replace); table.hidden = true; pager.hidden = true; return; }
+      if (result.replace) { body.replaceChildren(); clear(status, result.replace); table.hidden = true; pager.hidden = true; return; }
       table.hidden = false; pager.hidden = false; status.replaceChildren();
-      rows = result.items.length;
-      for (const item of result.items) {
-        const tr = el('tr', { dataset: { key: rowKey(item) } });
-        for (const column of columns) {
-          const cell = column.render(item);
-          tr.append(el('td', { dataset: { label: t(column.label) } }, cell));
-        }
-        body.append(tr);
-      }
+      rows = result.items;
+      renderRows();
       nextCursor = result.nextCursor || null;
-      if (!rows) clear(status, emptyState(t, empty));
+      if (!rows.length) clear(status, emptyState(t, empty));
       prev.disabled = page === 0; next.disabled = !nextCursor;
-      position.textContent = rows ? t('ui.table.page', { page: page + 1, count: rows }) : '';
+      position.textContent = rows.length ? t('ui.table.page', { page: page + 1, count: rows.length }) : '';
       onPage?.(result);
     } catch (error) {
       if (signal.aborted || destroyed) return;
@@ -194,7 +294,7 @@ export function dataTable(t, { caption, columns, fetchPage, rowKey, empty, order
       if (!signal.aborted) table.removeAttribute('aria-busy');
     }
   }
-  function reset() { cursors = [null]; page = 0; return load(); }
+  function reset() { cursors = [null]; page = 0; renderHead(); return load(); }
   prev.addEventListener('click', () => { if (page > 0) { page -= 1; load(); } });
   next.addEventListener('click', () => { if (nextCursor) { cursors[page + 1] = nextCursor; page += 1; load(); } });
   return { element: root, reload: reset, refresh: load, destroy() { destroyed = true; controller?.abort(); } };
@@ -450,4 +550,4 @@ export function subjectPicker(t, api, { label, name, value = '', kind = 'human',
   return wrapper;
 }
 
-export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, confirmDialog, subjectResolver, subjectPicker, subjectLabel, parseSubject });
+export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, confirmDialog, formatFullTime, formatCompactTime, timeCell, hashChip, disabledAction, subjectResolver, subjectPicker, subjectLabel, parseSubject });

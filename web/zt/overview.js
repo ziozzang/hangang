@@ -119,6 +119,8 @@ export async function renderOverview(cx, root) {
         tile('overview.kpi.unavailable', number(value('unavailable')), source, filtered({ outcome: 'unavailable' })));
     }
     if (series.ok && !disabled) kpis.append(sparkline(cx, series.value?.points || [], filtered({ outcome: 'deny' })));
+    const suppressed = all.ok && !disabled ? (all.value?.facets?.sampled || []).find(entry => entry.value === 'suppressed') : null;
+    const footnote = suppressed ? ui.el('p', { class: 'zt-footnote', text: t('overview.suppressed', { count: suppressed.estimated_requests, events: suppressed.events }) }) : null;
     const lists = ui.el('div', { class: 'zt-grid' });
     if (denies.ok && !disabled) {
       lists.append(
@@ -126,13 +128,16 @@ export async function renderOverview(cx, root) {
         topList(cx, { title: 'overview.top.routes', entries: denies.value?.facets?.route || [], href: entry => filtered({ outcome: 'deny', route: entry.value }), render: entry => entry.value }),
         topList(cx, { title: 'overview.top.countries', entries: denies.value?.facets?.country || [], href: entry => filtered({ outcome: 'deny', country: entry.value }), render: entry => entry.value }));
     }
-    const recent = ui.el('section', { class: 'panel zt-panel' }, ui.el('h2', { text: t('overview.changes') }));
-    const records = audit.records.slice(0, 5);
-    if (records.length) recent.append(ui.el('ol', { class: 'zt-top' }, records.map(record => ui.el('li', {}, ui.el('a', { href: '#audit' }, ui.el('span', { class: 'zt-top-label', text: `${t(`audit.source.${record.source}`)} · ${record.actor} · ${record.action}` }), ui.el('span', { class: 'kit-muted', text: new Intl.DateTimeFormat(document.documentElement.lang || undefined, { timeStyle: 'short', dateStyle: 'short' }).format(record.time) }))))));
-    else recent.append(ui.emptyState(t, { title: 'overview.changes.empty' }));
+    const recent = ui.el('section', { class: 'panel zt-panel zt-panel-wide' }, ui.el('div', { class: 'zt-panel-head' }, ui.el('h2', { text: t('overview.changes') }), ui.el('a', { class: 'button button-quiet', href: '#audit', text: t('overview.changes.all') })));
+    const records = audit.records.slice(0, 6);
+    if (records.length) {
+      recent.append(ui.el('ol', { class: 'zt-changes' }, records.map(record => ui.el('li', {}, ui.el('a', { href: cx.hashFor('audit', [], new URLSearchParams({ source: record.source })), title: `${t(`audit.source.${record.source}`)} · ${record.actor} · ${record.summary}` },
+        ui.el('span', { class: 'zt-change-main' }, ui.el('strong', { text: record.actor }), ' · ', ui.el('span', { text: record.summary })),
+        ui.el('time', { class: 'zt-change-time', dateTime: record.time.toISOString(), title: ui.formatFullTime(record.time), text: ui.relativeAge(t, Date.now() - record.time.getTime()) }))))));
+    } else recent.append(ui.emptyState(t, { title: 'overview.changes.empty' }));
     if (audit.failures?.length) recent.append(ui.el('p', { class: 'zt-banner', text: t('audit.partial', { sources: audit.failures.map(source => t(`audit.source.${source}`)).join(', ') }) }));
     lists.append(recent);
-    ui.clear(content, health, kpis, lists);
+    ui.clear(content, health, kpis, footnote, lists);
     refreshed.textContent = t('overview.refreshed', { time: new Intl.DateTimeFormat(document.documentElement.lang || undefined, { timeStyle: 'medium' }).format(new Date()) });
   }
   await draw();

@@ -26,7 +26,7 @@ function event(index, overrides = {}) {
   };
 }
 
-async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false } = {}) {
+async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false, hopaeEvents = false } = {}) {
   const calls = [];
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
@@ -49,7 +49,8 @@ async function setup(page, { disabled = false, resolve = 'ok', auditFailure = fa
       return route.fulfill({ json: { state: 'enabled', facets: {
         outcome: denyOnly ? [{ value: 'deny', events: 30, estimated_requests: 30 }] : [{ value: 'allow', events: 7, estimated_requests: 700 }, { value: 'deny', events: 30, estimated_requests: 30 }, { value: 'challenge', events: 5, estimated_requests: 5 }],
         reason: [{ value: 'pumgye.class_denied', events: 20, estimated_requests: 20 }, { value: 'sumunjang.network_denied', events: 10, estimated_requests: 10 }],
-        route: [{ value: 'app-api', events: 30, estimated_requests: 30 }], country: [{ value: 'KR', events: 30, estimated_requests: 30 }] } } });
+        route: [{ value: 'app-api', events: 30, estimated_requests: 30 }], country: [{ value: 'KR', events: 30, estimated_requests: 30 }],
+        sampled: [{ value: 'deny', events: 28, estimated_requests: 28 }, { value: 'suppressed', events: 2, estimated_requests: 410 }] } } });
     }
     if (p === '/v1/observability/decisions/timeseries') return route.fulfill({ json: disabled ? { state: 'disabled' } : { state: 'enabled', bucket_seconds: 300, points: [{ start_ms: 1, outcome: 'deny', events: 2, estimated_requests: 2 }, { start_ms: 1, outcome: 'allow', events: 2, estimated_requests: 200 }, { start_ms: 2, outcome: 'deny', events: 10, estimated_requests: 10 }, { start_ms: 2, outcome: 'allow', events: 1, estimated_requests: 100 }] } });
     if (p.startsWith('/v1/observability/requests/')) return route.fulfill({ json: { state: 'enabled', request_id: decodeURIComponent(p.split('/').pop()), events: [event(0)] } });
@@ -73,6 +74,10 @@ async function setup(page, { disabled = false, resolve = 'ok', auditFailure = fa
     if (p === '/v1/users') return route.fulfill({ json: { users: [{ id: 1, username: 'operator' }, { id: 2, username: 'kim' }] } });
     if (p === '/v1/plugins/audit') return route.fulfill({ json: { operations: [{ id: 9, started_at: Date.UTC(2026, 9, 16, 9) / 1000, completed_at: null, actor_name: 'operator', plugin: 'guard', path: 'policy', method: 'PUT', body_sha256: 'ab'.repeat(32), status: null }] } });
     if (p === '/v1/pumgye/audit') return route.fulfill({ json: [{ revision: 77, at_unix: Date.UTC(2026, 9, 16, 7) / 1000, actor: 'sha256:aa', sha256: 'cd'.repeat(32) }] });
+    if (p === '/v1/plugins/hopae/events/query') return hopaeEvents ? route.fulfill({ json: { items: [
+      { event_id: 'e_1', at: Date.UTC(2026, 9, 16, 9, 30) / 1000, kind: 'admin.user_disable', outcome: 'success', reason: null, user_id: 'u_kim', session_id: null, attrs: { actor: 'u_admin', actor_session: 's_x', count: 3 } },
+      { event_id: 'e_2', at: Date.UTC(2026, 9, 16, 9, 31) / 1000, kind: 'login.succeeded', outcome: 'success', reason: null, user_id: 'u_kim', attrs: {} },
+      { event_id: 'e_3', at: Date.UTC(2026, 9, 16, 9, 32) / 1000, kind: 'admin.denied', outcome: 'failure', reason: null, user_id: 'u_bob', attrs: { endpoint: '/v1/users/{id}/disable', reason: 'role_insufficient' } }], next_cursor: null } }) : route.fulfill({ status: 404, json: { detail: 'unknown plugin route' } });
     if (p === '/v1/geoip/lookup') return route.fulfill({ json: { ip: '198.51.100.7', country: 'KR', revision: 1 } });
     return route.fulfill({ status: 404, json: { detail: 'not found' } });
   });
@@ -197,7 +202,9 @@ test('account audit shows a structured before/after diff', async ({ page }) => {
   await page.goto('/ui/#audit?source=accounts');
   const view = page.locator('#view-audit');
   await expect(view.locator('tbody tr')).toHaveCount(1);
-  await view.locator('summary', { hasText: 'Before / after' }).click();
+  await expect(view.locator('tbody tr').first()).toContainText('Changed kim: role viewer → admin');
+  await view.locator('tbody tr').first().click();
+  await expect(view.locator('tbody tr').first()).toHaveAttribute('aria-expanded', 'true');
   await expect(view.locator('.kit-diff-change')).toContainText('role');
   await expect(view.locator('.kit-diff-change')).toContainText('"viewer" → "admin"');
 });
@@ -340,4 +347,55 @@ test('#audit is the unified audit; old #audit-trail links redirect and account a
   await page.locator('#view-audit').getByRole('link', { name: 'Account audit retention and policy' }).click();
   await expect(page).toHaveURL(/#account-audit$/);
   await expect(page.locator('#view-account-audit')).toBeVisible();
+});
+
+test('decision rows are dense, open request detail on click and support column choice', async ({ page }) => {
+  await setup(page);
+  await page.goto('/ui/#access/decisions');
+  const view = page.locator('#view-access');
+  await expect(view.locator('tbody tr')).toHaveCount(4);
+  const height = await view.locator('tbody tr').first().evaluate(row => row.getBoundingClientRect().height);
+  expect(height).toBeLessThanOrEqual(48);
+  await expect(view.locator('thead th')).not.toContainText(['Revisions']);
+  await view.locator('.kit-columns summary').click();
+  await view.locator('.kit-columns-list label', { hasText: 'Revisions' }).locator('input').check();
+  await expect(view.locator('thead th', { hasText: 'Revisions' })).toBeVisible();
+  await expect(view.locator('tbody td.kit-col-time time').first()).toHaveAttribute('title', /2026/);
+  await view.locator('tbody tr').nth(1).locator('td.kit-col-reason').click();
+  await expect(page).toHaveURL(/#access\/requests\/hg-0000000000000001$/);
+});
+
+test('suppressed summaries are a footnote, not a top reason, and changes are one line', async ({ page }) => {
+  await setup(page);
+  await page.locator('[data-view="overview"]').click();
+  const view = page.locator('#view-overview');
+  await expect(view.locator('.zt-footnote')).toContainText('410 repeated refusals');
+  await expect(view.locator('.zt-top')).not.toContainText(['summarized']);
+  const row = view.locator('.zt-changes a').first();
+  await expect(row).toBeVisible();
+  const box = await row.evaluate(node => node.getBoundingClientRect().height);
+  expect(box).toBeLessThanOrEqual(40);
+});
+
+test('Hopae admin events join the unified audit with summaries', async ({ page }) => {
+  await setup(page, { hopaeEvents: true });
+  await page.goto('/ui/#audit?source=hopae');
+  const view = page.locator('#view-audit');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('tbody tr').first()).toContainText('Refused an administrative request');
+  await expect(view.locator('tbody tr').nth(1)).toContainText('Disabled user u_kim; 3 sessions ended');
+  await expect(view.locator('tbody tr').nth(1).getByRole('link', { name: 'u_kim' })).toHaveAttribute('href', '#identities/users/u_kim');
+  await expect(view.locator('.zt-sources li', { hasText: 'Hopae administration' }).locator('[data-status="healthy"]')).toBeVisible();
+  await expect(view.locator('.zt-sources li', { hasText: 'Sumunjang policy' })).toContainText('Not yet connected');
+});
+
+test('request detail actions are real disabled buttons with an explanation', async ({ page }) => {
+  await setup(page);
+  await page.goto('/ui/#access/requests/hg-0000000000000000');
+  const action = page.locator('#view-access .kit-action-off').first();
+  await expect(action.getByRole('button', { name: 'Re-run in simulator' })).toBeDisabled();
+  await expect(action.locator('.kit-tip')).toBeHidden();
+  await action.focus();
+  await expect(action.locator('.kit-tip')).toBeVisible();
+  await expect(action.locator('.kit-tip')).toContainText('explain APIs');
 });

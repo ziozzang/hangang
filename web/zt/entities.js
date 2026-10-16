@@ -16,7 +16,7 @@ const OPENERS = Object.freeze({
 
 function recentDecisions(cx, params, caption) {
   const { t, ui } = cx;
-  const table = ui.dataTable(t, { caption, owner: 'ui.owner.exporter', columns: decisionColumns(cx), rowKey: event => event.event_id, empty: { title: 'entity.decisions.empty' }, fetchPage: decisionFetcher(cx, params, { limit: 20 }) });
+  const table = ui.dataTable(t, { id: 'entity-decisions', caption, owner: 'ui.owner.exporter', columns: decisionColumns(cx), rowKey: event => event.event_id, onRowOpen: event => cx.navigate(cx.hashFor('access', ['requests', event.request_id])), empty: { title: 'entity.decisions.empty' }, fetchPage: decisionFetcher(cx, params, { limit: 20 }) });
   cx.signal.addEventListener('abort', () => table.destroy(), { once: true });
   const all = ui.el('a', { class: 'button button-quiet', href: cx.hashFor('access', ['decisions'], params), text: t('entity.decisions.open') });
   return { section: ui.el('section', { class: 'panel zt-panel' }, ui.el('div', { class: 'zt-panel-head' }, ui.el('h2', { text: t('entity.decisions.title') }), all), table.element), table };
