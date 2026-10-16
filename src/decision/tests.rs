@@ -234,7 +234,15 @@ fn deny_flood_is_bounded_by_the_bucket_and_summarized() {
     let bytes = drain::encode(&summary, &context(&f.emitter, &keys, &rng)).unwrap();
     let event = schema::decode(&bytes).unwrap();
     assert_eq!(event.suppressed.unwrap().count, 995);
-    assert_eq!(event.outcome.as_ref().unwrap().reason, "hangang.suppressed");
+    // Attributed to the underlying reason; the sampling class marks the summary.
+    assert_eq!(
+        event.outcome.as_ref().unwrap().reason,
+        "sumunjang.network_denied"
+    );
+    assert_eq!(
+        event.sampling.unwrap().class,
+        v1::SampleClass::Suppressed as i32
+    );
     let json = schema::to_json(&event);
     assert!(json["stages"][0]["client"]["ip_ref"].is_null());
     assert!(json["stages"][0]["client"]["prefix_ref"].is_string());

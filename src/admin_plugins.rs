@@ -1126,4 +1126,229 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(audit_connection(&path).is_err());
     }
+
+    /// Hopae subject directory and authentication explain (Hopae
+    /// docs/SUBJECT_DIRECTORY.md, AUTHENTICATION_EXPLAIN.md) are POST reads:
+    /// listed as non-mutating routes they are forwarded to the exact
+    /// /v1/<path> with a signed actor assertion over the body, are not
+    /// recorded as mutations, and every other method or path is refused.
+    #[tokio::test]
+    async fn hopae_subject_directory_reads_are_signed_non_mutating_posts() {
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use std::sync::Mutex;
+        let key = std::env::var("PATH").unwrap_or_default();
+        assert!(
+            key.len() >= 32,
+            "the delegation key fixture reads PATH (at least 32 bytes)"
+        );
+        let calls = Arc::new(Mutex::new(
+            Vec::<(String, String, Value, Option<String>)>::new(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        let backend_calls = calls.clone();
+        let backend_key = key.clone();
+        let backend_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let calls = backend_calls.clone();
+                let key = backend_key.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let calls = calls.clone();
+                        let key = key.clone();
+                        async move {
+                            if request.uri().path() == "/authority" {
+                                return Ok::<_, std::convert::Infallible>(reply(
+                                    StatusCode::OK,
+                                    json!({"user":{"id":7,"username":"fixture-operator","role":"admin","enabled":true}}),
+                                ));
+                            }
+                            let header = |name: &str| {
+                                request
+                                    .headers()
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned)
+                            };
+                            let assertion = match (
+                                header("x-hopae-delegation"),
+                                header("x-hopae-delegation-mac"),
+                            ) {
+                                (Some(encoded), Some(mac)) => {
+                                    crate::console_delegation_wire::verify(
+                                        &encoded,
+                                        &mac,
+                                        key.as_bytes(),
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs(),
+                                    )
+                                }
+                                _ => None,
+                            };
+                            let method = request.method().to_string();
+                            let path = request.uri().path().to_owned();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let verified = assertion.filter(|a| {
+                                a.path == path
+                                    && a.method == method
+                                    && a.body_sha256
+                                        == crate::console_delegation_wire::digest(&bytes)
+                            });
+                            calls.lock().unwrap().push((
+                                method,
+                                path,
+                                serde_json::from_slice(&bytes).unwrap(),
+                                verified.map(|a| a.actor_name),
+                            ));
+                            Ok(reply(
+                                StatusCode::OK,
+                                json!({"items":[{"id":"u_kim","status":"active","reason":null,"kind":"human","display_name":"Kim"}],"resolved":1,"unknown":0,"complete":true,"privacy_profile":"standard"}),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("index.js"), "export function mount(){}").unwrap();
+        let manifest = serde_json::to_vec(&json!({"id":"hopae","name":"Hopae","version":"0.1.8","api_version":1,"entry":"index.js","assets":{"index.js":sha(b"export function mount(){}")},"routes":[
+            {"path":"subjects/resolve","method":"POST","mutation":false},
+            {"path":"subjects/search","method":"POST","mutation":false},
+            {"path":"subjects/lifecycle","method":"POST","mutation":false},
+            {"path":"subjects/lifecycle/snapshot","method":"POST","mutation":false},
+            {"path":"explain/authentication","method":"POST","mutation":false}]})).unwrap();
+        fs::write(root.join("manifest.json"), &manifest).unwrap();
+        let config = root.join("plugins.json");
+        fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":"hopae","directory":root,"manifest_sha256":sha(&manifest),"backend":format!("http://{backend}"),"token_env":"PATH","delegate_actor":true,"delegation_authority":"hangang"}]})).unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for file in fs::read_dir(root).unwrap() {
+                fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+        }
+        let registry = Arc::new(Registry::load(&config).unwrap());
+        let audit_path = registry.audit.clone();
+        let authority = move || Authority::Remote {
+            client: reqwest::Client::new(),
+            endpoint: format!("http://{backend}/authority").parse().unwrap(),
+            authorization: reqwest::header::HeaderValue::from_static("Bearer fixture-only"),
+            actor_id: 7,
+        };
+        let actor = || User {
+            id: 7,
+            username: "fixture-operator".into(),
+            role: crate::admin_users::Role::Admin,
+            enabled: true,
+        };
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = proxy_listener.accept().await.unwrap();
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request| {
+                        let registry = registry.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                registry.handle(request, authority(), actor()).await,
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://{proxy}/v1/plugins/hopae");
+        for (path, body) in [
+            (
+                "subjects/resolve",
+                json!({"ids":["u_kim","u_gone"],"privacy_profile":"strict"}),
+            ),
+            (
+                "subjects/search",
+                json!({"q":"kim","kind":"human","limit":20}),
+            ),
+            ("subjects/lifecycle", json!({"cursor":null,"limit":100})),
+            (
+                "subjects/lifecycle/snapshot",
+                json!({"cursor":null,"limit":200}),
+            ),
+            (
+                "explain/authentication",
+                json!({"url":"https://app.example.test/","subject":"u_kim"}),
+            ),
+        ] {
+            let response = client
+                .post(format!("{base}/{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let last = calls.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                (last.0.as_str(), last.1.as_str()),
+                ("POST", format!("/v1/{path}").as_str())
+            );
+            assert_eq!(last.2, body);
+            assert_eq!(
+                last.3.as_deref(),
+                Some("fixture-operator"),
+                "{path} must carry a verified assertion over the exact body"
+            );
+        }
+        let count = calls.lock().unwrap().len();
+        assert_eq!(
+            client
+                .get(format!("{base}/subjects/resolve"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/subjects/purge"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/subjects/resolve"))
+                .body("ids=u_kim")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(calls.lock().unwrap().len(), count);
+        assert!(
+            audit_read(&audit_path).unwrap()["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "reads are not mutations"
+        );
+        proxy_task.abort();
+        backend_task.abort();
+    }
 }

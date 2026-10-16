@@ -55,7 +55,7 @@ async function fixture(page, { locale = 'en', role = 'admin', putStatus = 200, d
 
 test('native ordered policy saves exact CAS body and shows partial coverage', async ({ page }) => {
   const { calls } = await fixture(page);
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-policy-meta')).toContainText('revision #0');
   await page.locator('#audit-policy-default').selectOption('drop');
   await page.locator('#audit-policy-add').click();
@@ -79,7 +79,7 @@ test('native ordered policy saves exact CAS body and shows partial coverage', as
 
 test('rule ordering, explicit catch-all and empty conditions stay local until valid save', async ({ page }) => {
   const { calls } = await fixture(page);
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-policy-add')).toBeEnabled();
   await page.locator('#audit-policy-add').click();
   await page.locator('#audit-policy-add').click();
@@ -103,7 +103,7 @@ test('rule ordering, explicit catch-all and empty conditions stay local until va
 for (const putStatus of [409, 503]) {
   test(`${putStatus} policy outcome retains draft without replay`, async ({ page }) => {
     const { calls } = await fixture(page, { putStatus });
-    await page.locator('[data-view="audit"]').click();
+    await page.evaluate(() => { location.hash = '#account-audit'; });
     await expect(page.locator('#audit-policy-add')).toBeEnabled();
     await page.locator('#audit-policy-default').selectOption('drop');
     await page.locator('#audit-policy-save').click(); await page.locator('#confirm-accept').click();
@@ -115,7 +115,7 @@ for (const putStatus of [409, 503]) {
 
 test('Korean policy labels survive locale rerender; late GET is scrubbed after logout', async ({ page }) => {
   const { release } = await fixture(page, { locale: 'ko', delayed: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-policy-panel')).toContainText('계정 감사 기록 정책');
   await page.locator('#logout-button').click();
   release();

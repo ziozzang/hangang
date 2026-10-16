@@ -10,6 +10,7 @@
 <link href="/ui/style.css" rel="stylesheet"/>
 <script src="/ui/app.js" type="module"></script>
 <link rel="stylesheet" href="/ui/lua-editor.css">
+<link rel="stylesheet" href="/ui/kit/kit.css">
 </head>
 <body>
 <a class="skip-link" data-i18n="Skip to content" href="#main">Skip to content</a>
@@ -40,10 +41,18 @@
 <a class="nav-link" data-admin-only="" data-view="docker" href="#docker"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M3 15h18l-2 4H6z M5 9h4v4H5z M10 9h4v4h-4z M15 9h4v4h-4z M10 4h4v4h-4z"></path></svg></span><bdi data-i18n="Docker">Docker</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="security" data-search-aliases="Security Gateway protections 보안 게이트웨이 보호" href="#security"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6z M8 12l3 3 5-6"></path></svg></span><bdi data-i18n="Gateway protections">Gateway protections</bdi></a><a class="nav-link" data-admin-only="" data-view="certificates" href="#certificates"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M7 11V8a5 5 0 0 1 10 0v3 M5 11h14v10H5z M12 15v3"></path></svg></span><bdi data-i18n="Certificates">Certificates</bdi></a>
 <p class="nav-group-label" data-admin-only="" data-i18n="ZERO TRUST">ZERO TRUST</p>
+<a class="nav-link" data-admin-only="" data-view="overview" data-search-aliases="overview posture kpi 개요 현황" href="#overview"><span aria-hidden="true">◎</span><bdi data-zt-label="nav.overview">Overview</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="access" data-search-aliases="access decision log requests denied 접근 판단 로그 요청 거부" href="#access"><span aria-hidden="true">⇄</span><bdi data-zt-label="nav.access">Access</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="identities" data-search-aliases="identities users sessions 신원 사용자 세션" href="#identities"><span aria-hidden="true">◉</span><bdi data-zt-label="nav.identities">Identities</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="policies" data-search-aliases="policies services roles 정책 서비스 역할" href="#policies"><span aria-hidden="true">▤</span><bdi data-zt-label="nav.policies">Policies</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="network" data-search-aliases="network ip threats 네트워크 IP 위협" href="#network"><span aria-hidden="true">◍</span><bdi data-zt-label="nav.network">Network</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="workloads" data-search-aliases="devices workloads mtls 장치 워크로드" href="#workloads"><span aria-hidden="true">▣</span><bdi data-zt-label="nav.workloads">Devices & Workloads</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="audit" data-search-aliases="audit unified administrative Account audit Console account audit 감사 통합 관리 계정 감사" href="#audit"><span aria-hidden="true">≡</span><bdi data-zt-label="nav.audit">Audit</bdi></a>
+<a class="nav-link" data-admin-only="" data-view="system" data-search-aliases="system components exporter privacy 시스템 구성 요소 내보내기" href="#system"><span aria-hidden="true">⚙</span><bdi data-zt-label="nav.system">System</bdi></a>
+<p class="nav-group-label nav-subgroup-label" data-admin-only="" data-zt-label="nav.components">COMPONENT PAGES</p>
 <a class="nav-link" data-admin-only="" data-view="pumgye" data-search-aliases="pumgye authorization permissions 품계 권한 인가" href="#pumgye"><span aria-hidden="true">◇</span><bdi data-i18n="Authorization · Pumgye">Authorization · Pumgye</bdi></a>
 <p class="nav-group-label" data-admin-only="" data-nav-slot="zero-trust-end" data-i18n="MANAGE">MANAGE</p><a class="nav-link" data-admin-only="" data-view="config" href="#config"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 5h14 M5 12h14 M5 19h14 M9 2v6 M15 9v6 M9 16v6"></path></svg></span><bdi data-i18n="Configuration">Configuration</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="users" data-search-aliases="Users Console accounts 사용자 콘솔 관리자 계정" href="#users"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M2 21v-3c0-6 14-6 14 0v3 M17 4c5 0 5 7 0 7 M19 14c3 1 3 4 3 7"></path></svg></span><bdi data-i18n="Console accounts">Console accounts</bdi></a>
-<a class="nav-link" data-admin-only="" data-view="audit" data-search-aliases="Account audit Console account audit 계정 감사" href="#audit"><span aria-hidden="true">≡</span><bdi data-i18n="Console account audit">Console account audit</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="config-operations" href="#config-operations"><span aria-hidden="true">≡</span><bdi data-i18n="Change history">Change history</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="utilities" href="#utilities"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M14 4a6 6 0 0 0-7 7L3 15l6 6 4-4a6 6 0 0 0 7-7l-4 3-4-4z"></path></svg></span><bdi data-i18n="Utilities">Utilities</bdi></a>
 <a class="nav-link" data-admin-only="" data-view="docs" href="#docs"><span aria-hidden="true"><svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" viewbox="0 0 24 24"><path d="M5 3h10l4 4v14H5z M14 3v5h5 M8 12h8 M8 16h6"></path></svg></span><bdi data-i18n="API reference">API reference</bdi></a>
@@ -403,7 +412,7 @@
 </div>
 <div aria-live="polite" class="user-list" id="user-list"></div>
 </section>
-<section aria-labelledby="audit-title" class="view" hidden="" id="view-audit">
+<section aria-labelledby="audit-title" class="view" hidden="" id="view-account-audit">
 <div class="page-head"><div><p class="eyebrow" data-i18n="Instance audit">Instance audit</p><h1 data-i18n="Account audit" id="audit-title">Account audit</h1><p data-i18n="Durable successful account changes on this instance only.">Durable successful account changes on this instance only.</p></div><button class="button button-secondary" data-i18n="Refresh" id="audit-refresh" type="button">Refresh</button></div>
 <p class="operations-caution" data-i18n="This instance records selected account changes and mandatory control receipts. A recording policy may omit create, update or delete events; missing records do not prove no change. Login, logout, rejected attempts and other instances are outside this view.">This instance records selected account changes and mandatory control receipts. A recording policy may omit create, update or delete events; missing records do not prove no change. Login, logout, rejected attempts and other instances are outside this view.</p>
 <div class="panel audit-panel" id="audit-policy-panel"><div class="section-heading"><div><h2 data-i18n="Account audit recording policy">Account audit recording policy</h2><p data-i18n="Ordered rules choose record or drop for account create, update and delete. Baseline, bootstrap, retention and policy-change receipts always remain; configuration recovery journals and SQL receipts are separate. HTTP and TCP history filters are not configured here.">Ordered rules choose record or drop for account create, update and delete. Baseline, bootstrap, retention and policy-change receipts always remain; configuration recovery journals and SQL receipts are separate. HTTP and TCP history filters are not configured here.</p></div><button class="button button-secondary" data-i18n="Refresh policy" id="audit-policy-refresh" type="button">Refresh policy</button></div><div class="user-panel"><p id="audit-policy-meta"></p><div class="inline-message" id="audit-policy-message" role="status" aria-live="polite"></div><div><label for="audit-policy-default" data-i18n="Default recording action">Default recording action</label><select id="audit-policy-default" disabled=""><option value="record" data-i18n="Record">Record</option><option value="drop" data-i18n="Drop">Drop</option></select></div><div class="user-list" id="audit-policy-rules"></div><div class="button-row"><button class="button button-secondary" data-i18n="Add ordered rule" disabled="" id="audit-policy-add" type="button">Add ordered rule</button><button class="button button-primary" data-i18n="Save audit policy" disabled="" id="audit-policy-save" type="button">Save audit policy</button></div></div></div>
@@ -434,6 +443,14 @@
 <div class="audit-pagination"><span id="config-operations-page-state"></span><button class="button button-secondary" data-i18n="Previous" disabled="" id="config-operations-previous" type="button">Previous</button><button class="button button-secondary" data-i18n="Next" disabled="" id="config-operations-next" type="button">Next</button></div>
 </div>
 </section>
+<section class="view zt-view" id="view-overview" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-access" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-identities" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-policies" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-network" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-workloads" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-audit" hidden><div class="zt-root"></div></section>
+<section class="view zt-view" id="view-system" hidden><div class="zt-root"></div></section>
 <footer class="field-help" id="geoip-attribution"><span data-i18n="Attribution">Attribution</span> · <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer" data-i18n="IP Geolocation by DB-IP">IP Geolocation by DB-IP</a></footer>
 </main>
 </div>

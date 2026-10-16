@@ -1061,12 +1061,22 @@ impl Emitter {
         let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
         capture.request_id = sampling::mix(counter ^ self.id_seed);
         self.counters.summaries.fetch_add(1, Ordering::Relaxed);
+        // The summary carries the shared underlying reason so counts stay
+        // attributed to it; the sampling class marks it as a summary.
+        let (outcome, deciding, _) = Self::outcome(
+            &Capture {
+                refusal: Some((Stage::Enforcement, summary.reason)),
+                ..Capture::disabled()
+            },
+            0,
+        );
+        let reason = summary.reason;
         Record {
             capture,
-            outcome: OutcomeKind::Deny,
+            outcome,
             status: 0,
-            deciding: Stage::Enforcement,
-            reason: Reason::Suppressed,
+            deciding,
+            reason,
             class: SampleClass::Suppressed,
             rate_ppm: sampling::PPM,
             suppressed: Some(summary),
@@ -1105,10 +1115,12 @@ impl Emitter {
                     OutcomeKind::Error => SampleClass::Error,
                     _ => SampleClass::Unavailable,
                 };
-                match self
-                    .buckets
-                    .admit(capture.route.as_ref(), capture.client_ip, capture.time_ms)
-                {
+                match self.buckets.admit(
+                    capture.route.as_ref(),
+                    capture.client_ip,
+                    reason,
+                    capture.time_ms,
+                ) {
                     sampling::Admission::Keep(summary) => {
                         if let Some(summary) = summary {
                             self.push(self.summary_record(summary));

@@ -5,6 +5,7 @@ import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
 import { loadOperations, pauseObserver, refreshOperationsCopy, resetOperations } from './operations.js';
 import { loadDockerPanel, refreshDockerCopy, resetDockerPanel } from './docker.js';
 import { createLuaEditor } from './lua-editor.js';
+import { ztView, loadZeroTrust, pauseZeroTrust, resetZeroTrust, canonicalHash, prepareZeroTrust } from './zt/shell.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const luaFields = [
@@ -455,6 +456,7 @@ function scrubRenderedData() {
 function logout(reason = '') {
   resetPlugins();
   resetPumgye();
+  resetZeroTrust();
   stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
@@ -593,13 +595,15 @@ async function login(event) {
 
 const pumgyeDestinations = Object.freeze({ services: 'pumgye-service-form', resources: 'pumgye-resources-panel', policy: 'pumgye-policy-panel' });
 function normalizeView(hash) {
-  const name = (hash || '').replace(/^#/, '').split('/')[0];
-  if (pluginView(name)) return name;
-  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
+  const name = (hash || '').replace(/^#/, '').split(/[/?]/)[0];
+  if (pluginView(name) || ztView(name)) return name;
+  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'account-audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
 }
 let navigationGeneration = 0;
 
 async function switchView() {
+  // The unified audit owns #audit (ADR 0020); keep earlier #audit-trail links working.
+  if (/^#audit-trail(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#audit' + location.hash.slice('#audit-trail'.length));
   const navigation = ++navigationGeneration;
   let name = normalizeView(location.hash);
   if (state.user && !isAdmin() && name !== 'status') {
@@ -610,17 +614,18 @@ async function switchView() {
   const section = name === 'pumgye' && requested.length === 2 && Object.hasOwn(pumgyeDestinations, requested[1]) ? requested[1] : '';
   // Preserve a signed-out deep link until installed capabilities are discovered.
   if (state.token) {
-    const canonical = '#' + name + (section ? '/' + section : '');
+    const canonical = ztView(name) ? (canonicalHash(location.hash) || '#' + name) : '#' + name + (section ? '/' + section : '');
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
   }
   pausePlugins();
+  if (!ztView(name)) pauseZeroTrust();
   state.view = name;
   if (name !== 'lua') state.luaPolicySequence++;
   if (name !== 'operations') pauseObserver();
   if (name !== 'security') resetSecurityBans();
   if (name !== 'config') resetGeoIpRuntime(true);
-  if (name !== 'audit') state.audit.sequence += 1;
-  if (name !== 'audit') state.auditPolicy.sequence += 1;
+  if (name !== 'account-audit') state.audit.sequence += 1;
+  if (name !== 'account-audit') state.auditPolicy.sequence += 1;
   if (name !== 'config-operations') state.configOperations.sequence += 1;
   if (name !== 'config-operations') resetConfigProof();
   if (name !== 'config-operations') resetConfigReceipt();
@@ -645,6 +650,7 @@ async function switchView() {
 async function loadView(name, quiet = false) {
   try {
     if (pluginView(name) && isAdmin()) await loadPlugin(name);
+    if (ztView(name) && isAdmin()) await loadZeroTrust(name, { api });
     if (name === 'status') await loadStatus();
     if (name === 'lua' && isAdmin()) await loadLuaPolicies();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);
@@ -659,7 +665,7 @@ async function loadView(name, quiet = false) {
       startWorkloadMaterialPolling();
     }
     if (name === 'users' && isAdmin()) await loadUsers();
-    if (name === 'audit' && isAdmin()) await Promise.all([loadAudit(0, []), loadAuditPolicy()]);
+    if (name === 'account-audit' && isAdmin()) await Promise.all([loadAudit(0, []), loadAuditPolicy()]);
     if (name === 'config-operations' && isAdmin()) await Promise.all([loadConfigOperations(0, []), loadConfigProof()]);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
@@ -5289,7 +5295,7 @@ async function loadAuditPolicy(force = false) {
   current.error = null; current.notice = null;
   try {
     const { data } = await api('/v1/audit/policy');
-    if (sequence !== current.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (sequence !== current.sequence || state.view !== 'account-audit' || !isAdmin()) return;
     if (!validAuditPolicyObservation(data)) throw new Error(t('Account audit policy response is invalid.'));
     current.observation = data; current.draft = auditPolicyDraftFromWire(data.policy); current.dirty = false;
   } catch (error) {
@@ -5308,7 +5314,7 @@ async function saveAuditPolicy() {
   catch (error) { current.error = error.message; renderAuditPolicy(); return; }
   const sequence = current.sequence; const generation = state.authGeneration; const token = state.token;
   const stillCurrent = () => sequence === current.sequence && generation === state.authGeneration &&
-    token === state.token && state.view === 'audit' && isAdmin();
+    token === state.token && state.view === 'account-audit' && isAdmin();
   const accepted = await confirmDialog({
     title: t('Publish account audit recording policy?'),
     body: policy.default_action === 'drop'
@@ -5422,7 +5428,7 @@ async function loadAudit(after = 0, previous = [], pageNumber = 1) {
   renderAudit();
   try {
     const { data } = await api(`/v1/audit/users?after=${after}&limit=100`);
-    if (sequence !== state.audit.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (sequence !== state.audit.sequence || state.view !== 'account-audit' || !isAdmin()) return;
     if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
       !['bootstrap', 'create', 'update', 'delete', 'prune', 'config_operations_prune'].every((action) => data.coverage.includes(action)) ||
       (data.policy_revision !== undefined && (!Number.isSafeInteger(data.policy_revision) || data.policy_revision < 0)) ||
@@ -6538,6 +6544,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', () => { stopBackendFreshness(); state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
+prepareZeroTrust();
 ensureGeoIpPanel();
 state.view = normalizeView(location.hash);
 if (!location.hash) history.replaceState(null, '', '#status');

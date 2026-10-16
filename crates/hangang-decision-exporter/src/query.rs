@@ -399,6 +399,7 @@ pub fn facets(conn: &rusqlite::Connection, filters: &Filters) -> Result<Value> {
         ("class", "info_class"),
         ("country", "country"),
         ("asn", "asn"),
+        ("sampled", "sample_class"),
     ] {
         let mut sql = format!(
             "SELECT {column}, COUNT(*), SUM(CASE WHEN suppressed > 0 THEN suppressed WHEN sample_ppm > 0 THEN 1000000.0 / sample_ppm ELSE 1 END) FROM events"
@@ -415,6 +416,7 @@ pub fn facets(conn: &rusqlite::Connection, filters: &Filters) -> Result<Value> {
             let value: Value = match column {
                 "result" => Value::String(schema::result_text(row.get(0)?)),
                 "stage" => Value::String(schema::stage_text(row.get(0)?)),
+                "sample_class" => Value::String(schema::sample_class_text(row.get(0)?)),
                 "asn" => Value::from(row.get::<_, i64>(0)?),
                 _ => Value::String(row.get(0)?),
             };

@@ -63,7 +63,7 @@ async function fixture(page, { locale = 'en', accounts = false, unavailable = fa
 
 test('admin audit shows scope, capacity and bounded ordered pages; export includes only current page', async ({ page }) => {
   const { calls } = await fixture(page);
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-rows tr')).toHaveCount(100);
   await expect(page.locator('#audit-meta')).toContainText('This instance only');
   await expect(page.locator('#audit-meta')).toContainText('100,000/100,000');
@@ -90,7 +90,7 @@ test('admin audit shows scope, capacity and bounded ordered pages; export includ
 
 test('prune needs explicit confirmation and exact page/CAS values; conflict never retries', async ({ page }) => {
   const { calls } = await fixture(page, { pruneConflict: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-rows tr')).toHaveCount(100);
   await page.locator('#audit-prune').click();
   await expect(page.locator('#confirm-dialog')).toBeVisible();
@@ -108,7 +108,7 @@ test('prune needs explicit confirmation and exact page/CAS values; conflict neve
 
 test('unavailable audit never appears as empty history, and viewer cannot open it', async ({ page }) => {
   await fixture(page, { unavailable: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-meta')).toContainText('Audit unavailable');
   await expect(page.locator('#audit-export')).toBeDisabled();
   await expect(page.locator('#audit-prune')).toBeDisabled();
@@ -116,7 +116,7 @@ test('unavailable audit never appears as empty history, and viewer cannot open i
 
 test('missing retention metadata fails closed as unavailable history', async ({ page }) => {
   await fixture(page, { missingRetention: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-meta')).toContainText('Audit unavailable');
   await expect(page.locator('#audit-rows')).toBeEmpty();
   await expect(page.locator('#audit-prune')).toBeDisabled();
@@ -124,7 +124,7 @@ test('missing retention metadata fails closed as unavailable history', async ({ 
 
 test('delayed admin audit response cannot repopulate after logout and viewer login', async ({ page }) => {
   const { calls, release } = await fixture(page, { accounts: true, delayed: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect.poll(() => calls.some((call) => call.path === '/v1/audit/users')).toBe(true);
   await page.locator('#logout-button').click();
   await page.locator('#login-username').fill('viewer');
@@ -140,7 +140,7 @@ test('delayed admin audit response cannot repopulate after logout and viewer log
 
 test('Korean audit copy and row labels follow locale without losing page data', async ({ page }) => {
   await fixture(page, { locale: 'ko' });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-title')).toHaveText('계정 감사 기록');
   await expect(page.locator('#audit-rows tr')).toHaveCount(100);
   await expect(page.locator('#audit-rows tr').first()).toContainText('감사 기준점');
@@ -152,7 +152,7 @@ test('Korean audit copy and row labels follow locale without losing page data', 
 test('forward paging stays available beyond the bounded backcursor stack', async ({ page }) => {
   test.setTimeout(60_000);
   await fixture(page, { longHistory: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-page-state')).toContainText('Page 1');
   for (let index = 2; index <= 66; index++) {
     await page.locator('#audit-next').click();
@@ -166,7 +166,7 @@ test('forward paging stays available beyond the bounded backcursor stack', async
 
 test('account audit labels configuration operation pruning as a distinct receipt', async ({ page }) => {
   await fixture(page, { configReceipt: true });
-  await page.locator('[data-view="audit"]').click();
+  await page.evaluate(() => { location.hash = '#account-audit'; });
   await expect(page.locator('#audit-rows tr').nth(1)).toContainText('Configuration operation history pruned');
   await expect(page.locator('#audit-rows tr').nth(1)).toContainText('4 terminal configuration operations pruned');
   await expect(page.locator('#audit-rows tr').nth(1)).toContainText('Configuration operation through #77');
