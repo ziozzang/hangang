@@ -1,4 +1,6 @@
 import { t } from './i18n.js';
+import { ui } from './kit/ui.js';
+import { t as kitT } from './zt/shell.js';
 // Host console lifecycle for trusted, hash-pinned operator-installed modules.
 let catalog = [], mounted = new Map(), generation = 0, host;
 const authorities = Object.freeze({ hopae: { label: 'Identity · Hopae', aliases: 'identity authentication 호패 신원 인증', order: 0 }, guard: { label: 'Network trust · Sumunjang', aliases: 'guard network trust 수문장 네트워크 신뢰', order: 1 } });
@@ -51,6 +53,8 @@ export async function loadPlugin(name) {
         window.addEventListener('hangang:localechange',notify,{signal:controller.signal});
         return ()=>{record.localeListeners.delete(notify);window.removeEventListener('hangang:localechange',notify);};
       },authentication:p.authentication==='hangang'?'hangang':'native',
+      // Shared UI kit (ADR 0020). Additive: v1 packages that ignore it are unaffected.
+      ui,t:kitT,navigate:(hash)=>{if(typeof hash==='string'&&/^#[a-z0-9-]+(?:[/?][^\s]*)?$/i.test(hash))location.hash=hash;},link:(entity)=>ui.entityHref(entity?.type,entity?.id),
       api:(path,options={})=>{if(controller.signal.aborted) return Promise.reject(Error('Session ended'));if(!/^[a-z0-9-]+(?:\/[a-z0-9-]+)*$/.test(path))return Promise.reject(Error('Invalid plugin API path'));return host.api(p.api_base+'/'+path,{...options,signal:controller.signal});},
       asset:(file)=>{if(!/^[a-zA-Z0-9_-]+\.(html|css)$/.test(file))return Promise.reject(Error('Invalid plugin asset'));return fetch(base+file,{signal:controller.signal,cache:'no-store'}).then(r=>{if(!r.ok)throw Error('Plugin asset unavailable');return r;});}
     }));

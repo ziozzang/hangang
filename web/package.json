@@ -3,8 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "playwright test",
-    "build:lua-editor": "node build-lua-editor.mjs"
+    "test": "node tools/lint-i18n.mjs && playwright test",
+    "build:lua-editor": "node build-lua-editor.mjs",
+    "lint:i18n": "node tools/lint-i18n.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

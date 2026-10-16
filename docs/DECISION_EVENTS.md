@@ -120,7 +120,7 @@ Head sampling is deterministic on the Hangang request ID.
 
 | Class | Kept | Bound |
 | --- | --- | --- |
-| Deny, challenge, error, unavailable | 100% | Token bucket per (route, /24 IPv4 or /48 IPv6 prefix); refusals beyond it are counted and summarized as one `hangang.suppressed` event per window with the count and first/last time |
+| Deny, challenge, error, unavailable | 100% | Token bucket per (reason, route, /24 IPv4 or /48 IPv6 prefix); refusals beyond it are counted and summarized as one event per window that keeps the underlying reason code, has sampling class `suppressed` and carries the count and first/last time, so counts stay attributed to their reason |
 | Allow | `allow_sample_percent` (1%) | Per-route override; `audit_all` routes and routes whose Pumgye gate uses an `audit_all_classes` class keep 100% (`audit` class) |
 
 Every kept event records its sampling class and rate, so the console labels

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
 // Match src/ui.rs: fresh HTML style nonce, same-origin scripts, no unsafe-inline/eval.
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost');
@@ -23,6 +23,9 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname === `/ui/locales/${name}`) return file(response, path.join('locales', name));
   }
   if (url.pathname === '/ui/style.css') return file(response, 'style.css');
+  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json']) {
+    if (url.pathname === `/ui/${name}`) return file(response, name);
+  }
   response.writeHead(404); response.end('fixture route missing');
 });
 async function file(response, name) {

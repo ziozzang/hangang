@@ -109,6 +109,7 @@ HTTP 라우트 목록과 백엔드 편집 화면은 기존 관리자 전용 `GET
 콘솔은 관리 리스너의 `/ui/`에서 제공됩니다. 같은 빌드는 `/openapi.json`에서 API 명세를 제공합니다. `hangang --help`로 명령줄 옵션을 확인할 수 있습니다.
 
 - [Guard zero-trust backbone](ko/GUARD.md)
+- [제로 트러스트 콘솔 섹션과 공용 UI 키트](ko/ZERO_TRUST_CONSOLE.md)
 - [판단 이벤트와 판단 내보내기 프로세스](ko/DECISION_EVENTS.md)
 
 - [호패 gRPC 게이트웨이 클라이언트](ko/HOPAE_GRPC.md)
