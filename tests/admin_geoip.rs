@@ -263,3 +263,74 @@ async fn admin_geoip_status_and_lookup_are_bounded_path_free_and_fail_closed() {
     server.abort();
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn admin_kubernetes_protection_report_is_admin_only_and_follows_the_controller() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, manager, server) = serve(Config::default(), &dir).await;
+    let base = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let path = "/v1/kubernetes/protection";
+    assert_eq!(get(&client, &base, path, None).await.status(), 401);
+    let disabled: serde_json::Value = get(&client, &base, path, Some(TOKEN))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        disabled,
+        serde_json::json!({"scope":"instance","enabled":false,"report":null})
+    );
+    let mut report = hangang::protection::Report {
+        require_protection: true,
+        ..Default::default()
+    };
+    report.counts.withheld = 1;
+    report.ingresses.push(hangang::protection::IngressRow {
+        namespace: "blue".into(),
+        name: "bare".into(),
+        state: "withheld",
+        published: false,
+        policy: None,
+        reason: Some("ProtectionRequired"),
+        message: Some("no policy".into()),
+    });
+    manager.metrics.kubernetes_protection.publish(report);
+    let response = get(&client, &base, path, Some(TOKEN)).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["cache-control"].to_str().unwrap(),
+        "no-store"
+    );
+    let enabled: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(enabled["enabled"], true);
+    assert_eq!(enabled["report"]["counts"]["withheld"], 1);
+    assert_eq!(
+        enabled["report"]["ingresses"][0]["reason"],
+        "ProtectionRequired"
+    );
+    assert_eq!(
+        get(&client, &base, &format!("{path}?x=1"), Some(TOKEN))
+            .await
+            .status(),
+        400
+    );
+    let post = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post.status(), 405);
+    let metrics = get(&client, &base, "/metrics", Some(TOKEN))
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("hangang_kubernetes_ingresses_withheld 1"));
+    server.abort();
+}

@@ -4,6 +4,20 @@
 
 ## Unreleased
 
+- Reconcile `ProtectionPolicy` (`world.hangang.dev/v1alpha1`, ADR 0022) with
+  `--kubernetes-protection-config`: policies attach to Ingresses by `targetRefs`
+  or as a namespace default and compile Hopae authentication, an enforced
+  Pumgye resource gate and fail-closed Sumunjang requirements into every
+  generated route. `require_protection` defaults on and withholds Ingresses
+  without an effective policy, with ambiguous attachments, unresolved
+  references or unmet network prerequisites; policy status, metrics and
+  `GET /v1/kubernetes/protection` report why. Ship the CRD, aggregated roles,
+  controller RBAC and protection/Service patches.
+- Accept PROXY protocol v2 on the public listener from `--proxy-protocol-from`
+  CIDRs only; other peers are never parsed.
+- Release deleted or moved protected Kubernetes scopes through a disabled,
+  unenforced revision instead of freezing the controller.
+
 ## 0.3.6 — 2026-10-15
 
 - Add opt-in native credential projection through Hopae's authenticated mTLS RPC.

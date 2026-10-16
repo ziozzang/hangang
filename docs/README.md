@@ -95,6 +95,7 @@ The administrator console **Lua policies** menu lists HTTP route policy and requ
 
 - [Docker discovery](DOCKER.md) — Docker service discovery
 - [Kubernetes Ingress controller](KUBERNETES.md) — Kubernetes integration
+- [Kubernetes route protection](KUBERNETES_PROTECTION.md) — ProtectionPolicy, fail-closed Ingress protection and PROXY protocol v2
 - [Scale-out operation](SCALE_OUT.md) — shared configuration and multi-node operation
 - [Redis configuration store](REDIS.md) — Redis-backed configuration
 - [Node observation identity](FLEET_OBSERVER.md) — fleet observer identity

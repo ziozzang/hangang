@@ -94,6 +94,7 @@ HTTP 라우트 목록과 백엔드 편집 화면은 기존 관리자 전용 `GET
 
 - [Docker 검색](ko/DOCKER.md) — Docker 서비스 검색
 - [Kubernetes Ingress 컨트롤러](ko/KUBERNETES.md) — Kubernetes 연동
+- [Kubernetes 경로 보호](ko/KUBERNETES_PROTECTION.md) — ProtectionPolicy, 실패 시 닫히는 Ingress 보호, PROXY protocol v2
 - [수평 확장 운영](ko/SCALE_OUT.md) — 공유 설정과 다중 노드 운영
 - [Redis 설정 저장소](ko/REDIS.md) — Redis 기반 설정
 - [노드 관찰 신원 · 영문](FLEET_OBSERVER.md) — 플릿 관찰자 신원
