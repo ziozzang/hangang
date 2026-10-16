@@ -82,7 +82,7 @@ test('HTTP native country policy configures, disables and removes with exact wir
 test('TCP Korean native policy and advanced JSON synchronize without losing unrelated route fields', async ({ page }) => {
   const { routeWrites } = await fixture(page, { locale: 'ko' });
   await edit(page, 'tcp');
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const draft = { ...tcp, country_policy: { allow: [], deny: ['RU'], on_unknown: 'allow', enforce: false } };
   await page.locator('#route-json').fill(JSON.stringify(draft));
   await expect(page.locator('#route-field-country_policy_action')).toHaveValue('configured');
@@ -108,7 +108,7 @@ test('invalid country lists and malformed advanced JSON never write or silently 
   await expect(page.locator('#route-message')).toContainText('cannot be allowed');
   await page.locator('#save-route').click(); expect(routeWrites.http).toHaveLength(0);
 
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const malformed = { ...http, country_policy: { allow: null, deny: ['RU'], on_unknown: 'deny' } };
   await page.locator('#route-json').fill(JSON.stringify(malformed));
   await page.locator('#route-field-priority').fill('2');
