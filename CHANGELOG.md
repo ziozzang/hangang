@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Console operator assurance (Hopae ADR-0021): with `operator_policy` the console
+  SSO verifies Hopae's signed operator assertion on every request, requires the
+  configured level and a passkey for sign-in and every change, and a factor used
+  within `sensitive_max_age_seconds` for sensitive changes (publish, activate,
+  factor reset, accounts, configuration), sending the operator to Hopae's step-up
+  path otherwise; the header shows the operator's AAL and factor.
+- Break-glass local administrator sign-in is audited (`--audit-log`) and can be
+  disabled with `--disable-local-login`.
+
 ## 0.3.6 — 2026-10-15
 
 - Add opt-in native credential projection through Hopae's authenticated mTLS RPC.

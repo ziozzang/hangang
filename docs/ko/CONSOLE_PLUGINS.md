@@ -209,6 +209,53 @@ fallback하지 않습니다. 연결은 Hopae 300초보다 빠른 240초에 회�
 공유 native client·고정 native_address를 사용하고 명시적 Hopae→Hangang 계정 매핑과
 세션/lease 검사를 유지합니다. 원격은 mTLS이며 이전 과정의 loopback 평문은 지원합니다.
 
+## 운영자 보증(패스키)과 비상 접근
+
+호패의 `console_operators` 정책(호패 ADR-0021)을 쓰면 콘솔은 운영자가 피싱에 강한
+인증 요소로 로그인했는지 요구할 수 있습니다. SSO 설정에 `operator_policy`를 추가하고,
+호패 `console_operators.assertion_key_env`와 같은 단언 키를 콘솔에 줍니다.
+
+```json
+"operator_policy": {
+  "assertion_key_env": "CONSOLE_OPERATOR_ASSERTION_KEY",
+  "minimum_aal": 2,
+  "require_factor": "webauthn",
+  "accept_enrollment_grace": false,
+  "sensitive_max_age_seconds": 300,
+  "step_up_path": "/ui/step-up"
+}
+```
+
+- 모든 SSO 요청(교환과 이후 각 요청)에는 호패가 HMAC으로 서명한 운영자
+  단언(`x-hopae-operator-assertion`)이 필요합니다. 없거나 위조되었거나 만료되었거나
+  다른 사용자·호스트의 단언이면 요청을 거부합니다.
+- **로그인과 읽기**에는 단언의 정책 충족(`satisfied`), `minimum_aal`(1–3) 이상, 그리고
+  `require_factor: webauthn`이면 패스키가 필요합니다. `accept_enrollment_grace`를 켜면
+  호패의 등록 유예로 들어온 운영자도 로그인과 읽기는 할 수 있지만 변경은 할 수 없습니다.
+- **모든 변경**에는 유예 없는 정책 충족이 필요합니다. **민감한 변경**(경로에
+  `/publish`, `/activate`, `/factors/reset`, `/bulk-disable`가 있거나 `/v1/admin-users`,
+  `/v1/users`, `/v1/config`, `/v1/plugins`, `/v1/audit/policy` 아래. `sensitive_paths`로
+  목록을 바꿀 수 있음)에는 `sensitive_max_age_seconds`(30–3600) 안에 사용한 인증 요소도
+  필요합니다.
+- 거부는 `403`과 `operator_step_up_required` 또는 `operator_reauthentication_required`,
+  그리고 `step_up_url`로 답합니다. 콘솔 UI는 그곳으로 이동하고, 콘솔 호스트의
+  게이트웨이 라우트(`/_hopae/login`처럼 호패가 보호)가 `step_up_path`에서 호패의 패스키
+  단계 상승을 실행한 뒤, 콘솔은 원래 화면(`/ui/?sso=hopae`, `/ui/` 안으로만)으로 돌아가
+  바뀐 호패 세션으로 다시 로그인합니다. 호패가 직접 단계 상승을 요구하면
+  (`x-hopae-reason: step_up_required`) 같은 방식으로 답합니다.
+- 헤더는 운영자의 수준과 인증 요소(`AAL2 · 패스키`)를, 로컬 관리자 세션이면
+  **비상 접근(로컬)**을 보여 줍니다. `GET /v1/auth/sso/session`도 같은 정보를 돌려줍니다.
+
+**비상 접근.** 로컬 관리자 로그인(`/v1/auth/login`)은 비상 경로로 남습니다.
+`--disable-local-login`(`--hopae-sso` 필요)은 이것과 모든 로컬 세션을 거부합니다. 감사
+기록(JSON 줄, `--audit-log <path>` 0600 또는 stderr): `console.sso_login`(보증 정보 또는
+거부), `console.step_up_required`, `console.change`(수준과 인증 요소가 있는 SSO 변경),
+`console.break_glass_login`(`attempt` 또는 `disabled`), `console.break_glass_change`.
+
+검증: `tests/console_operator_aal_smoke.py`(실제 권위와 콘솔, 서명 단언 픽스처)와 호패의
+브라우저 검증(`tools/browser-qual/run-operator.sh`: 실제 호패, 실제 한강 권위와 콘솔,
+가상 인증기를 쓰는 Chrome).
+
 ## 백엔드 mTLS
 
 바인딩의 tls에 server_name·ca·certificate·key를 설정할 수 있습니다. 파일 경로는

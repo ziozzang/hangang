@@ -243,6 +243,60 @@ client and fixed `native_address`, preserving explicit Hopae-to-Hangang
 account mappings and existing session/lease checks. Remote SSO peers require
 mTLS; loopback plaintext remains available during migration.
 
+## Operator assurance (passkey) and break-glass
+
+With Hopae's `console_operators` policy (Hopae ADR-0021) the console can require
+that operators signed in with a phishing-resistant factor. Add `operator_policy`
+to the SSO configuration and give the console the same assertion key as Hopae's
+`console_operators.assertion_key_env`:
+
+```json
+"operator_policy": {
+  "assertion_key_env": "CONSOLE_OPERATOR_ASSERTION_KEY",
+  "minimum_aal": 2,
+  "require_factor": "webauthn",
+  "accept_enrollment_grace": false,
+  "sensitive_max_age_seconds": 300,
+  "step_up_path": "/ui/step-up"
+}
+```
+
+- Every SSO request (the exchange and each later request) needs Hopae's
+  HMAC-signed operator assertion (`x-hopae-operator-assertion`). A missing,
+  forged, expired or foreign assertion (another user or host) refuses the request.
+- **Sign-in and reads** need the assertion's policy met (`satisfied`), at least
+  `minimum_aal` (1 to 3) and, with `require_factor: webauthn`, a passkey. With
+  `accept_enrollment_grace`, operators Hopae admits during its enrollment grace
+  may sign in and read, never change anything.
+- **Every change** needs the policy without grace. A **sensitive change** (path
+  containing `/publish`, `/activate`, `/factors/reset`, `/bulk-disable`, or under
+  `/v1/admin-users`, `/v1/users`, `/v1/config`, `/v1/plugins`,
+  `/v1/audit/policy`; `sensitive_paths` replaces the list) also needs the factor
+  used within `sensitive_max_age_seconds` (30 to 3600).
+- A refusal answers `403` with `operator_step_up_required` or
+  `operator_reauthentication_required` and a `step_up_url`. The console UI goes
+  there: the gateway route of the console host (protected by Hopae, like
+  `/_hopae/login`) runs Hopae's passkey step-up for `step_up_path`, then the
+  console returns to the view (`/ui/?sso=hopae`, inside `/ui/` only) and signs in
+  again with the rotated Hopae session. When Hopae itself asks for a step-up
+  (`x-hopae-reason: step_up_required`) the console answers the same way.
+- The header shows the operator's level and factor (`AAL2 · Passkey`), or
+  **Break-glass (local)** for a local administrator session;
+  `GET /v1/auth/sso/session` returns the same facts.
+
+**Break-glass.** The local administrator sign-in (`/v1/auth/login`) stays as the
+break-glass path. `--disable-local-login` (requires `--hopae-sso`) refuses it and
+every local session. Audit records (JSON lines, `--audit-log <path>` 0600 or
+stderr): `console.sso_login` (with the assurance or the refusal),
+`console.step_up_required`, `console.change` (SSO changes with the level and
+factor), `console.break_glass_login` (`attempt` or `disabled`) and
+`console.break_glass_change`.
+
+Validation: `tests/console_operator_aal_smoke.py` (real authority and console,
+signed-assertion fixture) and Hopae's browser qualification
+(`tools/browser-qual/run-operator.sh`: real Hopae, real Hangang authority and
+console, Chrome with a virtual authenticator).
+
 ## Backend mTLS
 
 A binding may include `tls` with `server_name`, `ca`, `certificate` and `key`.

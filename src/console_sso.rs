@@ -1,6 +1,15 @@
 //! Optional console SSO broker. Provider credentials stay in Hopae. Opaque
 //! browser sessions require their native Hopae cookie on every request; the
 //! upstream receives only private five-second leases for existing accounts.
+//!
+//! With `operator_policy` (Hopae ADR-0021) every verify answer must carry
+//! Hopae's HMAC-signed operator assertion (`x-hopae-operator-assertion`):
+//! the level the operator reached, the second factor and when it was used.
+//! Sign-in needs the configured minimum (or Hopae's enrollment grace when
+//! accepted), every mutation needs the minimum without grace, and a sensitive
+//! action (publish, activate, factor reset, ...) needs the factor used within
+//! `sensitive_max_age_seconds`; otherwise the operator is sent to the step-up
+//! path, which Hopae protects.
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use hangang::{admin_plugins::ClientContext, admin_users::User, hopae_native::Client};
@@ -28,6 +37,278 @@ struct Config {
     cookie: String,
     /// Stable opaque Hopae IDs -> existing Hangang usernames. Never email matching.
     accounts: HashMap<String, String>,
+    /// Phishing-resistant operator assurance (Hopae ADR-0021).
+    #[serde(default)]
+    operator_policy: Option<OperatorPolicyConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorPolicyConfig {
+    /// The variable holding the HMAC key Hopae signs operator assertions with.
+    assertion_key_env: String,
+    /// `1` to `3`; default `2`.
+    #[serde(default)]
+    minimum_aal: Option<u8>,
+    /// `webauthn` (default) or `any`.
+    #[serde(default)]
+    require_factor: Option<String>,
+    /// Admit operators Hopae admits during its enrollment grace (read-only:
+    /// mutations still need the factor). Default false.
+    #[serde(default)]
+    accept_enrollment_grace: bool,
+    /// Freshness of the factor for sensitive actions (default 300, 30 to 3600).
+    #[serde(default)]
+    sensitive_max_age_seconds: Option<u64>,
+    /// The console path Hopae steps up on (default `/ui/step-up`).
+    #[serde(default)]
+    step_up_path: Option<String>,
+    /// Path fragments marking a sensitive action (defaults below).
+    #[serde(default)]
+    sensitive_paths: Option<Vec<String>>,
+}
+
+/// Mutation paths that need a fresh factor unless configured otherwise:
+/// publications, activations, factor resets, account and grant changes.
+pub const DEFAULT_SENSITIVE: [&str; 9] = [
+    "/publish",
+    "/activate",
+    "/factors/reset",
+    "/bulk-disable",
+    "/v1/admin-users",
+    "/v1/users",
+    "/v1/config",
+    "/v1/plugins",
+    "/v1/audit/policy",
+];
+
+/// The operator policy as enforced.
+pub struct OperatorPolicy {
+    key: Vec<u8>,
+    pub minimum_aal: u8,
+    pub require_webauthn: bool,
+    pub accept_grace: bool,
+    pub max_age: u64,
+    pub step_up_path: String,
+    pub sensitive: Vec<String>,
+}
+
+/// The claims of Hopae's operator assertion (ADR-0021). Unknown claims are
+/// ignored so Hopae can add some.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct Assurance {
+    pub v: u8,
+    pub aud: String,
+    pub app: String,
+    pub host: String,
+    pub sub: String,
+    pub sid: String,
+    pub aal: u8,
+    pub factor: Option<String>,
+    pub factor_at: Option<i64>,
+    pub high_assurance: bool,
+    pub auth_time: i64,
+    pub require_aal: u8,
+    pub require_factor: String,
+    pub satisfied: bool,
+    pub grace: bool,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// Why the operator must step up (or is refused), with where to go.
+#[derive(Debug)]
+pub struct StepUp {
+    pub code: &'static str,
+    pub step_up_url: String,
+}
+impl std::fmt::Display for StepUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code)
+    }
+}
+impl std::error::Error for StepUp {}
+
+const ASSERTION_DOMAIN: &str = "hopae-operator-assertion.v1.";
+
+/// Verify an operator assertion: format, HMAC in constant time, audience,
+/// lifetime (`now` within `[iat - 5, exp]`).
+pub fn verify_assertion(key: &[u8], token: &str, now: i64) -> Result<Assurance> {
+    use hmac::{Hmac, Mac};
+    ensure!(token.len() <= 4096, "operator assertion too large");
+    let mut parts = token.split('.');
+    let (Some("v1"), Some(payload), Some(tag), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        anyhow::bail!("malformed operator assertion");
+    };
+    let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(tag)?;
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)?;
+    mac.update(ASSERTION_DOMAIN.as_bytes());
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&tag)
+        .map_err(|_| anyhow::anyhow!("operator assertion signature rejected"))?;
+    let claims: Assurance =
+        serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload)?)?;
+    ensure!(
+        claims.v == 1 && claims.aud == "hangang-console",
+        "operator assertion audience rejected"
+    );
+    ensure!(
+        now <= claims.exp && claims.iat <= now + 5,
+        "operator assertion expired"
+    );
+    Ok(claims)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+impl OperatorPolicy {
+    fn from_config(c: &OperatorPolicyConfig) -> Result<Self> {
+        let key =
+            std::env::var(&c.assertion_key_env).context("operator assertion key unavailable")?;
+        ensure!(
+            (32..=4096).contains(&key.len()),
+            "operator assertion key must be 32 to 4096 bytes"
+        );
+        let minimum_aal = c.minimum_aal.unwrap_or(2);
+        ensure!((1..=3).contains(&minimum_aal), "minimum_aal must be 1 to 3");
+        let require_webauthn = match c.require_factor.as_deref() {
+            None | Some("webauthn") => true,
+            Some("any") => false,
+            Some(_) => anyhow::bail!("require_factor must be webauthn or any"),
+        };
+        let max_age = c.sensitive_max_age_seconds.unwrap_or(300);
+        ensure!(
+            (30..=3600).contains(&max_age),
+            "sensitive_max_age_seconds must be 30 to 3600"
+        );
+        let step_up_path = c
+            .step_up_path
+            .clone()
+            .unwrap_or_else(|| "/ui/step-up".into());
+        ensure!(
+            step_up_path.starts_with("/ui/")
+                && !step_up_path.contains("//")
+                && step_up_path.len() <= 128,
+            "step_up_path must be a /ui/ path"
+        );
+        let sensitive = c
+            .sensitive_paths
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SENSITIVE.iter().map(|s| s.to_string()).collect());
+        ensure!(
+            sensitive.len() <= 64 && sensitive.iter().all(|p| !p.is_empty() && p.len() <= 128),
+            "invalid sensitive_paths"
+        );
+        Ok(Self {
+            key: key.into_bytes(),
+            minimum_aal,
+            require_webauthn,
+            accept_grace: c.accept_enrollment_grace,
+            max_age,
+            step_up_path,
+            sensitive,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn for_tests(key: &[u8], minimum_aal: u8, accept_grace: bool) -> Self {
+        Self {
+            key: key.to_vec(),
+            minimum_aal,
+            require_webauthn: true,
+            accept_grace,
+            max_age: 300,
+            step_up_path: "/ui/step-up".into(),
+            sensitive: DEFAULT_SENSITIVE.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The step-up location, returning to `back` (a `/ui/` path).
+    pub fn step_up_url(&self, back: &str) -> String {
+        let back = if back.starts_with("/ui/") && !back.contains("//") {
+            back
+        } else {
+            "/ui/"
+        };
+        format!(
+            "{}?return={}",
+            self.step_up_path,
+            back.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        )
+    }
+
+    fn meets(&self, a: &Assurance) -> bool {
+        a.satisfied
+            && a.aal >= self.minimum_aal
+            && (!self.require_webauthn || a.factor.as_deref() == Some("webauthn"))
+    }
+
+    /// May the operator hold a console session (sign-in, reads)?
+    pub fn admit(&self, a: &Assurance) -> Result<(), StepUp> {
+        if self.meets(a) || (self.accept_grace && a.grace) {
+            Ok(())
+        } else {
+            Err(StepUp {
+                code: "operator_step_up_required",
+                step_up_url: self.step_up_url("/ui/"),
+            })
+        }
+    }
+
+    /// Whether `method` on `path` changes state.
+    pub fn is_mutation(method: &hyper::Method, path: &str) -> bool {
+        !matches!(
+            *method,
+            hyper::Method::GET | hyper::Method::HEAD | hyper::Method::OPTIONS
+        ) && path != "/v1/auth/logout"
+    }
+
+    pub fn is_sensitive(&self, path: &str) -> bool {
+        self.sensitive.iter().any(|p| path.contains(p.as_str()))
+    }
+
+    /// May the operator perform `method` on `path` now? Mutations need the
+    /// policy without grace; sensitive ones a factor used within `max_age`.
+    pub fn allow(
+        &self,
+        a: &Assurance,
+        method: &hyper::Method,
+        path: &str,
+        now: i64,
+    ) -> Result<(), StepUp> {
+        if !Self::is_mutation(method, path) {
+            return self.admit(a);
+        }
+        let fresh = a
+            .factor_at
+            .is_some_and(|t| now - t <= self.max_age as i64 && t <= now + 5);
+        if !self.meets(a) {
+            return Err(StepUp {
+                code: "operator_step_up_required",
+                step_up_url: self.step_up_url("/ui/"),
+            });
+        }
+        if self.is_sensitive(path) && !fresh {
+            return Err(StepUp {
+                code: "operator_reauthentication_required",
+                step_up_url: self.step_up_url("/ui/"),
+            });
+        }
+        Ok(())
+    }
 }
 fn cookie_name() -> String {
     "__Host-hopae".into()
@@ -35,6 +316,7 @@ fn cookie_name() -> String {
 #[derive(Clone)]
 struct Session {
     identity: String,
+    assurance: Arc<Mutex<Option<Assurance>>>,
     handle: String,
     ip: std::net::IpAddr,
     ua: Option<String>,
@@ -48,6 +330,7 @@ struct Lease {
 }
 pub struct Sso {
     config: Config,
+    policy: Option<OperatorPolicy>,
     native: Client,
     system: HeaderValue,
     origin: String,
@@ -136,7 +419,13 @@ impl Sso {
             key,
         )?;
         let origin = url.origin().ascii_serialization();
+        let policy = config
+            .operator_policy
+            .as_ref()
+            .map(OperatorPolicy::from_config)
+            .transpose()?;
         Ok(Self {
+            policy,
             config,
             native,
             system,
@@ -179,7 +468,15 @@ impl Sso {
         );
         Ok(handle)
     }
-    async fn identity(&self, handle: &str, context: &ClientContext) -> Result<String> {
+    pub fn policy(&self) -> Option<&OperatorPolicy> {
+        self.policy.as_ref()
+    }
+
+    async fn identity(
+        &self,
+        handle: &str,
+        context: &ClientContext,
+    ) -> Result<(String, Option<Assurance>)> {
         let mut h = HeaderMap::new();
         for (n, v) in [
             ("x-hopae-contract", "1".to_owned()),
@@ -210,7 +507,23 @@ impl Sso {
         }
         let response =
             tokio::time::timeout(Duration::from_secs(2), self.native.verify(&h)).await??;
-        ensure!(response.status() == 200, "Hopae session rejected");
+        if response.status() != 200 {
+            // Hopae's policy (ADR-0021) wants a step-up first.
+            if let Some(policy) = &self.policy
+                && response.status() == 401
+                && response
+                    .headers()
+                    .get("x-hopae-reason")
+                    .is_some_and(|v| v == "step_up_required")
+            {
+                return Err(StepUp {
+                    code: "operator_step_up_required",
+                    step_up_url: policy.step_up_url("/ui/"),
+                }
+                .into());
+            }
+            anyhow::bail!("Hopae session rejected");
+        }
         let id = response
             .headers()
             .get("x-forwarded-user")
@@ -220,7 +533,26 @@ impl Sso {
             self.config.accounts.contains_key(id),
             "Hopae identity is not mapped to a Hangang account"
         );
-        Ok(id.into())
+        let assurance = match &self.policy {
+            None => None,
+            Some(policy) => {
+                let token = response
+                    .headers()
+                    .get("x-hopae-operator-assertion")
+                    .context("Hopae operator assertion missing")?
+                    .to_str()?;
+                let a = verify_assertion(&policy.key, token, unix_now())?;
+                let host = self.origin.split_once("://").map_or("", |(_, h)| h);
+                ensure!(
+                    a.sub == id
+                        && a.host
+                            .eq_ignore_ascii_case(host.split(':').next().unwrap_or(host)),
+                    "operator assertion is for another identity or host"
+                );
+                Some(a)
+            }
+        };
+        Ok((id.into(), assurance))
     }
     async fn lease(
         &self,
@@ -285,9 +617,13 @@ impl Sso {
             "same-origin SSO exchange required"
         );
         let handle = self.handle(h)?;
-        let identity = self.identity(&handle, context).await?;
+        let (identity, assurance) = self.identity(&handle, context).await?;
+        if let (Some(policy), Some(a)) = (&self.policy, &assurance) {
+            policy.admit(a)?;
+        }
         let session = Session {
             identity,
+            assurance: Arc::new(Mutex::new(assurance.clone())),
             handle,
             ip: context.ip,
             ua: context.user_agent.clone(),
@@ -305,8 +641,27 @@ impl Sso {
         sessions.retain(|_, v| v.expires > Instant::now());
         ensure!(sessions.len() < 512, "SSO session capacity reached");
         sessions.insert(token.clone(), session);
-        Ok(serde_json::json!({"token":token,"user":user,"expires_in_seconds":28800}))
+        Ok(
+            serde_json::json!({"token":token,"user":user,"expires_in_seconds":28800,"assurance":assurance}),
+        )
     }
+    /// The mapped account and the latest operator assurance of a session.
+    pub fn session_info(&self, token: &str) -> Option<(String, Option<Assurance>)> {
+        let s = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(token)
+            .cloned()?;
+        let a = s
+            .assurance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Some((self.config.accounts[&s.identity].clone(), a))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn authorization(
         &self,
         token: &str,
@@ -314,6 +669,8 @@ impl Sso {
         context: &ClientContext,
         client: &reqwest::Client,
         upstream: &reqwest::Url,
+        method: &hyper::Method,
+        path: &str,
     ) -> Result<HeaderValue> {
         let session = self
             .sessions
@@ -329,10 +686,12 @@ impl Sso {
                 && self.handle(h)? == session.handle,
             "SSO session binding rejected"
         );
-        ensure!(
-            self.identity(&session.handle, context).await? == session.identity,
-            "SSO identity changed"
-        );
+        let (identity, assurance) = self.identity(&session.handle, context).await?;
+        ensure!(identity == session.identity, "SSO identity changed");
+        if let (Some(policy), Some(a)) = (&self.policy, &assurance) {
+            *session.assurance.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.clone());
+            policy.allow(a, method, path, unix_now())?;
+        }
         Ok(self.lease(&session, client, upstream).await?.0)
     }
     pub fn logout(&self, token: &str) {
@@ -409,8 +768,10 @@ mod tests {
             upstream_token_env: "FIXTURE".into(),
             cookie: cookie_name(),
             accounts: HashMap::from([("u_fixture".into(), "operator".into())]),
+            operator_policy: None,
         };
         let sso = Sso {
+            policy: None,
             config,
             native: Client::new(
                 address,
@@ -426,7 +787,7 @@ mod tests {
             user_agent: None,
         };
         assert_eq!(
-            sso.identity("fixture-handle", &context).await.unwrap(),
+            sso.identity("fixture-handle", &context).await.unwrap().0,
             "u_fixture"
         );
         allow.store(false, Ordering::SeqCst);
@@ -441,5 +802,125 @@ mod tests {
         h.insert("cookie", "__Host-hopae=a; __Host-hopae=b".parse().unwrap());
         assert!(sso.handle(&h).is_err());
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+
+    const KEY: &[u8] = b"console-operator-assertion-key-0123456789";
+
+    fn sign(claims: &serde_json::Value, key: &[u8]) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).unwrap());
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).unwrap();
+        mac.update(ASSERTION_DOMAIN.as_bytes());
+        mac.update(payload.as_bytes());
+        let tag =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("v1.{payload}.{tag}")
+    }
+
+    fn claims(now: i64) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "aud": "hangang-console", "app": "console", "host": "console.example.test",
+            "sub": "u_op", "sid": "s_op", "aal": 2, "factor": "webauthn", "factor_at": now - 10,
+            "high_assurance": false, "auth_time": now - 100, "require_aal": 2,
+            "require_factor": "webauthn", "satisfied": true, "grace": false,
+            "iat": now, "exp": now + 60
+        })
+    }
+
+    #[test]
+    fn assertions_are_verified_strictly() {
+        let now = 1_000_000;
+        let c = claims(now);
+        let a = verify_assertion(KEY, &sign(&c, KEY), now).unwrap();
+        assert_eq!((a.aal, a.factor.as_deref()), (2, Some("webauthn")));
+        // Another key, a changed claim, expiry, the wrong audience.
+        assert!(
+            verify_assertion(
+                b"another-key-of-at-least-thirty-two-bytes",
+                &sign(&c, KEY),
+                now
+            )
+            .is_err()
+        );
+        let t = sign(&c, KEY);
+        let forged = t.replacen("v1.", "v1.e", 1);
+        assert!(verify_assertion(KEY, &forged, now).is_err());
+        assert!(verify_assertion(KEY, &t, now + 61).is_err());
+        let mut other = c.clone();
+        other["aud"] = "elsewhere".into();
+        assert!(verify_assertion(KEY, &sign(&other, KEY), now).is_err());
+        // Unknown future claims are ignored.
+        let mut more = c.clone();
+        more["new_claim"] = 1.into();
+        assert!(verify_assertion(KEY, &sign(&more, KEY), now).is_ok());
+    }
+
+    #[test]
+    fn sign_in_mutations_and_sensitive_actions_need_the_policy_and_freshness() {
+        let now = 1_000_000;
+        let p = OperatorPolicy::for_tests(KEY, 2, false);
+        let a: Assurance = serde_json::from_value(claims(now)).unwrap();
+        let get = hyper::Method::GET;
+        let post = hyper::Method::POST;
+        assert!(p.admit(&a).is_ok());
+        assert!(p.allow(&a, &post, "/v1/routes", now).is_ok());
+        assert!(
+            p.allow(
+                &a,
+                &post,
+                "/v1/plugins/hopae/routes/authentication/profiles/publish",
+                now
+            )
+            .is_ok()
+        );
+        // A stale factor: reads and ordinary changes pass, sensitive ones step up.
+        let stale = now + 301;
+        assert!(p.allow(&a, &get, "/v1/routes", stale).is_ok());
+        assert!(p.allow(&a, &post, "/v1/routes", stale).is_ok());
+        let e = p
+            .allow(
+                &a,
+                &post,
+                "/v1/plugins/hopae/routes/users/factors/reset",
+                stale,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "operator_reauthentication_required");
+        assert_eq!(e.step_up_url, "/ui/step-up?return=%2Fui%2F");
+        // A TOTP session does not meet a webauthn policy.
+        let mut totp = a.clone();
+        totp.factor = Some("totp".into());
+        totp.satisfied = false;
+        assert_eq!(
+            p.admit(&totp).unwrap_err().code,
+            "operator_step_up_required"
+        );
+        // AAL 3 required.
+        let p3 = OperatorPolicy::for_tests(KEY, 3, false);
+        assert!(p3.admit(&a).is_err());
+        // The grace admits reads only when accepted, never mutations.
+        let mut grace = a.clone();
+        grace.satisfied = false;
+        grace.grace = true;
+        grace.factor = None;
+        grace.factor_at = None;
+        assert!(p.admit(&grace).is_err());
+        let pg = OperatorPolicy::for_tests(KEY, 2, true);
+        assert!(pg.admit(&grace).is_ok());
+        assert!(pg.allow(&grace, &get, "/v1/routes", now).is_ok());
+        assert!(pg.allow(&grace, &post, "/v1/routes", now).is_err());
+        // Logout is never blocked; step-up returns stay inside /ui/.
+        assert!(pg.allow(&grace, &post, "/v1/auth/logout", now).is_ok());
+        assert_eq!(
+            p.step_up_url("https://evil.example/"),
+            "/ui/step-up?return=%2Fui%2F"
+        );
+        assert_eq!(p.step_up_url("//evil"), "/ui/step-up?return=%2Fui%2F");
     }
 }
