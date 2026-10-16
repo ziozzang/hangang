@@ -63,7 +63,7 @@ const coverage = new Map([
   ['POST /v1/users', ['#create-user-form', 'app', "api('/v1/users', { method: 'POST'"]],
   ['PUT /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
   ['DELETE /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
-  ['GET /v1/audit/users', ['#view-audit', 'app', '/v1/audit/users?after=']],
+  ['GET /v1/audit/users', ['#view-account-audit', 'app', '/v1/audit/users?after=']],
   ['GET /v1/audit/policy', ['#audit-policy-panel', 'app', "api('/v1/audit/policy')"]],
   ['PUT /v1/audit/policy', ['#audit-policy-save', 'app', "api('/v1/audit/policy', { method: 'PUT'"]],
   ['GET /v1/config/operations', ['#view-config-operations', 'app', '/v1/config/operations?after=']],

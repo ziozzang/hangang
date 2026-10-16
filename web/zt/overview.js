@@ -128,7 +128,7 @@ export async function renderOverview(cx, root) {
     }
     const recent = ui.el('section', { class: 'panel zt-panel' }, ui.el('h2', { text: t('overview.changes') }));
     const records = audit.records.slice(0, 5);
-    if (records.length) recent.append(ui.el('ol', { class: 'zt-top' }, records.map(record => ui.el('li', {}, ui.el('a', { href: '#audit-trail' }, ui.el('span', { class: 'zt-top-label', text: `${t(`audit.source.${record.source}`)} · ${record.actor} · ${record.action}` }), ui.el('span', { class: 'kit-muted', text: new Intl.DateTimeFormat(document.documentElement.lang || undefined, { timeStyle: 'short', dateStyle: 'short' }).format(record.time) }))))));
+    if (records.length) recent.append(ui.el('ol', { class: 'zt-top' }, records.map(record => ui.el('li', {}, ui.el('a', { href: '#audit' }, ui.el('span', { class: 'zt-top-label', text: `${t(`audit.source.${record.source}`)} · ${record.actor} · ${record.action}` }), ui.el('span', { class: 'kit-muted', text: new Intl.DateTimeFormat(document.documentElement.lang || undefined, { timeStyle: 'short', dateStyle: 'short' }).format(record.time) }))))));
     else recent.append(ui.emptyState(t, { title: 'overview.changes.empty' }));
     if (audit.failures?.length) recent.append(ui.el('p', { class: 'zt-banner', text: t('audit.partial', { sources: audit.failures.map(source => t(`audit.source.${source}`)).join(', ') }) }));
     lists.append(recent);

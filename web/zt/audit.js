@@ -46,18 +46,18 @@ export async function loadAuditRecords(cx) {
 
 export async function renderAudit(cx, root, params) {
   const { t, ui } = cx;
-  const { content } = cx.page(root, { crumbs: [{ label: t('nav.audit') }], title: t('nav.audit'), owner: t('audit.owner') });
+  const { content } = cx.page(root, { crumbs: [{ label: t('nav.audit') }], title: t('nav.audit'), owner: t('audit.owner'), actions: [ui.el('a', { class: 'button button-quiet', href: '#account-audit', text: t('audit.manage_accounts') })] });
   const form = ui.el('form', { class: 'zt-filters', attrs: { role: 'search', 'aria-label': t('audit.filters') } },
     ui.field(t, { label: 'audit.filter.source', name: 'source', value: params.get('source') || '', options: [{ value: '', label: 'access.any' }, ...SOURCES.map(value => ({ value, label: `audit.source.${value}` }))] }),
     ui.field(t, { label: 'audit.filter.outcome', name: 'outcome', value: params.get('outcome') || '', options: [{ value: '', label: 'access.any' }, ...OUTCOMES.map(value => ({ value, label: `ui.status.${value}` }))] }),
     ui.field(t, { label: 'audit.filter.actor', name: 'actor', value: params.get('actor') || '', maxLength: 128 }),
     ui.field(t, { label: 'audit.filter.action', name: 'action', value: params.get('action') || '', maxLength: 128 }),
-    ui.el('div', { class: 'button-row zt-filter-actions' }, ui.el('button', { type: 'submit', class: 'button button-primary', text: t('access.apply') }), ui.el('button', { type: 'button', class: 'button button-quiet', text: t('access.reset'), on: { click: () => cx.navigate('#audit-trail') } })));
+    ui.el('div', { class: 'button-row zt-filter-actions' }, ui.el('button', { type: 'submit', class: 'button button-primary', text: t('access.apply') }), ui.el('button', { type: 'button', class: 'button button-quiet', text: t('access.reset'), on: { click: () => cx.navigate('#audit') } })));
   form.addEventListener('submit', event => {
     event.preventDefault();
     const next = new URLSearchParams();
     for (const name of ['source', 'outcome', 'actor', 'action']) { const value = form.elements[name].value.trim(); if (value) next.set(name, value); }
-    cx.navigate(cx.hashFor('audit-trail', [], next));
+    cx.navigate(cx.hashFor('audit', [], next));
   });
   const sources = ui.el('ul', { class: 'zt-sources', attrs: { 'aria-label': t('audit.sources') } });
   const partial = ui.el('div', { class: 'zt-banner', hidden: true, attrs: { role: 'alert' } });

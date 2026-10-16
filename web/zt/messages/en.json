@@ -65,6 +65,7 @@
  "audit.filter.outcome": "Outcome",
  "audit.filter.source": "Source",
  "audit.filters": "Audit filters",
+ "audit.manage_accounts": "Account audit retention and policy",
  "audit.owner": "Administrative changes federated from each authority's own journal",
  "audit.partial": "Some sources could not be read: {sources}. Their activity is not shown, which does not mean there was none.",
  "audit.source.accounts": "Console accounts",

@@ -18,7 +18,7 @@ administrator-only and read data through the existing management API.
 | Identities | `#identities/users/{id}` | Subject resolved through Hopae `subjects/resolve` when available, otherwise the opaque ID; recent decisions by forward lookup |
 | Network | `#network/ip/{ip}` | GeoIP country and recent decisions for the address |
 | Policies | `#policies/services/{id}` | Recent decisions for the Pumgye service |
-| Audit | `#audit-trail` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff |
+| Audit | `#audit` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff. Console-account audit retention, policy and export moved to `#account-audit`; earlier `#audit-trail` links redirect |
 | System | `#system` | Components, packages, decision events, exporter and privacy profile; raw JSON only behind *View raw diagnostics* |
 
 Identities, Policies, Network and Devices & Workloads otherwise show an entity

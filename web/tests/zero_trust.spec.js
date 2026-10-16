@@ -168,8 +168,8 @@ test('overview tiles link to the filtered log and failed sources are unavailable
 
 test('unified audit federates sources, marks uncertain outcomes and labels partial failures', async ({ page }) => {
   await setup(page, { auditFailure: true });
-  await page.locator('[data-view="audit-trail"]').click();
-  const view = page.locator('#view-audit-trail');
+  await page.locator('[data-view="audit"]').click();
+  const view = page.locator('#view-audit');
   await expect(view.locator('tbody tr')).toHaveCount(2);
   await expect(view.getByRole('alert')).toContainText('Console accounts');
   await expect(view.locator('tbody tr').first().locator('[data-status="uncertain"]')).toBeVisible();
@@ -182,8 +182,8 @@ test('unified audit federates sources, marks uncertain outcomes and labels parti
 
 test('account audit shows a structured before/after diff', async ({ page }) => {
   await setup(page);
-  await page.goto('/ui/#audit-trail?source=accounts');
-  const view = page.locator('#view-audit-trail');
+  await page.goto('/ui/#audit?source=accounts');
+  const view = page.locator('#view-audit');
   await expect(view.locator('tbody tr')).toHaveCount(1);
   await view.locator('summary', { hasText: 'Before / after' }).click();
   await expect(view.locator('.kit-diff-change')).toContainText('role');
@@ -208,7 +208,7 @@ test('unavailable subject resolution keeps the opaque ID', async ({ page }) => {
 
 test('raw JSON appears only in System behind a disclosure', async ({ page }) => {
   await setup(page);
-  for (const view of ['overview', 'access', 'audit-trail']) {
+  for (const view of ['overview', 'access', 'audit']) {
     await page.locator(`[data-view="${view}"]`).click();
     await expect(page.locator(`#view-${view} .zt-title`)).toBeVisible();
     await expect(page.locator(`#view-${view} pre`)).toHaveCount(0);
@@ -287,4 +287,14 @@ test('network and service entity routes show recent decisions', async ({ page })
   expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('service=reports');
   await page.goto('/ui/#workloads');
   await expect(page.locator('#view-workloads')).toContainText('not configured yet');
+});
+
+test('#audit is the unified audit; old #audit-trail links redirect and account audit stays reachable', async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => { location.hash = '#audit-trail?source=pumgye'; });
+  await expect(page).toHaveURL(/#audit\?source=pumgye$/);
+  await expect(page.locator('#view-audit tbody tr')).toHaveCount(1);
+  await page.locator('#view-audit').getByRole('link', { name: 'Account audit retention and policy' }).click();
+  await expect(page).toHaveURL(/#account-audit$/);
+  await expect(page.locator('#view-account-audit')).toBeVisible();
 });

@@ -64,6 +64,7 @@
  "audit.filter.outcome": "결과",
  "audit.filter.source": "출처",
  "audit.filters": "감사 필터",
+ "audit.manage_accounts": "계정 감사 보존과 정책",
  "audit.owner": "각 권한 기관 자체 기록에서 모은 관리 변경",
  "audit.partial": "일부 출처를 읽지 못했습니다: {sources}. 해당 활동이 표시되지 않을 뿐 없었다는 뜻은 아닙니다.",
  "audit.source.accounts": "콘솔 계정",

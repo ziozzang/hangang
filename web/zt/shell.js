@@ -9,8 +9,8 @@ import { renderAudit } from './audit.js';
 import { renderUser, renderIp, renderService, renderSection, renderSystem } from './entities.js';
 
 export const t = createTranslator(getLocale);
-export const SECTIONS = Object.freeze(['overview', 'access', 'identities', 'policies', 'network', 'workloads', 'audit-trail', 'system']);
-const SECTION_KEYS = Object.freeze({ overview: 'nav.overview', access: 'nav.access', identities: 'nav.identities', policies: 'nav.policies', network: 'nav.network', workloads: 'nav.workloads', 'audit-trail': 'nav.audit', system: 'nav.system' });
+export const SECTIONS = Object.freeze(['overview', 'access', 'identities', 'policies', 'network', 'workloads', 'audit', 'system']);
+const SECTION_KEYS = Object.freeze({ overview: 'nav.overview', access: 'nav.access', identities: 'nav.identities', policies: 'nav.policies', network: 'nav.network', workloads: 'nav.workloads', audit: 'nav.audit', system: 'nav.system' });
 
 let catalogs = null, generation = 0, active = null, host = null, resolver = null;
 
@@ -93,7 +93,7 @@ export async function loadZeroTrust(name, hostContext) {
     else if (name === 'identities' && route.parts[0] === 'users' && route.parts[1]) await renderUser(cx, root, route.parts[1]);
     else if (name === 'network' && route.parts[0] === 'ip' && route.parts[1]) await renderIp(cx, root, route.parts[1]);
     else if (name === 'policies' && route.parts[0] === 'services' && route.parts[1]) await renderService(cx, root, route.parts[1]);
-    else if (name === 'audit-trail') await renderAudit(cx, root, route.params);
+    else if (name === 'audit') await renderAudit(cx, root, route.params);
     else if (name === 'system') await renderSystem(cx, root);
     else await renderSection(cx, root, name);
   } catch (error) {
