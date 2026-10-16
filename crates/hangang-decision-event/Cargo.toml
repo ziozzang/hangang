@@ -1,0 +1,13 @@
+[package]
+name = "hangang-decision-event"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded hangang.decision.v1 access-decision event schema, validation and console projection"
+
+[dependencies]
+prost = "0.14"
+serde_json = "1"
+
+[build-dependencies]
+prost-build = "0.14"

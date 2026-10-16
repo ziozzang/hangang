@@ -851,6 +851,8 @@ struct ViewerResponse;
 #[derive(Clone)]
 pub struct Admin {
     pub plugins: Option<Arc<crate::admin_plugins::Registry>>,
+    /// ADR 0019 decision events; `None` serves the decision log as disabled.
+    pub decisions: Option<Arc<crate::decision::Emitter>>,
     pub fleet_observer: Option<Arc<crate::fleet_observer::Runtime>>,
     pub fleet_collector: Option<Arc<crate::fleet_collector::Runtime>>,
     pub acme_status: Option<Arc<std::sync::RwLock<crate::acme_runtime::Status>>>,
@@ -1438,6 +1440,19 @@ impl Admin {
         }
         if path.starts_with("/v1/pumgye/") {
             return Ok(self.handle_pumgye(req, actor).await);
+        }
+        if path.starts_with("/v1/observability/") {
+            // Decision records are privileged even though pseudonymous.
+            if actor.role() != crate::admin_users::Role::Admin {
+                return Ok(problem(403, "Forbidden", "administrator role required"));
+            }
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            let reply =
+                crate::decision::broker::handle(self.decisions.as_ref(), &path, req.uri().query())
+                    .await;
+            return Ok(json_value(reply.status, &reply.body, None));
         }
         if path == "/v1/security/bans" {
             if req.method() != hyper::Method::GET {
@@ -2801,6 +2816,9 @@ impl Admin {
         }
         if path == "/metrics" && req.method() == hyper::Method::GET {
             let mut output = self.manager.metrics.render();
+            if let Some(decisions) = &self.decisions {
+                decisions.render_metrics(&mut output);
+            }
             for (metric, kind) in [
                 ("sessions", "gauge"),
                 ("datagrams_received_total", "counter"),

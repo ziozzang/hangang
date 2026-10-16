@@ -680,6 +680,13 @@ impl AuthorityRuntime {
     pub fn revision(&self) -> u64 {
         self.native.revision()
     }
+    /// Decision-event transport label of point decisions.
+    pub(crate) fn decision_transport(&self) -> crate::decision::Transport {
+        match &self.native {
+            DecisionClient::Grpc(_) => crate::decision::Transport::Grpc,
+            DecisionClient::Native(_) => crate::decision::Transport::Ppg1,
+        }
+    }
     pub fn require_revision(&self, revision: u64) {
         self.native.require_revision(revision);
     }
@@ -692,8 +699,28 @@ impl AuthorityRuntime {
         aal: u8,
         guard: pumgye_core::GuardEvidence,
     ) -> Result<Option<u64>> {
+        self.authorize_traced(gate, method, subject, ip, aal, guard)
+            .await
+            .map(crate::decision::Decided::allowed_revision)
+    }
+
+    /// Like [`Self::authorize`] with the exact Pumgye decision variant and
+    /// revision for decision events.
+    pub async fn authorize_traced(
+        self: &std::sync::Arc<Self>,
+        gate: &Gate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+    ) -> Result<crate::decision::Decided> {
+        use crate::decision::{Authorization, Decided};
         let Some(permissions) = gate.permissions.get(method) else {
-            return Ok(None);
+            return Ok(Decided {
+                decision: Authorization::NotMapped,
+                revision: None,
+            });
         };
         self.start_watch();
         if let [permission] = permissions.as_slice() {
@@ -710,9 +737,12 @@ impl AuthorityRuntime {
             };
             let reply = self.native.decide(&query).await?;
             self.success();
-            return Ok(
-                (reply.decision == Some(pumgye_core::Decision::Allow)).then_some(reply.revision)
-            );
+            return Ok(Decided {
+                decision: reply
+                    .decision
+                    .map_or(Authorization::Unavailable, Authorization::from_decision),
+                revision: Some(reply.revision),
+            });
         }
         let queries = permissions
             .iter()
@@ -730,10 +760,22 @@ impl AuthorityRuntime {
             .collect::<Vec<_>>();
         let replies = self.native.decide_batch(&queries).await?;
         self.success();
-        Ok(replies
+        let decision = replies
             .iter()
-            .all(|r| r.decision == Some(pumgye_core::Decision::Allow))
-            .then(|| replies[0].revision))
+            .map(|r| {
+                r.decision
+                    .map_or(Authorization::Unavailable, Authorization::from_decision)
+            })
+            .find(|d| *d != Authorization::Allow)
+            .unwrap_or(if replies.is_empty() {
+                Authorization::Unavailable
+            } else {
+                Authorization::Allow
+            });
+        Ok(Decided {
+            decision,
+            revision: replies.first().map(|r| r.revision),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -756,9 +798,10 @@ impl AuthorityRuntime {
             crate::pumgye_grpc_client::ResourceClass::Legacy,
         )
         .await
+        .map(crate::decision::Decided::allowed_revision)
     }
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn authorize_workload_resource(
+    pub(crate) async fn authorize_resource_traced(
         self: &std::sync::Arc<Self>,
         gate: &ResourceGate,
         method: &str,
@@ -766,7 +809,28 @@ impl AuthorityRuntime {
         ip: std::net::IpAddr,
         aal: u8,
         guard: pumgye_core::GuardEvidence,
-    ) -> Result<Option<u64>> {
+    ) -> Result<crate::decision::Decided> {
+        self.authorize_resource_typed(
+            gate,
+            method,
+            subject,
+            ip,
+            aal,
+            guard,
+            crate::pumgye_grpc_client::ResourceClass::Legacy,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn authorize_workload_resource_traced(
+        self: &std::sync::Arc<Self>,
+        gate: &ResourceGate,
+        method: &str,
+        subject: &str,
+        ip: std::net::IpAddr,
+        aal: u8,
+        guard: pumgye_core::GuardEvidence,
+    ) -> Result<crate::decision::Decided> {
         anyhow::ensure!(aal == 0, "Workload point decision requires AAL0");
         self.authorize_resource_typed(
             gate,
@@ -780,7 +844,7 @@ impl AuthorityRuntime {
         .await
     }
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn authorize_human_resource(
+    pub(crate) async fn authorize_human_resource_traced(
         self: &std::sync::Arc<Self>,
         gate: &ResourceGate,
         method: &str,
@@ -788,7 +852,7 @@ impl AuthorityRuntime {
         ip: std::net::IpAddr,
         aal: u8,
         guard: pumgye_core::GuardEvidence,
-    ) -> Result<Option<u64>> {
+    ) -> Result<crate::decision::Decided> {
         anyhow::ensure!(
             matches!(aal, 1 | 2) && pumgye_core::HumanSubject::parse(subject).is_ok(),
             "Human point decision requires canonical subject/AAL1-or2"
@@ -814,9 +878,12 @@ impl AuthorityRuntime {
         aal: u8,
         guard: pumgye_core::GuardEvidence,
         class: crate::pumgye_grpc_client::ResourceClass,
-    ) -> Result<Option<u64>> {
+    ) -> Result<crate::decision::Decided> {
         let Some(action) = gate.actions.get(method) else {
-            return Ok(None);
+            return Ok(crate::decision::Decided {
+                decision: crate::decision::Authorization::NotMapped,
+                revision: None,
+            });
         };
         let DecisionClient::Grpc(client) = &self.native else {
             anyhow::bail!("resource authority requires gRPC");
@@ -844,11 +911,10 @@ impl AuthorityRuntime {
             }
         };
         self.success();
-        Ok(
-            (reply.decision
-                == pumgye_core::ResourceDecision::Decided(pumgye_core::Decision::Allow))
-            .then_some(reply.revision),
-        )
+        Ok(crate::decision::Decided {
+            decision: crate::decision::Authorization::from_resource(reply.decision),
+            revision: Some(reply.revision),
+        })
     }
 
     /// Compare local observed policy/network floors without refreshing lease health.
