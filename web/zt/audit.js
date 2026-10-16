@@ -38,7 +38,7 @@ export async function loadAuditRecords(cx) {
   const [accounts, users, plugins, pumgye, hopae, sumunjang] = await Promise.all([
     settle(cx, '/v1/audit/users?limit=100'), settle(cx, '/v1/users'), settle(cx, '/v1/plugins/audit'), settle(cx, '/v1/pumgye/audit'),
     settle(cx, '/v1/plugins/hopae/events/query', { method: 'POST', json: { limit: 200 } }),
-    settle(cx, '/v1/plugins/guard/audit'),
+    settle(cx, '/v1/plugins/guard/audit/query', { method: 'POST', json: { limit: 200 } }),
   ]);
   const names = new Map();
   if (users.ok) for (const user of users.data?.users || []) if (user && Number.isFinite(user.id)) names.set(user.id, user.username);
@@ -77,14 +77,23 @@ export async function loadAuditRecords(cx) {
     }
   } else if (hopae.ok || hopae.missing) disconnected.push('hopae');
   else failures.push('hopae');
-  // Sumunjang policy audit: wired to the guard package's `audit` read; until
-  // that operation ships it reports not connected.
-  if (sumunjang.ok && Array.isArray(sumunjang.data?.items ?? sumunjang.data?.records)) {
-    for (const entry of sumunjang.data.items ?? sumunjang.data.records) {
-      if (!entry || !Number.isFinite(entry.revision)) continue;
-      records.push({ id: `sumunjang:${entry.revision}`, source: 'sumunjang', time: new Date(Number(entry.at ?? entry.at_unix ?? 0) * 1000), actor: typeof entry.actor === 'string' ? entry.actor : t('audit.actor.unknown'), action: typeof entry.action === 'string' ? entry.action : 'publish', target: { type: 'revision', id: String(entry.revision) }, outcome: 'committed', summary: t('audit.summary.sumunjang', { revision: entry.revision }), digest: typeof entry.sha256 === 'string' ? entry.sha256 : null, operation: String(entry.revision) });
+  // Sumunjang policy-change audit (sumunjang.audit.v1, docs/AUDIT_EXPLAIN.md)
+  // through the guard package's POST audit/query read.
+  if (sumunjang.ok && sumunjang.data?.schema === 'sumunjang.audit.v1' && Array.isArray(sumunjang.data.entries)) {
+    for (const entry of sumunjang.data.entries) {
+      if (!entry || typeof entry.id !== 'string' || typeof entry.action !== 'string' || !OUTCOMES.includes(entry.result)) continue;
+      const actor = entry.actor && typeof entry.actor === 'object' ? (entry.actor.name || (entry.actor.id != null ? `#${entry.actor.id}` : null) || t(`audit.actor.${entry.actor.kind === 'credential' ? 'system' : 'unknown'}`)) : t('audit.actor.unknown');
+      const digest = value => (typeof value === 'string' && value ? value.replace(/^sha256:/, '') : null);
+      const revision = Number.isFinite(entry.policy_revision) ? entry.policy_revision : Number.isFinite(entry.revision_after) ? entry.revision_after : null;
+      records.push({ id: `sumunjang:${entry.id}`, source: 'sumunjang', time: new Date(Number.isFinite(entry.time_ms) ? entry.time_ms : Number(entry.time) * 1000), actor, action: entry.action,
+        target: typeof entry.target === 'string' && entry.target ? { type: 'guard', id: entry.target } : null, outcome: entry.result,
+        summary: typeof entry.summary === 'string' && entry.summary ? entry.summary : t('audit.summary.sumunjang', { revision: revision ?? '—' }),
+        digest: digest(entry.after_digest) || digest(entry.before_digest),
+        digests: [['audit.digest.before', digest(entry.before_digest)], ['audit.digest.after', digest(entry.after_digest)]].filter(([, value]) => value),
+        facts: [['audit.policy_revision', revision], ['audit.decision_revision', Number.isFinite(entry.revision_before) || Number.isFinite(entry.revision_after) ? `${entry.revision_before ?? '—'} → ${entry.revision_after ?? '—'}` : null], ['audit.reason', entry.reason], ['audit.error', entry.error]].filter(([, value]) => value !== null && value !== undefined && value !== ''),
+        operation: entry.id });
     }
-  } else if (sumunjang.ok || sumunjang.missing) disconnected.push('sumunjang');
+  } else if (sumunjang.missing) disconnected.push('sumunjang');
   else failures.push('sumunjang');
   records.sort((a, b) => b.time - a.time);
   return { records, failures, disconnected };
@@ -96,7 +105,9 @@ function detail(cx, record) {
   if (record.before || record.after) box.append(ui.el('h3', { text: t('audit.diff') }), ui.structuredDiff(t, record.before, record.after));
   if (record.attrs && Object.keys(record.attrs).length) box.append(ui.el('h3', { text: t('audit.attributes') }), ui.structuredDiff(t, {}, record.attrs));
   const facts = [[t('audit.col.source'), t(`audit.source.${record.source}`)], [t(`audit.record_id.${record.source}`), ui.el('code', { class: 'kit-mono', text: record.operation })], [t('audit.col.time'), ui.formatFullTime(record.time)]];
-  if (record.digest) facts.push([t('audit.digest'), ui.hashChip(t, record.digest, { full: true })]);
+  for (const [key, value] of record.facts || []) facts.push([t(key), String(value)]);
+  if (record.digests?.length) for (const [key, value] of record.digests) facts.push([t(key), ui.hashChip(t, value, { full: true })]);
+  else if (record.digest) facts.push([t('audit.digest'), ui.hashChip(t, record.digest, { full: true })]);
   box.append(ui.el('dl', { class: 'zt-dl' }, facts.map(([key, value]) => [ui.el('dt', { text: key }), ui.el('dd', {}, value)])));
   return box;
 }
@@ -106,6 +117,7 @@ function target(cx, record) {
   if (!record.target) return '—';
   if (record.target.type === 'plugin') return ui.el('a', { href: `#plugin-${record.target.id}`, text: t(PLUGIN_LABELS[record.target.id] || 'ui.owner.host') });
   if (record.target.type === 'revision') return ui.el('a', { href: record.source === 'sumunjang' ? '#plugin-guard' : '#pumgye', text: t('ui.revision', { revision: record.target.id }) });
+  if (record.target.type === 'guard') return ui.el('a', { href: '#plugin-guard', class: 'kit-mono', text: record.target.id });
   if (record.target.type === 'user') return ui.el('a', { href: ui.entityHref('user', record.target.id), class: 'kit-mono', text: record.target.id });
   return ui.el('span', { text: record.target.id });
 }

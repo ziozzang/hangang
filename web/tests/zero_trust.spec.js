@@ -26,7 +26,7 @@ function event(index, overrides = {}) {
   };
 }
 
-async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false, hopaeEvents = false } = {}) {
+async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false, hopaeEvents = false, guardAudit = false } = {}) {
   const calls = [];
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
@@ -74,6 +74,10 @@ async function setup(page, { disabled = false, resolve = 'ok', auditFailure = fa
     if (p === '/v1/users') return route.fulfill({ json: { users: [{ id: 1, username: 'operator' }, { id: 2, username: 'kim' }] } });
     if (p === '/v1/plugins/audit') return route.fulfill({ json: { operations: [{ id: 9, started_at: Date.UTC(2026, 9, 16, 9) / 1000, completed_at: null, actor_name: 'operator', plugin: 'guard', path: 'policy', method: 'PUT', body_sha256: 'ab'.repeat(32), status: null }] } });
     if (p === '/v1/pumgye/audit') return route.fulfill({ json: [{ revision: 77, at_unix: Date.UTC(2026, 9, 16, 7) / 1000, actor: 'sha256:aa', sha256: 'cd'.repeat(32) }] });
+    if (p === '/v1/plugins/guard/audit/query') return guardAudit ? route.fulfill({ json: { schema: 'sumunjang.audit.v1', entries: [
+      { id: 'a118', time: 1760605000, time_ms: Date.UTC(2026, 9, 16, 9, 40), actor: { kind: 'delegated', id: 7, name: 'operator', issuer: 'hangang' }, action: 'policy.document.replace', target: 'policy', result: 'committed', revision_before: 41, revision_after: 42, policy_revision: 12, before_digest: 'sha256:' + 'aa'.repeat(32), after_digest: 'sha256:' + 'bb'.repeat(32), summary: 'mode observe -> enforce; allow +1: 192.0.2.0/24', reason: 'enable enforcement', message_key: 'sumunjang.audit.result.committed' },
+      { id: 'a117', time: 1760604000, actor: { kind: 'credential' }, action: 'rules.lua.replace', target: 'rules', result: 'refused', revision_before: 41, revision_after: 41, before_digest: 'sha256:' + 'cc'.repeat(32), after_digest: null, summary: 'Lua compile error', error: 'syntax error near end' }],
+      next_cursor: null, retention: { max_rows: 100000, max_days: 365, retained_rows: 2 } } }) : route.fulfill({ status: 404, json: { detail: 'unknown plugin route' } });
     if (p === '/v1/plugins/hopae/events/query') return hopaeEvents ? route.fulfill({ json: { items: [
       { event_id: 'e_1', at: Date.UTC(2026, 9, 16, 9, 30) / 1000, kind: 'admin.user_disable', outcome: 'success', reason: null, user_id: 'u_kim', session_id: null, attrs: { actor: 'u_admin', actor_session: 's_x', count: 3 } },
       { event_id: 'e_2', at: Date.UTC(2026, 9, 16, 9, 31) / 1000, kind: 'login.succeeded', outcome: 'success', reason: null, user_id: 'u_kim', attrs: {} },
@@ -398,4 +402,29 @@ test('request detail actions are real disabled buttons with an explanation', asy
   await action.focus();
   await expect(action.locator('.kit-tip')).toBeVisible();
   await expect(action.locator('.kit-tip')).toContainText('explain APIs');
+});
+
+test('Sumunjang policy audit joins the unified audit through audit/query', async ({ page }) => {
+  const calls = await setup(page, { guardAudit: true });
+  await page.goto('/ui/#audit?source=sumunjang');
+  const view = page.locator('#view-audit');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  expect(JSON.parse(calls.find(c => c.path === '/v1/plugins/guard/audit/query').body)).toEqual({ limit: 200 });
+  const first = view.locator('tbody tr').first();
+  await expect(first).toContainText('mode observe -> enforce; allow +1: 192.0.2.0/24');
+  await expect(first).toContainText('policy.document.replace');
+  await expect(first.locator('[data-status="committed"]')).toBeVisible();
+  await expect(view.locator('tbody tr').nth(1).locator('[data-status="refused"]')).toBeVisible();
+  await expect(view.locator('.zt-sources li', { hasText: 'Sumunjang policy' }).locator('[data-status="healthy"]')).toBeVisible();
+  await first.locator('td.kit-col-source').click();
+  const detail = view.locator('.kit-expansion');
+  await expect(detail).toContainText('Policy revision');
+  await expect(detail).toContainText('41 → 42');
+  await expect(detail).toContainText('enable enforcement');
+  await expect(detail.locator('.kit-chip-full')).toHaveCount(2);
+  await expect(detail.locator('.kit-chip-full').first()).toContainText('aa'.repeat(32));
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(view.locator('.kit-expansion')).toHaveCount(0);
+  await view.locator('tbody tr').first().locator('td.kit-col-source').click();
+  await expect(view.locator('.kit-expansion')).toContainText('정책 리비전');
 });

@@ -72,7 +72,10 @@ then forwards them to `/v1/<path>` with the signed actor assertion over the
 exact body, does not record them as mutations, and Hopae's delegation verifier
 applies its JSON API rule. Without those routes, or when Hopae is rate limited,
 user pages show the opaque ID. Hopae
-administration events and Sumunjang policy changes are listed as audit sources
-that are not yet connected. The simulator, impact analysis, reveal, saved views
+`admin.*` events (`events/query`) and Sumunjang policy-change audit
+(`audit/query`, `sumunjang.audit.v1`) join the unified audit through their
+console packages; a source whose package does not declare the operation is
+shown as not connected, and a failing source is labelled, never shown as no
+activity. The simulator, impact analysis, reveal, saved views
 and CSV export arrive with ADR 0020 P1 and P2. Legacy pages keep their
 English-sentence dictionaries until they are migrated.
