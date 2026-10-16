@@ -1438,6 +1438,9 @@ impl Admin {
         {
             return Ok(problem(403, "Forbidden", "administrator role required"));
         }
+        if path.starts_with("/v1/pumgye/explain") || path == "/v1/pumgye/audit/simulations" {
+            return Ok(self.handle_pumgye_simulation(req, actor).await);
+        }
         if path.starts_with("/v1/pumgye/") {
             return Ok(self.handle_pumgye(req, actor).await);
         }
@@ -3031,6 +3034,56 @@ fn observer_unauthorized() -> Response<Body> {
     response
 }
 
+/// `on_behalf_of` for Pumgye simulation audit: `console:<account>` restricted
+/// to Pumgye's identifier alphabet and length (docs/EXPLAIN.md).
+fn pumgye_on_behalf_of(username: &str) -> String {
+    let mut value = String::from("console:");
+    for ch in username.chars() {
+        if value.len() >= 128 {
+            break;
+        }
+        value.push(if ch.is_ascii_alphanumeric() || "_.:@-".contains(ch) {
+            ch
+        } else {
+            '_'
+        });
+    }
+    value
+}
+
+/// Per-console-account simulation token bucket (burst 20, 2 per second),
+/// applied before Pumgye's process-wide bucket. Bounded to 1,024 accounts.
+fn pumgye_simulation_admit(account: &str) -> bool {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    const BURST: f64 = 20.0;
+    const REFILL_PER_SECOND: f64 = 2.0;
+    static BUCKETS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (f64, Instant)>>> =
+        std::sync::OnceLock::new();
+    let mut buckets = BUCKETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    if !buckets.contains_key(account) && buckets.len() >= 1024 {
+        buckets.retain(|_, (tokens, at)| {
+            *tokens + at.elapsed().as_secs_f64() * REFILL_PER_SECOND < BURST
+        });
+        if buckets.len() >= 1024 {
+            return false;
+        }
+    }
+    let (tokens, at) = buckets.entry(account.to_owned()).or_insert((BURST, now));
+    *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * REFILL_PER_SECOND).min(BURST);
+    *at = now;
+    if *tokens >= 1.0 {
+        *tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
 fn viewer_allowed(path: &str, method: &hyper::Method) -> bool {
     *method == hyper::Method::GET
         && matches!(
@@ -3496,6 +3549,134 @@ impl Admin {
         }
     }
 
+    /// Console broker for Pumgye explain/what-if (Pumgye docs/EXPLAIN.md,
+    /// "Hangang console broker contract"): administrator only, per-actor rate
+    /// limited before Pumgye's own bucket, `on_behalf_of` set from the
+    /// authenticated session (never the browser), structured Pumgye errors
+    /// relayed so the console can locate invalid fields.
+    async fn handle_pumgye_simulation(
+        &self,
+        req: Request<Incoming>,
+        actor: AdminActor,
+    ) -> Response<Body> {
+        if actor.role() != crate::admin_users::Role::Admin {
+            return problem(403, "Forbidden", "administrator role required");
+        }
+        let (target, method) = match req.uri().path() {
+            "/v1/pumgye/explain" => ("v1/explain", hyper::Method::POST),
+            "/v1/pumgye/explain/batch" => ("v1/explain/batch", hyper::Method::POST),
+            "/v1/pumgye/explain/diff" => ("v1/explain/diff", hyper::Method::POST),
+            "/v1/pumgye/audit/simulations" => ("v1/audit/simulations", hyper::Method::GET),
+            _ => return problem(404, "Not Found", "unknown Pumgye simulation operation"),
+        };
+        if req.method() != method {
+            return problem(
+                405,
+                "Method Not Allowed",
+                "unsupported method for this operation",
+            );
+        }
+        let after_id = match req.uri().query() {
+            None => None,
+            Some(query) if target == "v1/audit/simulations" => {
+                match query
+                    .strip_prefix("after_id=")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|v| *v <= i64::MAX as u64)
+                {
+                    Some(value) => Some(value),
+                    None => return problem(400, "Bad Request", "invalid simulation audit cursor"),
+                }
+            }
+            Some(_) => return problem(400, "Bad Request", "query parameters unsupported"),
+        };
+        let user = actor.user();
+        if !pumgye_simulation_admit(&user.username) {
+            let mut limited = problem(
+                429,
+                "Too Many Requests",
+                "simulation rate limit for this console account",
+            );
+            limited
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+            return limited;
+        }
+        let body = if method == hyper::Method::POST {
+            let mut payload: serde_json::Value =
+                match read_json(req, crate::pumgye::SIMULATION_REQUEST_LIMIT as u64).await {
+                    Ok(payload) => payload,
+                    Err(response) => return response,
+                };
+            let Some(object) = payload.as_object_mut() else {
+                return problem(
+                    400,
+                    "Bad Request",
+                    "simulation request must be a JSON object",
+                );
+            };
+            object.insert(
+                "on_behalf_of".into(),
+                serde_json::Value::String(pumgye_on_behalf_of(&user.username)),
+            );
+            match serde_json::to_vec(&payload) {
+                Ok(bytes) if bytes.len() <= crate::pumgye::SIMULATION_REQUEST_LIMIT => Some(bytes),
+                _ => return problem(413, "Payload Too Large", "simulation request exceeds bound"),
+            }
+        } else {
+            None
+        };
+        let authority = actor.mutation_authority();
+        if let Err(error) = self.users.authorize_admin(authority.clone()).await {
+            return account_problem(error);
+        }
+        let Some(remote) = self.manager.active.load().pumgye_remote.clone() else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "independent Pumgye authority is not available",
+            );
+        };
+        let method = if method == hyper::Method::POST {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        let outcome = remote.simulation(method, target, body, after_id).await;
+        // A revoked account may not observe the result.
+        if let Err(error) = self.users.authorize_admin(authority).await {
+            return account_problem(error);
+        }
+        let Ok((status, bytes)) = outcome else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "Pumgye simulation unavailable",
+            );
+        };
+        if !matches!(status, 200 | 400 | 409 | 413 | 422 | 429) {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "Pumgye simulation unavailable",
+            );
+        }
+        let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "invalid Pumgye simulation response",
+            );
+        };
+        let mut response = json_value(status, &document, None);
+        if status == 429 {
+            response
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+        }
+        response
+    }
+
     async fn handle_pumgye(&self, req: Request<Incoming>, actor: AdminActor) -> Response<Body> {
         if actor.role() != crate::admin_users::Role::Admin {
             return problem(403, "Forbidden", "administrator role required");
@@ -3508,6 +3689,14 @@ impl Admin {
         };
         let method = req.method().clone();
         let write = method == hyper::Method::PUT && path == "v1/policy";
+        // Operator reason for a publication (console sends it percent-encoded);
+        // recorded in the Hangang audit log with the actor and resulting revision.
+        let change_reason = req
+            .headers()
+            .get("x-hangang-change-reason")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 2048)
+            .map(str::to_owned);
         if !write && method != hyper::Method::GET {
             return problem(405, "Method Not Allowed", "GET or policy PUT required");
         }
@@ -3705,6 +3894,16 @@ impl Admin {
         } else {
             None
         };
+        if write {
+            tracing::info!(
+                target: "hangang::audit",
+                actor = %actor.user().username,
+                base_revision = ?expected,
+                revision = ?revision,
+                reason = %change_reason.as_deref().unwrap_or(""),
+                "Pumgye policy published"
+            );
+        }
         let mut result = json_value(200, &document, revision);
         result.headers_mut().insert(
             "x-hangang-config-revision",
@@ -4846,6 +5045,19 @@ pub async fn watch_config(manager: Arc<Manager>, cancel: tokio_util::sync::Cance
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pumgye_simulation_actor_is_sanitized_and_rate_limited_per_account() {
+        assert_eq!(pumgye_on_behalf_of("alice"), "console:alice");
+        assert_eq!(pumgye_on_behalf_of("a b/c\u{e9}"), "console:a_b_c_");
+        assert_eq!(pumgye_on_behalf_of(&"x".repeat(400)).len(), 128);
+        let account = format!("rate-{}", std::process::id());
+        let admitted = (0..40)
+            .filter(|_| pumgye_simulation_admit(&account))
+            .count();
+        assert_eq!(admitted, 20);
+        assert!(pumgye_simulation_admit(&format!("{account}-other")));
+    }
 
     #[test]
     fn strict_revision() {

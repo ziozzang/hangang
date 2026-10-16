@@ -1,4 +1,3 @@
-import { loadPumgye, resetPumgye } from "./pumgye.js";
 import { discoverPlugins, pluginView, loadPlugin, pausePlugins, resetPlugins } from './plugins.js';
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
 import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
@@ -455,7 +454,6 @@ function scrubRenderedData() {
 
 function logout(reason = '') {
   resetPlugins();
-  resetPumgye();
   resetZeroTrust();
   stopBackendFreshness();
   stopCertificatePolling();
@@ -593,28 +591,27 @@ async function login(event) {
   }
 }
 
-const pumgyeDestinations = Object.freeze({ services: 'pumgye-service-form', resources: 'pumgye-resources-panel', policy: 'pumgye-policy-panel' });
 function normalizeView(hash) {
   const name = (hash || '').replace(/^#/, '').split(/[/?]/)[0];
   if (pluginView(name) || ztView(name)) return name;
-  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'account-audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
+  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'account-audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 let navigationGeneration = 0;
 
 async function switchView() {
   // The unified audit owns #audit (ADR 0020); keep earlier #audit-trail links working.
   if (/^#audit-trail(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#audit' + location.hash.slice('#audit-trail'.length));
+  // The embedded Pumgye page moved into the Policies section (ADR 0020).
+  if (/^#pumgye(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', location.hash.startsWith('#pumgye/policy') ? '#policies/advanced' : '#policies');
   const navigation = ++navigationGeneration;
   let name = normalizeView(location.hash);
   if (state.user && !isAdmin() && name !== 'status') {
     name = 'status';
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
-  const requested = location.hash.slice(1).split('/');
-  const section = name === 'pumgye' && requested.length === 2 && Object.hasOwn(pumgyeDestinations, requested[1]) ? requested[1] : '';
   // Preserve a signed-out deep link until installed capabilities are discovered.
   if (state.token) {
-    const canonical = ztView(name) ? (canonicalHash(location.hash) || '#' + name) : '#' + name + (section ? '/' + section : '');
+    const canonical = ztView(name) ? (canonicalHash(location.hash) || '#' + name) : '#' + name;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
   }
   pausePlugins();
@@ -635,15 +632,13 @@ async function switchView() {
     view.classList.toggle('is-active', active);
   });
   $$('.nav-link').forEach((link) => { const active = link.dataset.view === name; link.classList.toggle('is-active', active); if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current'); });
-  $$('#pumgye-section-nav a').forEach(link => { if(link.hash === location.hash)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current'); });
   if (name === 'status' && state.token) startStatusPolling(); else stopStatusPolling();
   if (name !== 'config' && name !== 'tcp') stopWorkloadMaterialPolling();
   if (name === 'certificates' && state.token && !document.hidden) startCertificatePolling(); else stopCertificatePolling();
   startBackendFreshness();
   if (state.token) await loadView(name);
   if (navigation !== navigationGeneration || !state.token) return;
-  const destination = section ? document.getElementById(pumgyeDestinations[section]) : $('#main');
-  if (section) { destination.tabIndex = -1; destination.scrollIntoView({block:'start'}); }
+  const destination = $('#main');
   destination.focus({ preventScroll: true });
 }
 
@@ -657,7 +652,6 @@ async function loadView(name, quiet = false) {
     if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
-    if (name === 'pumgye' && isAdmin()) await loadPumgye({ api }, { resume: true });
     if (name === 'config') await loadConfig(false);
     if (name === 'config' && isAdmin()) await loadGeoIpStatus();
     if (name === 'config' || name === 'tcp') {

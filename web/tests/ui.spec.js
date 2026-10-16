@@ -1844,7 +1844,7 @@ test('Hopae SSO callback activates the mapped Hangang account and removes callba
 });
 
 
-test('Pumgye matrix publishes user and IP assignments with CAS', async ({ page }) => {
+test('embedded Pumgye policy publishes user and IP assignments with CAS through the Policies section', async ({ page }) => {
   let active=structuredClone(config);
   const calls=await fixtures(page, {'/v1/config': async route => {
     if(route.request().method()==='PUT') {
@@ -1853,18 +1853,27 @@ test('Pumgye matrix publishes user and IP assignments with CAS', async ({ page }
     }
     await route.fulfill({json:active,headers:{etag:`"${active.revision}"`}});
   }});
-  await login(page);await page.locator('[data-view="pumgye"]').click();
-  await page.locator('#pumgye-new-service').fill('orders');
-  await page.locator('#pumgye-service-form button').click();
-  await page.locator('#pumgye-subject').fill('u_reader');
-  await page.locator('#pumgye-assignment-roles').fill('reader');
-  await page.locator('#pumgye-assignment-form button').click();
-  await page.locator('#pumgye-kind').selectOption('network');
-  await page.locator('#pumgye-subject').fill('192.0.2.0/24');
-  await page.locator('#pumgye-assignment-form button').click();
-  await expect(page.locator('#pumgye-matrix tr')).toHaveCount(2);
-  await page.locator('#pumgye-publish').click();
-  await expect(page.locator('#pumgye-message')).toHaveText('Authorization policy published.');
+  await login(page);await page.locator('[data-view="policies"]').click();
+  const view=page.locator('#view-policies');
+  await view.locator('summary',{hasText:'New service'}).click();
+  await view.getByLabel('Service ID').fill('orders');
+  await view.getByRole('button',{name:'Add service to draft'}).click();
+  await expect(page).toHaveURL(/#policies\/services\/orders$/);
+  await page.evaluate(()=>{location.hash='#policies/services/orders?tab=assignments';});
+  const form=view.locator('form.zt-assign');
+  await form.locator('input[name="subject"]').fill('u_reader');
+  await form.getByRole('checkbox',{name:'reader',exact:true}).check();
+  await form.getByRole('button',{name:'Add assignment to draft'}).click();
+  await expect(view.locator('tbody tr')).toHaveCount(1);
+  await view.getByLabel('Network (CIDR)').fill('192.0.2.0/24');
+  await view.locator('.zt-inline-form').filter({has:page.locator('input[name="cidr"]')}).getByRole('checkbox',{name:'reader',exact:true}).check();
+  await view.locator('.zt-inline-form').filter({has:page.locator('input[name="cidr"]')}).getByRole('button',{name:'Add'}).click();
+  await expect(view.locator('.zt-network-list')).toContainText('192.0.2.0/24');
+  await view.getByRole('link',{name:'Review & publish'}).click();
+  await expect(view.locator('.zt-impact')).toContainText('independent Pumgye');
+  await view.getByLabel('Reason (required)').fill('new orders service');
+  await view.getByRole('button',{name:'Publish revision 8'}).click();
+  await expect(page).toHaveURL(/#policies(\?refresh=1)?$/);
   expect(active.pumgye.services.orders.users.u_reader).toEqual(['reader']);
   expect(active.pumgye.services.orders.networks[0]).toEqual({cidr:'192.0.2.0/24',roles:['reader']});
   expect(active.http).toEqual(config.http);

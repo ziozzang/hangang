@@ -11,10 +11,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const repo = path.resolve(web, '..');
 const failures = [];
-const catalog = name => JSON.parse(readFileSync(path.join(web, 'zt/messages', `${name}.json`), 'utf8'));
-const en = catalog('en'), ko = catalog('ko');
+const repo = path.resolve(web, '..');
+// Host catalogs plus section catalogs (`<prefix>.<locale>.json`); the
+// pumgye.* catalog is seeded verbatim from Pumgye's own contract-tested set.
+const PREFIXES_FILES = ['', 'policies.', 'pumgye.'];
+const read = file => JSON.parse(readFileSync(path.join(web, 'zt/messages', file), 'utf8'));
+const en = {}, ko = {};
+for (const prefix of PREFIXES_FILES) {
+  const a = read(`${prefix}en.json`), b = read(`${prefix}ko.json`);
+  for (const key of Object.keys(a)) if (!Object.hasOwn(b, key)) failures.push(`${prefix}en has ${key}; ${prefix}ko does not`);
+  for (const key of Object.keys(b)) if (!Object.hasOwn(a, key)) failures.push(`${prefix}ko has ${key}; ${prefix}en does not`);
+  for (const key of Object.keys(a)) if (Object.hasOwn(en, key)) failures.push(`${key} is defined in more than one catalog`);
+  Object.assign(en, a); Object.assign(ko, b);
+}
 const flat = value => typeof value === 'object' ? Object.values(value) : [value];
 
 for (const [name, a, b] of [['en', en, ko], ['ko', ko, en]]) {
@@ -24,13 +34,14 @@ for (const [name, a, b] of [['en', en, ko], ['ko', ko, en]]) {
   }
 }
 for (const [key, value] of Object.entries(ko)) {
+  if (key.startsWith('pumgye.') || /Kubernetes|Human|AAL/.test(flat(value).join(''))) continue;
   if (flat(value).every(message => /^[\x20-\x7e]*$/.test(message)) && flat(en[key] ?? []).every(message => /[a-z]{4,}/i.test(message)) && !/\{|µs|AAL|ASN|HTTP|AS\{/.test(flat(value).join('')) && !['decision.authority.catalog'].includes(key)) {
     failures.push(`ko:${key} looks untranslated`);
   }
 }
 
-const sources = ['kit', 'zt'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
-const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system)\.[A-Za-z0-9_.-]+$/;
+const sources = ['kit', 'zt', 'zt/policies'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
+const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system|policies)\.[A-Za-z0-9_.-]+$/;
 const PREFIXES = new Set(['decision.stage', 'decision.principal', 'decision.result']);
 const literal = /(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
 const forbidden = [
@@ -80,6 +91,21 @@ const families = {
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],
 };
 for (const name of ['identities', 'policies', 'network', 'workloads']) families[`section.${name}`] = ['owner', 'planned', 'body'];
+Object.assign(families, {
+  'ui.trace': ['pass', 'deny', 'warn', 'not_evaluated', 'unknown'],
+  'policies.context': ['network_and_guard', 'kubernetes_api'],
+  'policies.kind': ['user', 'human', 'workload', 'kubernetes_api'],
+  'policies.tab': ['overview', 'resources', 'roles', 'assignments', 'simulate', 'history'],
+  'policies.aal.option': ['0', '1', '2', '3'],
+  'policies.sim.target': ['permission', 'resource'],
+  'policies.sim.guard': ['enforced_allow', 'observe', 'deny', 'unavailable'],
+  'policies.sim.source': ['published', 'candidate'],
+  'policies.impact.entity': ['information_classes', 'service', 'assignment', 'network', 'resource'],
+  'policies.impact.change': ['added', 'removed', 'modified'],
+  'policies.source': ['independent', 'embedded', 'kubernetes', 'unknown'],
+  'policies.subject.invalid': ['user', 'human', 'workload', 'kubernetes'],
+  'pumgye.reason': ['allow', 'unknown_service', 'guest', 'network_guest', 'permission_denied', 'class_denied', 'assurance_denied', 'guard_denied', 'guard_unavailable', 'unknown_resource', 'unknown_action', 'unavailable'],
+});
 for (const [prefix, suffixes] of Object.entries(families)) for (const suffix of suffixes) if (!Object.hasOwn(en, `${prefix}.${suffix}`)) failures.push(`missing family key ${prefix}.${suffix}`);
 
 const registry = readFileSync(path.join(repo, 'crates/hangang-decision-event/src/reasons.rs'), 'utf8');

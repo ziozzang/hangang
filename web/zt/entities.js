@@ -4,14 +4,12 @@ import { decisionColumns, decisionFetcher } from './access.js';
 
 const LINKS = Object.freeze({
   identities: [{ href: '#plugin-hopae', label: 'section.link.hopae', plugin: 'hopae' }, { href: '#users', label: 'section.link.console_accounts' }],
-  policies: [{ href: '#pumgye/services', label: 'section.link.pumgye_services' }, { href: '#pumgye/resources', label: 'section.link.pumgye_resources' }, { href: '#pumgye/policy', label: 'section.link.pumgye_policy' }],
   network: [{ href: '#plugin-guard', label: 'section.link.sumunjang', plugin: 'guard' }, { href: '#security', label: 'section.link.gateway_protections' }],
   workloads: [{ href: '#http', label: 'section.link.http_routes' }, { href: '#tcp', label: 'section.link.tcp_routes' }],
 });
 const OPENERS = Object.freeze({
   identities: { label: 'section.open.user', route: ['users'], pattern: '.{1,1024}' },
   network: { label: 'section.open.ip', route: ['ip'], pattern: '[0-9A-Fa-f:.]{2,45}' },
-  policies: { label: 'section.open.service', route: ['services'], pattern: '[A-Za-z0-9_.:-]{1,128}' },
 });
 
 function recentDecisions(cx, params, caption) {
@@ -81,13 +79,6 @@ export async function renderIp(cx, root, ip) {
   } else ui.clear(geo, ui.errorState(t, { owner: 'ui.owner.host', message: lookup.reason?.message }));
 }
 
-export async function renderService(cx, root, id) {
-  const { t, ui } = cx;
-  const { content } = cx.page(root, { crumbs: [{ label: t('nav.policies'), href: '#policies' }, { label: t('entity.service.crumb') }, { label: id }], title: id, owner: t('entity.service.owner') });
-  const { section, table } = recentDecisions(cx, new URLSearchParams({ service: id }), 'entity.decisions.caption');
-  content.append(ui.el('nav', { class: 'button-row', attrs: { 'aria-label': t('entity.service.related') } }, ui.el('a', { class: 'button button-quiet', href: '#pumgye/services', text: t('entity.service.pumgye') })), section);
-  await table.reload();
-}
 
 /** Sections whose dedicated pages are later phases: entity search and links. */
 export async function renderSection(cx, root, name) {
