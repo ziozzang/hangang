@@ -8,18 +8,20 @@ import { fileURLToPath } from 'node:url';
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shots = process.env.NETWORK_SCREENS || path.join(web, 'test-results', 'network-screens');
 const NOW = Math.floor(Date.now() / 1000);
-const ROUTES = ['kubernetes/authority:GET', 'kubernetes/status:GET', 'kubernetes/evaluate:POST', 'status:GET', 'policy/document:GET', 'policy/document:PUT', 'candidates:GET', 'candidates/approve:POST', 'blocks:GET', 'blocks:POST', 'blocks:DELETE', 'lookup:POST', 'networks/inspect:POST', 'rules:GET', 'rules:PUT', 'rules/lua:PUT', 'rules/validate:POST', 'geoip/reload:POST', 'update/status:GET', 'update/check:POST', 'audit:GET', 'audit/query:POST', 'explain:POST', 'explain/batch:POST', 'reasons:GET'];
+const LEGACY_ROUTES = ['kubernetes/authority:GET', 'kubernetes/status:GET', 'kubernetes/evaluate:POST', 'status:GET', 'policy/document:GET', 'policy/document:PUT', 'candidates:GET', 'candidates/approve:POST', 'blocks:GET', 'blocks:POST', 'blocks:DELETE', 'lookup:POST', 'networks/inspect:POST', 'rules:GET', 'rules:PUT', 'rules/lua:PUT', 'rules/validate:POST', 'geoip/reload:POST', 'update/status:GET', 'update/check:POST', 'audit:GET', 'audit/query:POST', 'explain:POST', 'explain/batch:POST', 'reasons:GET'];
+// Console package 0.1.6 (Sumunjang docs/CONSOLE_NETWORK_API.md).
+const ROUTES = [...LEGACY_ROUTES, 'rules/document:GET', 'history/query:POST', 'asn/catalog/query:POST', 'allowlist:GET', 'allowlist:POST', 'allowlist:DELETE'];
 
 const CANDIDATES = [
-  { ip: '203.0.113.7', score: 64, suspicion: 'high', eligible: true, events: 9, first_seen: NOW - 3000, last_seen: NOW - 40, asn: 64511 },
-  { ip: '198.51.100.23', score: 24, suspicion: 'suspicious', eligible: true, events: 5, first_seen: NOW - 2000, last_seen: NOW - 300, asn: 64511 },
-  { ip: '192.0.2.44', score: 6, suspicion: 'watch', eligible: false, events: 3, first_seen: NOW - 900, last_seen: NOW - 600, asn: 64500 },
-  { ip: '2001:db8::9', score: 2, suspicion: 'watch', eligible: false, events: 1, first_seen: NOW - 500, last_seen: NOW - 500, asn: null },
+  { ip: '203.0.113.7', score: 64, suspicion: 'high', eligible: true, events: 9, first_seen: NOW - 3000, last_seen: NOW - 40, asn: 64511, country: 'NL', signals: { honeypot: 3, scanner: 4, auth_failure: 2, invalid_request: 0 } },
+  { ip: '198.51.100.23', score: 24, suspicion: 'suspicious', eligible: true, events: 5, first_seen: NOW - 2000, last_seen: NOW - 300, asn: 64511, country: 'NL', signals: { honeypot: 0, scanner: 4, auth_failure: 1, invalid_request: 0 } },
+  { ip: '192.0.2.44', score: 6, suspicion: 'watch', eligible: false, events: 3, first_seen: NOW - 900, last_seen: NOW - 600, asn: 64500, country: 'US', signals: { honeypot: 0, scanner: 0, auth_failure: 2, invalid_request: 1 } },
+  { ip: '2001:db8::9', score: 2, suspicion: 'watch', eligible: false, events: 1, first_seen: NOW - 500, last_seen: NOW - 500, asn: null, country: null, signals: { honeypot: 0, scanner: 0, auth_failure: 0, invalid_request: 1 } },
 ];
 const BLOCKS = [
-  { network: '203.0.113.7/32', expires_at: NOW + 3 * 60, reason: 'manual candidate approval' },
-  { network: '198.18.0.0/15', expires_at: NOW + 86400 * 6, reason: 'benchmark range abuse — 벤치마크 대역 악용' },
-  { network: '192.0.2.99/32', expires_at: NOW + 700, reason: 'automatic threshold' },
+  { network: '203.0.113.7/32', expires_at: NOW + 3 * 60, reason: 'manual candidate approval', source: 'approved', created_at: NOW - 600, created_by: 'operator' },
+  { network: '198.18.0.0/15', expires_at: NOW + 86400 * 6, reason: 'benchmark range abuse — 벤치마크 대역 악용', source: 'manual', created_at: NOW - 86400, created_by: 'admin-credential' },
+  { network: '192.0.2.99/32', expires_at: NOW + 700, reason: 'automatic threshold', source: 'auto', created_at: NOW - 200, created_by: 'system' },
 ];
 const RULES = { version: 1, rules: [
   { id: 'deny-tor-asn', priority: 50, asns: [64511], action: 'deny', score: 20, description: 'abusive hosting ASN' },
@@ -51,7 +53,7 @@ function explainFor(ip, { mode = 'observe' } = {}) {
     enforce_preview: enforce, geoip: { country: 'NL', asn: 64511 }, evaluated: { source: 'published', revision: 418, policy_revision: 'p12', mode: 'observe', stored: false } };
 }
 
-async function setup(page, { mode = 'observe', conflict = false, noGuard = false, routes = ROUTES, state = { mode } } = {}) {
+async function setup(page, { mode = 'observe', conflict = false, rulesConflict = false, noGuard = false, routes = ROUTES, state = { mode } } = {}) {
   const calls = [];
   const policy = { get mode() { return state.mode; }, auto_block: false, window_secs: 60, threshold: 10, block_ttl_secs: 900, allow: ['10.20.0.0/16', '192.0.2.10/32'], weights: { honeypot: 10, scanner: 5, auth_failure: 1, invalid_request: 2 } };
   await page.route('**/*', async route => {
@@ -74,6 +76,23 @@ async function setup(page, { mode = 'observe', conflict = false, noGuard = false
     if (op === 'blocks') return route.fulfill({ json: request.method() === 'DELETE' ? { removed: true } : { ok: true }, headers: { 'x-hangang-plugin-operation': '92' } });
     if (op === 'candidates/approve') return route.fulfill({ json: { network: `${body.ip}/32` }, headers: { 'x-hangang-plugin-operation': '93' } });
     if (op === 'rules' && request.method() === 'GET') return route.fulfill({ json: RULES });
+    if (op === 'rules/document') return route.fulfill({ json: { revision: 'L7f3a:r7', rules: RULES, source: 'lua', script: 'local rules = {}\nrules[1] = { id = "deny-tor-asn", priority = 50, asns = { 64511 }, action = "deny", score = 20 }\nreturn { version = 1, rules = rules }\n' } });
+    if ((op === 'rules' || op === 'rules/lua') && request.method() === 'PUT' && body?.expected_revision && rulesConflict) return route.fulfill({ status: 409, json: { error: 'rules revision conflict', current_revision: 'L7f3a:r8' } });
+    if (op === 'rules' && body?.expected_revision) return route.fulfill({ json: { revision: 'L7f3a:r8', rules: body.rules, source: 'json', script: null }, headers: { 'x-hangang-plugin-operation': '94' } });
+    if (op === 'history/query') return route.fulfill({ json: { schema: 'sumunjang.history.v1', ip: body.ip, in_memory: true, retained_since: NOW - 5400, since: NOW - 21600, until: NOW + 1, bucket_secs: 60, retention_secs: 21600,
+      buckets: [50, 42, 41, 30, 12, 3].map((ago, index) => ({ start: NOW - ago * 60 - (NOW % 60), score: [12, 25, 8, 30, 15, 20][index], signals: { honeypot: index % 2, scanner: 2, auth_failure: index % 3 === 0 ? 1 : 0, invalid_request: 0 } })),
+      totals: { score: 110, signals: { honeypot: 3, scanner: 12, auth_failure: 2, invalid_request: 0 } }, window: { signal_score: 44, threshold: 10, window_secs: 60 }, stats: { started_at: NOW - 5400, retention_secs: 21600, bucket_secs: 60, addresses: 4, buckets: 30, max_addresses: 10000, max_buckets: 262144, dropped: 0 } } });
+    if (op === 'allowlist' && request.method() === 'GET') return route.fulfill({ json: { schema: 'sumunjang.allowlist.v1', revision: 'p12', entries: [
+      { network: '10.20.0.0/16', expires_at: null, reason: 'corporate VPN egress', created_at: NOW - 86400 * 30, created_by: 'operator', expired: false },
+      { network: '192.0.2.10/32', expires_at: NOW + 86400 * 2, reason: 'contractor laptop', created_at: NOW - 86400, created_by: 'operator', expired: false },
+      { network: '198.51.100.77/32', expires_at: NOW - 3600, reason: 'incident bridge', created_at: NOW - 86400 * 3, created_by: 'admin-credential', expired: true }] } });
+    if (op === 'allowlist') return route.fulfill({ json: { schema: 'sumunjang.allowlist.v1', revision: 'p13', entries: [] }, headers: { 'x-hangang-plugin-operation': '95' } });
+    if (op === 'asn/catalog/query') {
+      const all = [{ asn: 64500, prefixes: ['192.0.2.0/24', '198.51.100.0/24'] }, { asn: 64511, prefixes: ['203.0.113.0/24', '203.0.113.128/25', '2001:db8::/32', '198.18.0.0/15', '100.64.0.0/10', '100.65.0.0/16', '100.66.0.0/16', '100.67.0.0/16'] }, { asn: 64512, prefixes: ['192.168.0.0/16'] }];
+      const filtered = body.asn ? all.filter(entry => entry.asn === body.asn) : all;
+      const page = body.cursor ? filtered.slice(2) : filtered.slice(0, 2);
+      return route.fulfill({ json: { schema: 'sumunjang.asn_catalog.v1', source: 'offline_catalog', total_prefixes: 11, total_asns: 3, entries: page, next_cursor: !body.cursor && filtered.length > 2 ? 'c64511_100.67.0.0/16' : null } });
+    }
     if (op === 'rules' || op === 'rules/lua') return route.fulfill({ json: body?.rules ? body : RULES, headers: { 'x-hangang-plugin-operation': '94' } });
     if (op === 'rules/validate') return body.script && /error/.test(body.script) ? route.fulfill({ status: 400, json: { error: 'invalid explain request', errors: [{ path: '/script', message: 'syntax error near end' }] } }) : route.fulfill({ json: { valid: true, rules: body.rules || RULES } });
     if (op === 'lookup') return route.fulfill({ json: { ip: body.ip, geoip: { country_code: 'NL', country_name: 'Netherlands', city: 'Amsterdam', accuracy_radius_km: 50, asn: 64511, asn_organization: 'Example Hosting B.V.' }, inspection: { ip: body.ip, asn: 64511, score: 64, signal_score: 44, static_rule_score: 20, suspicion: 'high', matched_rules: ['deny-tor-asn'], decision: { action: 'allow' } } } });
@@ -128,7 +147,7 @@ test('overview: observe banner, what enforce would change, KPIs, trend and top l
   const batch = calls.find(call => call.path.endsWith('/explain/batch'));
   expect(batch.body.candidate.policy.mode).toBe('enforce');
   await expect(view.locator('.zt-kpi').first()).toContainText('2');
-  await expect(view.locator('.zt-kpi').nth(1)).toContainText('1 manual · 1 approved · 1 automatic');
+  await expect(view.locator('.zt-kpi').nth(1)).toContainText('1 Manual · 1 Approved candidate · 1 Automatic');
   await expect(view.locator('.zt-kpi-wide')).toContainText('40 denials');
   expect(calls.find(call => call.path === '/v1/observability/decisions/timeseries')).toBeTruthy();
   await expect(view.locator('.zt-panel', { hasText: 'Top denied countries' })).toContainText('NL');
@@ -152,7 +171,17 @@ test('threat queue filters in the URL and bulk approval needs typed count and re
   await expect(view.locator('tbody tr')).toHaveCount(4);
   await expect(view.locator('tbody tr').first()).toContainText('203.0.113.7');
   await expect(view.locator('tbody tr').first()).toContainText('High');
+  // Per-signal counts and country from Sumunjang 0.1.6 candidates.
+  await expect(view.locator('tbody tr').first().locator('.zt-signal')).toHaveText(['Honeypot 3', 'Scanner 4', 'Auth 2']);
+  await expect(view.locator('tbody tr').first()).toContainText('NL');
+  await expect(view.locator('.zt-field-off')).toHaveCount(0);
   await expect(view.locator('tbody tr').nth(2).locator('input[type=checkbox]')).toBeDisabled();
+  await view.getByRole('textbox', { name: 'Country' }).fill('us');
+  await view.getByRole('button', { name: 'Apply filters' }).click();
+  await expect(page).toHaveURL(/country=US/);
+  await expect(view.locator('tbody tr')).toHaveCount(1);
+  await page.goto('/ui/#network/threats');
+  await expect(view.locator('tbody tr')).toHaveCount(4);
   await view.getByRole('checkbox', { name: 'Eligible for approval only' }).check();
   await view.getByRole('button', { name: 'Apply filters' }).click();
   await expect(page).toHaveURL(/#network\/threats\?eligible=1$/);
@@ -169,6 +198,7 @@ test('threat queue filters in the URL and bulk approval needs typed count and re
   const approvals = calls.filter(call => call.path.endsWith('/candidates/approve'));
   expect(approvals.map(call => call.body.ip)).toEqual(['203.0.113.7', '198.51.100.23']);
   expect(decodeURIComponent(approvals[0].reason)).toBe('scanner burst from hosting range');
+  expect(approvals[0].body.reason).toBe('scanner burst from hosting range');
   await view.locator('tbody tr').first().click();
   await expect(page).toHaveURL(/#network\/ip\/203\.0\.113\.7$/);
 });
@@ -184,6 +214,15 @@ test('IP detail: GeoIP, risk, block with expiry, explain trace and enforce previ
   await expect(view.locator('.zt-panel', { hasText: 'Location and network' })).toContainText('Example Hosting B.V.');
   await expect(view.locator('.zt-panel', { hasText: 'Block and allow status' })).toContainText('Approved candidate');
   await expect(view.locator('.zt-expiry').first()).toHaveClass(/is-soon/);
+  // In-memory history: minute bars, threshold line, honest coverage label.
+  const history = view.locator('.zt-panel', { hasText: 'Score and signal history' });
+  await expect(history.locator('svg.zt-history-chart rect')).toHaveCount(6);
+  await expect(history.locator('svg.zt-history-chart .zt-threshold')).toHaveCount(1);
+  await expect(history).toContainText('Since Sumunjang restarted at');
+  await expect(history).toContainText('Total score 110');
+  await expect(history).toContainText('Scanner 12');
+  await expect(view.getByRole('region', { name: 'Risk' })).toContainText('Honeypot 3');
+  await expect(view.locator('.zt-gap')).toHaveCount(0);
   const stages = view.locator('.zt-guard-trace .kit-stage');
   await expect(stages).toHaveCount(8);
   await expect(view.locator('.zt-guard-trace .is-deciding')).toHaveAttribute('data-stage', 'blocklist');
@@ -236,6 +275,13 @@ test('blocks and allowlist: origins, expiry, manual add with CIDR validation and
   const view = page.locator('#view-network');
   await expect(view.locator('tbody tr')).toHaveCount(3);
   await expect(view.locator('tbody tr').first()).toContainText('Approved candidate');
+  // Provenance comes from Sumunjang, not from reason strings.
+  await expect(view.locator('tbody tr').first()).toContainText('operator');
+  const manual = view.locator('tbody tr', { hasText: '198.18.0.0/15' });
+  await expect(manual).toContainText('Shared admin credential');
+  await expect(manual).toContainText('benchmark range abuse');
+  await expect(view.locator('tbody tr', { hasText: '192.0.2.99' })).toContainText('Sumunjang (automatic)');
+  await expect(view.locator('.zt-gap')).toHaveCount(0);
   await view.locator('.zt-filter-chips a', { hasText: 'Automatic' }).click();
   await expect(page).toHaveURL(/kind=automatic/);
   await expect(view.locator('tbody tr')).toHaveCount(1);
@@ -255,19 +301,44 @@ test('blocks and allowlist: origins, expiry, manual add with CIDR validation and
   await dialog.getByRole('button', { name: 'Block', exact: true }).click();
   await expect(view.locator('.zt-outcome')).toContainText('Block added');
   expect(calls.filter(call => call.path.endsWith('/blocks') && call.method === 'POST').at(-1).body.network).toBe('198.51.100.0/24');
+  // Unblock carries the reason in Sumunjang's body (audit) and in the host journal.
+  await expect(page).toHaveURL(/#network\/blocks\?updated=/);
+  await view.locator('tbody tr', { hasText: '198.18.0.0/15' }).getByRole('button', { name: 'Remove block' }).click();
+  await dialog.getByLabel('Type 198.18.0.0/15 to confirm').fill('198.18.0.0/15');
+  await dialog.getByLabel(/Reason/).fill('benchmark finished');
+  await dialog.getByRole('button', { name: 'Remove block' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Block removed');
+  expect(calls.filter(call => call.path.endsWith('/blocks') && call.method === 'DELETE').at(-1).body).toEqual({ network: '198.18.0.0/15', reason: 'benchmark finished' });
+  await page.waitForTimeout(1200);
   await page.goto('/ui/#network/blocks/allowlist');
-  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('tbody tr')).toHaveCount(3);
+  // Expired entries stay listed, greyed, with their expiry.
+  await expect(view.locator('tbody tr.is-expired')).toHaveCount(1);
+  await expect(view.locator('tbody tr.is-expired')).toContainText('198.51.100.77');
+  await expect(view.locator('tbody tr.is-expired')).toContainText('Expired');
+  await expect(view.locator('tbody tr').nth(1)).toContainText('contractor laptop');
+  await expect(view.locator('tbody tr').nth(1)).toContainText('expires in 2 days');
   await view.locator('tbody tr').nth(1).getByRole('button', { name: 'Remove from allowlist' }).click();
   await dialog.getByLabel('Type 192.0.2.10/32 to confirm').fill('192.0.2.10/32');
   await dialog.getByLabel(/Reason/).fill('contractor left');
   await dialog.getByRole('button', { name: 'Remove' }).click();
   await expect(view.locator('.zt-outcome')).toContainText('Removed from the allowlist');
-  const put = calls.filter(call => call.path.endsWith('/policy/document') && call.method === 'PUT').at(-1);
-  expect(put.body).toMatchObject({ expected_revision: 'p12', reason: 'contractor left' });
-  expect(put.body.policy.allow).toEqual(['10.20.0.0/16']);
+  const removal = calls.filter(call => call.path.endsWith('/allowlist') && call.method === 'DELETE').at(-1);
+  expect(removal.body).toEqual({ expected_revision: 'p12', network: '192.0.2.10/32', reason: 'contractor left' });
+  expect(calls.some(call => call.path.endsWith('/policy/document') && call.method === 'PUT')).toBe(false);
+  await expect(page).toHaveURL(/allowlist\?updated=/);
+  await view.getByRole('button', { name: 'Add to allowlist' }).click();
+  await dialog.getByLabel('Address or CIDR').fill('192.0.2.200');
+  await dialog.getByLabel('Expires after').selectOption('7d');
+  await dialog.getByLabel(/Reason/).fill('vendor maintenance');
+  await dialog.getByRole('button', { name: 'Add to allowlist' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Allowlist updated');
+  const added = calls.filter(call => call.path.endsWith('/allowlist') && call.method === 'POST').at(-1).body;
+  expect(added).toMatchObject({ expected_revision: 'p12', network: '192.0.2.200/32', reason: 'vendor maintenance' });
+  expect(added.expires_at - Math.floor(Date.now() / 1000)).toBeGreaterThan(86400 * 6);
 });
 
-test('rules: structured edit, validate, diff, what-if and publish guarded by a fresh read', async ({ page }) => {
+test('rules: structured edit, validate, diff, what-if and compare-and-set publish', async ({ page }) => {
   const calls = await setup(page);
   await page.goto('/ui/#network/rules?rule=deny-tor-asn');
   const view = page.locator('#view-network');
@@ -293,8 +364,55 @@ test('rules: structured edit, validate, diff, what-if and publish guarded by a f
   await dialog.getByRole('button', { name: 'Publish' }).click();
   await expect(view.locator('.zt-outcome', { hasText: 'Published' })).toContainText('Published 3 rules (operation 94)');
   const put = calls.filter(call => call.path.endsWith('/rules') && call.method === 'PUT').at(-1);
-  expect(put.body.rules[2].action).toBe('deny');
+  expect(put.body).toMatchObject({ expected_revision: 'L7f3a:r7', reason: 'deny GB after review' });
+  expect(put.body.rules.rules[2].action).toBe('deny');
   expect(decodeURIComponent(put.reason)).toBe('deny GB after review');
+  // No fresh-read guard: the revision precondition replaces it.
+  expect(calls.filter(call => call.path.endsWith('/plugins/guard/rules') && call.method === 'GET')).toHaveLength(0);
+});
+
+test('rules publish with a stale revision is refused and keeps the draft', async ({ page }) => {
+  await setup(page, { rulesConflict: true });
+  await page.goto('/ui/#network/rules');
+  const view = page.locator('#view-network');
+  await view.locator('tr.zt-rule').nth(2).getByLabel('Action').selectOption('deny');
+  await view.getByRole('button', { name: 'Review and publish' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await dialog.getByLabel('Type rules to confirm').fill('rules');
+  await dialog.getByLabel(/Reason/).fill('deny GB');
+  await dialog.getByRole('button', { name: 'Publish' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Someone changed this since you loaded it');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(view.locator('tr.zt-rule').nth(2).locator('select[name=action]')).toHaveValue('deny');
+});
+
+test('older Sumunjang packages keep the fresh-read guard and the policy-document allowlist', async ({ page }) => {
+  const calls = await setup(page, { routes: LEGACY_ROUTES });
+  await page.goto('/ui/#network/rules');
+  const view = page.locator('#view-network');
+  await view.locator('tr.zt-rule').nth(2).getByLabel('Action').selectOption('deny');
+  await view.getByRole('button', { name: 'Review and publish' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await dialog.getByLabel('Type rules to confirm').fill('rules');
+  await dialog.getByLabel(/Reason/).fill('legacy publish');
+  await dialog.getByRole('button', { name: 'Publish' }).click();
+  await expect(view.locator('.zt-outcome', { hasText: 'Published' })).toBeVisible();
+  const put = calls.filter(call => call.path.endsWith('/rules') && call.method === 'PUT').at(-1);
+  expect(put.body.expected_revision).toBeUndefined();
+  expect(put.body.rules[2].action).toBe('deny');
+  await expect(page).toHaveURL(/published=/);
+  await page.goto('/ui/#network/blocks/allowlist');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await view.locator('tbody tr').nth(1).getByRole('button', { name: 'Remove from allowlist' }).click();
+  await dialog.getByLabel('Type 192.0.2.10/32 to confirm').fill('192.0.2.10/32');
+  await dialog.getByLabel(/Reason/).fill('contractor left');
+  await dialog.getByRole('button', { name: 'Remove' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Removed from the allowlist');
+  const policyPut = calls.filter(call => call.path.endsWith('/policy/document') && call.method === 'PUT').at(-1);
+  expect(policyPut.body.policy.allow).toEqual(['10.20.0.0/16']);
+  await expect(page).toHaveURL(/updated=/);
+  await page.goto('/ui/#network/ip/203.0.113.7');
+  await expect(view.locator('.zt-gap')).toContainText('history');
 });
 
 test('Lua rules use the host editor and show Sumunjang field errors', async ({ page }) => {
@@ -302,7 +420,9 @@ test('Lua rules use the host editor and show Sumunjang field errors', async ({ p
   await page.goto('/ui/#network/rules/lua');
   const view = page.locator('#view-network');
   await expect(view.locator('.hangang-lua-editor')).toBeVisible();
-  await expect(view.locator('.zt-banner')).toContainText('never stores Lua source');
+  await expect(view.locator('.zt-banner')).toContainText('Loaded the Lua source stored with rules revision L7f3a:r7');
+  await expect(view.locator('textarea[name=script]')).toHaveValue(/deny-tor-asn/);
+  await expect(view.locator('.zt-change-count')).toHaveText('0 changes');
   await view.locator('textarea[name=script]').evaluate(node => { node.value = 'error('; node.dispatchEvent(new Event('input', { bubbles: true })); });
   await view.getByRole('button', { name: 'Validate' }).click();
   await expect(view.locator('.zt-validation')).toContainText('syntax error near end');
@@ -330,12 +450,23 @@ test('policy: switching to enforce shows impact and requires typing the mode; co
 });
 
 test('ASN pools are read-only with the proposal workflow disabled and explained', async ({ page }) => {
-  await setup(page);
+  const calls = await setup(page);
   await page.goto('/ui/#network/asn');
   const view = page.locator('#view-network');
-  await expect(view.locator('tbody tr')).toHaveCount(2);
-  await expect(view.locator('tbody tr').first()).toContainText('AS64511');
-  await expect(view.locator('tbody tr').first()).toContainText('deny-tor-asn');
+  const catalog = view.locator('.zt-panel', { hasText: 'Offline ASN catalog' });
+  await expect(catalog.locator('tbody tr')).toHaveCount(2);
+  await expect(catalog).toContainText('3 ASNs, 11 prefixes');
+  await expect(catalog.locator('tbody tr').nth(1)).toContainText('+2 more');
+  await expect(catalog.locator('tbody tr').nth(1)).toContainText('deny-tor-asn');
+  await catalog.getByRole('button', { name: 'Next' }).click();
+  await expect(catalog.locator('tbody tr')).toHaveCount(1);
+  expect(calls.filter(call => call.path.endsWith('/asn/catalog/query')).at(-1).body.cursor).toBe('c64511_100.67.0.0/16');
+  await page.goto('/ui/#network/asn?asn=64500');
+  await expect(catalog.locator('tbody tr')).toHaveCount(1);
+  expect(calls.filter(call => call.path.endsWith('/asn/catalog/query')).at(-1).body.asn).toBe(64500);
+  const evidence = view.locator('.zt-panel', { hasText: 'ASNs in evidence and rules' });
+  await expect(evidence.locator('tbody tr')).toHaveCount(1);
+  await expect(evidence.locator('tbody tr').first()).toContainText('AS64500');
   await expect(view.getByRole('button', { name: 'Propose ASN rule' })).toBeDisabled();
 });
 
