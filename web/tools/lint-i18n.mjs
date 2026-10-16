@@ -13,7 +13,9 @@ import { fileURLToPath } from 'node:url';
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repo = path.resolve(web, '..');
 const failures = [];
-const catalog = name => JSON.parse(readFileSync(path.join(web, 'zt/messages', `${name}.json`), 'utf8'));
+// Section catalogs (zt/<section>/messages) merge into the host catalog.
+const SECTION_CATALOGS = ['zt/messages', 'zt/network/messages'];
+const catalog = name => Object.assign({}, ...SECTION_CATALOGS.map(dir => JSON.parse(readFileSync(path.join(web, dir, `${name}.json`), 'utf8'))));
 const en = catalog('en'), ko = catalog('ko');
 const flat = value => typeof value === 'object' ? Object.values(value) : [value];
 
@@ -29,8 +31,8 @@ for (const [key, value] of Object.entries(ko)) {
   }
 }
 
-const sources = ['kit', 'zt'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
-const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system)\.[A-Za-z0-9_.-]+$/;
+const sources = ['kit', 'zt', 'zt/network'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
+const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system|network)\.[A-Za-z0-9_.-]+$/;
 const PREFIXES = new Set(['decision.stage', 'decision.principal', 'decision.result']);
 const literal = /(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
 const forbidden = [
@@ -80,6 +82,28 @@ const families = {
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],
 };
 for (const name of ['identities', 'policies', 'network', 'workloads']) families[`section.${name}`] = ['owner', 'planned', 'body'];
+// Network section (zt/network): dynamic key families built from Sumunjang values.
+const sumunjang = name => JSON.parse(readFileSync(path.join(web, 'zt/network/messages', `${name}.json`), 'utf8'));
+Object.assign(families, {
+  'network.page': ['overview', 'threats', 'blocks', 'rules', 'policy', 'asn'],
+  'network.mode': ['observe', 'enforce', 'unknown', 'observe.body', 'enforce.body', 'unknown.body'],
+  'network.suspicion': ['normal', 'watch', 'suspicious', 'high', 'blocked'],
+  'network.verdict': ['allow', 'deny', 'observe'],
+  'network.outcome': ['committed', 'refused', 'uncertain'],
+  'network.block.kind': ['manual', 'approved', 'automatic'],
+  'network.block.reason': ['manual', 'approved', 'automatic'],
+  'network.rule.action': ['allow', 'deny', 'observe'],
+  'network.trace.stage': ['mode', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block'],
+  'network.asn_source': ['geoip', 'catalog', 'none'],
+  'network.duration': ['15m', '1h', '24h', '7d', '30d'],
+  'network.signal': ['honeypot', 'scanner', 'auth_failure', 'invalid_request'],
+  'network.diff': ['add', 'remove', 'change'],
+  'network.ip.trace': ['published', 'enforce'],
+  'network.rules.tab': ['json', 'lua'],
+  'network.blocks.tab': ['blocks', 'allowlist'],
+  // Every code Sumunjang's catalog registers needs both messages (codes from guard-core messages).
+  'network.code': Object.keys(sumunjang('en')).filter(key => key.startsWith('network.code.sumunjang.')).map(key => key.slice('network.code.'.length)),
+});
 for (const [prefix, suffixes] of Object.entries(families)) for (const suffix of suffixes) if (!Object.hasOwn(en, `${prefix}.${suffix}`)) failures.push(`missing family key ${prefix}.${suffix}`);
 
 const registry = readFileSync(path.join(repo, 'crates/hangang-decision-event/src/reasons.rs'), 'utf8');
