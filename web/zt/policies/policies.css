@@ -61,3 +61,12 @@
   .zt-draftbar-actions { margin-inline-start: 0; width: 100%; }
   .zt-form-grid { grid-template-columns: 1fr; }
 }
+.zt-panel > .kit-field, .zt-panel > .zt-fieldset { flex: 0 0 auto; }
+.zt-assign-row { display: grid; grid-template-columns: minmax(10rem, 16rem) minmax(0, 1fr); gap: .75rem; align-items: start; }
+#view-policies td input[type="checkbox"], #view-policies th input[type="checkbox"] { width: 1rem; height: 1rem; min-height: 0; padding: 0; }
+#view-policies .kit-col-select { width: 4.5rem; }
+#view-policies [data-table="policy-assignments"] .kit-col-subject, #view-policies .kit-col-subject:has(.kit-entity-id) { width: 38%; }
+#view-policies .kit-col-subject .zt-inline { display: inline-flex; flex-wrap: wrap; gap: .3rem; align-items: center; max-width: 100%; }
+#view-policies .kit-col-subject .kit-entity-id { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#view-policies .kit-col-subject .kit-tag { flex: none; }
+@media (max-width: 720px) { .zt-assign-row { grid-template-columns: 1fr; } }

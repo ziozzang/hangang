@@ -53,7 +53,7 @@ async function impact(cx, state) {
     if (delta.removed_information_classes?.length) parts.push(t('policies.impact.removed_classes', { list: delta.removed_information_classes.join(', ') }));
     if (Array.isArray(delta.minimum_aal) && delta.minimum_aal[0] !== delta.minimum_aal[1]) parts.push(t('policies.impact.aal', { before: delta.minimum_aal[0], after: delta.minimum_aal[1] }));
     rows.append(ui.el('tr', {}, ui.el('td', { text: t(`policies.impact.entity.${change.entity}`) }), ui.el('td', { class: 'kit-mono', text: change.service || '—' }),
-      ui.el('td', { class: 'kit-mono', text: change.subject || change.cidr || change.resource || '—' }), ui.el('td', {}, ui.statusBadge(t, change.change === 'removed' ? 'deny' : change.change === 'added' ? 'allow' : 'challenge', `policies.impact.change.${change.change}`)),
+      ui.el('td', { class: 'kit-mono', text: change.subject || change.cidr || change.resource || '—' }), ui.el('td', {}, ui.statusBadge(t, change.change === 'removed' ? 'deny' : change.change === 'added' ? 'allow' : 'stale', `policies.impact.change.${change.change}`)),
       ui.el('td', { text: parts.join(' · ') || '—' })));
   }
   panel.append(ui.el('p', { class: 'kit-muted', text: t('policies.impact.rights', { count: diff.total ?? changes.length }) }));

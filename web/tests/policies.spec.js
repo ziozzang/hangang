@@ -34,7 +34,7 @@ export const deniedExplain = {
     outcome: { decision: 'ClassDenied', allow: false, reason_code: 'pumgye.class_denied', message_key: 'pumgye.reason.class_denied', hint_key: 'pumgye.hint.class_denied', deciding_stage: 'information_class', detail_code: 'pumgye.detail.class_missing_subject' },
     trace: [
       { stage: 'fence', result: 'pass', code: 'pumgye.detail.fence_satisfied', label_key: 'pumgye.stage.fence', detail: { revision: 77, minimum_revision: 0, serving: true } },
-      { stage: 'service', result: 'pass', code: 'pumgye.detail.service_found', label_key: 'pumgye.stage.service', detail: {} },
+      { stage: 'service', result: 'pass', code: 'pumgye.detail.service_found', label_key: 'pumgye.stage.service', detail: { service: 'reports' } },
       { stage: 'guard', result: 'pass', code: 'pumgye.detail.guard_enforced_allow', label_key: 'pumgye.stage.guard', detail: { evidence: 'enforced_allow' } },
       { stage: 'subject', result: 'pass', code: 'pumgye.detail.subject_assigned', label_key: 'pumgye.stage.subject', detail: { map: 'users', subject: 'u_lee', roles: ['reader'] } },
       { stage: 'network', result: 'pass', code: 'pumgye.detail.network_matched', label_key: 'pumgye.stage.network', detail: { ip: '10.1.2.3', matched: { index: 0, cidr: '10.0.0.0/8', roles: ['reader', 'analyst', 'admin'] }, shadowed: [] } },
@@ -270,4 +270,29 @@ test('policies at 390 px dark stay within the viewport', async ({ page }) => {
     await page.waitForTimeout(200);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0);
   }
+});
+
+test('cross-section simulator entry keeps the subject and picks or redirects to a service', async ({ page }) => {
+  await setup(page);
+  await page.goto('/ui/#policies/simulate?subject=u_kim');
+  const links = view(page).locator('.zt-simulate-pick a');
+  await expect(links).toHaveText(['billing', 'reports', 'cluster-api']);
+  await expect(view(page).locator('.zt-simulate-pick li', { hasText: 'reports' })).toContainText('assigned');
+  await links.filter({ hasText: 'reports' }).click();
+  await expect(page).toHaveURL(/#policies\/services\/reports\?/);
+  await expect(page).toHaveURL(/subject=u_kim/);
+  await expect(page).toHaveURL(/tab=simulate/);
+  await expect(view(page).locator('input[name="subject"]')).toHaveValue('u_kim');
+  await page.goto('/ui/#policies/simulate?subject=' + encodeURIComponent(HUMAN) + '&service=reports');
+  await expect(page).toHaveURL(/#policies\/services\/reports\?.*kind=human/);
+  await expect(view(page).locator('select[name="kind"]')).toHaveValue('human');
+});
+
+test('role editor preselects the class ceiling for a contiguous selection', async ({ page }) => {
+  await setup(page);
+  await page.goto('/ui/#policies/services/reports?tab=roles&role=analyst');
+  const editor = view(page).locator('.zt-role-editor');
+  await expect(editor.getByLabel('Class ceiling')).toHaveValue('confidential');
+  await editor.getByRole('checkbox', { name: 'internal' }).uncheck();
+  await expect(editor.getByLabel('Class ceiling')).toHaveValue('');
 });

@@ -188,6 +188,46 @@ async function renderAdvanced(cx, root) {
   content.append(policyHeader(cx), ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t('policies.advanced.note') }), ui.el('div', { class: 'button-row' }, toggle, apply), error, pre, editor);
 }
 
+/** Subject kind implied by an identifier format (Hopae user ids, human1:, s_ workload ids). */
+function kindForSubject(subject) {
+  if (subject.startsWith('human1:')) return 'human';
+  if (/^s_[A-Za-z0-9]+$/.test(subject)) return 'workload';
+  return 'user';
+}
+
+/**
+ * `#policies/simulate?subject=…[&service=…]` — cross-section entry (Identities
+ * links here). The simulator is per service: with a known service (or only one)
+ * redirect into its simulator tab; otherwise let the operator pick the service,
+ * listing the ones the subject is assigned in first. All parameters are kept.
+ */
+function renderSimulateEntry(cx, root, params) {
+  const { t, ui } = cx;
+  const policy = working();
+  const services = Object.keys(policy.services || {}).sort();
+  const subject = (params.get('subject') || '').trim().slice(0, 256);
+  const target = id => {
+    const next = new URLSearchParams(params);
+    next.delete('service');
+    next.set('tab', 'simulate');
+    if (subject && !next.get('kind')) next.set('kind', kindForSubject(subject));
+    return cx.hashFor('policies', ['services', id], next);
+  };
+  const requested = params.get('service');
+  if (requested && Object.hasOwn(policy.services || {}, requested)) { location.replace(target(requested)); return; }
+  if (services.length === 1) { location.replace(target(services[0])); return; }
+  const { content } = cx.page(root, { crumbs: [{ label: t('nav.policies'), href: '#policies' }, { label: t('policies.simulate.title') }], title: t('policies.simulate.title'), owner: subject ? t('policies.simulate.for', { subject }) : t('policies.simulate.subtitle') });
+  content.append(policyHeader(cx));
+  if (!services.length) { content.append(ui.emptyState ? ui.emptyState(t, { title: 'policies.catalog.empty' }) : ui.el('p', { class: 'kit-muted', text: t('policies.catalog.empty') })); return; }
+  const assigned = new Set(subject ? services.filter(id => assignments(policy.services[id]).some(row => row.subject === subject)) : []);
+  const ordered = [...services.filter(id => assigned.has(id)), ...services.filter(id => !assigned.has(id))];
+  content.append(ui.el('section', { class: 'panel zt-panel', attrs: { 'aria-label': t('policies.simulate.pick') } },
+    ui.el('h2', { text: t('policies.simulate.pick') }),
+    ui.el('ul', { class: 'zt-network-list zt-simulate-pick' }, ordered.map(id => ui.el('li', {},
+      ui.el('a', { href: target(id), class: 'kit-mono', text: id }),
+      assigned.has(id) ? ui.el('span', { class: 'kit-tag', text: t('policies.simulate.assigned') }) : null)))));
+}
+
 export async function renderPolicies(cx, root, route) {
   const { t, ui } = cx;
   await ensureCatalogs();
@@ -201,6 +241,7 @@ export async function renderPolicies(cx, root, route) {
   const [page, id] = route.parts;
   if (page === 'services' && id) return renderService(cx, root, id, route.params, { header: policyHeader, subjectCell });
   if (page === 'matrix') return renderMatrix(cx, root, route.params);
+  if (page === 'simulate') return renderSimulateEntry(cx, root, route.params);
   if (page === 'advanced') return renderAdvanced(cx, root);
   if (page === 'publish') return renderPublish(cx, root, { header: policyHeader });
   return renderCatalog(cx, root, route.params);

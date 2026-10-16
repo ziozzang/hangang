@@ -7,8 +7,9 @@ import { contextOf, kindsFor } from './model.js';
 const GUARD = Object.freeze(['enforced_allow', 'observe', 'deny', 'unavailable']);
 const FIELD_FOR_PATH = Object.freeze({ 'case.subject.id': 'subject', 'case.subject.kind': 'kind', 'case.subject': 'subject', 'case.ip': 'ip', 'case.aal': 'aal', 'case.guard': 'guard', 'case.permission': 'permission', 'case.information_class': 'information_class', 'case.resource': 'resource', 'case.action': 'action' });
 
-function params(detail) {
-  const out = {};
+function params(detail, fallback = {}) {
+  // Case values fill placeholders the stage detail leaves out.
+  const out = { ...fallback };
   for (const [key, value] of Object.entries(detail || {})) {
     if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) out[key] = value ?? '—';
     else if (Array.isArray(value) && value.every(item => typeof item !== 'object')) out[key] = value.join(', ');
@@ -27,7 +28,7 @@ function stageExtra(cx, entry) {
   return null;
 }
 
-export function explainResult(cx, response) {
+export function explainResult(cx, response, testCase = {}) {
   const { t, ui } = cx;
   const result = response.result || {};
   const outcome = result.outcome || {};
@@ -46,10 +47,11 @@ export function explainResult(cx, response) {
     const published = result.comparison.published || {};
     parts.push(ui.el('p', { class: `zt-banner${result.comparison.changed ? ' zt-banner-warn' : ''}`, text: t(result.comparison.changed ? 'policies.sim.changed' : 'policies.sim.unchanged', { before: published.decision ?? '—', after: outcome.decision ?? '—' }) }));
   }
+  const caseParams = params({ service: testCase.service, subject: testCase.subject?.id, permission: testCase.permission, resource: testCase.resource, action: testCase.action, ip: testCase.ip, presented: testCase.aal });
   const trace = (result.trace || []).map(entry => ({
     stage: entry.stage, result: entry.result,
     label: t(entry.label_key || `pumgye.stage.${entry.stage}`),
-    text: entry.code ? t(entry.code, params(entry.detail)) : '',
+    text: entry.code ? t(entry.code, params(entry.detail, caseParams)) : '',
     deciding: entry.stage === outcome.deciding_stage,
     extra: stageExtra(cx, entry),
   }));
@@ -137,7 +139,7 @@ export async function renderSimulator(cx, id, service, policy, params) {
     try {
       const { data } = await cx.api('/v1/pumgye/explain', { method: 'POST', json: body });
       if (cx.signal.aborted) return wrap;
-      ui.clear(output, explainResult(cx, data));
+      ui.clear(output, explainResult(cx, data, testCase));
     } catch (error) {
       if (error?.status === 401) throw error;
       const loose = placeErrors(cx, form, error);
