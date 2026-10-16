@@ -20,6 +20,7 @@ administrator-only and read data through the existing management API.
 | Policies | `#policies` | Pumgye service catalog (context, Sumunjang requirement, role, assignment, network and resource counts, highest class), access matrix and advanced JSON |
 | Policies | `#policies/services/{id}` | Service detail tabs: overview, resources and actions, roles, assignments, access simulator and change history |
 | Policies | `#policies/publish` | Review and publish: structured diff, what-if impact, required reason, typed confirmation and conflict resolution |
+| Policies | `#policies/simulate?subject={id}` | Cross-section simulator entry (used by Identities): redirects to the service's simulator tab when `service` is given or only one exists, otherwise picks a service (assigned ones first), keeping the subject |
 | Audit | `#audit` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff. Console-account audit retention, policy and export moved to `#account-audit`; earlier `#audit-trail` links redirect |
 | System | `#system` | Components, packages, decision events, exporter and privacy profile; raw JSON only behind *View raw diagnostics* |
 
