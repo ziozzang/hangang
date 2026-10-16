@@ -253,11 +253,32 @@ This is phase D1. Not yet implemented:
   empty.
 - Request IDs are not yet shown on deny pages.
 
-Per-request overhead measured by `tests/decision_overhead.rs` in an unoptimized
-debug build is about 0.1 µs with decision events off and 0.3 to 1.5 µs with them
-on; drain-side encoding is a background cost. The ADR 0019 budget (at most 2%
-CPU and 5 µs p99 at 100k decisions per second) is a qualification target for
-release builds and has not yet been measured.
+- Key custody: the shared epoch key file with one `manage_keys` node is the
+  D1 decision. Distributing or deriving epoch keys through a KMS is a phase D3
+  follow-up (ADR 0019 open question 1).
+
+### Measured overhead
+
+`tests/decision_overhead.rs` measures the request-path cost of capture plus
+completion in isolation (single thread, release build, AMD Ryzen 7 8745HS,
+three runs; percentiles include about 20 ns of clock reads):
+
+| Path | Mean | p50 | p99 |
+| --- | --- | --- | --- |
+| Off (inactive capture) | 21–24 ns | 40 ns | 50–51 ns |
+| On, allowed decision at 1% sampling | 143–149 ns | 160–171 ns | 190–201 ns |
+| On, refusal kept (bucket and ring push) | 179–203 ns | 190–210 ns | 230–281 ns |
+| On, refusal suppressed by the bucket | 179–208 ns | 200–221 ns | 231–301 ns |
+| Drain encode per kept event (standard profile, background) | 6.1–8.2 µs | — | — |
+
+Against the ADR 0019 budget: the added request-path latency is at most about
+0.25 µs at p99 (budget 5 µs). At 100k decisions per second with 1% allow
+sampling, capture costs about 15 ms of CPU per second and draining about 1,000
+kept events costs about 8 ms per second, together about 2.3% of one core, well
+below 2% of the cores a gateway serving that load uses. Refusal-heavy traffic
+costs about 8 µs of drain CPU per kept refusal; the token bucket bounds how many
+are kept. These are microbenchmark results; an end-to-end load qualification at
+10k and 100k requests per second remains to be done.
 
 ## Verification and related guides
 

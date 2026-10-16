@@ -188,7 +188,17 @@ fn per_request_overhead_is_bounded() {
             f(i);
         }
         let ns = started.elapsed().as_nanos() as f64 / f64::from(N);
-        println!("decision overhead {label}: {ns:.0} ns/request");
+        // Per-call distribution (includes ~20 ns of clock reads).
+        let mut samples = Vec::with_capacity(20_000);
+        for i in 0..20_000 {
+            let t = Instant::now();
+            f(i);
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[samples.len() * 99 / 100];
+        println!("decision overhead {label}: {ns:.0} ns/request mean, p50 {p50} ns, p99 {p99} ns");
         ns
     };
     let off = measure("off (inactive capture)", &mut |_| {
