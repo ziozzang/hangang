@@ -1445,7 +1445,7 @@ async fn run(args: Args) -> Result<()> {
             ("public-listener", public_tls.clone()),
             ("admin-listener", admin_tls.clone()),
         ] {
-            if let Some(tls) = tls {
+            if let Some(tls) = tls.filter(|tls| tls.file_backed()) {
                 tls_watchers.push(tokio::spawn(tls.watch_every(
                     reload_period,
                     Some(metrics.tls_reload.status(name)),

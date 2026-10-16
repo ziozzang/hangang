@@ -93,6 +93,11 @@ impl ReloadingTls {
             rejected: std::sync::atomic::AtomicU64::new(0),
         }
     }
+    /// True when the configuration comes from certificate files that
+    /// [`Self::watch_every`] polls (not a dynamic SNI or ACME set).
+    pub fn file_backed(&self) -> bool {
+        self.files.is_some()
+    }
     /// Reloads rejected by parsing since start; each distinct bad pair counts once.
     pub fn rejected_reloads(&self) -> u64 {
         self.rejected.load(std::sync::atomic::Ordering::Relaxed)

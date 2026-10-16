@@ -440,11 +440,7 @@ mod tests {
         assert!(!serial.is_empty());
         assert_eq!(tracker.poll(&material), Change::Unchanged);
         // An unparsable key is rejected and reported once for that content.
-        std::fs::write(
-            dir.path().join("tls.key"),
-            b"truncated key material\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("tls.key"), b"truncated key material\n").unwrap();
         assert!(matches!(tracker.poll(&material), Change::Rejected(_)));
         assert_eq!(tracker.poll(&material), Change::Unchanged);
         // A key that does not belong to the certificate is rejected too.
