@@ -502,6 +502,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,9 +1021,12 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "crossbeam-queue",
  "ed25519-dalek",
  "futures-util",
  "guard-grpc",
+ "hangang-decision-event",
+ "hangang-decision-exporter",
  "hangang-route-grpc",
  "hangang-runtime",
  "hickory-resolver",
@@ -1044,6 +1056,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "ring",
  "rsa",
  "rusqlite",
  "rustls",
@@ -1067,6 +1080,35 @@ dependencies = [
  "webpki-roots",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "hangang-decision-event"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "serde_json",
+]
+
+[[package]]
+name = "hangang-decision-exporter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "hangang-decision-event",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "prost",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

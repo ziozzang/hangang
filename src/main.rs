@@ -66,6 +66,9 @@ struct Args {
     /// Exact path generating scanner evidence; repeat for multiple paths.
     #[arg(long, requires = "guard_url")]
     guard_scanner_path: Vec<String>,
+    /// ADR 0019 decision events configuration (JSON). Absent: off.
+    #[arg(long, env = "HANGANG_DECISION_EVENTS_CONFIG")]
+    decision_events_config: Option<PathBuf>,
     /// Print version, project URL, and author without starting the gateway.
     #[arg(long)]
     about: bool,
@@ -1174,6 +1177,24 @@ async fn run(args: Args) -> Result<()> {
             )
         })
         .transpose()?;
+    let decisions = match &args.decision_events_config {
+        Some(path) => hangang::decision::Emitter::new(
+            hangang::decision::Config::from_file(path)
+                .map_err(|error| anyhow::anyhow!("decision events config: {error}"))?,
+        )?,
+        None => None,
+    };
+    let decision_task = decisions.clone().map(|emitter| {
+        tracing::info!(
+            profile = emitter.profile().as_str(),
+            "decision events enabled"
+        );
+        tokio::spawn(hangang::decision::drain::run(
+            emitter,
+            env!("CARGO_PKG_VERSION").to_owned(),
+            cancel.clone(),
+        ))
+    });
     let traffic = Arc::new(hangang::traffic::TrafficHistory::default());
     let proxy = Proxy::with_client_config_and_idle_limit(
         active.clone(),
@@ -1196,6 +1217,7 @@ async fn run(args: Args) -> Result<()> {
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
     .with_guard(guard)
+    .with_decision_events(decisions.clone())
     .with_route_owner_queries(args.route_owner_config.is_some())
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
     tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
@@ -1266,6 +1288,7 @@ async fn run(args: Args) -> Result<()> {
     };
     let users = Arc::new(hangang::admin_users::Store::open(users_db_path)?);
     let admin = Admin {
+        decisions,
         plugins: admin_plugins,
         fleet_collector: fleet_collector.clone(),
         fleet_observer: fleet_observer.clone(),
@@ -1565,6 +1588,10 @@ async fn run(args: Args) -> Result<()> {
     }
     if let Some(task) = fleet_collector_task {
         let _ = task.await;
+    }
+    if let Some(task) = decision_task {
+        // One final bounded drain pass; never delays shutdown beyond its timeouts.
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
     for watcher in tls_watchers {
         let _ = watcher.await;
