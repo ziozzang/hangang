@@ -1070,6 +1070,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hangang-decision-event"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "serde_json",
+]
+
+[[package]]
 name = "hangang-route-grpc"
 version = "0.1.0"
 dependencies = [
