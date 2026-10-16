@@ -159,7 +159,8 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn identifier(value: &str, max: usize) -> bool {
+/// Identifier fields: `[A-Za-z0-9_.:-]`, bounded, never an IP literal.
+pub fn identifier(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value
@@ -172,7 +173,8 @@ fn optional_identifier(value: &str, max: usize) -> bool {
     value.is_empty() || identifier(value, max)
 }
 
-fn host(value: &str) -> bool {
+/// Configured route host (lowercase DNS name or wildcard), never an IP literal.
+pub fn host(value: &str) -> bool {
     value.is_empty()
         || (value.len() <= 253
             && value
@@ -181,7 +183,8 @@ fn host(value: &str) -> bool {
             && value.parse::<std::net::IpAddr>().is_err())
 }
 
-fn path_template(value: &str) -> bool {
+/// Configured route template; no query, encoding or parameters.
+pub fn path_template(value: &str) -> bool {
     value.is_empty()
         || (value.starts_with('/')
             && value.len() <= 256

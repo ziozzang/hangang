@@ -132,4 +132,5 @@ pub mod projection_receipt;
 
 mod native_route_owner;
 
+pub mod decision;
 pub mod route_owner_grpc;
