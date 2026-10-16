@@ -1,7 +1,7 @@
 // Network ▸ Overview: mode banner with what enforcement would change, KPI
 // tiles that link to their lists, network-stage decision trend from the
 // Hangang decision log, top countries and ASNs, recent policy changes.
-import { can, guard, sectionPage, capabilities, notConnected, modeBanner, panel, number, blockKind, asnText, failure } from './common.js';
+import { can, guard, sectionPage, capabilities, notConnected, modeBanner, panel, number, blockKind, BLOCK_KINDS, asnText, failure } from './common.js';
 
 async function settle(promise) { try { return { ok: true, value: (await promise).data }; } catch (error) { if (error?.status === 401) throw error; return { ok: false, error }; } }
 
@@ -74,12 +74,12 @@ export async function renderNetworkOverview(cx, root) {
         denied.length ? ui.el('ul', { class: 'zt-chips zt-preview-list' }, denied.slice(0, 8).map(entry => ui.el('a', { class: 'kit-tag', href: `#network/ip/${encodeURIComponent(entry.ip)}`, text: entry.ip }))) : null);
     });
   } else if (mode === 'observe') preview.append(ui.el('p', { class: 'kit-muted', text: t('network.overview.preview.nothing') }));
-  const counts = { manual: 0, approved: 0, automatic: 0 };
+  const counts = Object.fromEntries(BLOCK_KINDS.map(kind => [kind, 0]));
   for (const block of active) counts[blockKind(block)] += 1;
   const eligible = list.filter(entry => entry.eligible).length;
   const kpis = ui.el('div', { class: 'zt-kpis' },
     kpi(cx, { label: 'network.overview.kpi.queue', value: candidates.ok ? number(eligible) : t('ui.status.unavailable'), href: '#network/threats?eligible=1', note: candidates.ok ? t('network.overview.kpi.queue.note', { count: number(list.length) }) : null, tone: eligible ? 'is-warn' : '' }),
-    kpi(cx, { label: 'network.overview.kpi.blocks', value: blocks.ok ? number(active.length) : t('ui.status.unavailable'), href: '#network/blocks', note: blocks.ok ? t('network.overview.kpi.blocks.note', { manual: counts.manual, approved: counts.approved, automatic: counts.automatic }) : null }),
+    kpi(cx, { label: 'network.overview.kpi.blocks', value: blocks.ok ? number(active.length) : t('ui.status.unavailable'), href: '#network/blocks', note: blocks.ok ? BLOCK_KINDS.filter(kind => counts[kind]).map(kind => t('network.overview.kpi.blocks.kind', { kind: t(`network.block.kind.${kind}`), count: counts[kind] })).join(' · ') || null : null }),
     kpi(cx, { label: 'network.overview.kpi.allow', value: number((policy.value.policy?.allow || []).length), href: '#network/blocks/allowlist' }),
     kpi(cx, { label: 'network.overview.kpi.rules', value: rules.ok ? number(rules.value?.rules?.length ?? 0) : t('ui.status.unavailable'), href: '#network/rules' }),
     series.ok && series.value?.state !== 'disabled' ? trend(cx, series.value?.points || []) : kpi(cx, { label: 'network.overview.trend', value: t(series.ok ? 'system.decisions.disabled' : 'ui.status.unavailable'), href: '#system' }));

@@ -1,7 +1,7 @@
 // Network write actions shared by the IP page, threat queue and blocks page:
 // block, unblock, allowlist add/remove and candidate approval. Each asks for
 // a reason and previews the impact through Sumunjang's own evaluation.
-import { guard, formDialog, isCidr, isIp, hostNetwork, number, IPV4 } from './common.js';
+import { guard, formDialog, isCidr, isIp, hostNetwork, number, IPV4, capabilities, can } from './common.js';
 
 const DURATIONS = Object.freeze({ '15m': 900, '1h': 3600, '24h': 86400, '7d': 604800, '30d': 2592000 });
 
@@ -102,14 +102,24 @@ export async function unblockDialog(cx, block) {
   const { t } = cx;
   return formDialog(cx, {
     title: 'network.unblock.title', intro: t('network.unblock.effect', { network: block.network }), confirm: block.network, confirmLabel: 'network.unblock.confirm', danger: true,
-    submit: values => guard(cx, 'blocks', { method: 'DELETE', json: { network: block.network }, reason: values.reason }),
+    submit: values => guard(cx, 'blocks', { method: 'DELETE', json: { network: block.network, reason: values.reason }, reason: values.reason }),
   });
 }
 
-/** Allowlist add/remove: CAS on the policy document with the reason in the audit. */
+/** Allowlist duration choices; entries without expiry stay until removed. */
+const ALLOW_DURATIONS = Object.freeze({ never: 0, '24h': 86400, '7d': 604800, '30d': 2592000, '90d': 7776000 });
+
+/**
+ * Allowlist add/remove with a reason. Uses Sumunjang's dedicated allowlist
+ * routes (expiry and reason per entry, CAS on the policy revision) and falls
+ * back to the policy document for older packages.
+ */
 export async function allowDialog(cx, { network = '', remove = false, fixed = false } = {}) {
   const { t, ui } = cx;
+  const caps = await capabilities(cx);
+  const dedicated = can(caps, 'allowlist', 'GET') && can(caps, 'allowlist', remove ? 'DELETE' : 'POST');
   const { data: document } = await guard(cx, 'policy/document');
+  const revision = dedicated ? (await guard(cx, 'allowlist')).data?.revision ?? document.revision : document.revision;
   const target = network ? hostNetwork(network) : '';
   const preview = ui.el('div');
   const spec = { label: 'network.allow.network', name: 'network', value: target, maxLength: 64, help: 'network.allow.network.help', placeholder: 'network.block.network.placeholder' };
@@ -119,11 +129,21 @@ export async function allowDialog(cx, { network = '', remove = false, fixed = fa
   const refresh = () => { const value = input.value.trim(); const cidr = isIp(value) ? hostNetwork(value) : value; input.setCustomValidity(isCidr(cidr) ? '' : t('network.block.network.invalid')); if (isCidr(cidr) && !remove) impactPreview(cx, cidr, { allow: true, policyDocument: document }).then(box => ui.clear(preview, box)); };
   input.addEventListener('change', refresh);
   if (target) refresh();
+  const fields = [{ ...spec, node }];
+  if (dedicated && !remove) fields.push({ label: 'network.allow.duration', name: 'duration', value: 'never', options: Object.keys(ALLOW_DURATIONS).map(value => ({ value, label: `network.allow.duration.${value}` })), help: 'network.allow.duration.help' });
   return formDialog(cx, {
     title: remove ? 'network.unallow.title' : 'network.allow.title', intro: t(remove ? 'network.unallow.effect' : 'network.allow.effect', { network: target || '—' }), body: preview,
-    fields: [{ ...spec, node }], confirm: remove || fixed ? target : null, confirmLabel: remove ? 'network.unallow.confirm' : 'network.allow.confirm', danger: !remove,
+    fields, confirm: remove || fixed ? target : null, confirmLabel: remove ? 'network.unallow.confirm' : 'network.allow.confirm', danger: !remove,
     submit: values => {
       const cidr = isIp(values.network) ? hostNetwork(values.network) : values.network;
+      if (dedicated) {
+        if (remove) return guard(cx, 'allowlist', { method: 'DELETE', json: { expected_revision: revision, network: cidr, reason: values.reason }, reason: values.reason });
+        let reason = values.reason;
+        // Sumunjang keeps at most 128 bytes of entry reason; the journal keeps the full text.
+        while (new TextEncoder().encode(reason).length > 128) reason = reason.slice(0, -1);
+        const seconds = ALLOW_DURATIONS[values.duration] || 0;
+        return guard(cx, 'allowlist', { method: 'POST', json: { expected_revision: revision, network: cidr, ...(seconds ? { expires_at: Math.floor(Date.now() / 1000) + seconds } : {}), reason }, reason: values.reason });
+      }
       const allow = remove ? (document.policy.allow || []).filter(entry => entry !== cidr) : [...new Set([...(document.policy.allow || []), cidr])];
       return guard(cx, 'policy/document', { method: 'PUT', json: { expected_revision: document.revision, policy: { ...document.policy, allow }, reason: values.reason }, reason: values.reason });
     },
@@ -138,7 +158,7 @@ export async function approveCandidates(cx, ips, { onEach } = {}) {
   if (!confirmed) return null;
   const results = [];
   for (const ip of ips) {
-    try { const { operation } = await guard(cx, 'candidates/approve', { json: { ip }, reason: confirmed.reason }); results.push({ ip, kind: 'committed', operation }); }
+    try { const { operation } = await guard(cx, 'candidates/approve', { json: { ip, reason: confirmed.reason }, reason: confirmed.reason }); results.push({ ip, kind: 'committed', operation }); }
     catch (error) { if (error?.status === 401) throw error; results.push({ ip, kind: !error?.status || error.status >= 500 ? 'uncertain' : 'refused', error }); }
     onEach?.(results.at(-1));
   }

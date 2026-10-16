@@ -1,9 +1,9 @@
 // Network ▸ Rules: Sumunjang JSON rules as a structured form or Lua in the
 // host CodeMirror editor; validate with Sumunjang, structured diff against
 // the published rules, what-if on the tracked traffic sample, publish with a
-// reason. Sumunjang's rule replacement has no revision precondition, so the
-// console re-reads the published rules right before publishing and refuses
-// when they changed (the draft is kept).
+// reason. Publishing is a compare-and-set on the rules revision (Sumunjang
+// 0.1.6 `rules/document`); against older packages the console re-reads the
+// published rules right before publishing instead. The draft is always kept.
 import { can, guard, sectionPage, capabilities, notConnected, modeBanner, panel, button, formDialog, outcomeBanner, errorText, fieldErrors, failure, isCidr } from './common.js';
 import { changeList, loadDraft, saveDraft, dropDraft, trafficSample, whatIf } from './diff.js';
 import { createLuaEditor } from '../../lua-editor.js';
@@ -84,15 +84,19 @@ export async function renderRules(cx, root, parts, params) {
   const status = ui.el('div', { class: 'zt-notes' });
   const holder = ui.el('div', { class: 'zt-content' }, ui.loadingState(t));
   content.append(ui.el('nav', { class: 'zt-tabs', attrs: { 'aria-label': t('network.rules.tabs') } }, ['json', 'lua'].map(name => ui.el('a', { href: name === 'json' ? '#network/rules' : '#network/rules/lua', text: t(`network.rules.tab.${name}`), attrs: { 'aria-current': (name === 'lua') === lua ? 'page' : false } }))), status, holder);
-  let published, policy = null;
+  // Sumunjang 0.1.6+: the rules document carries the CAS revision and the stored Lua source.
+  const cas = can(caps, 'rules/document');
+  let published, policy = null, document = null;
   try {
-    [published, policy] = await Promise.all([guard(cx, 'rules').then(answer => answer.data || { version: 1, rules: [] }), guard(cx, 'policy/document').then(answer => answer.data?.policy).catch(error => { if (error?.status === 401) throw error; return null; })]);
+    [published, policy] = await Promise.all([cas ? guard(cx, 'rules/document').then(answer => { document = answer.data || null; return document?.rules || { version: 1, rules: [] }; }) : guard(cx, 'rules').then(answer => answer.data || { version: 1, rules: [] }), guard(cx, 'policy/document').then(answer => answer.data?.policy).catch(error => { if (error?.status === 401) throw error; return null; })]);
   } catch (error) { ui.clear(holder, failure(cx, error, () => cx.navigate(`#network/rules?retry=${Date.now()}`))); return; }
   if (cx.signal.aborted) return;
-  const base = JSON.stringify(published);
+  const base = cas ? String(document?.revision ?? '') : JSON.stringify(published);
+  const storedScript = cas && document?.source === 'lua' && typeof document.script === 'string' ? document.script : null;
   const draftName = lua ? 'rules-lua' : 'rules';
   const stored = loadDraft(draftName);
-  let draft = lua ? { script: LUA_TEMPLATE } : structuredClone({ version: published.version || 1, rules: (published.rules || []).map(normalize) });
+  const initialScript = storedScript ?? LUA_TEMPLATE;
+  let draft = lua ? { script: initialScript } : structuredClone({ version: published.version || 1, rules: (published.rules || []).map(normalize) });
   if (stored?.base === base && stored.draft) { draft = stored.draft; status.append(ui.el('p', { class: 'zt-banner', attrs: { role: 'status' } }, ui.el('span', { text: t('network.draft.restored') }), ' ', button(cx, 'network.draft.discard', () => { dropDraft(draftName); cx.navigate(`${location.hash.split('?')[0]}?fresh=${Date.now()}`); }))); }
   else if (stored && stored.base !== base) status.append(ui.el('p', { class: 'zt-banner zt-banner-warn', attrs: { role: 'alert' } }, ui.el('span', { text: t('network.draft.stale') }), ' ', button(cx, 'network.draft.keep', () => { saveDraft(draftName, base, stored.draft); cx.navigate(`${location.hash.split('?')[0]}?rebased=${Date.now()}`); }), ' ', button(cx, 'network.draft.discard', () => { dropDraft(draftName); cx.navigate(`${location.hash.split('?')[0]}?fresh=${Date.now()}`); })));
   const canPublish = can(caps, lua ? 'rules/lua' : 'rules', 'PUT');
@@ -105,11 +109,11 @@ export async function renderRules(cx, root, parts, params) {
   const publishButton = ui.el('button', { type: 'button', class: 'button button-primary', text: t('network.publish.review'), disabled: true });
   const changed = () => {
     if (!lua) compiled = draft;
-    const diff = compiled ? changeList(cx, ruleEntities(cx, published), ruleEntities(cx, compiled)) : { element: ui.el('p', { class: 'kit-muted', text: t('network.rules.lua.validate_first') }), count: lua ? (draft.script.trim() ? 1 : 0) : 0 };
+    const diff = compiled ? changeList(cx, ruleEntities(cx, published), ruleEntities(cx, compiled)) : { element: ui.el('p', { class: 'kit-muted', text: t('network.rules.lua.validate_first') }), count: lua ? (draft.script.trim() && draft.script !== initialScript ? 1 : 0) : 0 };
     counter.textContent = t('network.publish.changes', { count: diff.count });
     publishButton.disabled = !canPublish || !diff.count;
     ui.clear(diffBox, diff.element);
-    if (lua ? draft.script !== LUA_TEMPLATE : diff.count) saveDraft(draftName, base, draft); else dropDraft(draftName);
+    if (lua ? draft.script !== initialScript : diff.count) saveDraft(draftName, base, draft); else dropDraft(draftName);
     return diff;
   };
   const candidate = () => (lua ? { script: draft.script } : { rules: draft });
@@ -141,7 +145,8 @@ export async function renderRules(cx, root, parts, params) {
     const area = ui.el('textarea', { id, name: 'script', rows: 16, value: draft.script, spellcheck: false, disabled: !canPublish && !canValidate, class: 'kit-mono zt-lua' });
     area.addEventListener('input', () => { draft.script = area.value; compiled = null; ui.clear(validation); changed(); });
     editorNode = ui.el('label', { class: 'kit-field zt-field-wide', htmlFor: id }, ui.el('span', { class: 'kit-field-label', text: t('network.rules.lua.label') }), area, ui.el('small', { class: 'kit-help', text: t('network.rules.lua.help') }));
-    form.append(ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t('network.gap.lua_source') }), editorNode);
+    const luaNote = !cas ? 'network.gap.lua_source' : storedScript !== null ? 'network.rules.lua.loaded' : 'network.rules.lua.from_json';
+    form.append(ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t(luaNote, { revision: document?.revision ?? '—' }) }), editorNode);
     queueMicrotask(() => { try { luaEditor = createLuaEditor(area, { context: 'body', label: t('network.rules.lua.label') }); } catch { luaEditor = null; } });
     cx.signal.addEventListener('abort', () => luaEditor?.destroy(), { once: true });
   } else {
@@ -170,6 +175,12 @@ export async function renderRules(cx, root, parts, params) {
       confirm: t('network.rules.confirm_target'), confirmLabel: 'network.publish.confirm', danger: true,
       submit: async values => {
         // Revision guard: Sumunjang's PUT has no precondition, so compare with a fresh read.
+        if (cas) {
+          // Compare-and-set on the rules revision; a stale base is refused with 409 and the draft kept.
+          return lua ? guard(cx, 'rules/lua', { method: 'PUT', json: { script: draft.script, expected_revision: document.revision, reason: values.reason }, reason: values.reason })
+            : guard(cx, 'rules', { method: 'PUT', json: { expected_revision: document.revision, rules: draft, reason: values.reason }, reason: values.reason });
+        }
+        // Older Sumunjang has no precondition: compare with a fresh read first.
         const current = (await guard(cx, 'rules')).data;
         if (JSON.stringify(current) !== base) throw Object.assign(new Error('conflict'), { status: 409, payload: { error: 'rules changed since loaded' } });
         return lua ? guard(cx, 'rules/lua', { method: 'PUT', json: { script: draft.script }, reason: values.reason }) : guard(cx, 'rules', { method: 'PUT', json: draft, reason: values.reason });
@@ -177,7 +188,7 @@ export async function renderRules(cx, root, parts, params) {
     });
     if (!result) return;
     dropDraft(draftName);
-    ui.clear(status, outcomeBanner(cx, 'committed', 'network.rules.published', { count: result.data?.rules?.length ?? 0, operation: result.operation || '—' }));
+    ui.clear(status, outcomeBanner(cx, 'committed', 'network.rules.published', { count: (result.data?.rules?.rules ?? result.data?.rules)?.length ?? 0, operation: result.operation || '—' }));
     setTimeout(() => cx.navigate(`${location.hash.split('?')[0]}?published=${Date.now()}`), 1200);
   });
   const toolbar = ui.el('div', { class: 'zt-editor-bar' }, counter, ui.el('div', { class: 'button-row' },

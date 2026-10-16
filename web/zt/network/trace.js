@@ -5,6 +5,8 @@ import { codeText, expiry, networkLink, asnText } from './common.js';
 
 export const TRACE_STAGES = Object.freeze(['mode', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block']);
 const DECIDING = Object.freeze({ observe: 'mode', allowlist: 'allowlist', rule: 'rules', block: 'blocklist', default: 'outcome' });
+export // Sumunjang's fixed English reasons for approved and automatic blocks; the origin is shown elsewhere.
+const FIXED_REASONS = new Set(['automatic threshold', 'manual candidate approval']);
 export const VERDICTS = Object.freeze(['allow', 'deny', 'observe']);
 const VERDICT_KIND = Object.freeze({ allow: 'allow', deny: 'deny', observe: 'simulation' });
 
@@ -39,7 +41,7 @@ function stageDetail(cx, stage) {
   }
   if (stage.stage === 'blocklist') {
     const items = [];
-    if (stage.block) items.push(ui.el('li', {}, networkLink(cx, stage.block.network), ' ', ui.el('span', { class: 'kit-muted', text: stage.block.reason || '' }), ' ', expiry(cx, stage.block.expires_at)));
+    if (stage.block) items.push(ui.el('li', {}, networkLink(cx, stage.block.network), ' ', FIXED_REASONS.has(stage.block.reason) ? null : ui.el('span', { class: 'kit-muted', text: stage.block.reason || '' }), ' ', expiry(cx, stage.block.expires_at)));
     for (const block of stage.expired || []) items.push(ui.el('li', { class: 'is-expired' }, networkLink(cx, block.network), ' ', ui.el('span', { class: 'kit-tag kit-tag-warn', text: t('network.expiry.expired') })));
     return items.length ? ui.el('ul', { class: 'zt-trace-rules' }, items) : null;
   }

@@ -218,3 +218,14 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 @media (max-width: 720px) { .zt-rules-table { table-layout: auto; } .zt-rules-table th { width: auto !important; } }
 .zt-matched-rules .is-winner { outline: 1px solid var(--cyan); }
 .zt-matched-rules .is-expired { text-decoration: line-through; opacity: .75; }
+#view-network tr.is-expired { opacity: .55; }
+#view-network tr.is-expired:hover { opacity: .8; }
+.zt-signals .zt-signal { font-variant-numeric: tabular-nums; }
+.zt-history { display: flex; flex-direction: column; gap: .5rem; }
+.zt-history-chart { width: 100%; height: 7rem; display: block; }
+.zt-history-chart rect { fill: var(--amber); }
+.zt-history-chart line { stroke: var(--line-bright); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.zt-history-chart .zt-threshold { stroke: var(--red); stroke-dasharray: 3 3; }
+.zt-history-axis { display: flex; justify-content: space-between; font-size: .76rem; color: var(--muted); }
+.zt-history-legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-size: .85rem; }
+.zt-asn-prefixes { display: flex; flex-wrap: wrap; gap: .25rem; }
