@@ -229,3 +229,6 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 .zt-history-axis { display: flex; justify-content: space-between; font-size: .76rem; color: var(--muted); }
 .zt-history-legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-size: .85rem; }
 .zt-asn-prefixes { display: flex; flex-wrap: wrap; gap: .25rem; }
+.kit-tag-add { color: var(--green); }
+.zt-zone { color: var(--cyan); text-decoration: none; }
+#view-network [aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 1px var(--red) inset; }

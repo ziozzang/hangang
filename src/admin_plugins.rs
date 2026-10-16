@@ -149,6 +149,9 @@ struct Manifest {
     entry: String,
     assets: BTreeMap<String, String>,
     routes: Vec<Route>,
+    /// Contract v2 (`api_version: 2`): bounded route patterns `prefix/*`.
+    #[serde(default)]
+    route_patterns: Vec<RoutePattern>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +159,63 @@ struct Route {
     path: String,
     method: String,
     mutation: bool,
+}
+/// `{"path": "zones/*", "method": "GET", "mutation": false, "max_depth": 1}`:
+/// matches `zones/<s1>[/…/<sN>]` with 1 ≤ N ≤ `max_depth` segments, each a
+/// valid identifier (lowercase letters, digits, `-`, ≤ 32 bytes), for exactly
+/// this method. The prefix itself is a valid route name; the bare prefix is
+/// not matched (declare it as a plain route).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutePattern {
+    path: String,
+    method: String,
+    mutation: bool,
+    #[serde(default = "default_depth")]
+    max_depth: usize,
+}
+fn default_depth() -> usize {
+    1
+}
+/// Plain routes per package (v1 allowed 32). Lookup is a linear scan of short
+/// strings and the manifest stays operator-reviewed and ≤ 64 KiB, so 64 keeps
+/// review practical while leaving room for complete owner APIs.
+const MAX_ROUTES: usize = 64;
+/// Route patterns per package (contract v2) and segments a pattern may span.
+const MAX_PATTERNS: usize = 16;
+const MAX_PATTERN_DEPTH: usize = 4;
+/// Plain routes and patterns together.
+const MAX_ROUTE_ENTRIES: usize = 64;
+fn valid_method(method: &str, mutation: bool) -> bool {
+    matches!(method, "GET" | "POST" | "PUT" | "DELETE")
+        && (method != "GET" || !mutation)
+        && (!matches!(method, "PUT" | "DELETE") || mutation)
+}
+impl Manifest {
+    /// The mutation flag of the route or pattern registered for this exact
+    /// endpoint and method; `None` when nothing is registered. Plain routes
+    /// win; a pattern only matches its prefix followed by 1..=max_depth valid
+    /// identifier segments, so `..`, empty segments, encoded slashes and
+    /// other methods never match.
+    fn resolve(&self, endpoint: &str, method: &str) -> Option<bool> {
+        if let Some(route) = self
+            .routes
+            .iter()
+            .find(|r| r.path == endpoint && r.method == method)
+        {
+            return Some(route.mutation);
+        }
+        if endpoint.len() > 256 {
+            return None;
+        }
+        self.route_patterns.iter().find_map(|p| {
+            let prefix = p.path.strip_suffix("/*")?;
+            let rest = endpoint.strip_prefix(prefix)?.strip_prefix('/')?;
+            let depth = rest.split('/').count();
+            (p.method == method && depth <= p.max_depth && rest.split('/').all(valid_id))
+                .then_some(p.mutation)
+        })
+    }
 }
 struct Asset {
     bytes: Bytes,
@@ -260,7 +320,8 @@ impl Registry {
             let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
             ensure!(
                 manifest.id == binding.id
-                    && manifest.api_version == 1
+                    && matches!(manifest.api_version, 1 | 2)
+                    && (manifest.api_version == 2 || manifest.route_patterns.is_empty())
                     && !manifest.name.is_empty()
                     && manifest.name.len() <= 64,
                 "invalid console plugin manifest"
@@ -268,7 +329,9 @@ impl Registry {
             semver::Version::parse(&manifest.version)?;
             ensure!(
                 manifest.assets.len() <= 16
-                    && manifest.routes.len() <= 32
+                    && manifest.routes.len() <= MAX_ROUTES
+                    && manifest.route_patterns.len() <= MAX_PATTERNS
+                    && manifest.routes.len() + manifest.route_patterns.len() <= MAX_ROUTE_ENTRIES
                     && manifest.entry.ends_with(".js")
                     && manifest.assets.contains_key(&manifest.entry),
                 "invalid plugin entry/limits"
@@ -301,11 +364,29 @@ impl Registry {
             for route in &manifest.routes {
                 ensure!(
                     route_name(&route.path)
-                        && matches!(route.method.as_str(), "GET" | "POST" | "PUT" | "DELETE")
-                        && (route.method != "GET" || !route.mutation)
-                        && (!matches!(route.method.as_str(), "PUT" | "DELETE") || route.mutation)
+                        && valid_method(&route.method, route.mutation)
                         && endpoints.insert((route.path.clone(), route.method.clone())),
                     "invalid/duplicate plugin route"
+                );
+            }
+            let mut patterns = std::collections::HashSet::new();
+            for pattern in &manifest.route_patterns {
+                let prefix = pattern.path.strip_suffix("/*").unwrap_or("");
+                ensure!(
+                    route_name(prefix)
+                        && (1..=MAX_PATTERN_DEPTH).contains(&pattern.max_depth)
+                        && valid_method(&pattern.method, pattern.mutation)
+                        && patterns.insert((prefix.to_owned(), pattern.method.clone())),
+                    "invalid/duplicate plugin route pattern"
+                );
+                // A plain route under the prefix with the same method would be
+                // shadowed ambiguously; require one or the other.
+                ensure!(
+                    !manifest.routes.iter().any(|r| r.method == pattern.method
+                        && r.path
+                            .strip_prefix(prefix)
+                            .is_some_and(|rest| rest.starts_with('/'))),
+                    "plugin route overlaps a route pattern"
                 );
             }
             let mut backend = reqwest::Url::parse(&binding.backend)?;
@@ -447,7 +528,7 @@ impl Registry {
         })
     }
     pub fn discovery(&self) -> Value {
-        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id),"authentication":p.delegation_authority.as_deref().unwrap_or("native"),"routes":p.manifest.routes.iter().map(|r|json!({"path":r.path,"method":r.method,"mutation":r.mutation})).collect::<Vec<_>>()})).collect::<Vec<_>>()})
+        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id),"authentication":p.delegation_authority.as_deref().unwrap_or("native"),"routes":p.manifest.routes.iter().map(|r|json!({"path":r.path,"method":r.method,"mutation":r.mutation})).collect::<Vec<_>>(),"route_patterns":p.manifest.route_patterns.iter().map(|r|json!({"path":r.path,"method":r.method,"mutation":r.mutation,"max_depth":r.max_depth})).collect::<Vec<_>>()})).collect::<Vec<_>>()})
     }
     pub fn asset<B>(&self, request: &Request<B>) -> Option<Response<Body>> {
         let path = request.uri().path().strip_prefix("/ui/plugins/")?;
@@ -519,12 +600,7 @@ impl Registry {
         let Some(plugin) = self.plugins.get(id) else {
             return problem(StatusCode::NOT_FOUND, "unknown plugin");
         };
-        let Some(route) = plugin
-            .manifest
-            .routes
-            .iter()
-            .find(|r| r.path == endpoint && r.method == req.method().as_str())
-        else {
+        let Some(mutation) = plugin.manifest.resolve(endpoint, req.method().as_str()) else {
             return problem(StatusCode::NOT_FOUND, "plugin route is not registered");
         };
         if req.uri().query().is_some() {
@@ -601,7 +677,7 @@ impl Registry {
         if authority.check().await.is_err() {
             return problem(StatusCode::FORBIDDEN, "administrator authority was revoked");
         }
-        let record = if route.mutation {
+        let record = if mutation {
             let audit = self.audit.clone();
             let actor = actor.clone();
             let route = endpoint.to_owned();
@@ -1233,24 +1309,29 @@ mod tests {
         assert!(audit_connection(&path).is_err());
     }
 
-    /// Hopae subject directory and authentication explain (Hopae
-    /// docs/SUBJECT_DIRECTORY.md, AUTHENTICATION_EXPLAIN.md) are POST reads:
-    /// listed as non-mutating routes they are forwarded to the exact
-    /// /v1/<path> with a signed actor assertion over the body, are not
-    /// recorded as mutations, and every other method or path is refused.
-    #[tokio::test]
-    async fn hopae_subject_directory_reads_are_signed_non_mutating_posts() {
+    type Calls = Arc<std::sync::Mutex<Vec<(String, String, Value, Option<String>)>>>;
+    /// A signed-delegation backend and the broker in front of it for `manifest`
+    /// (plugin id = manifest id). The backend records each call with the
+    /// actor of an assertion verified over the exact method, path and body.
+    async fn delegated_fixture(
+        manifest: Value,
+    ) -> (
+        String,
+        Calls,
+        PathBuf,
+        tempfile::TempDir,
+        Vec<tokio::task::AbortHandle>,
+    ) {
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
         use std::sync::Mutex;
+        let id = manifest["id"].as_str().unwrap().to_owned();
         let key = std::env::var("PATH").unwrap_or_default();
         assert!(
             key.len() >= 32,
             "the delegation key fixture reads PATH (at least 32 bytes)"
         );
-        let calls = Arc::new(Mutex::new(
-            Vec::<(String, String, Value, Option<String>)>::new(),
-        ));
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend = listener.local_addr().unwrap();
         let backend_calls = calls.clone();
@@ -1307,7 +1388,7 @@ mod tests {
                             calls.lock().unwrap().push((
                                 method,
                                 path,
-                                serde_json::from_slice(&bytes).unwrap(),
+                                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
                                 verified.map(|a| a.actor_name),
                             ));
                             Ok(reply(
@@ -1325,15 +1406,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("index.js"), "export function mount(){}").unwrap();
-        let manifest = serde_json::to_vec(&json!({"id":"hopae","name":"Hopae","version":"0.1.8","api_version":1,"entry":"index.js","assets":{"index.js":sha(b"export function mount(){}")},"routes":[
-            {"path":"subjects/resolve","method":"POST","mutation":false},
-            {"path":"subjects/search","method":"POST","mutation":false},
-            {"path":"subjects/lifecycle","method":"POST","mutation":false},
-            {"path":"subjects/lifecycle/snapshot","method":"POST","mutation":false},
-            {"path":"explain/authentication","method":"POST","mutation":false}]})).unwrap();
+        let manifest = serde_json::to_vec(&manifest).unwrap();
         fs::write(root.join("manifest.json"), &manifest).unwrap();
         let config = root.join("plugins.json");
-        fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":"hopae","directory":root,"manifest_sha256":sha(&manifest),"backend":format!("http://{backend}"),"token_env":"PATH","delegate_actor":true,"delegation_authority":"hangang"}]})).unwrap()).unwrap();
+        fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":id,"directory":root,"manifest_sha256":sha(&manifest),"backend":format!("http://{backend}"),"token_env":"PATH","delegate_actor":true,"delegation_authority":"hangang"}]})).unwrap()).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             for file in fs::read_dir(root).unwrap() {
@@ -1376,8 +1452,30 @@ mod tests {
                 });
             }
         });
+        let base = format!("http://{proxy}/v1/plugins/{id}");
+        (
+            base,
+            calls,
+            audit_path,
+            dir,
+            vec![proxy_task.abort_handle(), backend_task.abort_handle()],
+        )
+    }
+
+    /// Hopae subject directory and authentication explain (Hopae
+    /// docs/SUBJECT_DIRECTORY.md, AUTHENTICATION_EXPLAIN.md) are POST reads:
+    /// listed as non-mutating routes they are forwarded to the exact
+    /// /v1/<path> with a signed actor assertion over the body, are not
+    /// recorded as mutations, and every other method or path is refused.
+    #[tokio::test]
+    async fn hopae_subject_directory_reads_are_signed_non_mutating_posts() {
+        let (base, calls, audit_path, _dir, tasks) = delegated_fixture(json!({"id":"hopae","name":"Hopae","version":"0.1.8","api_version":1,"entry":"index.js","assets":{"index.js":sha(b"export function mount(){}")},"routes":[
+            {"path":"subjects/resolve","method":"POST","mutation":false},
+            {"path":"subjects/search","method":"POST","mutation":false},
+            {"path":"subjects/lifecycle","method":"POST","mutation":false},
+            {"path":"subjects/lifecycle/snapshot","method":"POST","mutation":false},
+            {"path":"explain/authentication","method":"POST","mutation":false}]})).await;
         let client = reqwest::Client::new();
-        let base = format!("http://{proxy}/v1/plugins/hopae");
         for (path, body) in [
             (
                 "subjects/resolve",
@@ -1454,7 +1552,180 @@ mod tests {
                 .is_empty(),
             "reads are not mutations"
         );
-        proxy_task.abort();
-        backend_task.abort();
+        tasks.iter().for_each(tokio::task::AbortHandle::abort);
+    }
+
+    fn manifest_v2(routes: Value, patterns: Value) -> Manifest {
+        serde_json::from_value(json!({"id":"guard","name":"Guard","version":"0.2.0","api_version":2,"entry":"index.js","assets":{},"routes":routes,"route_patterns":patterns})).unwrap()
+    }
+
+    /// Contract v2 patterns match only their prefix plus 1..=max_depth
+    /// identifier segments for the declared method; plain routes win.
+    #[test]
+    fn route_patterns_match_bounded_identifier_segments_only() {
+        let m = manifest_v2(
+            json!([{"path":"zones","method":"GET","mutation":false}]),
+            json!([{"path":"zones/*","method":"GET","mutation":false},{"path":"zones/*","method":"DELETE","mutation":true},{"path":"rules/sets/*","method":"PUT","mutation":true,"max_depth":2}]),
+        );
+        assert_eq!(m.resolve("zones", "GET"), Some(false));
+        assert_eq!(m.resolve("zones/corp", "GET"), Some(false));
+        assert_eq!(m.resolve("zones/corp", "DELETE"), Some(true));
+        assert_eq!(m.resolve("rules/sets/a/b", "PUT"), Some(true));
+        for (path, method) in [
+            ("zones/corp", "POST"), // method not declared for the pattern
+            ("zones/corp", "HEAD"),
+            ("zones/a/b", "GET"), // deeper than max_depth
+            ("rules/sets/a/b/c", "PUT"),
+            ("zones/", "GET"), // empty segment
+            ("zones//x", "GET"),
+            ("zones/..", "GET"),     // traversal
+            ("zones/%2e%2e", "GET"), // encoded traversal
+            ("zones/a%2Fb", "GET"),  // encoded slash
+            ("zones/Corp", "GET"),   // not a valid identifier
+            ("zonesx/corp", "GET"),  // prefix must end at a segment
+            ("other/zones/corp", "GET"),
+        ] {
+            assert_eq!(m.resolve(path, method), None, "{method} {path}");
+        }
+        assert_eq!(m.resolve(&format!("zones/{}", "a".repeat(33)), "GET"), None);
+    }
+
+    #[test]
+    fn route_pattern_manifests_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("index.js"), "export function mount(){}").unwrap();
+        let load = |manifest: Value| {
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            fs::write(root.join("manifest.json"), &bytes).unwrap();
+            let config = root.join("plugins.json");
+            fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":"guard","directory":root,"manifest_sha256":sha(&bytes),"backend":"http://127.0.0.1:9080","token_env":"HOME"}]})).unwrap()).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            for file in fs::read_dir(root).unwrap() {
+                fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            Registry::load(&config)
+        };
+        let base = |version: u32, routes: Value, patterns: Value| json!({"id":"guard","name":"Guard","version":"0.2.0","api_version":version,"entry":"index.js","assets":{"index.js":sha(b"export function mount(){}")},"routes":routes,"route_patterns":patterns});
+        let ok = json!([{"path":"zones/*","method":"POST","mutation":true}]);
+        assert!(load(base(2, json!([]), ok.clone())).is_ok());
+        // v1 manifests keep their exact semantics: no patterns.
+        assert!(load(base(1, json!([]), ok.clone())).is_err());
+        assert!(load(base(3, json!([]), json!([]))).is_err());
+        for bad in [
+            json!([{"path":"zones","method":"GET","mutation":false}]), // no /*
+            json!([{"path":"zones/*/x","method":"GET","mutation":false}]),
+            json!([{"path":"../*","method":"GET","mutation":false}]),
+            json!([{"path":"zones/*","method":"GET","mutation":true}]), // GET cannot mutate
+            json!([{"path":"zones/*","method":"DELETE","mutation":false}]), // DELETE must mutate
+            json!([{"path":"zones/*","method":"PATCH","mutation":true}]),
+            json!([{"path":"zones/*","method":"GET","mutation":false,"max_depth":0}]),
+            json!([{"path":"zones/*","method":"GET","mutation":false,"max_depth":5}]),
+            json!([{"path":"zones/*","method":"GET","mutation":false},{"path":"zones/*","method":"GET","mutation":false}]),
+        ] {
+            assert!(load(base(2, json!([]), bad.clone())).is_err(), "{bad}");
+        }
+        // A plain route under a pattern prefix with the same method is ambiguous.
+        assert!(
+            load(base(
+                2,
+                json!([{"path":"zones/corp","method":"GET","mutation":false}]),
+                json!([{"path":"zones/*","method":"GET","mutation":false}])
+            ))
+            .is_err()
+        );
+        // Plain routes: up to 64; patterns: up to 16; together at most 64.
+        let routes = |n: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|i| json!({"path":format!("r{i}"),"method":"GET","mutation":false}))
+                    .collect(),
+            )
+        };
+        let patterns = |n: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|i| json!({"path":format!("p{i}/*"),"method":"GET","mutation":false}))
+                    .collect(),
+            )
+        };
+        assert!(load(base(1, routes(64), json!([]))).is_ok());
+        assert!(load(base(1, routes(65), json!([]))).is_err());
+        assert!(load(base(2, json!([]), patterns(16))).is_ok());
+        assert!(load(base(2, json!([]), patterns(17))).is_err());
+        assert!(load(base(2, routes(49), patterns(16))).is_err());
+        assert!(load(base(2, routes(48), patterns(16))).is_ok());
+    }
+
+    /// A pattern route is forwarded to exactly `/v1/<prefix>/<segment>` with
+    /// the method requested; the delegation assertion covers that exact path,
+    /// method and body; the pattern's mutation flag decides journaling.
+    #[tokio::test]
+    async fn route_patterns_forward_the_exact_signed_path_and_journal_mutations() {
+        let (base, calls, audit_path, _dir, tasks) = delegated_fixture(json!({"id":"guard","name":"Guard","version":"0.2.0","api_version":2,"entry":"index.js","assets":{"index.js":sha(b"export function mount(){}")},
+            "routes":[{"path":"zones","method":"GET","mutation":false}],
+            "route_patterns":[{"path":"zones/*","method":"POST","mutation":true},{"path":"zones/*","method":"GET","mutation":false}]})).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/zones/corp"))
+            .json(&json!({"reason":"x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let last = calls.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            (last.0.as_str(), last.1.as_str()),
+            ("POST", "/v1/zones/corp")
+        );
+        assert_eq!(
+            last.3.as_deref(),
+            Some("fixture-operator"),
+            "assertion must cover the exact forwarded path"
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key("x-hangang-plugin-operation")
+        );
+        let operations = audit_read(&audit_path).unwrap()["operations"].clone();
+        assert_eq!(operations[0]["path"], "zones/corp");
+        assert_eq!(operations.as_array().unwrap().len(), 1);
+        let response = client
+            .get(format!("{base}/zones/corp"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            audit_read(&audit_path).unwrap()["operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "pattern reads are not mutations"
+        );
+        let before = calls.lock().unwrap().len();
+        for (method, path) in [
+            ("DELETE", "zones/corp"),
+            ("POST", "zones/a/b"),
+            ("POST", "zones/..%2fstatus"),
+            ("PUT", "zones/corp"),
+        ] {
+            let response = client
+                .request(method.parse().unwrap(), format!("{base}/{path}"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "refused requests never reach the backend"
+        );
+        tasks.iter().for_each(tokio::task::AbortHandle::abort);
     }
 }

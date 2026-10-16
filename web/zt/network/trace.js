@@ -3,7 +3,7 @@
 // outcome, then the informational score and automatic-block stages.
 import { codeText, expiry, networkLink, asnText } from './common.js';
 
-export const TRACE_STAGES = Object.freeze(['mode', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block']);
+export const TRACE_STAGES = Object.freeze(['mode', 'zone', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block']);
 const DECIDING = Object.freeze({ observe: 'mode', allowlist: 'allowlist', rule: 'rules', block: 'blocklist', default: 'outcome' });
 export // Sumunjang's fixed English reasons for approved and automatic blocks; the origin is shown elsewhere.
 const FIXED_REASONS = new Set(['automatic threshold', 'manual candidate approval']);
@@ -17,6 +17,7 @@ export function verdictBadge(cx, verdict) {
 
 function stageBadge(cx, stage) {
   const { t, ui } = cx;
+  if (stage.stage === 'zone') return cx.ui.statusBadge(cx.t, stage.zones?.length ? 'healthy' : 'disabled', stage.zones?.length ? 'network.trace.zone.in' : 'network.trace.no_match');
   if (stage.stage === 'mode') return ui.statusBadge(t, stage.mode === 'enforce' ? 'healthy' : 'simulation', `network.mode.${stage.mode === 'enforce' ? 'enforce' : 'observe'}`);
   if (stage.stage === 'allowlist') return ui.statusBadge(t, stage.matched ? 'allow' : 'disabled', stage.matched ? 'network.trace.matched' : 'network.trace.no_match');
   if (stage.stage === 'rules') return ui.statusBadge(t, stage.winner ? (stage.matched?.find(rule => rule.winner)?.action === 'deny' ? 'deny' : 'allow') : 'disabled', stage.winner ? 'network.trace.winner' : 'network.trace.no_match');
@@ -28,6 +29,7 @@ function stageBadge(cx, stage) {
 
 function stageDetail(cx, stage) {
   const { t, ui } = cx;
+  if (stage.stage === 'zone') return stage.zones?.length ? ui.el('p', { class: 'zt-chips' }, stage.zones.map(id => ui.el('a', { class: 'kit-tag zt-zone', href: `#network/zones/${encodeURIComponent(id)}`, text: id }))) : null;
   if (stage.stage === 'rules') {
     const rows = [...(stage.matched || []).map(rule => ({ ...rule, expired: false })), ...(stage.expired || []).map(rule => ({ ...rule, expired: true }))];
     if (!rows.length) return null;
@@ -59,7 +61,7 @@ export function explainTimeline(cx, result) {
   const list = ui.el('ol', { class: 'kit-timeline zt-guard-trace' });
   for (const name of TRACE_STAGES) {
     const stage = stages.find(entry => entry.stage === name);
-    if (!stage && (name === 'score' || name === 'auto_block')) continue;
+    if (!stage && (name === 'zone' || name === 'score' || name === 'auto_block')) continue;
     const isDeciding = deciding === name;
     const item = ui.el('li', { class: `kit-stage${isDeciding ? ' is-deciding' : ''}${stage ? '' : ' is-skipped'}${stage?.informational ? ' is-informational' : ''}`, dataset: { stage: name } });
     const head = ui.el('div', { class: 'kit-stage-head' }, ui.el('strong', { text: t(`network.trace.stage.${name}`) }));

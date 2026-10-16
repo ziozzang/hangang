@@ -149,7 +149,7 @@ Object.assign(families, {
 // Network section (zt/network): dynamic key families built from Sumunjang values.
 const sumunjang = name => JSON.parse(readFileSync(path.join(web, 'zt/network/messages', `${name}.json`), 'utf8'));
 Object.assign(families, {
-  'network.page': ['overview', 'threats', 'blocks', 'rules', 'policy', 'asn'],
+  'network.page': ['overview', 'threats', 'blocks', 'zones', 'rules', 'policy', 'asn'],
   'network.mode': ['observe', 'enforce', 'unknown', 'observe.body', 'enforce.body', 'unknown.body'],
   'network.suspicion': ['normal', 'watch', 'suspicious', 'high', 'blocked'],
   'network.verdict': ['allow', 'deny', 'observe'],
@@ -158,7 +158,7 @@ Object.assign(families, {
   'network.block.reason': ['manual', 'approved', 'automatic', 'kubernetes', 'unknown'],
   'network.allow.duration': ['never', '24h', '7d', '30d', '90d'],
   'network.rule.action': ['allow', 'deny', 'observe'],
-  'network.trace.stage': ['mode', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block'],
+  'network.trace.stage': ['mode', 'zone', 'allowlist', 'geo', 'rules', 'blocklist', 'outcome', 'score', 'auto_block'],
   'network.asn_source': ['geoip', 'catalog', 'none'],
   'network.duration': ['15m', '1h', '24h', '7d', '30d'],
   'network.signal': ['honeypot', 'scanner', 'auth_failure', 'invalid_request'],

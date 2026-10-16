@@ -111,6 +111,7 @@ AAL 3 고보증 키, 최근 사용이 있는 패스키, 인증 앱, 복구 코�
 | `#network/threats?q=&stage=&asn=&eligible=` | 위협 대기열: 점수, 단계, 이벤트, ASN, 최근 확인. 개수 입력 확인과 사유로 일괄 승인 | `candidates`, `candidates/approve` |
 | `#network/ip/{ip}` | IP 상세: GeoIP/ASN, 점수와 단계, 일치 규칙, 만료가 있는 차단, 허용 목록, 설명 추적(게시본과 관찰 중에는 집행 시), 관련 판단. 사유와 함께 차단·해제·허용 | `lookup`, `explain`, `blocks`, `policy/document` |
 | `#network/blocks[/allowlist]?kind=` | 차단(수동, 승인, 자동)과 만료 카운트다운, 허용 목록. 추가 시 CIDR 검증과 영향 미리 보기 | `blocks`, `networks/inspect`, `explain/batch`, `policy/document` |
+| `#network/zones[/{id}]` | 네트워크 존(수문장 0.1.7): 64개 존·65,536개 접두사 한도 대비 사용량이 있는 목록, 접두사와 추적 주소가 있는 상세, 존 리비전 비교 후 교체와 사유로 생성·교체·삭제, 양식에 표시되는 수문장 `/zone/id`·`/zone/prefixes/N` 오류, 추적 주소의 소속 변화 미리 보기. IP 추적과 위협 대기열에 존 표시 | `zones`(GET/POST), `explain/batch` |
 | `#network/rules[/lua]?rule=` | 구조화 양식 또는 호스트 CodeMirror 편집기의 Lua 규칙. 검증, 변경 목록, 추적 주소 가정 분석, 사유와 함께 게시 | `rules`, `rules/validate`, `rules/lua`, `explain/batch` |
 | `#network/policy` | 모드, 자동 차단, 창, 임계값, 차단 수명, 가중치. 변경 목록, 가정 분석, 사유가 있는 CAS 게시(`expected_revision`). 집행 전환은 모드 이름 입력 필요 | `policy/document`, `explain/batch` |
 | `#network/asn` | 근거에 나타난 ASN과 이를 지정한 규칙(읽기 전용). 제안 절차는 예정으로 표시 | `candidates`, `rules` |
