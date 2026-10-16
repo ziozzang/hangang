@@ -1193,10 +1193,7 @@ mod tests {
             headers.insert("x-hangang-change-reason", bad.parse().unwrap());
             assert_eq!(change_reason(&headers), Err(()), "{bad}");
         }
-        headers.insert(
-            "x-hangang-change-reason",
-            "a".repeat(513).parse().unwrap(),
-        );
+        headers.insert("x-hangang-change-reason", "a".repeat(513).parse().unwrap());
         assert_eq!(change_reason(&headers), Err(()));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.db");
