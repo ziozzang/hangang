@@ -16,7 +16,7 @@ administrator-only and read data through the existing management API.
 | Access | `#access/decisions` | Decision log with server-side filters held in the URL, cursor pagination, time-order toggle, request/user/IP search and a bounded live tail |
 | Access | `#access/requests/{request_id}` | Request detail: stage timeline with the deciding stage, localized reason and remediation, revision vector with *changed since* |
 | Identities | `#identities/users/{id}` | Subject resolved through Hopae `subjects/resolve` when available, otherwise the opaque ID; recent decisions by forward lookup |
-| Network | `#network/ip/{ip}` | GeoIP country and recent decisions for the address |
+| Network | `#network/…` | Overview, threat queue, IP detail, blocks & allowlist, rules, policy and ASN pools through the Sumunjang package (see below) |
 | Policies | `#policies/services/{id}` | Recent decisions for the Pumgye service |
 | Audit | `#audit` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff. Console-account audit retention, policy and export moved to `#account-audit`; earlier `#audit-trail` links redirect |
 | System | `#system` | Components, packages, decision events, exporter and privacy profile; raw JSON only behind *View raw diagnostics* |
@@ -26,6 +26,37 @@ opener and links to the current component pages. When decision events are off,
 every decision view states *Decision events disabled* instead of showing an
 empty list. Actions that need later phases (simulator, reveal) are shown
 disabled with the reason.
+
+## Network
+
+All Network pages call the Sumunjang console package through the host broker
+(`/v1/plugins/guard/<route>`). The former Sumunjang package page is no longer
+in the navigation; `#plugin-guard` links redirect to `#network`.
+
+| Route | Page | Sumunjang routes |
+| --- | --- | --- |
+| `#network` | Overview: mode banner; in observe mode what enforcement would deny among tracked addresses; queue, blocks, allowlist and rule counts; network-stage denial trend and top countries from the Hangang decision log; top ASNs; recent policy changes | `policy/document`, `candidates`, `blocks`, `rules`, `explain/batch`, `audit/query` |
+| `#network/threats?q=&stage=&asn=&eligible=` | Threat queue: score, stage, events, ASN, last seen; bulk approval with typed count and reason | `candidates`, `candidates/approve` |
+| `#network/ip/{ip}` | IP detail: GeoIP/ASN, score and stage, matched rules, covering blocks with expiry, allowlist, explain trace (published and, while observing, if enforced), related decisions; block/unblock/allowlist with reason | `lookup`, `explain`, `blocks`, `policy/document` |
+| `#network/blocks[/allowlist]?kind=` | Blocks (manual, approved, automatic) with expiry countdown; allowlist; additions validate the CIDR and preview impact | `blocks`, `networks/inspect`, `explain/batch`, `policy/document` |
+| `#network/rules[/lua]?rule=` | Rules as a structured form or Lua in the host CodeMirror editor; validate, change list, what-if on tracked addresses, publish with reason | `rules`, `rules/validate`, `rules/lua`, `explain/batch` |
+| `#network/policy` | Mode, automatic blocking, window, threshold, block lifetime and weights; change list, what-if, CAS publish (`expected_revision`) with reason; switching to enforce requires typing the mode | `policy/document`, `explain/batch` |
+| `#network/asn` | ASNs seen in evidence and rules naming them (read-only); proposal workflow shown as planned | `candidates`, `rules` |
+
+Sumunjang status, GeoIP databases (reload), signed updates (check) and the
+Kubernetes source moved to System; raw diagnostics stay collapsed. Writes
+carry the operator reason in `x-hangang-change-reason` (operation journal);
+policy writes also send it in Sumunjang's `reason`, and a manual block uses
+it as the block reason (128 bytes). Rule replacement has no revision
+precondition in Sumunjang, so the console re-reads the published rules
+right before publishing and refuses when they changed.
+
+Sumunjang API follow-ups the pages state in place: per-address score and
+signal history; per-signal counts and country on candidates; block creator
+and creation time; an `expected_revision` on `PUT /v1/rules` and
+`/v1/rules/lua`; the Lua source is not retained; a readable ASN catalog and
+an ASN proposal API; a reason field on block, approval and rule writes;
+`explain/batch` and impact estimates cover tracked addresses only.
 
 ## Shared UI kit
 
