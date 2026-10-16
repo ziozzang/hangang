@@ -1,7 +1,7 @@
 // Identities ▸ Users ▸ user detail (ADR 0020 §3): Profile & linked
 // identities, Authentication, Sessions, Groups, Access (Pumgye grants) and
 // Activity (Hopae events plus the Hangang decision log for this subject).
-import { can, hopae, failure, sectionPage, capabilities, timeOrDash, subjectStatus, aalBadge, factorList, formDialog, outcomeBanner, facts, panel, scan, button, sourceBadge, errorText } from './common.js';
+import { can, hopae, failure, sectionPage, capabilities, timeOrDash, subjectStatus, aalBadge, factorList, formDialog, outcomeBanner, facts, panel, button, sourceBadge, errorText, filteredList, hopaeStatus } from './common.js';
 import { sessionColumns } from './sessions.js';
 import { explainPanel } from './explain.js';
 import { decisionColumns, decisionFetcher } from '../access.js';
@@ -37,12 +37,18 @@ function eventColumns(cx) {
 }
 
 /** Bounded scan of the newest Hopae events for one user (no server filter yet). */
-async function userEvents(cx, userId, filter = () => true) {
-  return scan(cx, 'events/query', { match: event => event?.user_id === userId && filter(event), pages: 3, signal: cx.signal });
+/** A user's events: filtered by Hopae (0.1.10) or a bounded scan for older packages. */
+async function userEvents(cx, userId, kindPrefix = null) {
+  return filteredList(cx, 'events/query', { filters: { user_id: userId, ...(kindPrefix ? { kind_prefix: kindPrefix } : {}) }, match: event => event?.user_id === userId && (!kindPrefix || String(event.kind || '').startsWith(kindPrefix) || (kindPrefix === 'factor.' && event.kind === 'admin.factor_reset')), pages: 3 });
+}
+
+async function userSessions(cx, userId) {
+  return filteredList(cx, 'sessions/query', { filters: { user_id: userId }, match: session => session.user_id === userId });
 }
 
 function scanNote(cx, result) {
-  return result.complete ? null : cx.ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: cx.t('identities.scan.partial', { count: result.seen }) });
+  if (result.complete) return null;
+  return cx.ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: cx.t(result.server ? 'identities.scan.truncated' : 'identities.scan.partial', { count: result.seen }) });
 }
 
 function staticTable(cx, { id, caption, columns, items, empty, onRowOpen }) {
@@ -66,9 +72,27 @@ async function profileTab(cx, user, caps) {
   const { t, ui } = cx;
   const providers = user.providers || [];
   let providerInfo = new Map();
-  if (providers.length && can(caps, 'status')) {
-    try { providerInfo = new Map(((await hopae(cx, 'status')).data?.providers || []).map(provider => [provider.provider_id, provider])); }
-    catch (error) { if (error?.status === 401) throw error; }
+  if (can(caps, 'status')) providerInfo = new Map(((await hopaeStatus(cx, caps))?.providers || []).map(provider => [provider.provider_id, provider]));
+  // Hopae 0.1.10 `users/get`: each linked identity with its provider subject and times.
+  let identities = null;
+  if (can(caps, 'users/get') && (user.user_id || /^u_/.test(user.id))) {
+    try { identities = (await hopae(cx, 'users/get', { json: { id: user.user_id || user.id } })).data?.identities || []; }
+    catch (error) { if (error?.status === 401) throw error; identities = null; }
+  }
+  if (identities) {
+    const list = identities.length ? ui.el('ul', { class: 'zt-linked' }, identities.map(identity => {
+      const info = providerInfo.get(identity.provider_id);
+      return ui.el('li', { class: 'zt-card zt-identity' },
+        ui.el('div', { class: 'zt-card-head' }, ui.el('div', { class: 'zt-stack' }, ui.el('strong', { text: info?.display_name || identity.provider_id }), ui.el('span', { class: 'kit-entity-id', text: identity.provider_id })), info ? ui.statusBadge(t, info.health === 'ok' ? 'healthy' : info.health === 'degraded' ? 'stale' : 'disabled', `identities.provider.health.${['ok', 'degraded', 'disabled'].includes(info.health) ? info.health : 'unknown'}`) : null),
+        facts(cx, [
+          ['identities.identity.subject', identity.subject ? ui.el('span', { class: 'zt-id' }, ui.el('code', { class: 'kit-mono zt-break', text: identity.subject }), ui.copyButton(t, identity.subject)) : null],
+          ['identities.identity.email', identity.email ? ui.el('span', {}, ui.el('span', { text: identity.email }), ' ', ui.el('span', { class: 'kit-tag', text: t(identity.email_verified ? 'identities.identity.verified' : 'identities.identity.unverified') })) : null],
+          ['identities.identity.name', identity.name || null],
+          ['identities.identity.first_seen', timeOrDash(cx, identity.first_seen_at)],
+          ['identities.identity.last_seen', timeOrDash(cx, identity.last_seen_at)],
+        ]));
+    })) : ui.el('p', { class: 'kit-muted', text: t('identities.user.linked.none') });
+    return [profilePanel(cx, user), panel(cx, 'identities.user.linked', list), recentDecisions(cx, user.user_id || user.id, 10)];
   }
   const linked = providers.length ? ui.el('ul', { class: 'zt-linked' }, providers.map(id => {
     const info = providerInfo.get(id);
@@ -76,7 +100,15 @@ async function profileTab(cx, user, caps) {
       ui.el('span', { class: 'kit-muted', text: info ? t(`identities.provider.kind.${['oidc', 'oauth2', 'email_link', 'password', 'ldap'].includes(info.kind) ? info.kind : 'other'}`) : t('identities.unreported') }));
   })) : ui.el('p', { class: 'kit-muted', text: t('identities.user.linked.none') });
   return [
-    panel(cx, 'identities.user.profile', facts(cx, [
+    profilePanel(cx, user),
+    panel(cx, 'identities.user.linked', ui.el('div', { class: 'zt-content' }, linked, ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('identities.gap.linked_identities') })))),
+    recentDecisions(cx, user.user_id || user.id, 10),
+  ];
+}
+
+function profilePanel(cx, user) {
+  const { t, ui } = cx;
+  return panel(cx, 'identities.user.profile', facts(cx, [
       ['identities.user.display_name', user.display_name],
       ['identities.user.email', user.email],
       ['identities.user.kind', user.kind ? t(`decision.principal.${user.kind}`) : null],
@@ -86,21 +118,83 @@ async function profileTab(cx, user, caps) {
       ['identities.users.col.created', timeOrDash(cx, user.created_at)],
       ['identities.users.col.last_login', timeOrDash(cx, user.last_login_at)],
       ['identities.user.last_seen', timeOrDash(cx, user.last_seen_at)],
-    ])),
-    panel(cx, 'identities.user.linked', ui.el('div', { class: 'zt-content' }, linked, ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('identities.gap.linked_identities') })))),
-    recentDecisions(cx, user.user_id || user.id, 10),
-  ];
+    ]));
+}
+
+/** Before Hopae 0.1.10: factor state is not reported; reset is CLI-only. */
+function legacyFactorsPanel(cx) {
+  const { t, ui } = cx;
+  const factorRows = ['webauthn', 'totp', 'recovery'].map(factor => ui.el('li', { class: 'zt-factor' },
+    ui.el('span', { class: 'zt-factor-icon', text: factor === 'webauthn' ? '⚿' : factor === 'totp' ? '⏱' : '⎘', attrs: { 'aria-hidden': 'true' } }),
+    ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t(`identities.factor.${factor}`) }), ui.el('span', { class: 'kit-muted', text: t(`identities.factor.${factor}.help`) })),
+    ui.statusBadge(t, 'unknown', 'identities.factor.unreported')));
+  return panel(cx, 'identities.factors.title', ui.el('div', { class: 'zt-content' }, ui.el('ul', { class: 'zt-factors' }, factorRows),
+    ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('identities.gap.factors') }))), { actions: [ui.disabledAction(t, 'identities.factors.reset', 'identities.gap.factor_reset')] });
+}
+
+/**
+ * Hopae 0.1.10 `users/factors`: passkeys (authenticator from the AAGUID,
+ * synced or device-bound, backup state, assurance, last use), the
+ * authenticator app and recovery codes, with per-factor reset and reset-all
+ * (`users/factors/reset`, reason required; Hopae refuses self-targets).
+ */
+function factorsPanel(cx, id, caps, user) {
+  const { t, ui } = cx;
+  const body = ui.el('div', { class: 'zt-content' }, ui.loadingState(t));
+  const status = ui.el('div', { class: 'zt-notes' });
+  const canReset = can(caps, 'users/factors/reset');
+  const label = user.display_name || user.email || id;
+  const reset = (scope, extra, intro, confirm) => async () => {
+    const result = await formDialog(cx, { title: scope === 'all' ? 'identities.factors.reset_all.title' : 'identities.factors.reset.title', intro, confirm, confirmLabel: scope === 'all' ? 'identities.factors.reset_all' : 'identities.factors.remove', danger: true,
+      submit: values => hopae(cx, 'users/factors/reset', { json: { id, scope, ...extra, reason: values.reason }, reason: values.reason }) });
+    if (!result) return;
+    const data = result.data || {};
+    ui.clear(status, outcomeBanner(cx, 'committed', data.changed === false ? 'identities.factors.reset.nothing' : 'identities.factors.reset.done', { passkeys: data.passkeys_revoked ?? 0, sessions: data.sessions_terminated ?? 0, operation: result.operation || '—' }));
+    load();
+  };
+  const action = (labelKey, handler) => canReset ? ui.el('button', { type: 'button', class: 'button button-quiet zt-row-action', text: t(labelKey), on: { click: handler } }) : ui.disabledAction(t, labelKey, 'identities.gap.not_declared');
+  async function load() {
+    let data;
+    try { ({ data } = await hopae(cx, 'users/factors', { json: { id } })); }
+    catch (error) { ui.clear(body, failure(cx, error, load)); return; }
+    if (cx.signal.aborted) return;
+    const passkeys = Array.isArray(data?.passkeys) ? data.passkeys : [];
+    const recovery = data?.recovery_codes || {};
+    const rows = [];
+    for (const key of passkeys) {
+      const high = key.assurance === 'aal3';
+      rows.push(ui.el('li', { class: `zt-factor zt-passkey${high ? ' is-high' : ''}`, dataset: { factor: key.factor_id } },
+        ui.el('span', { class: 'zt-factor-icon', text: '⚿', attrs: { 'aria-hidden': 'true' } }),
+        ui.el('span', { class: 'zt-stack' },
+          ui.el('strong', { text: key.label || key.authenticator || t('identities.passkey.unnamed') }),
+          ui.el('span', { class: 'kit-muted' }, ui.el('span', { text: key.authenticator || t(key.aaguid ? 'identities.passkey.unknown_authenticator' : 'identities.passkey.undisclosed') }), ' · ',
+            ui.el('span', { text: t(key.kind === 'device_bound' ? 'identities.passkey.device_bound' : 'identities.passkey.synced') }),
+            key.kind === 'device_bound' ? null : [' · ', ui.el('span', { text: t(key.backup_state ? 'identities.passkey.backed_up' : 'identities.passkey.not_backed_up') })]),
+          ui.el('span', { class: 'kit-muted' }, ui.el('span', { text: t('identities.passkey.last_used') }), ' ', key.last_used_at ? timeOrDash(cx, key.last_used_at) : ui.el('span', { text: t('identities.passkey.never_used') }), ' · ', ui.el('span', { text: t('identities.passkey.added') }), ' ', timeOrDash(cx, key.created_at))),
+        ui.el('span', { class: 'zt-factor-side' }, aalBadge(cx, high ? 3 : 2), high ? ui.el('span', { class: 'kit-tag zt-high', title: t('identities.passkey.high.help'), text: t('identities.passkey.high') }) : null,
+          action('identities.factors.remove', reset('passkey', { factor_id: key.factor_id }, t('identities.factors.remove_passkey.effect', { user: label, passkey: key.label || key.authenticator || key.factor_id }))))));
+    }
+    if (!passkeys.length) rows.push(ui.el('li', { class: 'zt-factor' }, ui.el('span', { class: 'zt-factor-icon', text: '⚿', attrs: { 'aria-hidden': 'true' } }), ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t('identities.factor.webauthn') }), ui.el('span', { class: 'kit-muted', text: t('identities.passkey.none') })), ui.statusBadge(t, 'disabled', 'identities.factor.not_enrolled')));
+    const totp = Boolean(data?.totp?.active);
+    rows.push(ui.el('li', { class: 'zt-factor', dataset: { factor: 'totp' } }, ui.el('span', { class: 'zt-factor-icon', text: '⏱', attrs: { 'aria-hidden': 'true' } }),
+      ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t('identities.factor.totp') }), ui.el('span', { class: 'kit-muted', text: t('identities.factor.totp.help') })),
+      ui.el('span', { class: 'zt-factor-side' }, ui.statusBadge(t, totp ? 'healthy' : 'disabled', totp ? 'identities.factor.active' : 'identities.factor.not_enrolled'), totp ? action('identities.factors.remove', reset('totp', {}, t('identities.factors.remove_totp.effect', { user: label }))) : null)));
+    const remaining = Number(recovery.remaining) || 0;
+    rows.push(ui.el('li', { class: 'zt-factor', dataset: { factor: 'recovery' } }, ui.el('span', { class: 'zt-factor-icon', text: '⎘', attrs: { 'aria-hidden': 'true' } }),
+      ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t('identities.factor.recovery') }),
+        ui.el('span', { class: 'kit-muted', text: recovery.generated_at ? t('identities.recovery.remaining', { count: remaining }) : t('identities.recovery.none') }),
+        recovery.reenrollment_required_at ? ui.el('span', { class: 'kit-tag kit-tag-warn', text: t('identities.recovery.reenroll') }) : null),
+      ui.el('span', { class: 'zt-factor-side' }, ui.statusBadge(t, remaining ? 'healthy' : 'disabled', remaining ? 'identities.factor.active' : 'identities.factor.not_enrolled'), remaining ? action('identities.factors.remove', reset('recovery_codes', {}, t('identities.factors.remove_recovery.effect', { user: label }))) : null)));
+    ui.clear(body, status, ui.el('ul', { class: 'zt-factors' }, rows), ui.el('p', { class: 'kit-help', text: t('identities.factors.reset.help') }));
+  }
+  load();
+  return panel(cx, 'identities.factors.title', body, { actions: [canReset ? button(cx, 'identities.factors.reset_all', reset('all', {}, t('identities.factors.reset_all.effect', { user: label }), label), { kind: 'danger' }) : ui.disabledAction(t, 'identities.factors.reset_all', 'identities.gap.not_declared')] });
 }
 
 async function authenticationTab(cx, user, caps) {
   const { t, ui } = cx;
   const id = user.user_id || user.id;
-  const factorRows = ['webauthn', 'totp', 'recovery'].map(factor => ui.el('li', { class: 'zt-factor' },
-    ui.el('span', { class: 'zt-factor-icon', text: factor === 'webauthn' ? '⚿' : factor === 'totp' ? '⏱' : '⎘', attrs: { 'aria-hidden': 'true' } }),
-    ui.el('span', { class: 'zt-stack' }, ui.el('strong', { text: t(`identities.factor.${factor}`) }), ui.el('span', { class: 'kit-muted', text: t(`identities.factor.${factor}.help`) })),
-    ui.statusBadge(t, 'unknown', 'identities.factor.unreported')));
-  const factors = panel(cx, 'identities.factors.title', ui.el('div', { class: 'zt-content' }, ui.el('ul', { class: 'zt-factors' }, factorRows),
-    ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('identities.gap.factors') }))), { actions: [ui.disabledAction(t, 'identities.factors.reset', 'identities.gap.factor_reset')] });
+  const factors = can(caps, 'users/factors') ? factorsPanel(cx, id, caps, user) : legacyFactorsPanel(cx);
   const observed = ui.el('div', {}, ui.loadingState(t));
   const activity = ui.el('div', {}, ui.loadingState(t));
   const test = explainPanel(cx, { subject: id });
@@ -108,7 +202,7 @@ async function authenticationTab(cx, user, caps) {
   (async () => {
     if (can(caps, 'sessions/query')) {
       try {
-        const result = await scan(cx, 'sessions/query', { match: session => session.user_id === id, signal: cx.signal });
+        const result = await userSessions(cx, id);
         if (cx.signal.aborted) return;
         const aal = result.items.reduce((best, session) => Math.max(best, Number(session.aal) || 0), 0);
         const used = [...new Set(result.items.flatMap(session => Array.isArray(session.factors) ? session.factors : []))];
@@ -117,7 +211,7 @@ async function authenticationTab(cx, user, caps) {
     } else ui.clear(observed, ui.el('p', { class: 'kit-muted', text: t('identities.error.not_declared') }));
     if (can(caps, 'events/query')) {
       try {
-        const result = await userEvents(cx, id, event => /^factor\.|^admin\.factor_reset$/.test(event.kind || ''));
+        const result = await userEvents(cx, id, 'factor.');
         if (cx.signal.aborted) return;
         const table = staticTable(cx, { id: 'identities-factor-events', caption: 'identities.factors.activity', columns: eventColumns(cx), items: result.items, empty: { title: 'identities.factors.activity.empty', body: 'identities.factors.activity.empty.body' } });
         ui.clear(activity, scanNote(cx, result), table.element);
@@ -140,7 +234,7 @@ async function sessionsTab(cx, user, caps, refreshHeader) {
     empty: { title: 'identities.sessions.empty.user', body: 'identities.sessions.empty.body' },
     expand: session => facts(cx, [['identities.session.id', ui.el('span', {}, ui.el('code', { class: 'kit-mono', text: session.session_id }), ui.copyButton(t, session.session_id))], ['identities.session.ua', session.ua_prefix], ['identities.session.hosts.label', (session.hosts || []).join(', ')], ['identities.session.auth_source', session.auth_time_source ? t(session.auth_time_source === 'provider_claim' ? 'identities.session.auth_source.provider' : 'identities.session.auth_source.hopae') : null], ['identities.session.col.expires', timeOrDash(cx, session.absolute_expires_at)]]),
     fetchPage: async ({ signal }) => {
-      const result = await scan(cx, 'sessions/query', { match: session => session.user_id === id, signal });
+      const result = await userSessions(cx, id);
       ui.clear(note, scanNote(cx, result));
       return { items: result.items, nextCursor: null };
     },

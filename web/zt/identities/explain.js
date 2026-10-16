@@ -55,6 +55,9 @@ export function explainResult(cx, answer) {
     panel(cx, 'identities.explain.assurance', facts(cx, [
       ['identities.explain.current_aal', aalBadge(cx, assurance.current_aal)],
       ['identities.explain.required_aal', aalBadge(cx, assurance.required_aal ?? stepUp.required_aal)],
+      // Hopae 0.1.10: AAL 3 rules are met only by a live high-assurance passkey elevation.
+      ['identities.explain.presented_aal', Number.isFinite(stepUp.presented_aal) ? aalBadge(cx, stepUp.presented_aal) : null],
+      ['identities.explain.aal3_evidence', typeof stepUp.aal3_evidence === 'boolean' ? t(stepUp.aal3_evidence ? 'identities.explain.aal3_evidence.yes' : 'identities.explain.aal3_evidence.no') : null],
       ['identities.explain.achievable_aal', aalBadge(cx, assurance.achievable_aal)],
       ['identities.explain.totp', second.totp_configured === undefined ? null : t(second.totp_enrolled ? 'identities.explain.totp.enrolled' : !second.totp_configured ? 'identities.explain.totp.not_configured' : second.totp_enrolled === false ? 'identities.explain.totp.not_enrolled' : 'identities.explain.totp.unknown')],
       ['identities.explain.second_factors', secondFactors.length ? factorList(cx, secondFactors) : null],
@@ -90,7 +93,7 @@ export function explainPanel(cx, { subject = '', url = '', onRun, embedded = fal
   form.append(urlField, subjectField,
     ui.field(t, { label: 'identities.explain.navigation', name: 'navigation', value: 'document', options: [{ value: 'document', label: 'identities.explain.navigation.document' }, { value: 'other', label: 'identities.explain.navigation.other' }] }),
     ui.field(t, { label: 'identities.explain.client_ip', name: 'client_ip', maxLength: 45, help: 'identities.explain.client_ip.help' }),
-    ui.field(t, { label: 'identities.explain.aal', name: 'aal', value: '', options: [{ value: '', label: 'identities.explain.aal.default' }, { value: '1', label: 'identities.explain.aal.1' }, { value: '2', label: 'identities.explain.aal.2' }] }),
+    ui.field(t, { label: 'identities.explain.aal', name: 'aal', value: '', options: [{ value: '', label: 'identities.explain.aal.default' }, { value: '1', label: 'identities.explain.aal.1' }, { value: '2', label: 'identities.explain.aal.2' }, { value: '3', label: 'identities.explain.aal.3' }] }),
     factorsBox,
     ui.el('div', { class: 'button-row zt-filter-actions' }, ui.el('button', { type: 'submit', class: 'button button-primary', text: t('identities.explain.run') })));
   const output = ui.el('div', { class: 'zt-explain-output', attrs: { 'aria-live': 'polite' } }, ui.el('p', { class: 'kit-muted', text: t('identities.explain.idle') }));

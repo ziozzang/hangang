@@ -15,7 +15,41 @@ export async function capabilities(cx) {
   if (!hopae) return { installed: false, failed: false, routes: null, version: null };
   // Hosts before route discovery report no list: every route is then tried.
   const routes = Array.isArray(hopae.routes) ? new Set(hopae.routes.map(route => `${route.path}:${route.method}`)) : null;
-  return { installed: true, failed: false, routes, version: hopae.version || null, authentication: hopae.authentication || null };
+  const caps = { installed: true, failed: false, routes, version: hopae.version || null, authentication: hopae.authentication || null };
+  CAPS.set(cx.signal, caps);
+  return caps;
+}
+
+/**
+ * Hopae console package 0.1.10 (Hopae ADMIN.md "Hangang console routes"):
+ * server-side filters on the listings and optional `reason` in mutation
+ * bodies. Older adapters refuse unknown body fields, so both are gated.
+ */
+export function modern(caps) { return can(caps, 'users/bulk-disable') && can(caps, 'users/get'); }
+
+/** Mutation body with the operator reason when the package accepts it. */
+export function withReason(caps, json, reason) { return modern(caps) && reason ? { ...json, reason } : json; }
+
+const STATUS = new WeakMap(), CAPS = new WeakMap();
+
+/** Hopae `status`, read once per page render (providers, portal URL, console authority). */
+export async function hopaeStatus(cx, caps) {
+  if (!can(caps, 'status')) return null;
+  // Cached per render: the context is frozen, its abort signal is unique.
+  if (!STATUS.has(cx.signal)) STATUS.set(cx.signal, hopae(cx, 'status').then(answer => answer.data || null).catch(error => { if (error?.status === 401) throw error; return null; }));
+  return STATUS.get(cx.signal);
+}
+
+const AUTHORITY_MODES = Object.freeze(['local', 'hangang']);
+/** Who decides console grants: Hopae's own table or the Hangang console. */
+export function authorityBadge(cx, status) {
+  const { t, ui } = cx;
+  const authority = status?.console?.authority;
+  if (!authority) return null;
+  const mode = AUTHORITY_MODES.includes(authority.mode) ? authority.mode : 'local';
+  const delegation = ['none', 'mapped', 'hangang'].includes(authority.delegation) ? authority.delegation : 'none';
+  return ui.el('span', { class: `zt-authority-mode zt-authority-${mode}`, dataset: { authority: mode }, title: t(`identities.authority.delegation.${delegation}`) },
+    ui.el('span', { class: 'kit-muted', text: t('identities.authority.mode') }), ' ', ui.el('strong', { text: t(`identities.authority.mode.${mode}`) }));
 }
 
 export function can(caps, route) {
@@ -28,14 +62,19 @@ export function can(caps, route) {
  * header (percent-encoded UTF-8) into the private operation journal; Hopae's
  * own body contracts are unchanged.
  */
+const REASON_ROUTES = new Set(['users/disable', 'users/enable', 'users/sessions-terminate', 'sessions/terminate', 'users/factors/reset', 'users/bulk-disable', 'authentication/profiles/publish', 'authentication/projections/publish']);
+
 export async function hopae(cx, route, { json = {}, reason } = {}) {
   const headers = reason ? { 'x-hangang-change-reason': encodeURIComponent(reason) } : undefined;
+  // Package 0.1.10 records the reason in Hopae's own audit too (attrs.note).
+  const caps = CAPS.get(cx.signal);
+  if (reason && REASON_ROUTES.has(route) && caps && modern(caps) && json.reason === undefined) json = { ...json, reason };
   const options = GET_ROUTES.has(route) ? { headers } : { method: 'POST', json, headers };
   const { data, response } = await cx.api(`${BASE}${route}`, options);
   return { data, operation: response?.headers?.get?.('x-hangang-plugin-operation') || null };
 }
 
-const HOPAE_CODES = new Set(['revision_conflict', 'group_not_local', 'key_in_use', 'already_member', 'not_member', 'unknown_user', 'group_not_found', 'group_deleted', 'too_many_groups', 'group_full', 'too_many_local_groups', 'invalid_request', 'invalid_profiles', 'invalid_projections', 'profiles_unavailable', 'projections_unavailable', 'rate_limited', 'store_unavailable', 'audit_unavailable', 'cursor_expired', 'invalid_cursor', 'revision_required']);
+const HOPAE_CODES = new Set(['revision_conflict', 'group_not_local', 'key_in_use', 'already_member', 'not_member', 'unknown_user', 'group_not_found', 'group_deleted', 'too_many_groups', 'group_full', 'too_many_local_groups', 'invalid_request', 'invalid_profiles', 'invalid_projections', 'profiles_unavailable', 'projections_unavailable', 'rate_limited', 'store_unavailable', 'audit_unavailable', 'cursor_expired', 'invalid_cursor', 'revision_required', 'self_target', 'factor_not_found', 'invalid_reason', 'invalid_filter', 'delegation_rejected', 'not_found', 'invalid_id']);
 
 /** Localized sentence for a failed broker call; never the raw backend text. */
 export function errorText(t, error) {
@@ -83,6 +122,9 @@ export function sectionPage(cx, root, { active, crumbs = [], title, owner, actio
   }
   nav.append(list);
   view.content.before(nav);
+  // The authority mode badge follows when Hopae's status reports it (0.1.10+).
+  const caps = CAPS.get(cx.signal);
+  if (caps) hopaeStatus(cx, caps).then(status => { const badge = authorityBadge(cx, status); if (badge && !cx.signal.aborted) nav.append(badge); }).catch(() => {});
   return view;
 }
 
@@ -233,6 +275,27 @@ export function panel(cx, titleKey, body, { actions = [], id, params } = {}) {
   const { t, ui } = cx;
   return ui.el('section', { class: 'panel zt-panel', id, attrs: { 'aria-label': t(titleKey, params) } },
     ui.el('div', { class: 'zt-panel-head' }, ui.el('h2', { text: t(titleKey, params) }), actions.length ? ui.el('div', { class: 'button-row' }, actions) : null), body);
+}
+
+/**
+ * One user's sessions or events: filtered by Hopae (0.1.10 `user_id`,
+ * `kind_prefix`, …) or, for older packages, a bounded scan of the newest
+ * records. `server` tells the caller which one answered.
+ */
+export async function filteredList(cx, route, { filters, match, pages = 5 }) {
+  const caps = CAPS.get(cx.signal);
+  if (!caps || !modern(caps)) return scan(cx, route, { match, pages, signal: cx.signal });
+  let cursor = null, seen = 0;
+  const items = [];
+  for (let page = 0; page < pages; page += 1) {
+    const { data } = await hopae(cx, route, { json: { limit: 200, ...filters, ...(cursor ? { cursor } : {}) } });
+    if (cx.signal.aborted) break;
+    const batch = Array.isArray(data?.items) ? data.items : [];
+    seen += batch.length; items.push(...batch);
+    cursor = data?.next_cursor || null;
+    if (!cursor) return { items, complete: true, seen, server: true };
+  }
+  return { items, complete: false, seen, server: true };
 }
 
 /** Pages through a cursor-listed Hopae read up to `pages`, keeping matching items. */

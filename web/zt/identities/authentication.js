@@ -1,7 +1,7 @@
 // Identities ▸ Authentication: service authentication profiles as a form
 // (Hopae `authentication/profiles`, CAS publish with a reason) and the
 // "test access as a user" panel (`explain/authentication`).
-import { can, hopae, failure, sectionPage, notConnected, capabilities, panel, outcomeBanner, button } from './common.js';
+import { can, hopae, failure, sectionPage, notConnected, capabilities, panel, outcomeBanner, button, errorText } from './common.js';
 import { changeList, loadDraft, saveDraft, dropDraft, publish } from './editor.js';
 import { explainPanel } from './explain.js';
 
@@ -124,6 +124,43 @@ function profileForm(cx, profile, index, { onChange, onRemove, readOnly }) {
   return box;
 }
 
+const VALIDATION_CODES = Object.freeze(['invalid_document', 'undeclared_reference', 'invalid_profile', 'configuration_rule', 'invalid_configuration', 'compile_failed']);
+const FIELD_NAMES = Object.freeze({ token_env: 'key_env', subject: 'key_subject', expires_at: 'key_expires' });
+
+/**
+ * Inline findings from `authentication/profiles/validate`: paths such as
+ * `profiles[0].ports[1]` or `profiles[1].api_keys[0].token_env` mark the
+ * field in the form; every finding is also listed with its path.
+ */
+function showFindings(cx, editor, box, errors) {
+  const { t, ui } = cx;
+  editor.querySelectorAll('[aria-invalid="true"]').forEach(node => { node.removeAttribute('aria-invalid'); node.closest('.kit-field, td')?.querySelector('.zt-field-error')?.remove(); });
+  const items = errors.map(error => {
+    const code = VALIDATION_CODES.includes(error.code) ? error.code : 'other';
+    const path = String(error.path ?? '');
+    const match = /^profiles\[(\d+)\](?:\.([a-z_]+))?(?:\[(\d+)\])?(?:\.([a-z_]+))?/.exec(path);
+    let target = null;
+    if (path === 'authority_id') target = editor.querySelector('[name="authority_id"]');
+    else if (match) {
+      const profile = editor.querySelector(`.zt-profile[data-index="${match[1]}"]`);
+      if (profile) {
+        profile.open = true;
+        if (match[2] === 'api_keys' && match[3] !== undefined) target = profile.querySelectorAll('tr.zt-key')[Number(match[3])]?.querySelector(`[name="${FIELD_NAMES[match[4]] || 'key_env'}"]`) || null;
+        else if (match[2]) target = profile.querySelector(`[name="${match[2]}"]`);
+        target ??= profile.querySelector('summary');
+      }
+    }
+    const message = t(`identities.validate.code.${code}`);
+    if (target && target.tagName !== 'SUMMARY') {
+      target.setAttribute('aria-invalid', 'true');
+      (target.closest('.kit-field') || target.parentElement).append(ui.el('small', { class: 'zt-field-error', text: message }));
+    }
+    return ui.el('li', {}, ui.el('code', { class: 'kit-mono', text: path || t('identities.validate.document') }), ' ', ui.el('span', { text: message }), error.message ? ui.el('span', { class: 'kit-muted', title: String(error.message), text: ' ⓘ' }) : null);
+  });
+  ui.clear(box, ui.el('div', { class: 'zt-outcome zt-outcome-refused', attrs: { role: 'alert' } }, ui.statusBadge(t, 'refused', 'identities.outcome.refused'), ui.el('span', { text: t('identities.validate.invalid', { count: errors.length }) })), ui.el('ul', { class: 'zt-field-errors' }, items));
+  (editor.querySelector('[aria-invalid="true"]') || box).scrollIntoView?.({ block: 'center' });
+}
+
 async function renderProfiles(cx, content, caps) {
   const { t, ui } = cx;
   if (!can(caps, 'authentication/profiles')) { content.append(notConnected(cx, caps, 'authentication/profiles')); return; }
@@ -182,10 +219,21 @@ async function renderProfiles(cx, content, caps) {
     })));
   }
   authority.querySelector('input').addEventListener('input', event => { draft.authority_id = event.target.value.trim(); changed(); });
+  const findings = ui.el('div', { class: 'zt-validation', attrs: { 'aria-live': 'polite' } });
   publishButton.addEventListener('click', async () => {
     const form = editor.querySelector('form');
     if (form && !form.reportValidity()) return;
     changed();
+    // Hopae 0.1.10 dry-run: the publication's own checks, shown inline before review.
+    if (can(caps, 'authentication/profiles/validate')) {
+      ui.clear(findings, ui.loadingState(t));
+      let report;
+      try { report = (await hopae(cx, 'authentication/profiles/validate', { json: { configuration: draft } })).data; }
+      catch (error) { if (error?.status === 401) throw error; ui.clear(findings, outcomeBanner(cx, 'refused', 'identities.literal', { value: errorText(t, error) })); return; }
+      if (cx.signal.aborted) return;
+      if (!report?.valid) { showFindings(cx, editor, findings, Array.isArray(report?.errors) ? report.errors : []); return; }
+      ui.clear(findings, outcomeBanner(cx, 'committed', 'identities.validate.valid'));
+    }
     const result = await publish(cx, { route: 'authentication/profiles/publish', revision, configuration: draft, diff: changeList(cx, profileEntities(cx, base), profileEntities(cx, draft)), target: draft.authority_id || t('identities.profile.authority'), status });
     if (!result) return;
     dropDraft(DRAFT);
@@ -197,7 +245,7 @@ async function renderProfiles(cx, content, caps) {
     : ui.disabledAction(t, 'identities.publish.review', 'identities.gap.not_declared'));
   const form = ui.el('form', { class: 'zt-editor', attrs: { 'aria-label': t('identities.profile.editor') } }, authority, list);
   form.addEventListener('submit', event => event.preventDefault());
-  ui.clear(editor, toolbar, form, panel(cx, 'identities.publish.preview', preview));
+  ui.clear(editor, toolbar, findings, form, panel(cx, 'identities.publish.preview', preview));
   renderList();
   changed();
   if (document.configuration === null) status.append(ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t('identities.profile.none_published') }));

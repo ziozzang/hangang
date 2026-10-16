@@ -29,7 +29,10 @@ export async function renderProviders(cx, root) {
     if (!providers.length) { ui.clear(body, ui.emptyState(t, { title: 'identities.providers.empty', body: 'identities.providers.empty.body' })); return; }
     const origin = portalOrigin(data);
     const healthy = providers.filter(provider => provider.health === 'ok').length;
-    const summary = ui.el('p', { class: 'zt-summary', text: t('identities.providers.summary', { count: providers.length, healthy }) });
+    const portal = data?.portal || null;
+    const summary = ui.el('div', { class: 'zt-provider-summary' }, ui.el('p', { class: 'zt-summary', text: t('identities.providers.summary', { count: providers.length, healthy }) }),
+      portal ? ui.el('p', { class: 'zt-summary' }, ui.el('span', { text: t('identities.providers.portal') }), ' ', ui.el('code', { class: 'kit-mono', text: portal.public_url || '—' }), ' · ',
+        ui.statusBadge(t, portal.passkeys ? 'healthy' : 'disabled', portal.passkeys ? (portal.passwordless ? 'identities.providers.passkeys.passwordless' : 'identities.providers.passkeys.on') : 'identities.providers.passkeys.off')) : null);
     const grid = ui.el('div', { class: 'zt-provider-grid' });
     for (const provider of providers) {
       const [kind, label] = HEALTH[provider.health] || ['unknown', 'identities.provider.health.unknown'];

@@ -1,6 +1,6 @@
 // Identities ▸ Sessions: live Hopae sessions (`sessions/query`) with device,
 // address, assurance and activity; terminate one with a reason.
-import { can, hopae, sectionPage, notConnected, timeOrDash, aalBadge, factorList, resolvedUser, formDialog, outcomeBanner, capabilities, scan, toMs } from './common.js';
+import { can, hopae, modern, sectionPage, notConnected, timeOrDash, aalBadge, factorList, resolvedUser, formDialog, outcomeBanner, capabilities, scan, toMs } from './common.js';
 
 /** "Chrome · macOS" from a sanitized user-agent prefix; the raw prefix stays in the tooltip. */
 export function deviceLabel(t, ua) {
@@ -55,21 +55,36 @@ export async function renderSessions(cx, root, params) {
   const { content } = sectionPage(cx, root, { active: 'sessions', title: t('identities.page.sessions'), owner: t('identities.sessions.owner') });
   if (!caps.installed || !can(caps, 'sessions/query')) { content.append(notConnected(cx, caps, 'sessions/query')); return; }
   const user = params.get('user') || '';
+  const server = modern(caps);
+  const aal = server && ['1', '2'].includes(params.get('aal')) ? params.get('aal') : '';
   const form = ui.el('form', { class: 'zt-filters', attrs: { role: 'search', 'aria-label': t('identities.sessions.filters') } },
     ui.subjectPicker(t, cx.api, { label: 'identities.sessions.filter.user', name: 'user', value: user, help: 'identities.sessions.filter.user.help' }),
+    // AAL 3 is never stored on a session (Hopae ADR-0018), so the filter offers 1 and 2.
+    server ? ui.field(t, { label: 'identities.sessions.filter.aal', name: 'aal', value: aal, options: [{ value: '', label: 'identities.filter.any' }, { value: '1', label: 'identities.sessions.aal.1' }, { value: '2', label: 'identities.sessions.aal.2' }] }) : null,
     ui.el('div', { class: 'button-row zt-filter-actions' }, ui.el('button', { type: 'submit', class: 'button button-primary', text: t('identities.users.apply') }), ui.el('a', { class: 'button button-quiet', href: '#identities/sessions', text: t('identities.users.reset') })));
-  form.addEventListener('submit', event => { event.preventDefault(); const value = form.elements.user.value.trim(); cx.navigate(cx.hashFor('identities', ['sessions'], value ? new URLSearchParams({ user: value }) : undefined)); });
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const next = new URLSearchParams();
+    const value = form.elements.user.value.trim();
+    if (value) next.set('user', value);
+    if (form.elements.aal?.value) next.set('aal', form.elements.aal.value);
+    cx.navigate(cx.hashFor('identities', ['sessions'], next));
+  });
   const banner = ui.el('div', { class: 'zt-notes' });
   const status = ui.el('div');
   let table;
   const columns = sessionColumns(cx, { showUser: true, canTerminate: can(caps, 'sessions/terminate'), onTerminated: (session, result) => { ui.clear(status, outcomeBanner(cx, 'committed', result.data?.changed === false ? 'identities.session.terminated.already' : 'identities.session.terminated', { operation: result.operation || '—' })); table.refresh(); } });
   table = ui.dataTable(t, {
     id: 'identities-sessions', caption: 'identities.sessions.caption', owner: 'ui.owner.hopae', columns, sortable: 'none', rowKey: session => session.session_id,
-    empty: { title: user ? 'identities.sessions.empty.user' : 'identities.sessions.empty', body: 'identities.sessions.empty.body' },
+    empty: { title: user || aal ? 'identities.sessions.empty.user' : 'identities.sessions.empty', body: 'identities.sessions.empty.body' },
     onRowOpen: session => cx.navigate(`#identities/users/${encodeURIComponent(session.user_id)}/sessions`),
     fetchPage: async ({ cursor, signal }) => {
+      if (server) {
+        const { data } = await hopae(cx, 'sessions/query', { json: { limit: 50, ...(user ? { user_id: user } : {}), ...(aal ? { aal: Number(aal) } : {}), ...(cursor ? { cursor } : {}) } });
+        return { items: Array.isArray(data?.items) ? data.items : [], nextCursor: data?.next_cursor || null };
+      }
       if (user) {
-        // Hopae's delegated listing has no user filter: scan the newest live sessions.
+        // Older packages have no user filter: scan the newest live sessions.
         const result = await scan(cx, 'sessions/query', { match: session => session.user_id === user, signal });
         ui.clear(banner, result.complete ? null : ui.el('p', { class: 'zt-banner', attrs: { role: 'note' }, text: t('identities.scan.partial', { count: result.seen }) }));
         return { items: result.items, nextCursor: null };
