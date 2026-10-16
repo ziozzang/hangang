@@ -17,6 +17,23 @@
   CIDRs only; other peers are never parsed.
 - Release deleted or moved protected Kubernetes scopes through a disabled,
   unenforced revision instead of freezing the controller.
+- Bound Kubernetes snapshot staleness (ADR 0022): beyond
+  `--kubernetes-max-staleness-seconds` (default 300, 60..3600) without API
+  confirmation, protected routes answer 503 with
+  `x-hangang-reason: kubernetes-authority-stale` while public routes keep
+  serving; exported as metrics, the `freshness` object of
+  `GET /v1/kubernetes/protection` and the console protection panel.
+- Default `--kubernetes-readiness snapshot`: an API-server outage no longer
+  withdraws readiness from every replica (`fresh` keeps the old behavior). List
+  requests use a 15-second timeout. Document the brief post-outage failures as
+  Kubernetes marking Pods NotReady, with a regression test showing Hangang
+  neither re-applies its snapshot nor flaps readiness.
+- Hot-reload listener certificates, Hopae/Pumgye upstream client identities and
+  the guard decision client identity by polling file contents every
+  `--tls-reload-seconds` (default 10; no inotify). Bad material keeps the old
+  certificate and raises `hangang_tls_reload_failing`; reloads log the new
+  serial and count `hangang_tls_reloads_total`. Listener files were previously
+  polled every 500 ms.
 
 ## 0.3.6 — 2026-10-15
 

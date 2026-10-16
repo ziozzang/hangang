@@ -95,6 +95,7 @@ Ingress가 생성하는 모든 경로(모든 호스트·경로 규칙과 기본 
 | 클라이언트 주소 보존 없이 `enforcement: Required` | Ingress 보류, `ClientAddressPreserved=False` | `ClientAddressUnavailable` |
 | 이후 호스트 이름 소유, TLS, 경로 검증, 예산으로 철회됨 | 게시되지 않음 | `Pending` |
 | `HTTPRoute` 또는 `Gateway` 대상 | 그 대상에는 아무것도 프로그래밍하지 않음 | `Unsupported` |
+| API 서버가 `--kubernetes-max-staleness-seconds`(기본값 5분)를 넘도록 스냅샷을 확인하지 못함 | 보호 경로는 `503`, `x-hangang-reason: kubernetes-authority-stale`로 응답하고 공개 경로는 계속 제공 | [제한된 오래됨](KUBERNETES.md#제한된-오래됨) |
 
 보류된 Ingress는 호스트 이름 소유를 유지하고(여전히 호스트를 주장함), `--kubernetes-publish-address` 상태 항목을 받지 않으며, 이미 가지고 있었다면 잃습니다. 보류는 다른 Ingress에 영향을 주지 않습니다.
 
@@ -102,7 +103,7 @@ Ingress가 생성하는 모든 경로(모든 호스트·경로 규칙과 기본 
 
 컨트롤러는 캐시된 `resourceVersion`을 전제 조건으로 `status`를 씁니다. 최상위 `conditions`에는 `Accepted`, `ResolvedRefs`, `Programmed`와, 네트워크 강제가 있는 정책이면 `ClientAddressPreserved`가 각각 `observedGeneration`과 함께 들어갑니다. `status.ancestors`는 Gateway API 정책 상태 규약을 따릅니다. 대상마다(네임스페이스 기본 정책이면 적용된 Ingress마다, 최대 16개이며 나머지는 `Programmed` 메시지에 개수로 표시) `controllerName: hangang.dev/gateway-controller`와 대상별 조건을 가진 항목 하나가 있습니다. 다른 컨트롤러가 쓴 항목은 보존합니다. `lastTransitionTime`은 조건의 status가 바뀔 때만 바뀌므로 복제본끼리 시각을 두고 다투지 않습니다. 충돌하거나 객체가 사라진 쓰기는 버리고, 그 원인이 된 감시 이벤트가 다시 조정합니다. `networking.k8s.io/v1` Ingress에는 조건 필드가 없으므로 Ingress는 게시 주소를 갖지 않는 것으로만 보류를 나타내며, 이유는 정책 상태와 아래 진단에서 확인합니다.
 
-관리 API의 `GET /v1/kubernetes/protection`(viewer 또는 관리자 역할, 읽기 전용, 비밀 정보 없음)은 이 인스턴스의 최신 보고서를 반환합니다. `require_protection`, 클라이언트 주소와 Sumunjang 상태, 개수, 선택된 Ingress마다 한 행(`protected`, `unprotected`, `withheld`, 게시된 스냅숏이 제공하는지, 부착된 정책, 이유와 메시지), 정책마다 한 행이 들어 있으며 각각 1,000행으로 제한됩니다. `/metrics`에는 `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted`, `hangang_kubernetes_client_address_preserved`가 추가됩니다. 배포 중에는 `withheld > 0`, 이전을 마친 뒤에는 `unprotected > 0`에 경보를 거십시오.
+관리 API의 `GET /v1/kubernetes/protection`(viewer 또는 관리자 역할, 읽기 전용, 비밀 정보 없음)은 이 인스턴스의 최신 보고서를 반환합니다. `require_protection`, 클라이언트 주소와 Sumunjang 상태, 개수, 선택된 Ingress마다 한 행(`protected`, `unprotected`, `withheld`, 게시된 스냅숏이 제공하는지, 부착된 정책, 이유와 메시지), 정책마다 한 행이 들어 있으며 각각 1,000행으로 제한됩니다. `/metrics`에는 `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted`, `hangang_kubernetes_client_address_preserved`가 추가됩니다. 배포 중에는 `withheld > 0`, 이전을 마친 뒤에는 `unprotected > 0`에 경보를 거십시오. 보고서의 `freshness` 객체와 `hangang_kubernetes_snapshot_age_seconds`, `hangang_kubernetes_protected_fail_closed`, `hangang_kubernetes_stale_refusals_total` 지표는 [제한된 오래됨](KUBERNETES.md#제한된-오래됨)을 나타냅니다. `protected_fail_closed == 1`에 경보를 거십시오.
 
 ## 클라이언트 주소 보존
 

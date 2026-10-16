@@ -33,6 +33,7 @@
 ## 백엔드, 멤버와 상태 점검
 
 - [아웃바운드 연결 정책 · 영문](UPSTREAM.md) — 백엔드 연결과 TLS 설정
+- [인증서 무중단 재적재](ko/TLS_RELOAD.md) — 리스너, 업스트림, guard 인증서를 재시작 없이 폴링으로 교체
 - [이름 있는 HTTP·TCP 멤버 · 영문](NAMED_MEMBERS.md) — 재사용 가능한 백엔드 멤버
 - [멤버 연결 수용 · 영문](MEMBER_ADMISSION.md) — HTTP 멤버 연결 수용과 활동
 - [멤버 수명 관리 · 영문](MEMBER_LIFECYCLE.md) — 멤버 상태 전환
