@@ -126,7 +126,7 @@ test('external principal requires a copied identity header and denies empty allo
 test('advanced JSON policy and Korean locale round-trip through unrelated native edits', async ({ page }) => {
   const { writes } = await fixture(page);
   await edit(page);
-  const advanced = page.locator('.advanced-editor');
+  const advanced = page.locator('#route-dialog .advanced-editor:has(> #route-json)');
   await advanced.locator('summary').click();
   const draft = structuredClone(protectedRoute);
   draft.resource_policy = { resource_id: 'acct', enforce: false, principal: { source: 'basic' }, allow: [{ subjects: ['앨리스'], methods: ['*'] }] };
@@ -162,7 +162,7 @@ test('advanced JSON cannot erase an enforced policy while editing an unrelated n
   configured.resource_policy = { resource_id: 'records', principal: { source: 'basic' }, allow: [] };
   const { writes } = await fixture(page, configured);
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const dropped = structuredClone(configured); delete dropped.resource_policy;
   await page.locator('#route-json').fill(JSON.stringify(dropped));
   await page.locator('#route-field-priority').fill('5');
@@ -174,7 +174,7 @@ test('advanced JSON cannot erase an enforced policy while editing an unrelated n
 test('malformed advanced policy rules cannot be normalized into an empty allowlist', async ({ page }) => {
   const { writes } = await fixture(page);
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const malformed = structuredClone(protectedRoute);
   malformed.resource_policy = { resource_id: 'records', principal: { source: 'basic' }, allow: [{ subjects: 'alice', methods: ['GET'] }] };
   await page.locator('#route-json').fill(JSON.stringify(malformed));

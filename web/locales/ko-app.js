@@ -172,7 +172,7 @@ export default {
   'Policy errors': '정책 오류', 'Lua policy failures, including capacity rejections': '용량 거부를 포함한 Lua 정책 실패',
   'Lua capacity rejections': 'Lua 용량 거부', 'Worker busy or restarting; counted in policy errors': '작업자가 바쁘거나 재시작 중 · 정책 오류에 포함',
   'Config updates': '구성 갱신', 'Published revisions': '게시된 리비전',
-  'Draining': '종료 대기 중', 'Waiting for configuration': '구성 대기 중', 'Accepting traffic': '트래픽 수락 중',
+  'Waiting for configuration': '구성 대기 중', 'Accepting traffic': '트래픽 수락 중',
   'Fleet': '전체 인스턴스', 'This instance': '이 인스턴스', ' · supervised': ' · 감독 모드',
   'External or not configured': '외부 발급기 또는 미설정',
   ' · Expires {date}': ' · 만료 {date}',
