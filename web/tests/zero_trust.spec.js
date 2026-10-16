@@ -221,7 +221,7 @@ test('subject resolution follows the Hopae directory contract and shows each sta
   await expect(view.locator('[data-subject-state="active"]')).toContainText('Active');
   await expect(view).toContainText('k***@corp.example');
   await expect(view).toContainText('oidc-corp');
-  expect(JSON.parse(calls.find(c => c.path === '/v1/plugins/hopae/subjects/resolve').body)).toEqual({ ids: ['u_kim'], privacy_profile: 'standard' });
+  expect(JSON.parse(calls.find(c => c.path === '/v1/plugins/hopae/subjects/resolve').body)).toEqual({ ids: ['u_kim'], privacy_profile: 'standard', include_groups: true });
   expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('subject=u_kim');
   await page.evaluate(() => { location.hash = '#identities/users/u_gone'; });
   await expect(view.locator('[data-subject-state="deleted"]')).toContainText('Deleted (tombstone)');

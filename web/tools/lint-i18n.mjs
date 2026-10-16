@@ -13,7 +13,9 @@ import { fileURLToPath } from 'node:url';
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repo = path.resolve(web, '..');
 const failures = [];
-const catalog = name => JSON.parse(readFileSync(path.join(web, 'zt/messages', `${name}.json`), 'utf8'));
+// Section catalogs (zt/identities/messages) merge into the host catalog.
+const SECTION_CATALOGS = ['zt/messages', 'zt/identities/messages'];
+const catalog = name => Object.assign({}, ...SECTION_CATALOGS.map(dir => JSON.parse(readFileSync(path.join(web, dir, `${name}.json`), 'utf8'))));
 const en = catalog('en'), ko = catalog('ko');
 const flat = value => typeof value === 'object' ? Object.values(value) : [value];
 
@@ -23,14 +25,16 @@ for (const [name, a, b] of [['en', en, ko], ['ko', ko, en]]) {
     if (flat(a[key]).some(message => typeof message !== 'string' || !message.trim())) failures.push(`${name}:${key} is empty`);
   }
 }
+// Product and protocol names stay in their original form in Korean.
+const PROPER_NAMES = /^(OpenID Connect|LDAP|OAuth 2\.0|Kubernetes TokenReview|https:\/\/[a-z0-9.\/-]+)$/;
 for (const [key, value] of Object.entries(ko)) {
-  if (flat(value).every(message => /^[\x20-\x7e]*$/.test(message)) && flat(en[key] ?? []).every(message => /[a-z]{4,}/i.test(message)) && !/\{|µs|AAL|ASN|HTTP|AS\{/.test(flat(value).join('')) && !['decision.authority.catalog'].includes(key)) {
+  if (flat(value).every(message => /^[\x20-\x7e]*$/.test(message)) && flat(en[key] ?? []).every(message => /[a-z]{4,}/i.test(message)) && !/\{|µs|AAL|ASN|HTTP|AS\{/.test(flat(value).join('')) && !['decision.authority.catalog'].includes(key) && !PROPER_NAMES.test(flat(value).join(''))) {
     failures.push(`ko:${key} looks untranslated`);
   }
 }
 
-const sources = ['kit', 'zt'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
-const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system)\.[A-Za-z0-9_.-]+$/;
+const sources = ['kit', 'zt', 'zt/identities'].flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
+const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system|identities)\.[A-Za-z0-9_.-]+$/;
 const PREFIXES = new Set(['decision.stage', 'decision.principal', 'decision.result']);
 const literal = /(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
 const forbidden = [
@@ -80,6 +84,33 @@ const families = {
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],
 };
 for (const name of ['identities', 'policies', 'network', 'workloads']) families[`section.${name}`] = ['owner', 'planned', 'body'];
+// Identities section (zt/identities): dynamic key families built from Hopae values.
+const identityModule = name => readFileSync(path.join(web, 'zt/identities', name), 'utf8');
+const frozenList = (source, name) => JSON.parse(source.match(new RegExp(`${name} = Object\\.freeze\\((\\[[^\\]]*\\])`))[1].replace(/'/g, '"'));
+Object.assign(families, {
+  'identities.page': ['users', 'sessions', 'groups', 'providers', 'authentication', 'projections'],
+  'identities.user.tab': frozenList(identityModule('user.js'), 'TABS'),
+  'identities.event': frozenList(identityModule('user.js'), 'EVENT_KINDS'),
+  'identities.event.outcome': ['success', 'failure', 'info'],
+  'identities.explain.reason': frozenList(identityModule('explain.js'), 'EXPLAIN_REASONS'),
+  'identities.explain.check': [...frozenList(identityModule('explain.js'), 'EXPLAIN_CHECKS'), 'other'],
+  'identities.explain.outcome': ['allow', 'login', 'step_up', 'reauth', 'deny', 'unavailable', 'indeterminate', 'not_applicable'],
+  'identities.explain.result': ['pass', 'fail', 'skip', 'info'],
+  'identities.explain.input': ['session', 'subject', 'anonymous'],
+  'identities.factor': ['totp', 'webauthn', 'external', 'recovery', 'federated', 'password', 'otp', 'certificate', 'bearer'],
+  'identities.group.source': ['local', 'ldap', 'oidc', 'unknown'],
+  'identities.aal.help': ['0', '1', '2', '3'],
+  'identities.provider.kind': ['oidc', 'oauth2', 'email_link', 'password', 'ldap', 'other'],
+  'identities.provider.reauth': ['max_age', 'unsupported', 'other'],
+  'identities.provider.health': ['ok', 'degraded', 'disabled', 'unknown'],
+  'identities.circuit': ['closed', 'open', 'half_open', 'quarantined', 'unavailable'],
+  'identities.projection.credential': ['identity_header', 'bearer_reference'],
+  'identities.access.via': ['user', 'human', 'workload', 'group'],
+  'identities.auth.tab': ['profiles', 'test'],
+  'identities.diff': ['add', 'remove', 'change'],
+  'identities.outcome': ['committed', 'refused', 'uncertain'],
+  'identities.error.code': [...identityModule('common.js').match(/HOPAE_CODES = new Set\((\[[^\]]*\])/)[1].matchAll(/'([a-z_]+)'/g)].map(match => match[1]),
+});
 for (const [prefix, suffixes] of Object.entries(families)) for (const suffix of suffixes) if (!Object.hasOwn(en, `${prefix}.${suffix}`)) failures.push(`missing family key ${prefix}.${suffix}`);
 
 const registry = readFileSync(path.join(repo, 'crates/hangang-decision-event/src/reasons.rs'), 'utf8');

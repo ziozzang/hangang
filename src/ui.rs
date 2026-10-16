@@ -103,6 +103,62 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "application/json",
                 include_bytes!("../web/zt/messages/ko.json"),
             )),
+            "/ui/zt/identities/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/index.js"),
+            )),
+            "/ui/zt/identities/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/common.js"),
+            )),
+            "/ui/zt/identities/users.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/users.js"),
+            )),
+            "/ui/zt/identities/user.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/user.js"),
+            )),
+            "/ui/zt/identities/sessions.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/sessions.js"),
+            )),
+            "/ui/zt/identities/groups.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/groups.js"),
+            )),
+            "/ui/zt/identities/providers.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/providers.js"),
+            )),
+            "/ui/zt/identities/authentication.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/authentication.js"),
+            )),
+            "/ui/zt/identities/explain.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/explain.js"),
+            )),
+            "/ui/zt/identities/editor.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/editor.js"),
+            )),
+            "/ui/zt/identities/projections.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/projections.js"),
+            )),
+            "/ui/zt/identities/identities.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/identities/identities.css"),
+            )),
+            "/ui/zt/identities/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/identities/messages/en.json"),
+            )),
+            "/ui/zt/identities/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/identities/messages/ko.json"),
+            )),
             "/ui/lua-editor.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/lua-editor.js"),
@@ -276,6 +332,20 @@ mod tests {
             "/ui/zt/entities.js",
             "/ui/zt/messages/en.json",
             "/ui/zt/messages/ko.json",
+            "/ui/zt/identities/index.js",
+            "/ui/zt/identities/common.js",
+            "/ui/zt/identities/users.js",
+            "/ui/zt/identities/user.js",
+            "/ui/zt/identities/sessions.js",
+            "/ui/zt/identities/groups.js",
+            "/ui/zt/identities/providers.js",
+            "/ui/zt/identities/authentication.js",
+            "/ui/zt/identities/explain.js",
+            "/ui/zt/identities/editor.js",
+            "/ui/zt/identities/projections.js",
+            "/ui/zt/identities/identities.css",
+            "/ui/zt/identities/messages/en.json",
+            "/ui/zt/identities/messages/ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);
