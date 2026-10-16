@@ -55,7 +55,7 @@ async function fixture(page, initial = baseRoute, locale = 'en') {
 }
 
 async function edit(page) {
-  await page.locator('[data-route-id="jwt-route"]').getByRole('button', { name: 'Edit' }).click();
+  await page.locator('.route-row[data-route-id="jwt-route"]').getByRole('button', { name: 'Edit' }).click();
   await expect(page.locator('#route-dialog')).toBeVisible();
 }
 
@@ -67,7 +67,7 @@ async function reveal(page, name) {
 test('JWT route appears under auth policy and preserves local verification with a native edit', async ({ page }) => {
   const { writes } = await fixture(page);
   await page.locator('.route-policy-filter').selectOption('auth');
-  await expect(page.locator('[data-route-id="jwt-route"]')).toBeVisible();
+  await expect(page.locator('.route-row[data-route-id="jwt-route"]')).toBeVisible();
   await edit(page);
   await reveal(page, 'jwt_auth_enabled');
   await expect(page.locator('#route-field-jwt_auth_enabled')).toBeChecked();
@@ -86,7 +86,7 @@ test('advanced JWT JSON add and remote endpoint change survive an unrelated nati
   initial.jwt_auth = null; initial.resource_policy = null;
   const { writes } = await fixture(page, initial);
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const draft = structuredClone(initial);
   draft.jwt_auth = { verification, keys: { source: 'remote', config: {
     endpoint: { kind: 'jwks', url: 'https://issuer.example.test/jwks' },
@@ -111,7 +111,7 @@ test('advanced JSON switches Basic to JWT and keeps additional external authoriz
   initial.resource_policy = null;
   const { writes } = await fixture(page, initial);
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const draft = structuredClone(initial);
   draft.basic_auth = null;
   draft.jwt_auth = structuredClone(baseRoute.jwt_auth);
@@ -170,7 +170,7 @@ test('Basic and JWT cannot combine, while Protected cannot lose its only authent
 
 test('Korean JWT controls and raw public JWKS remain readable', async ({ page }) => {
   await fixture(page, baseRoute, 'ko');
-  await page.locator('[data-route-id="jwt-route"]').getByRole('button', { name: '편집' }).click();
+  await page.locator('.route-row[data-route-id="jwt-route"]').getByRole('button', { name: '편집' }).click();
   await reveal(page, 'jwt_auth_enabled');
   await expect(page.locator('label[for="route-field-jwt_auth_enabled"]')).toContainText('JWT 인증 사용');
   await expect(page.locator('label[for="route-field-jwt_issuer"]')).toContainText('발급자');
@@ -203,7 +203,7 @@ test('native revocation controls preserve exact token IDs and allow an explicit 
 test('advanced JWT revocation JSON survives an unrelated native edit', async ({ page }) => {
   const { writes } = await fixture(page);
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const draft = structuredClone(baseRoute);
   draft.jwt_auth.verification.revocation = { issued_before: 253402300799, token_ids: ['exact-α', 'exact-id'] };
   await page.locator('#route-json').fill(JSON.stringify(draft));
@@ -236,7 +236,7 @@ test('invalid duplicate, whitespace and out-of-range JWT revocation inputs do no
 
 test('Korean revocation controls explain publication and exact jti values', async ({ page }) => {
   await fixture(page, baseRoute, 'ko');
-  await page.locator('[data-route-id="jwt-route"]').getByRole('button', { name: '편집' }).click();
+  await page.locator('.route-row[data-route-id="jwt-route"]').getByRole('button', { name: '편집' }).click();
   await reveal(page, 'jwt_issued_before');
   await expect(page.locator('label[for="route-field-jwt_issued_before"]')).toContainText('이 시각 이전 발급 토큰 거부');
   await expect(page.locator('label[for="route-field-jwt_token_ids"]')).toContainText('거부할 토큰 ID');
