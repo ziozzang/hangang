@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hangang-route-grpc", "crates/hangang-decision-event"]
+members = ["crates/hangang-route-grpc", "crates/hangang-decision-event", "crates/hangang-decision-exporter"]
 resolver = "3"
 
 [package]
