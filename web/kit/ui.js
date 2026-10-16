@@ -121,7 +121,7 @@ export function field(t, { label, name, value = '', options, type = 'text', help
   let control;
   if (options) {
     control = el('select', { id, name });
-    for (const option of options) control.append(el('option', { value: option.value, text: t(option.label), selected: option.value === value }));
+    for (const option of options) control.append(el('option', { value: option.value, text: option.text ?? t(option.label), selected: option.value === value }));
   } else {
     control = el('input', { id, name, type, value, maxLength, autocomplete: 'off', spellcheck: false });
     if (pattern) control.pattern = pattern;
@@ -343,6 +343,25 @@ export function stageTimeline(t, event, { renderDetail } = {}) {
   return list;
 }
 
+/**
+ * Generic ordered trace (owner explain APIs): each entry has a label, a
+ * result (`pass`, `deny`, `warn`, `not_evaluated`) and an explanation; the
+ * deciding entry is highlighted.
+ */
+export function traceTimeline(t, entries) {
+  const list = el('ol', { class: 'kit-timeline kit-trace' });
+  const kinds = { pass: 'allow', deny: 'deny', warn: 'challenge', not_evaluated: 'disabled' };
+  for (const entry of entries) {
+    const kind = kinds[entry.result] || 'unknown';
+    const item = el('li', { class: `kit-stage${entry.deciding ? ' is-deciding' : ''}${entry.result === 'not_evaluated' ? ' is-skipped' : ''}`, dataset: { stage: entry.stage || '', result: entry.result || '' } },
+      el('div', { class: 'kit-stage-head' }, el('strong', { text: entry.label }), statusBadge(t, kind, `ui.trace.${Object.hasOwn(kinds, entry.result) ? entry.result : 'unknown'}`)),
+      entry.text ? el('p', { class: 'kit-trace-text', text: entry.text }) : null,
+      entry.extra || null);
+    list.append(item);
+  }
+  return list;
+}
+
 export function reasonText(t, code) {
   const key = `decision.reason.${code}`;
   const text = t(key);
@@ -550,4 +569,4 @@ export function subjectPicker(t, api, { label, name, value = '', kind = 'human',
   return wrapper;
 }
 
-export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, confirmDialog, formatFullTime, formatCompactTime, timeCell, hashChip, disabledAction, subjectResolver, subjectPicker, subjectLabel, parseSubject });
+export const ui = Object.freeze({ version: KIT_VERSION, el, clear, statusBadge, freshnessBadge, relativeAge, copyButton, entityLink, entityHref, emptyState, errorState, loadingState, field, dataTable, stageTimeline, reasonText, fixText, structuredDiff, traceTimeline, confirmDialog, formatFullTime, formatCompactTime, timeCell, hashChip, disabledAction, subjectResolver, subjectPicker, subjectLabel, parseSubject });

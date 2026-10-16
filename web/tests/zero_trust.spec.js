@@ -336,9 +336,6 @@ test('network and service entity routes show recent decisions', async ({ page })
   await expect(page.locator('#view-network')).toContainText('KR');
   await expect(page.locator('#view-network tbody tr')).toHaveCount(4);
   expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('ip=198.51.100.7');
-  await page.goto('/ui/#policies/services/reports');
-  await expect(page.locator('#view-policies h1')).toHaveText('reports');
-  expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('service=reports');
   await page.goto('/ui/#workloads');
   await expect(page.locator('#view-workloads')).toContainText('not configured yet');
 });

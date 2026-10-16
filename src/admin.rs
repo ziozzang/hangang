@@ -3689,6 +3689,14 @@ impl Admin {
         };
         let method = req.method().clone();
         let write = method == hyper::Method::PUT && path == "v1/policy";
+        // Operator reason for a publication (console sends it percent-encoded);
+        // recorded in the Hangang audit log with the actor and resulting revision.
+        let change_reason = req
+            .headers()
+            .get("x-hangang-change-reason")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 2048)
+            .map(str::to_owned);
         if !write && method != hyper::Method::GET {
             return problem(405, "Method Not Allowed", "GET or policy PUT required");
         }
@@ -3886,6 +3894,16 @@ impl Admin {
         } else {
             None
         };
+        if write {
+            tracing::info!(
+                target: "hangang::audit",
+                actor = %actor.user().username,
+                base_revision = ?expected,
+                revision = ?revision,
+                reason = %change_reason.as_deref().unwrap_or(""),
+                "Pumgye policy published"
+            );
+        }
         let mut result = json_value(200, &document, revision);
         result.headers_mut().insert(
             "x-hangang-config-revision",

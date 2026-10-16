@@ -103,6 +103,50 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "application/json",
                 include_bytes!("../web/zt/messages/ko.json"),
             )),
+            "/ui/zt/policies/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/index.js"),
+            )),
+            "/ui/zt/policies/model.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/model.js"),
+            )),
+            "/ui/zt/policies/store.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/store.js"),
+            )),
+            "/ui/zt/policies/service.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/service.js"),
+            )),
+            "/ui/zt/policies/simulator.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/simulator.js"),
+            )),
+            "/ui/zt/policies/publish.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/publish.js"),
+            )),
+            "/ui/zt/policies/policies.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/policies/policies.css"),
+            )),
+            "/ui/zt/messages/policies.en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/policies.en.json"),
+            )),
+            "/ui/zt/messages/policies.ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/policies.ko.json"),
+            )),
+            "/ui/zt/messages/pumgye.en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/pumgye.en.json"),
+            )),
+            "/ui/zt/messages/pumgye.ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/pumgye.ko.json"),
+            )),
             "/ui/lua-editor.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/lua-editor.js"),
@@ -110,10 +154,6 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
             "/ui/lua-editor.css" => Some((
                 "text/css; charset=utf-8",
                 include_bytes!("../web/lua-editor.css"),
-            )),
-            "/ui/pumgye.js" => Some((
-                "text/javascript; charset=utf-8",
-                include_bytes!("../web/pumgye.js"),
             )),
             "/ui/app.js" => Some((
                 "text/javascript; charset=utf-8",
@@ -276,6 +316,17 @@ mod tests {
             "/ui/zt/entities.js",
             "/ui/zt/messages/en.json",
             "/ui/zt/messages/ko.json",
+            "/ui/zt/policies/index.js",
+            "/ui/zt/policies/model.js",
+            "/ui/zt/policies/store.js",
+            "/ui/zt/policies/service.js",
+            "/ui/zt/policies/simulator.js",
+            "/ui/zt/policies/publish.js",
+            "/ui/zt/policies/policies.css",
+            "/ui/zt/messages/policies.en.json",
+            "/ui/zt/messages/policies.ko.json",
+            "/ui/zt/messages/pumgye.en.json",
+            "/ui/zt/messages/pumgye.ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);

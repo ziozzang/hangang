@@ -544,5 +544,10 @@
   "other": "Page {page} · {count} rows"
  },
  "ui.table.pagination": "Pagination",
- "ui.table.previous": "Previous"
+ "ui.table.previous": "Previous",
+ "ui.trace.deny": "Deny",
+ "ui.trace.not_evaluated": "Not evaluated",
+ "ui.trace.pass": "Pass",
+ "ui.trace.unknown": "Unknown",
+ "ui.trace.warn": "Warning"
 }

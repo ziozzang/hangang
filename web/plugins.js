@@ -26,7 +26,7 @@ export async function discoverPlugins(context) {
     const name='plugin-'+p.id;
     const link=document.createElement('a');link.className='nav-link';link.dataset.view=name;link.dataset.adminOnly='';link.href='#'+name;link.dataset.consolePlugin=p.id;
     const icon=document.createElement('span');icon.setAttribute('aria-hidden','true');icon.textContent='◇';const label=document.createElement('bdi');const authority=authorityFor(p.id);label.textContent=authority ? t(authority.label) : p.name;if(authority)label.dataset.i18n=authority.label;link.dataset.searchAliases=authority?.aliases || p.id;link.append(icon,label);
-    navigation.insertBefore(link, authorityFor(p.id) ? navigation.querySelector('[data-view="pumgye"]') : anchor);
+    navigation.insertBefore(link, anchor);
     const section=document.createElement('section');section.id='view-'+name;section.className='view';section.hidden=true;section.dataset.consolePlugin=p.id;
     const head=document.createElement('div');head.className='page-head';const title=document.createElement('h1');title.id='plugin-'+p.id+'-title';title.textContent=authority ? t(authority.label) : p.name;if(authority)title.dataset.i18n=authority.label;section.setAttribute('aria-labelledby',title.id);head.append(title);const root=document.createElement('div');root.className='plugin-root';section.append(head,root);document.querySelector('#main').insertBefore(section,document.querySelector('#geoip-attribution'));
     catalog.push({...p,name,root});
