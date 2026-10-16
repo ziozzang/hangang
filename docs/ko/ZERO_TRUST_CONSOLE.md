@@ -15,7 +15,7 @@
 | 접근 | `#access/decisions` | URL에 보관되는 서버 측 필터, 커서 페이지 나눔, 시간순 전환, 요청·사용자·IP 검색, 제한된 실시간 추적을 갖춘 판단 로그 |
 | 접근 | `#access/requests/{request_id}` | 요청 상세: 결정 단계가 강조된 단계 타임라인, 현지화된 사유와 해결 방법, *이후 변경* 표시가 있는 리비전 벡터 |
 | 신원 | `#identities/…` | 호패 패키지를 통한 사용자, 사용자 상세, 세션, 그룹, 공급자, 인증 정책, 자격 증명 투영(아래 참고) |
-| 네트워크 | `#network/ip/{ip}` | 주소의 GeoIP 국가와 최근 판단 |
+| 네트워크 | `#network/…` | 수문장 패키지를 통한 개요, 위협 대기열, IP 상세, 차단·허용 목록, 규칙, 정책, ASN 풀(아래 참고) |
 | 정책 | `#policies` | 품계 서비스 목록(권한 문맥, 수문장 요구, 역할·할당·네트워크·리소스 수, 최고 등급), 접근 매트릭스, 고급 JSON |
 | 정책 | `#policies/services/{id}` | 서비스 상세 탭: 개요, 리소스와 동작, 역할, 할당, 접근 시뮬레이터, 변경 이력 |
 | 정책 | `#policies/publish` | 검토 후 게시: 구조화된 차이, 변경 영향, 필수 사유, 이름 입력 확인, 충돌 해결 |
@@ -94,6 +94,33 @@
 `GET /v1/pumgye/audit/simulations`. 관리자 전용이고, 품계 자체 한도보다 먼저 콘솔
 계정별 한도(순간 20, 초당 2)를 적용하며, 세션에서 `on_behalf_of`를
 `console:<account>`로 정하고, 품계의 구조화된 오류를 그대로 전달합니다.
+
+## 네트워크
+
+모든 네트워크 페이지는 호스트 중계(`/v1/plugins/guard/<route>`)로 수문장 콘솔 패키지를
+호출합니다. 이전 수문장 패키지 페이지는 탐색에서 빠졌고 `#plugin-guard` 링크는
+`#network`로 리다이렉트됩니다.
+
+| 경로 | 페이지 | 수문장 경로 |
+| --- | --- | --- |
+| `#network` | 개요: 모드 배너, 관찰 모드에서는 추적 주소 중 집행 시 거부될 주소, 대기열·차단·허용 목록·규칙 수, 한강 판단 로그의 네트워크 단계 거부 추이와 상위 국가, 상위 ASN, 최근 정책 변경 | `policy/document`, `candidates`, `blocks`, `rules`, `explain/batch`, `audit/query` |
+| `#network/threats?q=&stage=&asn=&eligible=` | 위협 대기열: 점수, 단계, 이벤트, ASN, 최근 확인. 개수 입력 확인과 사유로 일괄 승인 | `candidates`, `candidates/approve` |
+| `#network/ip/{ip}` | IP 상세: GeoIP/ASN, 점수와 단계, 일치 규칙, 만료가 있는 차단, 허용 목록, 설명 추적(게시본과 관찰 중에는 집행 시), 관련 판단. 사유와 함께 차단·해제·허용 | `lookup`, `explain`, `blocks`, `policy/document` |
+| `#network/blocks[/allowlist]?kind=` | 차단(수동, 승인, 자동)과 만료 카운트다운, 허용 목록. 추가 시 CIDR 검증과 영향 미리 보기 | `blocks`, `networks/inspect`, `explain/batch`, `policy/document` |
+| `#network/rules[/lua]?rule=` | 구조화 양식 또는 호스트 CodeMirror 편집기의 Lua 규칙. 검증, 변경 목록, 추적 주소 가정 분석, 사유와 함께 게시 | `rules`, `rules/validate`, `rules/lua`, `explain/batch` |
+| `#network/policy` | 모드, 자동 차단, 창, 임계값, 차단 수명, 가중치. 변경 목록, 가정 분석, 사유가 있는 CAS 게시(`expected_revision`). 집행 전환은 모드 이름 입력 필요 | `policy/document`, `explain/batch` |
+| `#network/asn` | 근거에 나타난 ASN과 이를 지정한 규칙(읽기 전용). 제안 절차는 예정으로 표시 | `candidates`, `rules` |
+
+수문장 상태, GeoIP 데이터베이스(다시 불러오기), 서명된 업데이트(확인), Kubernetes 원천은
+시스템으로 옮겼고 원본 진단은 접힌 상태로만 보입니다. 쓰기는 운영자 사유를
+`x-hangang-change-reason`(작업 기록)으로 보내며, 정책 쓰기는 수문장 `reason`에도 담고
+수동 차단은 사유를 차단 사유(128바이트)로 씁니다. 수문장 규칙 교체에는 리비전 전제
+조건이 없어 콘솔이 게시 직전 게시된 규칙을 다시 읽고 바뀌었으면 거부합니다.
+
+페이지가 알려 주는 수문장 API 후속 과제: 주소별 점수·신호 이력, 후보의 신호별 횟수와
+국가, 차단 생성자와 생성 시각, `PUT /v1/rules`·`/v1/rules/lua`의 `expected_revision`,
+Lua 원문 미보관, 읽을 수 있는 ASN 카탈로그와 ASN 제안 API, 차단·승인·규칙 쓰기의 사유
+필드, `explain/batch`와 영향 추정은 추적 주소만 다룸.
 
 ## 공용 UI 키트
 

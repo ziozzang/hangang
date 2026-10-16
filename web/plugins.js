@@ -4,6 +4,7 @@ import { t as kitT } from './zt/shell.js';
 // Host console lifecycle for trusted, hash-pinned operator-installed modules.
 let catalog = [], mounted = new Map(), generation = 0, host;
 const authorities = Object.freeze({ hopae: { label: 'Identity · Hopae', aliases: 'identity authentication 호패 신원 인증', order: 0 }, guard: { label: 'Network trust · Sumunjang', aliases: 'guard network trust 수문장 네트워크 신뢰', order: 1 } });
+export const SUPERSEDED = Object.freeze({ guard: '#network' });
 const authorityFor = id => Object.hasOwn(authorities, id) ? authorities[id] : undefined;
 export function pluginView(name) { return catalog.some(p => name === 'plugin-' + p.id); }
 export async function discoverPlugins(context) {
@@ -21,7 +22,8 @@ export async function discoverPlugins(context) {
     ids.add(p.id);
     if (!/^[a-z0-9-]{1,32}$/.test(p.id) || typeof p.name !== 'string' || typeof p.entry !== 'string' || !p.entry.startsWith(`/ui/plugins/${p.id}/`) || p.api_base !== `/v1/plugins/${p.id}`) throw Error('Invalid console plugin discovery');
   }
-  const sorted = [...data.plugins].sort((a,b) => (authorityFor(a.id)?.order ?? 3) - (authorityFor(b.id)?.order ?? 3) || a.id.localeCompare(b.id, 'en'));
+  // Packages superseded by Zero Trust task sections keep their broker routes but no page (ADR 0020).
+  const sorted = [...data.plugins].filter(p => !Object.hasOwn(SUPERSEDED, p.id)).sort((a,b) => (authorityFor(a.id)?.order ?? 3) - (authorityFor(b.id)?.order ?? 3) || a.id.localeCompare(b.id, 'en'));
   for (const p of sorted) {
     const name='plugin-'+p.id;
     const link=document.createElement('a');link.className='nav-link';link.dataset.view=name;link.dataset.adminOnly='';link.href='#'+name;link.dataset.consolePlugin=p.id;

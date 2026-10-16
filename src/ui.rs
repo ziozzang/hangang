@@ -203,6 +203,70 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "application/json",
                 include_bytes!("../web/zt/messages/pumgye.ko.json"),
             )),
+            "/ui/zt/network/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/index.js"),
+            )),
+            "/ui/zt/network/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/common.js"),
+            )),
+            "/ui/zt/network/trace.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/trace.js"),
+            )),
+            "/ui/zt/network/actions.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/actions.js"),
+            )),
+            "/ui/zt/network/diff.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/diff.js"),
+            )),
+            "/ui/zt/network/overview.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/overview.js"),
+            )),
+            "/ui/zt/network/threats.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/threats.js"),
+            )),
+            "/ui/zt/network/ip.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/ip.js"),
+            )),
+            "/ui/zt/network/blocks.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/blocks.js"),
+            )),
+            "/ui/zt/network/rules.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/rules.js"),
+            )),
+            "/ui/zt/network/policy.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/policy.js"),
+            )),
+            "/ui/zt/network/asn.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/asn.js"),
+            )),
+            "/ui/zt/network/system.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/system.js"),
+            )),
+            "/ui/zt/network/network.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/network/network.css"),
+            )),
+            "/ui/zt/network/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/network/messages/en.json"),
+            )),
+            "/ui/zt/network/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/network/messages/ko.json"),
+            )),
             "/ui/lua-editor.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/lua-editor.js"),
@@ -397,6 +461,22 @@ mod tests {
             "/ui/zt/messages/policies.ko.json",
             "/ui/zt/messages/pumgye.en.json",
             "/ui/zt/messages/pumgye.ko.json",
+            "/ui/zt/network/index.js",
+            "/ui/zt/network/common.js",
+            "/ui/zt/network/trace.js",
+            "/ui/zt/network/actions.js",
+            "/ui/zt/network/diff.js",
+            "/ui/zt/network/overview.js",
+            "/ui/zt/network/threats.js",
+            "/ui/zt/network/ip.js",
+            "/ui/zt/network/blocks.js",
+            "/ui/zt/network/rules.js",
+            "/ui/zt/network/policy.js",
+            "/ui/zt/network/asn.js",
+            "/ui/zt/network/system.js",
+            "/ui/zt/network/network.css",
+            "/ui/zt/network/messages/en.json",
+            "/ui/zt/network/messages/ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);

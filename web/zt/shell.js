@@ -6,9 +6,10 @@ import { getLocale } from '../i18n.js';
 import { renderOverview } from './overview.js';
 import { renderDecisionLog, renderRequest } from './access.js';
 import { renderAudit } from './audit.js';
-import { renderIp, renderSection, renderSystem } from './entities.js';
+import { renderSection, renderSystem } from './entities.js';
 import { renderIdentities } from './identities/index.js';
 import { renderPolicies, resetPolicies } from './policies/index.js';
+import { renderNetwork } from './network/index.js';
 
 export const t = createTranslator(getLocale);
 export const SECTIONS = Object.freeze(['overview', 'access', 'identities', 'policies', 'network', 'workloads', 'audit', 'system']);
@@ -41,7 +42,7 @@ export function canonicalHash(hash) {
 }
 
 async function ensureCatalogs() {
-  if (!catalogs) catalogs = Promise.all([loadCatalogs('/ui/zt/messages'), loadCatalogs('/ui/zt/identities/messages')]).catch(error => { catalogs = null; throw error; });
+  if (!catalogs) catalogs = Promise.all([loadCatalogs('/ui/zt/messages'), loadCatalogs('/ui/zt/identities/messages'), loadCatalogs('/ui/zt/network/messages')]).catch(error => { catalogs = null; throw error; });
   return catalogs;
 }
 
@@ -93,7 +94,7 @@ export async function loadZeroTrust(name, hostContext) {
     else if (name === 'access' && route.parts[0] === 'requests' && route.parts[1]) await renderRequest(cx, root, route.parts[1]);
     else if (name === 'access') await renderDecisionLog(cx, root, route.params);
     else if (name === 'identities') await renderIdentities(cx, root, route);
-    else if (name === 'network' && route.parts[0] === 'ip' && route.parts[1]) await renderIp(cx, root, route.parts[1]);
+    else if (name === 'network') await renderNetwork(cx, root, route);
     else if (name === 'policies') await renderPolicies(cx, root, route);
     else if (name === 'audit') await renderAudit(cx, root, route.params);
     else if (name === 'system') await renderSystem(cx, root);

@@ -282,7 +282,8 @@ export function dataTable(t, { id, caption, columns, fetchPage, rowKey, empty, o
       rows = result.items;
       renderRows();
       nextCursor = result.nextCursor || null;
-      if (!rows.length) clear(status, emptyState(t, empty));
+      // An empty page shows only the empty state: no orphaned header row.
+      if (!rows.length) { clear(status, emptyState(t, empty)); table.hidden = true; pager.hidden = page === 0; }
       prev.disabled = page === 0; next.disabled = !nextCursor;
       position.textContent = rows.length ? t('ui.table.page', { page: page + 1, count: rows.length }) : '';
       onPage?.(result);

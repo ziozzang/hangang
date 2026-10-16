@@ -603,6 +603,8 @@ async function switchView() {
   if (/^#audit-trail(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#audit' + location.hash.slice('#audit-trail'.length));
   // The embedded Pumgye page moved into the Policies section (ADR 0020).
   if (/^#pumgye(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', location.hash.startsWith('#pumgye/policy') ? '#policies/advanced' : '#policies');
+  // The Sumunjang package page became the Network section (ADR 0020).
+  if (/^#plugin-guard(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#network');
   const navigation = ++navigationGeneration;
   let name = normalizeView(location.hash);
   if (state.user && !isAdmin() && name !== 'status') {

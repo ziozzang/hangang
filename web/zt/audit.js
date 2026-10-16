@@ -116,8 +116,8 @@ function target(cx, record) {
   const { t, ui } = cx;
   if (!record.target) return '—';
   if (record.target.type === 'plugin') return ui.el('a', { href: `#plugin-${record.target.id}`, text: t(PLUGIN_LABELS[record.target.id] || 'ui.owner.host') });
-  if (record.target.type === 'revision') return ui.el('a', { href: record.source === 'sumunjang' ? '#plugin-guard' : '#pumgye', text: t('ui.revision', { revision: record.target.id }) });
-  if (record.target.type === 'guard') return ui.el('a', { href: '#plugin-guard', class: 'kit-mono', text: record.target.id });
+  if (record.target.type === 'revision') return ui.el('a', { href: record.source === 'sumunjang' ? '#network/policy' : '#pumgye', text: t('ui.revision', { revision: record.target.id }) });
+  if (record.target.type === 'guard') return ui.el('a', { href: '#network/rules', class: 'kit-mono', text: record.target.id });
   if (record.target.type === 'user') return ui.el('a', { href: ui.entityHref('user', record.target.id), class: 'kit-mono', text: record.target.id });
   return ui.el('span', { text: record.target.id });
 }
