@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shots = process.env.NETWORK_SCREENS || path.join(web, 'test-results', 'network-screens');
 const NOW = Math.floor(Date.now() / 1000);
-const ROUTES = ['kubernetes/authority:GET', 'kubernetes/status:GET', 'kubernetes/evaluate:POST', 'status:GET', 'policy/document:GET', 'policy/document:PUT', 'candidates:GET', 'candidates/approve:POST', 'blocks:GET', 'blocks:POST', 'blocks:DELETE', 'lookup:POST', 'networks/inspect:POST', 'rules:GET', 'rules:PUT', 'rules/lua:PUT', 'rules/validate:POST', 'geoip/reload:POST', 'update/status:GET', 'update/check:POST', 'audit:GET', 'audit/query:POST', 'explain:POST', 'explain/batch:POST', 'reasons:GET'];
+const ROUTES = ['kubernetes/authority:GET', 'kubernetes/status:GET', 'kubernetes/evaluate:POST', 'status:GET', 'policy/document:GET', 'policy/document:PUT', 'candidates:GET', 'candidates/approve:POST', 'blocks:GET', 'blocks:POST', 'blocks:DELETE', 'lookup:POST', 'networks/inspect:POST', 'rules:GET', 'rules:PUT', 'rules/lua:PUT', 'rules/validate:POST', 'geoip/reload:POST', 'update/status:GET', 'update/check:POST', 'audit:GET', 'audit/query:POST', 'explain:POST', 'explain/batch:POST', 'reasons:GET', 'zones:GET', 'zones:POST'];
 
 const CANDIDATES = [
   { ip: '203.0.113.7', score: 64, suspicion: 'high', eligible: true, events: 9, first_seen: NOW - 3000, last_seen: NOW - 40, asn: 64511 },
@@ -27,6 +27,20 @@ const RULES = { version: 1, rules: [
   { id: 'watch-gb', priority: 10, countries: ['GB'], action: 'observe', score: 5, description: '' },
 ] };
 
+const ZONES = [
+  { id: 'corp', display_name: 'Corporate VPN', owner: 'netops', description: 'VPN egress ranges', prefixes: ['10.20.0.0/16', '203.0.113.0/24'], updated_at: NOW - 3600, updated_by: 'operator' },
+  { id: 'partner.acme', display_name: null, owner: null, description: null, prefixes: ['198.51.100.0/25', '2001:db8::/48'], updated_at: NOW - 86400, updated_by: 'admin-credential' },
+];
+function inPrefix(prefix, ip) {
+  const [base, bits] = prefix.split('/');
+  if (base.includes(':') !== ip.includes(':')) return false;
+  if (ip.includes(':')) return ip.startsWith(base.replace(/::$/, ':'));
+  const n = value => value.split('.').reduce((acc, part) => acc * 256 + Number(part), 0);
+  const size = 2 ** (32 - Number(bits));
+  return Math.floor(n(ip) / size) === Math.floor(n(base) / size);
+}
+function zonesOf(ip) { return ZONES.filter(zone => zone.prefixes.some(prefix => inPrefix(prefix, ip))).map(zone => zone.id); }
+
 function explainFor(ip, { mode = 'observe' } = {}) {
   const blocked = ip === '203.0.113.7';
   const enforce = {
@@ -34,6 +48,7 @@ function explainFor(ip, { mode = 'observe' } = {}) {
     reason_code: blocked ? 'sumunjang.deny.block_approved' : 'sumunjang.deny.rule', params: blocked ? { rule: null, network: '203.0.113.7/32' } : { rule: 'deny-tor-asn', network: null }, matched_rules: blocked ? ['watch-hosting'] : ['deny-tor-asn'],
     stages: [
       { stage: 'mode', mode: 'enforce', code: 'sumunjang.stage.mode.enforce', params: {} },
+      { stage: 'zone', informational: true, zones: zonesOf(ip), zone_revision: 5, code: zonesOf(ip).length ? 'sumunjang.stage.zone.match' : 'sumunjang.stage.zone.none', params: { zones: zonesOf(ip).join(', ') } },
       { stage: 'allowlist', matched: false, network: null, code: 'sumunjang.stage.allowlist.miss', params: { network: null } },
       { stage: 'geo', country: 'NL', asn: 64511, asn_source: 'geoip', simulated: false, required: true, code: 'sumunjang.stage.geo.context', params: { country: 'NL', asn: '64511', source: 'geoip' } },
       blocked
@@ -51,7 +66,7 @@ function explainFor(ip, { mode = 'observe' } = {}) {
     enforce_preview: enforce, geoip: { country: 'NL', asn: 64511 }, evaluated: { source: 'published', revision: 418, policy_revision: 'p12', mode: 'observe', stored: false } };
 }
 
-async function setup(page, { mode = 'observe', conflict = false, noGuard = false, routes = ROUTES, state = { mode } } = {}) {
+async function setup(page, { mode = 'observe', zoneConflict = false, zoneInvalid = false, conflict = false, noGuard = false, routes = ROUTES, state = { mode } } = {}) {
   const calls = [];
   const policy = { get mode() { return state.mode; }, auto_block: false, window_secs: 60, threshold: 10, block_ttl_secs: 900, allow: ['10.20.0.0/16', '192.0.2.10/32'], weights: { honeypot: 10, scanner: 5, auth_failure: 1, invalid_request: 2 } };
   await page.route('**/*', async route => {
@@ -78,9 +93,15 @@ async function setup(page, { mode = 'observe', conflict = false, noGuard = false
     if (op === 'rules/validate') return body.script && /error/.test(body.script) ? route.fulfill({ status: 400, json: { error: 'invalid explain request', errors: [{ path: '/script', message: 'syntax error near end' }] } }) : route.fulfill({ json: { valid: true, rules: body.rules || RULES } });
     if (op === 'lookup') return route.fulfill({ json: { ip: body.ip, geoip: { country_code: 'NL', country_name: 'Netherlands', city: 'Amsterdam', accuracy_radius_km: 50, asn: 64511, asn_organization: 'Example Hosting B.V.' }, inspection: { ip: body.ip, asn: 64511, score: 64, signal_score: 44, static_rule_score: 20, suspicion: 'high', matched_rules: ['deny-tor-asn'], decision: { action: 'allow' } } } });
     if (op === 'networks/inspect') return route.fulfill({ json: { network: body.network, score: 30, signal_score: 30, static_rule_score: 0, matched_rules: [], events: 14, unique_ips: 2, max_ip_score: 24, suspicion: 'suspicious' } });
+    if (op === 'zones' && request.method() === 'GET') return route.fulfill({ json: { schema: 'sumunjang.zones.v1', revision: 5, limits: { zones: 64, prefixes: 65536 }, zones: ZONES } });
+    if (op === 'zones') {
+      if (zoneConflict) return route.fulfill({ status: 409, json: { error: 'zone revision conflict; reload', current_revision: 6 } });
+      if (zoneInvalid) return route.fulfill({ status: 400, json: { error: 'invalid zone', errors: [{ path: '/zone/id', message: 'zone id must match [A-Za-z0-9_.:-]{1,128}' }, { path: '/zone/prefixes/1', message: 'invalid IP address syntax' }] } });
+      return route.fulfill({ json: { schema: 'sumunjang.zones.v1', revision: 6, zone: body.zone || null, zones: ZONES }, headers: { 'x-hangang-plugin-operation': '96' } });
+    }
     if (op === 'explain') return route.fulfill({ json: explainFor(body.ip, { mode: state.mode }) });
     if (op === 'explain/batch') {
-      const results = body.ips.map(ip => { const deny = ip === '203.0.113.7' || (body.candidate && ip.startsWith('198.51')); return { ip, published: { action: ip === '203.0.113.7' && state.mode === 'enforce' ? 'deny' : 'allow', verdict: state.mode === 'enforce' ? (ip === '203.0.113.7' ? 'deny' : 'allow') : 'observe', reason_code: 'sumunjang.allow.default', rules: [], block: null }, ...(body.candidate ? { candidate: { action: deny ? 'deny' : 'allow', verdict: deny ? 'deny' : 'allow', reason_code: deny ? 'sumunjang.deny.rule' : 'sumunjang.allow.default', rules: deny ? ['deny-tor-asn'] : [], block: null }, changed: deny } : {}) }; });
+      const results = body.ips.map(ip => { const deny = ip === '203.0.113.7' || (body.candidate && ip.startsWith('198.51')); return { ip, zones: zonesOf(ip), published: { action: ip === '203.0.113.7' && state.mode === 'enforce' ? 'deny' : 'allow', verdict: state.mode === 'enforce' ? (ip === '203.0.113.7' ? 'deny' : 'allow') : 'observe', reason_code: 'sumunjang.allow.default', rules: [], block: null }, ...(body.candidate ? { candidate: { action: deny ? 'deny' : 'allow', verdict: deny ? 'deny' : 'allow', reason_code: deny ? 'sumunjang.deny.rule' : 'sumunjang.allow.default', rules: deny ? ['deny-tor-asn'] : [], block: null }, changed: deny } : {}) }; });
       const changed = results.filter(entry => entry.changed).length;
       return route.fulfill({ json: { schema: 'sumunjang.explain.batch.v1', at: NOW, evaluated: { published_revision: 418, stored: false }, summary: body.candidate ? { total: results.length, changed, allow_to_deny: changed, deny_to_allow: 0, reason_changed: 0 } : null, results } });
     }
@@ -185,7 +206,7 @@ test('IP detail: GeoIP, risk, block with expiry, explain trace and enforce previ
   await expect(view.locator('.zt-panel', { hasText: 'Block and allow status' })).toContainText('Approved candidate');
   await expect(view.locator('.zt-expiry').first()).toHaveClass(/is-soon/);
   const stages = view.locator('.zt-guard-trace .kit-stage');
-  await expect(stages).toHaveCount(8);
+  await expect(stages).toHaveCount(9);
   await expect(view.locator('.zt-guard-trace .is-deciding')).toHaveAttribute('data-stage', 'blocklist');
   await expect(view.locator('.zt-guard-trace [data-stage="rules"]')).toContainText('Winning rule watch-hosting only observes; block evaluation continues.');
   await expect(view.locator('.zt-guard-trace [data-stage="rules"] .is-expired')).toContainText('old-deny');
@@ -398,4 +419,100 @@ test('screens: Korean light, English dark and Korean 390 px', async ({ page }) =
     }
     await page.evaluate(() => sessionStorage.clear());
   }
+});
+
+test('zones: list, detail with prefixes, create with validation, replace with impact and delete with CAS', async ({ page }) => {
+  const calls = await setup(page);
+  await page.goto('/ui/#network/zones');
+  const view = page.locator('#view-network');
+  await expect(view.locator('.zt-subnav [aria-current="page"]')).toContainText('Zones');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('tbody tr').first()).toContainText('Corporate VPN');
+  await expect(view.locator('tbody tr').nth(1)).toContainText('Shared admin credential');
+  await expect(view.locator('.zt-authority')).toContainText('2 of 64 zones · 4 of 65,536 prefixes');
+  await expectNoSnakeCase(view);
+  await shot(page, 'zones-en-light-1440');
+  // Create: client-side CIDR check, then Sumunjang's JSON Pointer errors.
+  await view.getByRole('button', { name: 'Create zone' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await dialog.getByLabel('Zone ID').fill('office');
+  await dialog.getByLabel('Prefixes').fill('192.0.2.0/24\nnot-a-prefix');
+  await dialog.getByLabel('Prefixes').blur();
+  await expect(dialog.locator('.zt-field-errors')).toContainText('/zone/prefixes/1');
+  await dialog.getByLabel('Prefixes').fill('192.0.2.0/24\n198.51.100.23');
+  await dialog.getByLabel('Prefixes').blur();
+  await expect(dialog.locator('.zt-impact')).toContainText('3 join');
+  await dialog.getByLabel(/Reason/).fill('new branch office');
+  await dialog.getByRole('button', { name: 'Create zone' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Zone created (operation 96)');
+  const created = calls.filter(call => call.path.endsWith('/plugins/guard/zones') && call.method === 'POST').at(-1);
+  expect(created.body).toEqual({ expected_revision: 5, zone: { id: 'office', prefixes: ['192.0.2.0/24', '198.51.100.23/32'] }, reason: 'new branch office' });
+  await expect(page).toHaveURL(/#network\/zones\/office\?updated=/);
+  // Detail, replace and delete.
+  await page.goto('/ui/#network/zones/corp');
+  await expect(view.getByRole('heading', { name: 'Corporate VPN', level: 1 })).toBeVisible();
+  await expect(view.locator('.zt-panel', { hasText: 'Prefixes (2)' }).locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('.zt-panel', { hasText: 'Tracked addresses in this zone' })).toContainText('203.0.113.7');
+  await expectNoSnakeCase(view);
+  await shot(page, 'zone-detail-en-light-1440');
+  await view.getByRole('button', { name: 'Edit' }).click();
+  await expect(dialog.getByLabel('Zone ID')).toHaveAttribute('readonly', '');
+  await dialog.getByLabel('Prefixes').fill('10.20.0.0/16');
+  await dialog.getByLabel('Prefixes').blur();
+  await expect(dialog.locator('.zt-impact')).toContainText('1 leaves');
+  await dialog.getByLabel(/Reason/).fill('retire the old range');
+  await dialog.getByRole('button', { name: 'Save zone' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Zone saved');
+  expect(calls.filter(call => call.path.endsWith('/plugins/guard/zones') && call.method === 'POST').at(-1).body).toMatchObject({ expected_revision: 5, zone: { id: 'corp', display_name: 'Corporate VPN', owner: 'netops', prefixes: ['10.20.0.0/16'] }, reason: 'retire the old range' });
+  await expect(page).toHaveURL(/updated=/);
+  await view.getByRole('button', { name: 'Delete zone' }).click();
+  await dialog.getByLabel('Type corp to confirm').fill('corp');
+  await dialog.getByLabel(/Reason/).fill('merged into partner');
+  await dialog.getByRole('button', { name: 'Delete zone' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Zone deleted');
+  expect(calls.filter(call => call.path.endsWith('/plugins/guard/zones') && call.method === 'POST').at(-1).body).toEqual({ expected_revision: 5, remove: 'corp', reason: 'merged into partner' });
+});
+
+test('zone writes surface Sumunjang path errors and stale revisions without losing the form', async ({ page }) => {
+  await setup(page, { zoneInvalid: true });
+  await page.goto('/ui/#network/zones');
+  const view = page.locator('#view-network');
+  await view.getByRole('button', { name: 'Create zone' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await dialog.getByLabel('Zone ID').fill('office');
+  await dialog.getByLabel('Prefixes').fill('192.0.2.0/24');
+  await dialog.getByLabel(/Reason/).fill('x');
+  await dialog.getByRole('button', { name: 'Create zone' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Sumunjang rejected 2 fields');
+  await expect(dialog.locator('.zt-field-errors code').first()).toHaveText('/zone/id');
+  await expect(dialog.getByLabel('Zone ID')).toHaveAttribute('aria-invalid', 'true');
+  await expect(dialog.getByLabel('Prefixes')).toHaveValue('192.0.2.0/24');
+});
+
+test('zone labels appear in the IP trace and the threat queue', async ({ page }) => {
+  await setup(page, { mode: 'enforce' });
+  await page.goto('/ui/#network/ip/203.0.113.7');
+  const view = page.locator('#view-network');
+  await expect(view.getByRole('region', { name: 'Location and network' }).locator('.zt-zone')).toHaveText('corp');
+  await expect(view.locator('.zt-guard-trace [data-stage="zone"]')).toContainText('Address is in network zones: corp.');
+  await page.goto('/ui/#network/threats');
+  await expect(view.locator('tbody tr').first().locator('.zt-zone')).toHaveText('corp');
+  await expect(view.locator('tbody tr').nth(1).locator('.zt-zone')).toHaveText('partner.acme');
+});
+
+test('screens: zones list and detail in Korean (light, 1440)', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await setup(page);
+  await page.locator('#locale-select').selectOption('ko');
+  const view = page.locator('#view-network');
+  await page.goto('/ui/#network/zones');
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('.zt-subnav')).toContainText('네트워크 존');
+  await expectNoSnakeCase(view);
+  await shot(page, 'zones-ko-light-1440');
+  await page.goto('/ui/#network/zones/corp');
+  await expect(view.locator('.zt-panel', { hasText: '접두사(2)' }).locator('tbody tr')).toHaveCount(2);
+  await expect(view.locator('.zt-panel', { hasText: '이 존의 추적 주소' })).toContainText('203.0.113.7');
+  await expectNoSnakeCase(view);
+  await shot(page, 'zone-detail-ko-light-1440');
 });

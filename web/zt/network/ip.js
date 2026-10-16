@@ -3,6 +3,7 @@
 // enforce would decide while observing), related Hangang decisions, actions.
 import { can, guard, failure, sectionPage, capabilities, modeBanner, facts, panel, button, suspicionBadge, expiry, networkLink, asnText, blockKind, isIp, outcomeBanner, number, codeText } from './common.js';
 import { explainTimeline, verdictBadge } from './trace.js';
+import { zoneBadges } from './zones.js';
 import { blockDialog, unblockDialog, allowDialog, approveCandidates, contains } from './actions.js';
 import { decisionColumns, decisionFetcher } from '../access.js';
 
@@ -41,6 +42,8 @@ export async function renderIpDetail(cx, root, ip) {
   const allowStage = result?.stages?.find(stage => stage.stage === 'allowlist');
   const allowEntry = allowStage?.matched ? allowStage.network : (policy.ok ? (policy.value.policy?.allow || []).find(network => contains(network, ip)) : null);
   const mode = policy.ok ? policy.value.policy?.mode : result?.evaluated?.mode;
+  // Zone labels (Sumunjang 0.1.7 explain `zone` stage); zones never change the decision.
+  const zoneStage = result?.stages?.find(stage => stage.stage === 'zone') || result?.enforce_preview?.stages?.find(stage => stage.stage === 'zone') || null;
   // Matched rules come from the same explain evaluation as the trace (the
   // enforce view while observing); the lookup snapshot is only a fallback.
   const evaluation = result?.enforce_preview || result;
@@ -65,6 +68,7 @@ export async function renderIpDetail(cx, root, ip) {
       ['network.ip.country', geo.country_name ? `${geo.country_name} (${geo.country_code || '—'})` : geo.country_code || t('entity.ip.country.unknown')],
       ['network.ip.city', geo.city || null],
       ['network.ip.accuracy', Number.isFinite(geo.accuracy_radius_km) ? t('network.ip.accuracy_value', { km: geo.accuracy_radius_km }) : null],
+      ['network.ip.zones', zoneStage ? zoneBadges(cx, zoneStage.zones) : null],
       ['network.ip.asn', ui.el('span', {}, ui.el('span', { text: asnText(cx, geo.asn ?? inspection.asn ?? result?.geoip?.asn) }), geo.asn_organization ? ui.el('span', { class: 'kit-muted' }, ' · ', geo.asn_organization) : null)],
     ])),
     panel(cx, 'network.ip.risk', facts(cx, [

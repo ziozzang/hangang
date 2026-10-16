@@ -2,9 +2,9 @@
 // Sumunjang console package broker (`/v1/plugins/guard/<route>`); nothing here
 // talks to Sumunjang directly.
 const BASE = '/v1/plugins/guard/';
-const GET_ROUTES = new Set(['status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status']);
-export const PAGES = Object.freeze(['overview', 'threats', 'blocks', 'rules', 'policy', 'asn']);
-const PAGE_ICONS = Object.freeze({ overview: '◍', threats: '⚠', blocks: '⛔', rules: '▤', policy: '⚙', asn: '⌘' });
+const GET_ROUTES = new Set(['zones', 'status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status']);
+export const PAGES = Object.freeze(['overview', 'threats', 'blocks', 'zones', 'rules', 'policy', 'asn']);
+const PAGE_ICONS = Object.freeze({ overview: '◍', threats: '⚠', blocks: '⛔', zones: '◫', rules: '▤', policy: '⚙', asn: '⌘' });
 
 /** Installed Sumunjang package and its declared routes (`path:METHOD`). */
 export async function capabilities(cx) {

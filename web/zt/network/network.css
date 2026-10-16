@@ -218,3 +218,6 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 @media (max-width: 720px) { .zt-rules-table { table-layout: auto; } .zt-rules-table th { width: auto !important; } }
 .zt-matched-rules .is-winner { outline: 1px solid var(--cyan); }
 .zt-matched-rules .is-expired { text-decoration: line-through; opacity: .75; }
+.kit-tag-add { color: var(--green); }
+.zt-zone { color: var(--cyan); text-decoration: none; }
+#view-network [aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 1px var(--red) inset; }

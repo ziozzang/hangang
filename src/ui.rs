@@ -255,6 +255,10 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/zt/network/system.js"),
             )),
+            "/ui/zt/network/zones.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/zones.js"),
+            )),
             "/ui/zt/network/network.css" => Some((
                 "text/css; charset=utf-8",
                 include_bytes!("../web/zt/network/network.css"),
@@ -474,6 +478,7 @@ mod tests {
             "/ui/zt/network/policy.js",
             "/ui/zt/network/asn.js",
             "/ui/zt/network/system.js",
+            "/ui/zt/network/zones.js",
             "/ui/zt/network/network.css",
             "/ui/zt/network/messages/en.json",
             "/ui/zt/network/messages/ko.json",

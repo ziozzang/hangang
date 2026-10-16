@@ -3,6 +3,7 @@
 // approval of eligible candidates with typed confirmation and a reason.
 import { can, guard, sectionPage, capabilities, notConnected, modeBanner, suspicionBadge, SUSPICIONS, ipLink, asnText, number, outcomeBanner, errorText, unavailable } from './common.js';
 import { approveCandidates } from './actions.js';
+import { zoneBadges } from './zones.js';
 
 const PAGE = 50;
 
@@ -70,6 +71,7 @@ export async function renderThreats(cx, root, params) {
     { key: 'score', label: 'network.threats.col.score', render: entry => scoreBar(cx, entry.score ?? 0, policy?.threshold ?? 0), title: () => '' },
     { key: 'stage', label: 'network.threats.col.stage', render: entry => suspicionBadge(cx, entry.suspicion) },
     { key: 'signals', label: 'network.threats.col.signals', render: entry => ui.el('span', { class: 'zt-stack' }, ui.el('span', { text: t('network.threats.events', { count: entry.events ?? 0 }) }), ui.el('span', { class: 'kit-muted', text: t('network.threats.signals.total') })), title: () => t('network.gap.candidate_signals') },
+    ...(can(caps, 'zones', 'GET') ? [{ key: 'zones', label: 'network.threats.col.zones', render: entry => entry.zones ? zoneBadges(cx, entry.zones) : ui.el('span', { class: 'kit-muted', text: t('network.none') }) }] : []),
     { key: 'asn', label: 'network.threats.col.asn', render: entry => Number.isFinite(entry.asn) ? ui.el('a', { href: `#network/threats?asn=${entry.asn}`, text: asnText(cx, entry.asn) }) : ui.el('span', { class: 'kit-muted', text: asnText(cx, null) }) },
     { key: 'eligible', label: 'network.threats.col.eligible', render: entry => entry.eligible ? ui.statusBadge(t, 'challenge', 'network.threats.eligible') : ui.el('span', { class: 'kit-muted', text: t('network.threats.below_threshold') }) },
     { key: 'last_seen', label: 'network.threats.col.last_seen', render: entry => ui.timeCell(t, (entry.last_seen || 0) * 1000) },
@@ -82,7 +84,16 @@ export async function renderThreats(cx, root, params) {
     fetchPage: async ({ cursor }) => {
       if (!cursor) await load();
       const offset = Number(cursor || 0), rows = filtered();
-      return { items: rows.slice(offset, offset + PAGE), nextCursor: offset + PAGE < rows.length ? String(offset + PAGE) : null };
+      const items = rows.slice(offset, offset + PAGE);
+      // Zone labels for this page from Sumunjang's batch evaluation (0.1.7+ reports `zones`).
+      if (items.length && can(caps, 'explain/batch') && can(caps, 'zones', 'GET')) {
+        try {
+          const { data } = await guard(cx, 'explain/batch', { json: { ips: items.map(entry => entry.ip) } });
+          const zones = new Map((data?.results || []).map(entry => [entry.ip, Array.isArray(entry.zones) ? entry.zones : null]));
+          for (const entry of items) entry.zones = zones.get(entry.ip) ?? null;
+        } catch (error) { if (error?.status === 401) throw error; }
+      }
+      return { items, nextCursor: offset + PAGE < rows.length ? String(offset + PAGE) : null };
     },
   });
   cx.signal.addEventListener('abort', () => table.destroy(), { once: true });
