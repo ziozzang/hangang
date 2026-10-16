@@ -2668,7 +2668,7 @@ mod tests {
                 "annotations":{"noise":"x".repeat(2048)},"managedFields":[{"manager":"kubectl"}]},
             "spec":{"targetRefs":[{"group":"networking.k8s.io","kind":"Ingress","name":"main"}],"network":{"enforcement":"None"},
                 "identity":{"profileRef":{"name":"corp"}},
-                "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":{"GET":"read"}}}}});
+                "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":[{"method":"GET","action":"read"}]}}}});
         cache
             .replace(ResourceKind::ProtectionPolicy, vec![policy], 10)
             .unwrap();

@@ -287,8 +287,22 @@ struct Authorization {
 struct PumgyeBinding {
     service_id: String,
     resource: String,
-    /// HTTP method to Pumgye action.
-    actions: BTreeMap<String, String>,
+    /// HTTP method to Pumgye action; unlisted methods are denied.
+    actions: Vec<ActionMapping>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionMapping {
+    method: String,
+    action: String,
+}
+impl PumgyeBinding {
+    fn action_map(&self) -> BTreeMap<String, String> {
+        self.actions
+            .iter()
+            .map(|mapping| (mapping.method.clone(), mapping.action.clone()))
+            .collect()
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -411,11 +425,13 @@ fn validate_spec(spec: &Spec) -> Result<()> {
         !pumgye.actions.is_empty() && pumgye.actions.len() <= MAX_ACTIONS,
         "authorization.pumgye.actions needs 1..16 methods"
     );
-    for (method, action) in &pumgye.actions {
+    let mut methods = BTreeSet::new();
+    for ActionMapping { method, action } in &pumgye.actions {
         ensure!(
             (1..=32).contains(&method.len()) && method.bytes().all(|b| b.is_ascii_uppercase()),
             "invalid HTTP method {method:?}"
         );
+        ensure!(methods.insert(method), "duplicate HTTP method {method}");
         ensure!(id(action), "invalid Pumgye action {action:?}");
     }
     Ok(())
@@ -856,7 +872,7 @@ fn decide(
         gate: crate::pumgye::ResourceGate {
             service_id: binding.service_id.clone(),
             resource: binding.resource.clone(),
-            actions: binding.actions.clone(),
+            actions: binding.action_map(),
         },
     }))
 }
@@ -1480,7 +1496,7 @@ mod tests {
             "metadata":{"namespace":namespace,"name":name,"uid":format!("uid-{name}"),"generation":3,
                 "creationTimestamp":"2026-01-01T00:00:00Z","resourceVersion":"7"},
             "spec":{"targetRefs":targets,"identity":{"profileRef":{"name":"corp"}},
-                "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":{"GET":"read","POST":"write"}}}}
+                "authorization":{"pumgye":{"serviceId":"orders","resource":"http:orders","actions":[{"method":"GET","action":"read"},{"method":"POST","action":"write"}]}}}
         })
     }
     fn default_policy(namespace: &str, name: &str) -> Value {
@@ -1734,7 +1750,12 @@ mod tests {
         let options = options_with(relaxed, enforcing());
         for mutate in [
             |p: &mut Value| {
-                p["spec"]["authorization"]["pumgye"]["actions"] = serde_json::json!({"get":"read"})
+                p["spec"]["authorization"]["pumgye"]["actions"] =
+                    serde_json::json!([{"method":"get","action":"read"}])
+            },
+            |p: &mut Value| {
+                p["spec"]["authorization"]["pumgye"]["actions"] =
+                    serde_json::json!([{"method":"GET","action":"a"},{"method":"GET","action":"b"}])
             },
             |p: &mut Value| p["spec"]["unknownField"] = true.into(),
             |p: &mut Value| p["spec"]["failureMode"] = "Open".into(),
@@ -2034,6 +2055,23 @@ mod tests {
         assert_eq!(intermediate.http.len(), 2);
         // An unchanged scope needs no release.
         assert!(release_plan(&previous, &previous).is_none());
+    }
+
+    #[test]
+    fn shipped_settings_example_is_valid() {
+        let settings: Settings = serde_json::from_str(include_str!(
+            "../deploy/kubernetes/protection-settings.example.json"
+        ))
+        .unwrap();
+        settings.validate().unwrap();
+        assert!(settings.require_protection);
+        assert_eq!(
+            settings.client_address,
+            ClientAddress::ServiceLocal {
+                namespace: "hangang".into(),
+                name: "hangang".into()
+            }
+        );
     }
 
     #[test]

@@ -1,0 +1,82 @@
+# Enables ProtectionPolicy reconciliation (ADR 0022). Prerequisites:
+#   kubectl apply -k deploy/kubernetes/crds        # cluster-scoped, once
+#   kubectl create configmap hangang-protection \
+#     --from-file=settings.json=deploy/kubernetes/protection-settings.example.json
+#   a kubernetes.io/tls Secret hangang-world-mtls (tls.crt, tls.key, ca.crt)
+#   for the Hopae/Pumgye/Sumunjang mTLS clients, and the token Secret
+#   hangang-world-tokens referenced below.
+# Edit protection-settings.example.json first: the client_address Service
+# must name this namespace's hangang Service, and the Sumunjang flags below
+# must point at your guard. Policies with network enforcement Required are
+# withheld until both Sumunjang (fail-closed query mode) and client address
+# preservation (see service-local-patch.yaml) are in place.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hangang
+spec:
+  template:
+    spec:
+      containers:
+        - name: hangang
+          args:
+            - --supervised
+            - --kubernetes-controller
+            - --kubernetes-namespace
+            - $(POD_NAMESPACE)
+            - --kubernetes-protection-config
+            - /etc/hangang/protection/settings.json
+            - --guard-url
+            - https://sumunjang.hangang-world.svc:8443
+            - --guard-mode
+            - query
+            - --guard-failure-mode
+            - deny
+            - --config
+            - /data/hangang.json
+            - --listen
+            - 0.0.0.0:8080
+            - --admin
+            - 127.0.0.1:9000
+            - --health-path
+            - /-/ready
+            - --lame-duck-seconds
+            - "10"
+            - --drain-seconds
+            - "20"
+          env:
+            - name: HOPAE_GATEWAY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hangang-world-tokens
+                  key: hopae-gateway-key
+            - name: PUMGYE_DECISION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hangang-world-tokens
+                  key: pumgye-decision-token
+            - name: PUMGYE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hangang-world-tokens
+                  key: pumgye-admin-token
+            - name: HANGANG_GUARD_COLLECTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hangang-world-tokens
+                  key: guard-collector-token
+          volumeMounts:
+            - name: protection
+              mountPath: /etc/hangang/protection
+              readOnly: true
+            - name: world-mtls
+              mountPath: /etc/hangang/world-mtls
+              readOnly: true
+      volumes:
+        - name: protection
+          configMap:
+            name: hangang-protection
+        - name: world-mtls
+          secret:
+            secretName: hangang-world-mtls
+            defaultMode: 0440

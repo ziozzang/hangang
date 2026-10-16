@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Cluster-scoped: install once per cluster, before any controller that sets
+# --kubernetes-protection-config. Kept separate from the namespaced
+# controller kustomization so CRD upgrades are an explicit step.
+resources:
+  - protectionpolicies.world.hangang.dev.yaml
+  - world-roles.yaml

@@ -1,0 +1,287 @@
+# ProtectionPolicy (ADR 0022, world.hangang.dev/v1alpha1).
+#
+# Structural schema with bounds on every string, list and map, CEL rules for
+# local invariants, and a status subresource that follows the Gateway API
+# policy status conventions (status.ancestors[] with controllerName and
+# Accepted/ResolvedRefs/Programmed conditions) plus top-level conditions with
+# observedGeneration. Cross-object checks (does the profile exist, is the
+# Pumgye service permitted for this namespace, can network enforcement be
+# honoured) are made by the controller and reported in status: admission
+# never depends on authority availability.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: protectionpolicies.world.hangang.dev
+  labels:
+    app.kubernetes.io/name: hangang
+    app.kubernetes.io/part-of: hangang-world
+spec:
+  group: world.hangang.dev
+  scope: Namespaced
+  names:
+    kind: ProtectionPolicy
+    listKind: ProtectionPolicyList
+    plural: protectionpolicies
+    singular: protectionpolicy
+    shortNames: ["hpp"]
+    categories: ["world"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Default
+          type: boolean
+          jsonPath: .spec.namespaceDefault
+        - name: Profile
+          type: string
+          jsonPath: .spec.identity.profileRef.name
+        - name: Service
+          type: string
+          jsonPath: .spec.authorization.pumgye.serviceId
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Programmed
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Programmed")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            Zero-trust protection for Kubernetes-declared routes: Hopae identity,
+            Pumgye authorization and Sumunjang/network enforcement, attached to
+            routes by targetRefs or as the namespace default.
+          required: ["spec"]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: ["identity", "authorization"]
+              x-kubernetes-validations:
+                - rule: "(has(self.namespaceDefault) && self.namespaceDefault) ? (!has(self.targetRefs) || size(self.targetRefs) == 0) : (has(self.targetRefs) && size(self.targetRefs) > 0)"
+                  message: "a namespaceDefault policy has no targetRefs; any other policy needs at least one targetRef"
+              properties:
+                targetRefs:
+                  type: array
+                  description: >-
+                    Objects in this namespace the policy attaches to. Ingress is
+                    programmed by this release; HTTPRoute and Gateway targets are
+                    accepted by the schema and reported as Unsupported.
+                  maxItems: 16
+                  x-kubernetes-list-type: atomic
+                  x-kubernetes-validations:
+                    - rule: "self.all(a, self.exists_one(b, a.group == b.group && a.kind == b.kind && a.name == b.name && (has(a.sectionName) ? (has(b.sectionName) && a.sectionName == b.sectionName) : !has(b.sectionName))))"
+                      message: "targetRefs must be unique"
+                  items:
+                    type: object
+                    required: ["group", "kind", "name"]
+                    x-kubernetes-validations:
+                      - rule: "self.kind == 'Ingress' ? self.group == 'networking.k8s.io' : self.group == 'gateway.networking.k8s.io'"
+                        message: "Ingress uses group networking.k8s.io; HTTPRoute and Gateway use gateway.networking.k8s.io"
+                      - rule: "self.kind != 'Ingress' || !has(self.sectionName)"
+                        message: "Ingress targets have no sections"
+                    properties:
+                      group:
+                        type: string
+                        enum: ["networking.k8s.io", "gateway.networking.k8s.io"]
+                      kind:
+                        type: string
+                        enum: ["Ingress", "HTTPRoute", "Gateway"]
+                      name:
+                        type: string
+                        minLength: 1
+                        maxLength: 253
+                        pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                      sectionName:
+                        type: string
+                        minLength: 1
+                        maxLength: 253
+                        pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                namespaceDefault:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Apply to every Ingress of this namespace that no policy
+                    targets. At most one default per namespace; several are a
+                    conflict and withhold the Ingresses they would cover.
+                identity:
+                  type: object
+                  required: ["profileRef"]
+                  properties:
+                    profileRef:
+                      type: object
+                      description: >-
+                        Hopae identity profile configured by the gateway operator
+                        (the future WorldIdentityProfile kind).
+                      required: ["name"]
+                      properties:
+                        name:
+                          type: string
+                          minLength: 1
+                          maxLength: 63
+                          pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                authorization:
+                  type: object
+                  required: ["pumgye"]
+                  properties:
+                    pumgye:
+                      type: object
+                      required: ["serviceId", "resource", "actions"]
+                      properties:
+                        serviceId:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                          pattern: "^[A-Za-z0-9_.:-]+$"
+                        resource:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                          pattern: "^[A-Za-z0-9_.:-]+$"
+                        actions:
+                          type: array
+                          description: HTTP method to Pumgye action. Methods not listed are denied.
+                          minItems: 1
+                          maxItems: 16
+                          x-kubernetes-list-type: map
+                          x-kubernetes-list-map-keys: ["method"]
+                          items:
+                            type: object
+                            required: ["method", "action"]
+                            properties:
+                              method:
+                                type: string
+                                minLength: 1
+                                maxLength: 32
+                                pattern: "^[A-Z]+$"
+                              action:
+                                type: string
+                                minLength: 1
+                                maxLength: 128
+                                pattern: "^[A-Za-z0-9_.:-]+$"
+                network:
+                  type: object
+                  properties:
+                    enforcement:
+                      type: string
+                      enum: ["Required", "None"]
+                      default: Required
+                      description: >-
+                        Required: Sumunjang admission must run fail-closed and the
+                        gateway must see the real client address, otherwise the
+                        routes are withheld (Programmed=False). None: identity and
+                        authorization only; no network condition is claimed.
+                failureMode:
+                  type: string
+                  enum: ["Closed"]
+                  default: Closed
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                conditions:
+                  type: array
+                  maxItems: 8
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: ["type"]
+                  items:
+                    type: object
+                    required: ["type", "status", "reason", "lastTransitionTime"]
+                    properties:
+                      type:
+                        type: string
+                        minLength: 1
+                        maxLength: 316
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                        minLength: 1
+                        maxLength: 1024
+                      message:
+                        type: string
+                        maxLength: 32768
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                ancestors:
+                  type: array
+                  maxItems: 16
+                  x-kubernetes-list-type: atomic
+                  items:
+                    type: object
+                    required: ["ancestorRef", "controllerName", "conditions"]
+                    properties:
+                      ancestorRef:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          group:
+                            type: string
+                            maxLength: 253
+                          kind:
+                            type: string
+                            maxLength: 63
+                          name:
+                            type: string
+                            minLength: 1
+                            maxLength: 253
+                          namespace:
+                            type: string
+                            maxLength: 63
+                          sectionName:
+                            type: string
+                            maxLength: 253
+                      controllerName:
+                        type: string
+                        minLength: 1
+                        maxLength: 253
+                      conditions:
+                        type: array
+                        maxItems: 8
+                        x-kubernetes-list-type: map
+                        x-kubernetes-list-map-keys: ["type"]
+                        items:
+                          type: object
+                          required: ["type", "status", "reason", "lastTransitionTime"]
+                          properties:
+                            type:
+                              type: string
+                              minLength: 1
+                              maxLength: 316
+                            status:
+                              type: string
+                              enum: ["True", "False", "Unknown"]
+                            reason:
+                              type: string
+                              minLength: 1
+                              maxLength: 1024
+                            message:
+                              type: string
+                              maxLength: 32768
+                            observedGeneration:
+                              type: integer
+                              format: int64
+                              minimum: 0
+                            lastTransitionTime:
+                              type: string
+                              format: date-time
