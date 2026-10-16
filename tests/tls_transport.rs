@@ -35,6 +35,61 @@ async fn certificate_reload_is_atomic_and_retains_last_good_pair() {
 }
 
 #[tokio::test]
+async fn polled_reload_reports_serial_and_alerts_on_bad_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&cert, first.cert.pem()).unwrap();
+    std::fs::write(&key, first.signing_key.serialize_pem()).unwrap();
+    let tls = Arc::new(ReloadingTls::new(cert.clone(), key.clone()).unwrap());
+    let registry = Arc::new(hangang::tls_reload::Registry::default());
+    let status = registry.status("public-listener");
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(tls.clone().watch_every(
+        Duration::from_millis(50),
+        Some(status.clone()),
+        cancel.clone(),
+    ));
+    let wait = |check: Box<dyn Fn() -> bool + Send>| async move {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let initial = hangang::tls_reload::leaf_serial(first.cert.pem().as_bytes()).unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.serial() == initial)).await;
+    let good = tls.current.load_full();
+    // Bad material: the old certificate stays and the alert gauge rises.
+    std::fs::write(&cert, "not a certificate").unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.failing())).await;
+    assert!(Arc::ptr_eq(&good, &tls.current.load_full()));
+    let mut text = String::new();
+    registry.render(&mut text);
+    assert!(text.contains("hangang_tls_reload_failing{material=\"public-listener\"} 1"));
+    assert!(text.contains("hangang_tls_reload_rejected_total{material=\"public-listener\"} 1"));
+    // A valid rotation is swapped in, counted, and clears the alert.
+    let second = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&key, second.signing_key.serialize_pem()).unwrap();
+    std::fs::write(&cert, second.cert.pem()).unwrap();
+    let s = status.clone();
+    wait(Box::new(move || s.reloads() == 1)).await;
+    assert!(!status.failing());
+    assert!(!Arc::ptr_eq(&good, &tls.current.load_full()));
+    assert_eq!(
+        status.serial(),
+        hangang::tls_reload::leaf_serial(second.cert.pem().as_bytes()).unwrap()
+    );
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn identical_rejected_material_is_parsed_once() {
     // The legacy watcher polls every 500 ms. Bad material must be parsed once
     // (off the executor) and then skipped by digest until it changes, rather

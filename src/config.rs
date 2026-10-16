@@ -2237,6 +2237,9 @@ struct PublicationRetirements {
 }
 
 pub struct Snapshot {
+    /// Client TLS material generation the snapshot's clients were built
+    /// under ([`crate::tls_reload::generation`]); reuse requires a match.
+    pub material_generation: u64,
     pub pumgye: Option<std::sync::Arc<pumgye_core::CompiledPolicy>>,
     pub pumgye_remote: Option<std::sync::Arc<crate::pumgye::AuthorityRuntime>>,
     retirements: std::sync::Mutex<Option<PublicationRetirements>>,
@@ -2656,6 +2659,9 @@ impl Snapshot {
                                 .1
                                 .clone();
                             let reused = previous
+                                .filter(|old| {
+                                    old.material_generation == crate::tls_reload::generation()
+                                })
                                 .and_then(|old| {
                                     old.http.iter().find(|r| {
                                         r.route.id == route.id
@@ -3075,6 +3081,7 @@ impl Snapshot {
             .transpose()?;
         let pumgye_remote = if let Some(authority) = &config.pumgye_authority {
             if let Some(old) = previous
+                .filter(|snapshot| snapshot.material_generation == crate::tls_reload::generation())
                 .and_then(|snapshot| snapshot.pumgye_remote.as_ref())
                 .filter(|old| &old.config == authority)
             {
@@ -3097,6 +3104,7 @@ impl Snapshot {
             None
         };
         let mut next = Self {
+            material_generation: crate::tls_reload::generation(),
             pumgye,
             pumgye_remote,
             retirements: Default::default(),

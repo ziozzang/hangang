@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub(super) struct Client {
-    channel: Channel,
+    channel: arc_swap::ArcSwap<Channel>,
+    address: String,
     token: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     slots: Arc<tokio::sync::Semaphore>,
     revision: AtomicU64,
@@ -22,7 +23,30 @@ pub(super) struct Client {
     timeout: Duration,
     cancel: CancellationToken,
 }
+fn channel(address: &str, tls: &super::NativeTls, timeout: Duration) -> Result<Channel> {
+    let tls = ClientTlsConfig::new()
+        .domain_name(&tls.server_name)
+        .ca_certificate(Certificate::from_pem(crate::tls::read_bounded(&tls.ca)?))
+        .identity(Identity::from_pem(
+            crate::tls::read_bounded(&tls.certificate)?,
+            crate::tls::read_bounded(&tls.key)?,
+        ));
+    Ok(Endpoint::from_shared(format!("https://{address}"))?
+        .tls_config(tls)?
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .buffer_size(TCP_POOL_SIZE)
+        .tcp_nodelay(true)
+        .connect_lazy())
+}
 impl Client {
+    /// Replace the channel after a certificate rotation; requests already
+    /// using the previous channel finish on it.
+    pub(super) fn reload(&self, tls: &super::NativeTls) -> Result<()> {
+        self.channel
+            .store(Arc::new(channel(&self.address, tls, self.timeout)?));
+        Ok(())
+    }
     pub(super) fn new(config: &Config, token: &str, cancel: CancellationToken) -> Result<Self> {
         let tls = config
             .decision_tls
@@ -32,24 +56,13 @@ impl Client {
             .decision_tcp
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("guard gRPC requires address"))?;
-        let tls = ClientTlsConfig::new()
-            .domain_name(&tls.server_name)
-            .ca_certificate(Certificate::from_pem(crate::tls::read_bounded(&tls.ca)?))
-            .identity(Identity::from_pem(
-                crate::tls::read_bounded(&tls.certificate)?,
-                crate::tls::read_bounded(&tls.key)?,
-            ));
         let timeout = Duration::from_millis(config.timeout_ms);
-        let endpoint = Endpoint::from_shared(format!("https://{address}"))?
-            .tls_config(tls)?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .buffer_size(TCP_POOL_SIZE)
-            .tcp_nodelay(true);
+        let channel = channel(&address.to_string(), tls, timeout)?;
         let mut token = format!("Bearer {token}").parse::<tonic::metadata::MetadataValue<_>>()?;
         token.set_sensitive(true);
         Ok(Self {
-            channel: endpoint.connect_lazy(),
+            channel: arc_swap::ArcSwap::from_pointee(channel),
+            address: address.to_string(),
             token,
             slots: Arc::new(tokio::sync::Semaphore::new(TCP_POOL_SIZE)),
             revision: AtomicU64::new(0),
@@ -83,7 +96,7 @@ impl Client {
             .metadata_mut()
             .insert("authorization", self.token.clone());
         let operation = async {
-            let mut client = NetworkClient::new(self.channel.clone())
+            let mut client = NetworkClient::new(self.channel.load().as_ref().clone())
                 .max_encoding_message_size(2048)
                 .max_decoding_message_size(1024);
             let reply = client.check(request).await?.into_inner();

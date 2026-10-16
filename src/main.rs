@@ -105,6 +105,20 @@ struct Args {
     /// watch timeout.
     #[arg(long, default_value_t = 60, requires = "kubernetes_controller")]
     kubernetes_stale_seconds: u64,
+    /// Bounded staleness (ADR 0022): seconds the published Kubernetes
+    /// snapshot may go unconfirmed before protected routes fail closed with
+    /// 503. 60..3600, at least --kubernetes-stale-seconds.
+    #[arg(long, default_value_t = 300, requires = "kubernetes_controller")]
+    kubernetes_max_staleness_seconds: u64,
+    /// Readiness semantics: `snapshot` (ADR 0022: ready while a snapshot is
+    /// published) or `fresh` (not ready once a watch is stale).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "snapshot",
+        requires = "kubernetes_controller"
+    )]
+    kubernetes_readiness: KubernetesReadiness,
     /// Operator protection settings (identity profiles, Pumgye authority,
     /// client address mode). Enables `ProtectionPolicy`
     /// (world.hangang.dev/v1alpha1) reconciliation; `require_protection`
@@ -254,6 +268,11 @@ struct Args {
     no_bootstrap: bool,
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Seconds between polls of certificate and key file contents (listener
+    /// certificates, upstream and guard client identities). Changed, valid
+    /// material is swapped in atomically; 0 disables polling. No inotify.
+    #[arg(long, default_value_t = 10)]
+    tls_reload_seconds: u64,
     /// Public TLS certificate chain (PEM), automatically reloaded.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -838,12 +857,25 @@ async fn run(args: Args) -> Result<()> {
                 watch_timeout: Duration::from_secs(30),
                 request_timeout: Duration::from_secs(40),
                 stale_after: Duration::from_secs(args.kubernetes_stale_seconds),
+                max_staleness: Duration::from_secs(300),
+                readiness: hangang::kubernetes::Readiness::Snapshot,
+                list_timeout: Duration::from_secs(15),
+                freshness: None,
                 protection: None,
             }
         } else {
             hangang::kubernetes::ControllerOptions::in_cluster(args.ingress_class.clone())?
         };
         options.stale_after = Duration::from_secs(args.kubernetes_stale_seconds);
+        anyhow::ensure!(
+            (60..=3600).contains(&args.kubernetes_max_staleness_seconds),
+            "--kubernetes-max-staleness-seconds must be 60..3600"
+        );
+        options.max_staleness = Duration::from_secs(args.kubernetes_max_staleness_seconds);
+        options.readiness = match args.kubernetes_readiness {
+            KubernetesReadiness::Snapshot => hangang::kubernetes::Readiness::Snapshot,
+            KubernetesReadiness::Fresh => hangang::kubernetes::Readiness::Fresh,
+        };
         options.ca_path = args.kubernetes_ca.clone();
         options.token_path = args.kubernetes_token.clone();
         options.namespace = args.kubernetes_namespace.clone();
@@ -1215,11 +1247,15 @@ async fn run(args: Args) -> Result<()> {
     .with_dot_segments_allowed(args.allow_dot_segments)
     .with_upstream_timeout(Duration::from_secs(args.upstream_timeout_seconds))
     .with_trusted_proxies(args.trusted_proxy_cidrs.clone())
+    .with_kubernetes_freshness(
+        args.kubernetes_controller
+            .then(|| metrics.kubernetes_freshness.clone()),
+    )
     .with_removed_response_headers(removed_response_headers.clone())
     .with_https_redirect_code(args.https_redirect_code)
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
-    .with_guard(guard)
+    .with_guard(guard.clone())
     .with_route_owner_queries(args.route_owner_config.is_some())
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
     tcp.set_workload_http(Arc::new(proxy.clone()), args.max_header_bytes)?;
@@ -1318,7 +1354,8 @@ async fn run(args: Args) -> Result<()> {
     let fleet_collector_task =
         fleet_collector.map(|runtime| tokio::spawn(runtime.watch(cancel.clone())));
     let discovery_task = tokio::spawn(discovery.watch(manager.active.clone(), cancel.clone()));
-    let watcher = if let Some(options) = controller_options {
+    let watcher = if let Some(mut options) = controller_options {
+        options.freshness = Some(metrics.kubernetes_freshness.clone());
         let sink = Arc::new(KubernetesSink {
             manager: manager.clone(),
             metrics: metrics.clone(),
@@ -1402,11 +1439,36 @@ async fn run(args: Args) -> Result<()> {
             cancel.clone(),
         )));
     }
-    for tls in [public_tls.clone(), admin_tls.clone()]
-        .into_iter()
-        .flatten()
-    {
-        tls_watchers.push(tokio::spawn(tls.watch(cancel.clone())));
+    let reload_period = Duration::from_secs(args.tls_reload_seconds);
+    if !reload_period.is_zero() {
+        for (name, tls) in [
+            ("public-listener", public_tls.clone()),
+            ("admin-listener", admin_tls.clone()),
+        ] {
+            if let Some(tls) = tls {
+                tls_watchers.push(tokio::spawn(tls.watch_every(
+                    reload_period,
+                    Some(metrics.tls_reload.status(name)),
+                    cancel.clone(),
+                )));
+            }
+        }
+        let mut owners: Vec<(String, Arc<dyn hangang::tls_reload::Owner>)> = vec![(
+            "upstream-client".into(),
+            Arc::new(hangang::tls_reload::ConfigOwner(manager.clone())),
+        )];
+        if let Some(guard) = guard.clone() {
+            owners.push((
+                "guard-decision".into(),
+                Arc::new(hangang::tls_reload::GuardOwner(guard)),
+            ));
+        }
+        tls_watchers.push(tokio::spawn(hangang::tls_reload::watch(
+            owners,
+            metrics.tls_reload.clone(),
+            reload_period,
+            cancel.clone(),
+        )));
     }
     let grace = Duration::from_secs(args.drain_seconds);
     let (route_owner_task, route_owner_failure) = if let Some(server) = route_owner_server {
@@ -2011,6 +2073,12 @@ fn snapshot_file() -> Result<std::fs::File> {
     {
         Ok(tempfile::tempfile()?)
     }
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum KubernetesReadiness {
+    Snapshot,
+    Fresh,
 }
 
 struct KubernetesSink {

@@ -199,7 +199,9 @@ struct IdleSocket {
 }
 struct TcpPool {
     address: pumgye_client::Endpoint,
-    tls: Option<(
+    /// Swapped when the client certificate rotates; pooled connections keep
+    /// the identity they were opened with.
+    tls: ArcSwapOption<(
         tokio_rustls::TlsConnector,
         rustls::pki_types::ServerName<'static>,
     )>,
@@ -236,7 +238,9 @@ impl TcpPool {
             } else {
                 let socket = TcpStream::connect(self.address.as_str()).await?;
                 socket.set_nodelay(true)?;
-                let mut socket: Box<dyn NativeIo> = if let Some((connector, name)) = &self.tls {
+                let tls = self.tls.load_full();
+                let mut socket: Box<dyn NativeIo> = if let Some((connector, name)) = tls.as_deref()
+                {
                     let stream = connector.connect(name.clone(), socket).await?;
                     ensure!(
                         stream.get_ref().1.alpn_protocol() == Some(b"hgd1".as_slice()),
@@ -514,6 +518,8 @@ pub struct GuardClient {
     test_clock: Mutex<Option<lifetime::TestClock>>,
     grpc: Option<grpc::Client>,
     tcp: Option<TcpPool>,
+    /// Decision mTLS material, polled for rotation.
+    decision_tls: Option<NativeTls>,
     transport_mode: TransportMode,
     failure_mode: FailureMode,
     cache_ms: u64,
@@ -530,6 +536,38 @@ pub struct GuardClient {
     scanner_paths: HashSet<String>,
 }
 impl GuardClient {
+    /// Decision client identity, for certificate rotation polling.
+    pub fn tls_material(&self) -> Vec<crate::tls_reload::Material> {
+        self.decision_tls
+            .iter()
+            .map(|tls| crate::tls_reload::Material {
+                ca: tls.ca.clone(),
+                certificate: tls.certificate.clone(),
+                key: tls.key.clone(),
+            })
+            .collect()
+    }
+    /// Rebuild the decision clients from the (rotated) files. New
+    /// connections present the new identity; open ones are unaffected.
+    pub fn reload_tls(&self) -> Result<()> {
+        let Some(tls) = &self.decision_tls else {
+            return Ok(());
+        };
+        if let Some(tcp) = &self.tcp {
+            let connector = crate::tls::mutual_client(
+                &tls.ca,
+                &tls.certificate,
+                &tls.key,
+                &tls.server_name,
+                b"hgd1",
+            )?;
+            tcp.tls.store(Some(Arc::new(connector)));
+        }
+        if let Some(grpc) = &self.grpc {
+            grpc.reload(tls)?;
+        }
+        Ok(())
+    }
     fn start_query(&self) -> Result<lifetime::Lifetime> {
         #[cfg(test)]
         if let Some(clock) = self.test_clock.lock().unwrap().as_ref() {
@@ -590,12 +628,13 @@ impl GuardClient {
             #[cfg(test)]
             test_clock: Mutex::new(None),
             grpc,
+            decision_tls: config.decision_tls.clone(),
             tcp: config
                 .decision_tcp
                 .filter(|_| !config.decision_grpc)
                 .map(|address| TcpPool {
                     address,
-                    tls: native_tls,
+                    tls: ArcSwapOption::from(native_tls.map(Arc::new)),
                     token: token.into_bytes(),
                     timeout: Duration::from_millis(config.timeout_ms),
                     slots: Semaphore::new(TCP_POOL_SIZE),
@@ -1132,6 +1171,7 @@ mod tests {
             test_clock: Mutex::new(None),
             grpc: None,
             tcp: None,
+            decision_tls: None,
             transport_mode: TransportMode::Snapshot,
             failure_mode: FailureMode::Deny,
             cache_ms: 0,
