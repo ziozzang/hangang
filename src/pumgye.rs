@@ -2,6 +2,11 @@
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+/// Pumgye explain request bound (1 MiB + 256 KiB, docs/EXPLAIN.md).
+pub const SIMULATION_REQUEST_LIMIT: usize = 1024 * 1024 + 256 * 1024;
+/// Bound of one explain/batch/diff answer relayed to the console.
+pub const SIMULATION_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceGate {
@@ -152,6 +157,152 @@ pub fn identity(headers: &hyper::HeaderMap) -> Option<(&str, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explain/batch/diff are POSTed unchanged with the administrator
+    /// credential, the simulation audit is a GET with only `after_id`, and
+    /// anything else is refused before any I/O.
+    #[tokio::test]
+    async fn simulation_operations_reach_only_the_documented_pumgye_paths() {
+        use http_body_util::BodyExt;
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(
+            Vec::<(String, String, Option<String>, Vec<u8>)>::new(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let record = seen.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let record = record.clone();
+                            async move {
+                                let method = request.method().to_string();
+                                let target = request.uri().to_string();
+                                let auth = request
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned);
+                                let body = request
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .unwrap()
+                                    .to_bytes()
+                                    .to_vec();
+                                record.lock().unwrap().push((method, target, auth, body));
+                                let mut response = hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from_static(br#"{"error":{"code":"pumgye.error.candidate_invalid","details":[]}}"#)));
+                                *response.status_mut() = hyper::StatusCode::UNPROCESSABLE_ENTITY;
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let config: AuthorityConfig = serde_json::from_value(serde_json::json!({
+            "transport": "native",
+            "decision_address": address.to_string(),
+            "management_address": address.to_string(),
+            "decision_token_env": "CARGO_MANIFEST_DIR",
+            "admin_token_env": "PATH",
+        }))
+        .unwrap();
+        let runtime = AuthorityRuntime::prepare(&config).unwrap();
+        let body =
+            br#"{"case":{"subject":{"id":"u_a","kind":"user"}},"on_behalf_of":"console:alice"}"#
+                .to_vec();
+        let (status, reply) = runtime
+            .simulation(
+                reqwest::Method::POST,
+                "v1/explain",
+                Some(body.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 422);
+        assert!(
+            String::from_utf8(reply)
+                .unwrap()
+                .contains("candidate_invalid")
+        );
+        runtime
+            .simulation(
+                reqwest::Method::POST,
+                "v1/explain/batch",
+                Some(b"{}".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .simulation(
+                reqwest::Method::POST,
+                "v1/explain/diff",
+                Some(b"{}".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .simulation(reqwest::Method::GET, "v1/audit/simulations", None, Some(42))
+            .await
+            .unwrap();
+        for refused in [
+            (reqwest::Method::GET, "v1/explain", None, None),
+            (
+                reqwest::Method::POST,
+                "v1/policy",
+                Some(b"{}".to_vec()),
+                None,
+            ),
+            (
+                reqwest::Method::POST,
+                "v1/explain",
+                Some(b"{}".to_vec()),
+                Some(1),
+            ),
+            (
+                reqwest::Method::POST,
+                "v1/explain",
+                Some(vec![b' '; SIMULATION_REQUEST_LIMIT + 1]),
+                None,
+            ),
+        ] {
+            assert!(
+                runtime
+                    .simulation(refused.0, refused.1, refused.2, refused.3)
+                    .await
+                    .is_err()
+            );
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(
+            (seen[0].0.as_str(), seen[0].1.as_str()),
+            ("POST", "/v1/explain")
+        );
+        assert_eq!(seen[0].3, body);
+        assert_eq!(
+            seen[0].2.as_deref(),
+            Some(format!("Bearer {}", std::env::var("PATH").unwrap()).as_str())
+        );
+        assert_eq!(seen[1].1, "/v1/explain/batch");
+        assert_eq!(seen[2].1, "/v1/explain/diff");
+        assert_eq!(
+            (seen[3].0.as_str(), seen[3].1.as_str()),
+            ("GET", "/v1/audit/simulations?after_id=42")
+        );
+        server.abort();
+    }
     #[test]
     fn service_identity_cannot_claim_human_assurance_or_reuse_human_subjects() {
         let mut headers = hyper::HeaderMap::new();
@@ -1048,6 +1199,62 @@ impl AuthorityRuntime {
     }
 
     /// Fixed owning-domain paths only; never forwards client URLs or credentials.
+    /// Read-only simulation operations of the owning Pumgye authority
+    /// (Pumgye docs/EXPLAIN.md): explain, batch, candidate diff and the
+    /// simulation audit. Bodies are forwarded unchanged within the bounds.
+    pub async fn simulation(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        after_id: Option<u64>,
+    ) -> Result<(u16, Vec<u8>)> {
+        ensure!(
+            (matches!(path, "v1/explain" | "v1/explain/batch" | "v1/explain/diff")
+                && method == reqwest::Method::POST
+                && body.is_some())
+                || (path == "v1/audit/simulations"
+                    && method == reqwest::Method::GET
+                    && body.is_none()),
+            "invalid Pumgye simulation operation"
+        );
+        let mut url = self.base_url.join(path)?;
+        if let Some(after) = after_id {
+            ensure!(
+                path == "v1/audit/simulations" && after <= i64::MAX as u64,
+                "invalid simulation audit cursor"
+            );
+            url.query_pairs_mut()
+                .append_pair("after_id", &after.to_string());
+        }
+        let mut request = self.management.request(method, url).header(
+            hyper::header::AUTHORIZATION,
+            self.admin
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Pumgye management credential unavailable"))?,
+        );
+        if let Some(body) = body {
+            ensure!(
+                body.len() <= SIMULATION_REQUEST_LIMIT,
+                "simulation request exceeds bound"
+            );
+            request = request
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let mut response = request.send().await?;
+        let status = response.status().as_u16();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= SIMULATION_RESPONSE_LIMIT,
+                "Pumgye simulation response exceeds bound"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((status, bytes))
+    }
+
     pub async fn management(
         &self,
         method: reqwest::Method,

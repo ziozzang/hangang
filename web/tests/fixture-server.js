@@ -15,7 +15,6 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === '/ui/lua-editor.js') return file(response, 'lua-editor.js');
   if (url.pathname === '/ui/lua-editor.css') return file(response, 'lua-editor.css');
   if (url.pathname === '/ui/plugins.js') return file(response, 'plugins.js');
-  if (url.pathname === '/ui/pumgye.js') return file(response, 'pumgye.js');
   if (url.pathname === '/ui/app.js') return file(response, 'app.js');
   if (url.pathname === '/ui/console.js') return file(response, 'console.js');
   if (url.pathname === '/ui/operations.js') return file(response, 'operations.js');
@@ -25,7 +24,7 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname === `/ui/locales/${name}`) return file(response, path.join('locales', name));
   }
   if (url.pathname === '/ui/style.css') return file(response, 'style.css');
-  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json', ...IDENTITIES]) {
+  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json', 'zt/policies/index.js', 'zt/policies/model.js', 'zt/policies/store.js', 'zt/policies/service.js', 'zt/policies/simulator.js', 'zt/policies/publish.js', 'zt/policies/policies.css', 'zt/messages/policies.en.json', 'zt/messages/policies.ko.json', 'zt/messages/pumgye.en.json', 'zt/messages/pumgye.ko.json', ...IDENTITIES]) {
     if (url.pathname === `/ui/${name}`) return file(response, name);
   }
   response.writeHead(404); response.end('fixture route missing');

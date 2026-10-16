@@ -11,9 +11,9 @@ export function registerCatalog(locale, messages) {
   catalogs.set(locale, { ...(catalogs.get(locale) || {}), ...messages });
 }
 
-export async function loadCatalogs(base, locales = ['en', 'ko']) {
+export async function loadCatalogs(base, locales = ['en', 'ko'], prefix = '') {
   await Promise.all(locales.map(async locale => {
-    const response = await fetch(`${base}/${locale}.json`, { cache: 'no-store' });
+    const response = await fetch(`${base}/${prefix}${locale}.json`, { cache: 'no-store' });
     if (!response.ok) throw Error('Message catalog unavailable');
     registerCatalog(locale, await response.json());
   }));

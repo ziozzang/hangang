@@ -16,6 +16,305 @@
     }
   ],
   "paths": {
+    "/v1/pumgye/explain": {
+      "post": {
+        "summary": "Explain one access decision (simulation)",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/explain/batch": {
+      "post": {
+        "summary": "Explain many cases or a candidate impact (simulation)",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain/batch` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/explain/diff": {
+      "post": {
+        "summary": "Diff a candidate policy against the published snapshot",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain/diff` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/audit/simulations": {
+      "get": {
+        "summary": "Read the Pumgye simulation audit",
+        "description": "Administrator-only broker for Pumgye `GET /v1/audit/simulations`; up to 100 rows in ID order.",
+        "parameters": [
+          {
+            "name": "after_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Simulation audit rows.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "description": "Rate limited."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
     "/v1/observability/status": {
       "get": {
         "summary": "Read decision event status",

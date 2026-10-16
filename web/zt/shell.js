@@ -6,8 +6,9 @@ import { getLocale } from '../i18n.js';
 import { renderOverview } from './overview.js';
 import { renderDecisionLog, renderRequest } from './access.js';
 import { renderAudit } from './audit.js';
-import { renderIp, renderService, renderSection, renderSystem } from './entities.js';
+import { renderIp, renderSection, renderSystem } from './entities.js';
 import { renderIdentities } from './identities/index.js';
+import { renderPolicies, resetPolicies } from './policies/index.js';
 
 export const t = createTranslator(getLocale);
 export const SECTIONS = Object.freeze(['overview', 'access', 'identities', 'policies', 'network', 'workloads', 'audit', 'system']);
@@ -66,8 +67,8 @@ export function page(root, { crumbs = [], title, owner, actions = [] }) {
   return { content, heading };
 }
 
-function context(signal) {
-  return Object.freeze({ t, ui, signal, api: (path, options = {}) => host.api(path, { ...options, signal }), navigate: hash => { location.hash = hash; }, resolver, parse: parseHash, hashFor, page });
+function context(signal, name) {
+  return Object.freeze({ t, ui, signal, api: (path, options = {}) => host.api(path, { ...options, signal }), navigate: hash => { if (location.hash === hash) loadZeroTrust(name, host); else location.hash = hash; }, reload: () => loadZeroTrust(name, host), resolver, parse: parseHash, hashFor, page });
 }
 
 /** Renders the section for the current hash. Superseded renders abort. */
@@ -86,14 +87,14 @@ export async function loadZeroTrust(name, hostContext) {
   if (epoch !== generation) return;
   relabelNavigation();
   const route = parseHash();
-  const cx = context(controller.signal);
+  const cx = context(controller.signal, name);
   try {
     if (name === 'overview') await renderOverview(cx, root);
     else if (name === 'access' && route.parts[0] === 'requests' && route.parts[1]) await renderRequest(cx, root, route.parts[1]);
     else if (name === 'access') await renderDecisionLog(cx, root, route.params);
     else if (name === 'identities') await renderIdentities(cx, root, route);
     else if (name === 'network' && route.parts[0] === 'ip' && route.parts[1]) await renderIp(cx, root, route.parts[1]);
-    else if (name === 'policies' && route.parts[0] === 'services' && route.parts[1]) await renderService(cx, root, route.parts[1]);
+    else if (name === 'policies') await renderPolicies(cx, root, route);
     else if (name === 'audit') await renderAudit(cx, root, route.params);
     else if (name === 'system') await renderSystem(cx, root);
     else await renderSection(cx, root, name);
@@ -107,7 +108,7 @@ export async function loadZeroTrust(name, hostContext) {
 export function pauseZeroTrust() { generation += 1; active?.abort(); active = null; }
 
 export function resetZeroTrust() {
-  pauseZeroTrust(); host = null; resolver = null;
+  pauseZeroTrust(); host = null; resolver = null; resetPolicies();
   document.querySelectorAll('.zt-root').forEach(root => root.replaceChildren());
 }
 
