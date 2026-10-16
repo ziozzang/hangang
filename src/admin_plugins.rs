@@ -447,7 +447,7 @@ impl Registry {
         })
     }
     pub fn discovery(&self) -> Value {
-        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id),"authentication":p.delegation_authority.as_deref().unwrap_or("native")})).collect::<Vec<_>>()})
+        json!({"api_version":1,"plugins":self.plugins.values().map(|p|json!({"id":p.manifest.id,"name":p.manifest.name,"version":p.manifest.version,"entry":format!("/ui/plugins/{}/{}",p.manifest.id,p.manifest.entry),"api_base":format!("/v1/plugins/{}",p.manifest.id),"authentication":p.delegation_authority.as_deref().unwrap_or("native"),"routes":p.manifest.routes.iter().map(|r|json!({"path":r.path,"method":r.method,"mutation":r.mutation})).collect::<Vec<_>>()})).collect::<Vec<_>>()})
     }
     pub fn asset<B>(&self, request: &Request<B>) -> Option<Response<Body>> {
         let path = request.uri().path().strip_prefix("/ui/plugins/")?;
@@ -567,6 +567,12 @@ impl Registry {
             }
             delegated_handle = matches.pop();
         }
+        // Optional operator reason for a mutation (percent-encoded UTF-8), kept
+        // in the private operation journal; it is never forwarded to the backend.
+        let reason = match change_reason(req.headers()) {
+            Ok(reason) => reason,
+            Err(()) => return problem(StatusCode::BAD_REQUEST, "invalid change reason"),
+        };
         let method = req.method().clone();
         let body = match tokio::time::timeout(
             Duration::from_secs(5),
@@ -602,8 +608,17 @@ impl Registry {
             let id = id.to_owned();
             let method = method.to_string();
             let digest = sha(&body);
+            let reason = reason.clone();
             match tokio::task::spawn_blocking(move || {
-                audit_begin(&audit, &actor, &id, &route, &method, &digest)
+                audit_begin_with_reason(
+                    &audit,
+                    &actor,
+                    &id,
+                    &route,
+                    &method,
+                    &digest,
+                    reason.as_deref(),
+                )
             })
             .await
             {
@@ -755,8 +770,49 @@ fn audit_connection(path: &Path) -> Result<rusqlite::Connection> {
     let db = rusqlite::Connection::open(path)?;
     db.busy_timeout(Duration::from_millis(250))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS plugin_operations(id INTEGER PRIMARY KEY, started_at INTEGER NOT NULL, completed_at INTEGER, actor_id INTEGER NOT NULL, actor_name TEXT NOT NULL, plugin TEXT NOT NULL, path TEXT NOT NULL, method TEXT NOT NULL, body_sha256 TEXT NOT NULL, status INTEGER);")?;
+    // Additive column for journals created before change reasons existed.
+    let has_reason: bool = db.query_row(
+        "SELECT count(*) FROM pragma_table_info('plugin_operations') WHERE name='reason'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? == 1;
+    if !has_reason {
+        db.execute_batch("ALTER TABLE plugin_operations ADD COLUMN reason TEXT;")?;
+    }
     Ok(db)
 }
+/// Decodes the optional `x-hangang-change-reason` header: percent-encoded
+/// UTF-8, 1 to 512 characters, no control characters.
+fn change_reason(headers: &hyper::HeaderMap) -> std::result::Result<Option<String>, ()> {
+    let mut values = headers.get_all("x-hangang-change-reason").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() || value.len() > 4096 {
+        return Err(());
+    }
+    let raw = value.as_bytes();
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            let hex = raw.get(index + 1..index + 3).ok_or(())?;
+            let text = std::str::from_utf8(hex).map_err(|_| ())?;
+            bytes.push(u8::from_str_radix(text, 16).map_err(|_| ())?);
+            index += 3;
+        } else {
+            bytes.push(raw[index]);
+            index += 1;
+        }
+    }
+    let text = String::from_utf8(bytes).map_err(|_| ())?;
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 512 || text.chars().any(char::is_control) {
+        return Err(());
+    }
+    Ok(Some(text.to_owned()))
+}
+#[cfg(test)]
 fn audit_begin(
     path: &Path,
     actor: &User,
@@ -765,11 +821,22 @@ fn audit_begin(
     method: &str,
     digest: &str,
 ) -> Result<i64> {
+    audit_begin_with_reason(path, actor, plugin, route, method, digest, None)
+}
+fn audit_begin_with_reason(
+    path: &Path,
+    actor: &User,
+    plugin: &str,
+    route: &str,
+    method: &str,
+    digest: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
     let mut db = audit_connection(path)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let count: i64 = tx.query_row("SELECT count(*) FROM plugin_operations", [], |r| r.get(0))?;
     ensure!(count < 100_000, "plugin audit capacity exhausted");
-    tx.execute("INSERT INTO plugin_operations(started_at,actor_id,actor_name,plugin,path,method,body_sha256) VALUES(unixepoch(),?1,?2,?3,?4,?5,?6)",rusqlite::params![actor.id,actor.username,plugin,route,method,digest])?;
+    tx.execute("INSERT INTO plugin_operations(started_at,actor_id,actor_name,plugin,path,method,body_sha256,reason) VALUES(unixepoch(),?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![actor.id,actor.username,plugin,route,method,digest,reason])?;
     let id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(id)
@@ -784,8 +851,8 @@ fn audit_read(path: &Path) -> Result<Value> {
         return Ok(json!({"operations":[]}));
     }
     let db = audit_connection(path)?;
-    let mut stmt=db.prepare("SELECT id,started_at,completed_at,actor_id,actor_name,plugin,path,method,body_sha256,status FROM plugin_operations ORDER BY id DESC LIMIT 100")?;
-    let rows=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"started_at":r.get::<_,i64>(1)?,"completed_at":r.get::<_,Option<i64>>(2)?,"actor_id":r.get::<_,i64>(3)?,"actor_name":r.get::<_,String>(4)?,"plugin":r.get::<_,String>(5)?,"path":r.get::<_,String>(6)?,"method":r.get::<_,String>(7)?,"body_sha256":r.get::<_,String>(8)?,"status":r.get::<_,Option<i64>>(9)?})))?;
+    let mut stmt=db.prepare("SELECT id,started_at,completed_at,actor_id,actor_name,plugin,path,method,body_sha256,status,reason FROM plugin_operations ORDER BY id DESC LIMIT 100")?;
+    let rows=stmt.query_map([],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"started_at":r.get::<_,i64>(1)?,"completed_at":r.get::<_,Option<i64>>(2)?,"actor_id":r.get::<_,i64>(3)?,"actor_name":r.get::<_,String>(4)?,"plugin":r.get::<_,String>(5)?,"path":r.get::<_,String>(6)?,"method":r.get::<_,String>(7)?,"body_sha256":r.get::<_,String>(8)?,"status":r.get::<_,Option<i64>>(9)?,"reason":r.get::<_,Option<String>>(10)?})))?;
     Ok(json!({"operations":rows.collect::<rusqlite::Result<Vec<_>>>()?}))
 }
 
@@ -821,6 +888,7 @@ mod tests {
         let registry = Registry::load(&path).unwrap();
         let discovery = registry.discovery().to_string();
         assert!(!discovery.contains("9080") && !discovery.contains("token_env"));
+        assert!(discovery.contains(r#"{"method":"PUT","mutation":true,"path":"policy"}"#));
         fs::write(dir.path().join("index.js"), "changed after startup").unwrap();
         let req = Request::builder()
             .uri("/ui/plugins/guard/index.js")
@@ -1111,6 +1179,47 @@ mod tests {
         assert_eq!(audit["operations"][0]["status"], 200);
         assert!(!audit.to_string().contains("sensitive request"));
         assert!(audit_complete(&path, id, 201).is_err());
+    }
+    #[test]
+    fn change_reason_is_decoded_bounded_and_journaled() {
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(change_reason(&headers), Ok(None));
+        headers.insert(
+            "x-hangang-change-reason",
+            "%EC%9D%B4%EC%9E%A5%20left".parse().unwrap(),
+        );
+        assert_eq!(change_reason(&headers), Ok(Some("이장 left".into())));
+        for bad in ["%ZZ", "%0A", "%20", "%E0%80"] {
+            headers.insert("x-hangang-change-reason", bad.parse().unwrap());
+            assert_eq!(change_reason(&headers), Err(()), "{bad}");
+        }
+        headers.insert(
+            "x-hangang-change-reason",
+            "a".repeat(513).parse().unwrap(),
+        );
+        assert_eq!(change_reason(&headers), Err(()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let actor = User {
+            id: 7,
+            username: "operator".into(),
+            role: crate::admin_users::Role::Admin,
+            enabled: true,
+        };
+        audit_begin_with_reason(
+            &path,
+            &actor,
+            "hopae",
+            "users/disable",
+            "POST",
+            &sha(b"{}"),
+            Some("left the company"),
+        )
+        .unwrap();
+        audit_begin(&path, &actor, "hopae", "users/enable", "POST", &sha(b"{}")).unwrap();
+        let audit = audit_read(&path).unwrap();
+        assert!(audit["operations"][0]["reason"].is_null());
+        assert_eq!(audit["operations"][1]["reason"], "left the company");
     }
     #[test]
     fn audit_rejects_symlinks_and_nonprivate_files() {
