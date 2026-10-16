@@ -134,12 +134,17 @@ it as the block reason (128 bytes). Rule replacement has no revision
 precondition in Sumunjang, so the console re-reads the published rules
 right before publishing and refuses when they changed.
 
-Sumunjang API follow-ups the pages state in place: per-address score and
-signal history; per-signal counts and country on candidates; block creator
-and creation time; an `expected_revision` on `PUT /v1/rules` and
-`/v1/rules/lua`; the Lua source is not retained; a readable ASN catalog and
-an ASN proposal API; a reason field on block, approval and rule writes;
-`explain/batch` and impact estimates cover tracked addresses only.
+With Sumunjang console package 0.1.6 (Sumunjang `docs/CONSOLE_NETWORK_API.md`)
+the pages also use: per-address in-memory score and signal history (minute
+buckets, labelled "since restart" from `retained_since`), per-signal counts and
+country on candidates, block provenance (`source`, `created_by`,
+`created_at`), the rules document with `expected_revision` compare-and-set and
+the stored Lua source, dedicated allowlist routes with expiry and reason
+(expired entries listed greyed), reasons on block removal and approval, and the
+paginated offline ASN catalog. Against 0.1.5 packages the pages fall back to the
+previous behaviour (fresh-read guard for rules, allowlist through the policy
+document) and say what is missing. Remaining follow-ups: ASN proposals, and
+impact estimates cover tracked addresses only.
 
 ## Shared UI kit
 
