@@ -3,6 +3,7 @@
 // ASNs seen in its evidence and the rules that name them. ASN-wide decisions
 // stay explicit, reviewed rules (Sumunjang docs/DESIGN.md); proposals are a
 // later workflow.
+import { asnWorkflow, asnTabs } from './asn_workflow.js';
 import { can, guard, sectionPage, capabilities, notConnected, panel, asnText, number, suspicionBadge, SUSPICIONS, failure } from './common.js';
 
 const PREFIX_PREVIEW = 6;
@@ -36,7 +37,11 @@ export async function renderAsn(cx, root, params) {
   const { t, ui } = cx;
   const caps = await capabilities(cx);
   if (cx.signal.aborted) return;
-  const { content } = sectionPage(cx, root, { active: 'asn', title: t('network.page.asn'), owner: t('network.asn.owner'), actions: [ui.disabledAction(t, 'network.asn.propose', 'network.gap.asn_proposals')] });
+  // Sumunjang 0.2.0 adds signed bundles and reviewed proposals; older packages keep the placeholder.
+  const workflow = asnWorkflow(caps);
+  const propose = workflow && can(caps, 'asn/proposals', 'POST') ? ui.el('a', { class: 'button button-primary', href: '#network/asn/proposals/new', text: t('network.asn.propose') }) : ui.disabledAction(t, 'network.asn.propose', 'network.gap.asn_proposals');
+  const { content } = sectionPage(cx, root, { active: 'asn', title: t('network.page.asn'), owner: t('network.asn.owner'), actions: [propose] });
+  content.append(asnTabs(cx, caps, 'pools'));
   if (!caps.installed || !can(caps, 'candidates')) { content.append(notConnected(cx, caps, 'candidates')); return; }
   const holder = ui.el('div', { class: 'zt-content' }, ui.loadingState(t));
   content.append(holder);
@@ -94,7 +99,7 @@ export async function renderAsn(cx, root, params) {
   tables.push(evidence);
   blocks.push(panel(cx, 'network.asn.evidence_title', evidence.element));
   if (!can(caps, 'asn/catalog/query')) blocks.push(ui.el('p', { class: 'zt-gap', attrs: { role: 'note' } }, ui.el('span', { class: 'kit-info', text: 'ⓘ', attrs: { 'aria-hidden': 'true' } }), ' ', ui.el('span', { text: t('network.gap.asn_catalog') })));
-  blocks.push(panel(cx, 'network.asn.proposals', ui.emptyState(t, { title: 'network.asn.proposals.planned', body: 'network.asn.proposals.body' })));
+  if (!workflow) blocks.push(panel(cx, 'network.asn.proposals', ui.emptyState(t, { title: 'network.asn.proposals.planned', body: 'network.asn.proposals.body' })));
   for (const table of tables) cx.signal.addEventListener('abort', () => table.destroy(), { once: true });
   ui.clear(holder, ...blocks);
   await Promise.all(tables.map(table => table.reload()));

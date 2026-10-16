@@ -232,3 +232,14 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 .kit-tag-add { color: var(--green); }
 .zt-zone { color: var(--cyan); text-decoration: none; }
 #view-network [aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 1px var(--red) inset; }
+/* ASN bundle and proposals. */
+.zt-steps { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+.zt-steps li { display: inline-flex; align-items: center; gap: .45rem; padding: .35rem .75rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-weight: 600; font-size: .88rem; }
+.zt-steps li.is-current { border-color: var(--cyan); color: var(--text); background: var(--cyan-soft); }
+.zt-step-number { display: inline-grid; place-items: center; width: 1.4rem; height: 1.4rem; border-radius: 50%; background: var(--surface-3); font-size: .78rem; }
+.zt-warnings { list-style: none; margin: 0; padding: .6rem .8rem; border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--line)); border-radius: 10px; background: color-mix(in srgb, var(--amber) 10%, var(--surface)); display: flex; flex-direction: column; gap: .3rem; }
+.zt-impact-samples td, .zt-impact-samples th { padding: .3rem .45rem; }
+.zt-prefix-choices { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: .3rem .8rem; max-height: 16rem; overflow: auto; }
+.zt-provenance { margin: 0; font-size: .85rem; }
+.zt-proposal-timeline .kit-stage-head { flex-wrap: wrap; }
+.zt-diff-report { display: flex; flex-direction: column; gap: .5rem; }

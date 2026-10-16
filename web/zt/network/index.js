@@ -7,6 +7,8 @@
 //   #network/policy                     mode, weights and thresholds
 //   #network/zones[/{id}]               network zones
 //   #network/asn                        ASN pools
+//   #network/asn/bundle                 signed ASN prefix bundle
+//   #network/asn/proposals[/new|/{id}]  ASN block proposals
 import { renderNetworkOverview } from './overview.js';
 import { renderThreats } from './threats.js';
 import { renderIpDetail } from './ip.js';
@@ -14,6 +16,7 @@ import { renderBlocks } from './blocks.js';
 import { renderRules } from './rules.js';
 import { renderPolicy } from './policy.js';
 import { renderAsn } from './asn.js';
+import { renderAsnBundle, renderProposals, renderProposalNew, renderProposal } from './asn_workflow.js';
 import { renderZones } from './zones.js';
 
 export async function renderNetwork(cx, root, route) {
@@ -24,6 +27,10 @@ export async function renderNetwork(cx, root, route) {
   if (page === 'rules') return renderRules(cx, root, route.parts.slice(1), route.params);
   if (page === 'policy') return renderPolicy(cx, root);
   if (page === 'zones') return renderZones(cx, root, route.parts.slice(1));
+  if (page === 'asn' && route.parts[1] === 'bundle') return renderAsnBundle(cx, root);
+  if (page === 'asn' && route.parts[1] === 'proposals' && route.parts[2] === 'new') return renderProposalNew(cx, root, route.params);
+  if (page === 'asn' && route.parts[1] === 'proposals' && route.parts[2]) return renderProposal(cx, root, route.parts[2]);
+  if (page === 'asn' && route.parts[1] === 'proposals') return renderProposals(cx, root, route.params);
   if (page === 'asn') return renderAsn(cx, root, route.params);
   return renderNetworkOverview(cx, root);
 }
