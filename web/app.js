@@ -699,10 +699,14 @@ function ensureProtectionPanel() {
 }
 
 function renderProtection(data) {
-  if (!isObject(data) || data.scope !== 'instance' || typeof data.enabled !== 'boolean') return t('The server returned invalid protection status.');
-  if (!data.enabled || !isObject(data.report)) return t('Kubernetes route protection is not enabled on this instance.');
-  const report = data.report; const counts = isObject(report.counts) ? report.counts : {};
   const count = (value) => formatNumber(Number.isSafeInteger(value) ? value : 0);
+  if (!isObject(data) || data.scope !== 'instance' || typeof data.enabled !== 'boolean') return t('The server returned invalid protection status.');
+  const freshness = isObject(data.freshness) ? data.freshness : null;
+  const staleness = freshness ? (freshness.protected_fail_closed
+    ? t('Snapshot is {age}s old, beyond the {bound}s bound: protected routes fail closed.', { age: count(freshness.snapshot_age_seconds), bound: count(freshness.max_snapshot_staleness_seconds) })
+    : t('Snapshot age {age}s of {bound}s allowed.', { age: count(freshness.snapshot_age_seconds), bound: count(freshness.max_snapshot_staleness_seconds) })) : null;
+  if (!data.enabled || !isObject(data.report)) return [t('Kubernetes route protection is not enabled on this instance.'), staleness].filter(Boolean).join('\n');
+  const report = data.report; const counts = isObject(report.counts) ? report.counts : {};
   const lines = [
     t('Protected {protected} · unprotected {unprotected} · withheld {withheld}', { protected: count(counts.protected), unprotected: count(counts.unprotected), withheld: count(counts.withheld) }),
     t('Invalid policies {invalid} · conflicted policies {conflicted}', { invalid: count(counts.invalid_policies), conflicted: count(counts.conflicted_policies) }),
@@ -710,6 +714,7 @@ function renderProtection(data) {
     report.client_address_preserved ? t('Client address preserved') : t('Client address not preserved: {detail}', { detail: String(report.client_address_message || '—').slice(0, 1024) }),
     report.guard_enforcing ? t('Sumunjang admission is fail-closed') : t('Sumunjang admission is not fail-closed'),
   ];
+  if (staleness) lines.push(staleness);
   const rows = Array.isArray(report.ingresses) ? report.ingresses : [];
   for (const row of rows.filter((row) => isObject(row) && row.state === 'withheld').slice(0, 50)) {
     lines.push(t('Withheld {namespace}/{name}: {reason}', { namespace: String(row.namespace), name: String(row.name), reason: String(row.reason || '—') }));

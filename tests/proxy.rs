@@ -7915,3 +7915,72 @@ async fn sacho_security_real_tls_h2_authority_and_forwarding_error_policy_are_un
     origin_task.abort();
     policy.shutdown().await;
 }
+
+/// ADR 0022 bounded staleness on the request path: once the Kubernetes
+/// snapshot is older than its bound, protected routes answer 503 with a
+/// stable reason before any authorization call; public routes keep serving.
+#[tokio::test]
+async fn stale_kubernetes_snapshot_fails_protected_routes_closed_and_keeps_public_routes() {
+    let (verify, verify_seen, verify_task) = upstream("verify").await;
+    let (origin, origin_seen, origin_task) = upstream("origin").await;
+    let mut protected = route(vec![format!("http://{origin}")]);
+    protected.id = "protected".into();
+    protected.path_prefix = Some("/private".into());
+    protected.access_mode = hangang::config::AccessMode::Protected;
+    protected.auth = Some(
+        serde_json::from_value(serde_json::json!({
+            "url": format!("http://{verify}/verify"),
+            "request_headers": ["authorization"],
+            "response_headers": ["x-forwarded-user"]
+        }))
+        .unwrap(),
+    );
+    let mut public = route(vec![format!("http://{origin}")]);
+    public.id = "public".into();
+    public.path_prefix = Some("/public".into());
+    public.access_mode = hangang::config::AccessMode::Public;
+    let freshness = Arc::new(hangang::kubernetes::Freshness::default());
+    let (proxy, _policy) = proxy(vec![protected, public]);
+    let proxy = proxy.with_kubernetes_freshness(Some(freshness.clone()));
+    let (address, front_task, _) = frontend(proxy).await;
+    let client = client();
+    let get = |path: &str| {
+        Request::get(format!("http://{address}{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    freshness.set_protected_fail_closed(true);
+    let refused = client.request(get("/private/x")).await.unwrap();
+    assert_eq!(refused.status(), 503);
+    assert_eq!(
+        refused.headers()["x-hangang-reason"],
+        "kubernetes-authority-stale"
+    );
+    assert!(
+        verify_seen.lock().unwrap().is_empty(),
+        "no authorization call"
+    );
+    assert_eq!(freshness.refusals(), 1);
+    let public_reply = client.request(get("/public/x")).await.unwrap();
+    assert_eq!(
+        public_reply.status(),
+        200,
+        "public routes keep the last good snapshot"
+    );
+    freshness.set_protected_fail_closed(false);
+    let resumed = client.request(get("/private/x")).await.unwrap();
+    assert_ne!(
+        resumed.status(),
+        503,
+        "protected routes resume within the bound"
+    );
+    assert_eq!(
+        verify_seen.lock().unwrap().len(),
+        1,
+        "authorization runs again"
+    );
+    assert_eq!(origin_seen.lock().unwrap().len(), 2);
+    front_task.abort();
+    verify_task.abort();
+    origin_task.abort();
+}
