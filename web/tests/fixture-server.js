@@ -8,7 +8,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Identities section modules (web/zt/identities).
 const IDENTITIES = ['index.js', 'common.js', 'users.js', 'user.js', 'sessions.js', 'groups.js', 'providers.js', 'authentication.js', 'explain.js', 'editor.js', 'projections.js', 'identities.css', 'messages/en.json', 'messages/ko.json'].map(name => `zt/identities/${name}`);
 // Network section modules (web/zt/network).
-const NETWORK = ["index.js", "common.js", "trace.js", "actions.js", "diff.js", "overview.js", "threats.js", "ip.js", "blocks.js", "rules.js", "policy.js", "asn.js", "system.js", "zones.js", "network.css", "messages/en.json", "messages/ko.json"].map(name => `zt/network/${name}`);
+const NETWORK = ["index.js", "common.js", "trace.js", "actions.js", "diff.js", "overview.js", "threats.js", "ip.js", "blocks.js", "rules.js", "policy.js", "asn.js", "system.js", "zones.js", "asn_workflow.js", "network.css", "messages/en.json", "messages/ko.json"].map(name => `zt/network/${name}`);
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
 // Match src/ui.rs: fresh HTML style nonce, same-origin scripts, no unsafe-inline/eval.
 const server = http.createServer(async (request, response) => {

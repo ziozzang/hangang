@@ -131,7 +131,11 @@ in the navigation; `#plugin-guard` links redirect to `#network`.
 | `#network/zones[/{id}]` | Network zones (Sumunjang 0.1.7): list with usage against the 64-zone/65,536-prefix bounds, detail with prefixes and tracked members, create/replace/delete as a compare-and-set on the zone revision with a reason, Sumunjang's `/zone/id` and `/zone/prefixes/N` errors on the form, membership impact on tracked addresses; zone labels in the IP trace and threat queue | `zones` (GET/POST), `explain/batch` |
 | `#network/rules[/lua]?rule=` | Rules as a structured form or Lua in the host CodeMirror editor; validate, change list, what-if on tracked addresses, publish with reason | `rules`, `rules/validate`, `rules/lua`, `explain/batch` |
 | `#network/policy` | Mode, automatic blocking, window, threshold, block lifetime and weights; change list, what-if, CAS publish (`expected_revision`) with reason; switching to enforce requires typing the mode | `policy/document`, `explain/batch` |
-| `#network/asn` | ASNs seen in evidence and rules naming them (read-only); proposal workflow shown as planned | `candidates`, `rules` |
+| `#network/asn` | ASNs seen in evidence and rules naming them (read-only); tabs for the prefix bundle and block proposals with Sumunjang 0.2.0, otherwise the proposal workflow shown as planned | `candidates`, `rules` |
+| `#network/asn/bundle` | Signed prefix bundle (Sumunjang 0.2.0): version, source, provenance, digest, trusted signature key, scheduled refresh status, previous bundles; manual refresh, upload of a signed bundle file (at most 1 MiB, sent through the broker) and rollback as a compare-and-set on the installed version with typed `v<version>` and a reason; the diff report (added, removed, reassigned prefixes, top ASNs) after each install | `asn/bundle` (GET/PUT), `asn/refresh`, `asn/bundle/rollback` |
+| `#network/asn/proposals[?state=&asn=]` | Block proposals: state filters (open, each state), ASN, scope, approvals n/m, tracked addresses, reason, proposer, expiry | `asn/proposals` |
+| `#network/asn/proposals/new` | Wizard: ASN (prefixes from the offline catalog) → scope (whole ASN, selected prefixes, evidence aggregates) with an impact preview and Sumunjang's located errors → reason and expiry (1–30 days) → draft; Hangang decision-log counts for the ASN are attached right after | `asn/catalog/query`, `asn/preview`, `asn/proposals` (POST), `asn/proposals/{id}` |
+| `#network/asn/proposals/{id}` | Proposal detail: impact (networks, estimated IPv4 addresses and IPv6 /64s, evidence addresses, current-mode and enforce verdict changes with samples, collisions with the allowlist, zones and existing blocks, warnings), Hangang decision-log counts, approval timeline; submit, approve, reject, refresh impact, activate (typed `AS<asn>`) and withdraw per state, each with a reason and the proposal revision; the proposer sees why approval is disabled (two-person rule) | `asn/proposals/{id}` (GET/POST) |
 
 Sumunjang status, GeoIP databases (reload), signed updates (check) and the
 Kubernetes source moved to System; raw diagnostics stay collapsed. Writes
@@ -150,8 +154,15 @@ the stored Lua source, dedicated allowlist routes with expiry and reason
 (expired entries listed greyed), reasons on block removal and approval, and the
 paginated offline ASN catalog. Against 0.1.5 packages the pages fall back to the
 previous behaviour (fresh-read guard for rules, allowlist through the policy
-document) and say what is missing. Remaining follow-ups: ASN proposals, and
-impact estimates cover tracked addresses only.
+document) and say what is missing. Remaining follow-up: impact estimates cover tracked addresses only.
+
+With Sumunjang console package 0.2.0 (broker contract v2, route pattern
+`asn/proposals/*`; Sumunjang `docs/ASN_PROPOSALS.md`) the ASN page adds the
+prefix bundle and block proposal pages above. Decision-log context is attached
+to a proposal with the `annotate` action as aggregate counts only (7-day
+window from the console's decision facets filtered by ASN: events, estimated
+requests, outcomes, stages, country count); no addresses or subjects leave
+Hangang. Packages without these routes keep the read-only ASN page.
 
 ## Shared UI kit
 

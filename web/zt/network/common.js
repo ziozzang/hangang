@@ -2,7 +2,7 @@
 // Sumunjang console package broker (`/v1/plugins/guard/<route>`); nothing here
 // talks to Sumunjang directly.
 const BASE = '/v1/plugins/guard/';
-const GET_ROUTES = new Set(['zones', 'status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status', 'rules/document', 'allowlist']);
+const GET_ROUTES = new Set(['asn/bundle', 'asn/proposals', 'zones', 'status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status', 'rules/document', 'allowlist']);
 export const PAGES = Object.freeze(['overview', 'threats', 'blocks', 'zones', 'rules', 'policy', 'asn']);
 const PAGE_ICONS = Object.freeze({ overview: '◍', threats: '⚠', blocks: '⛔', zones: '◫', rules: '▤', policy: '⚙', asn: '⌘' });
 
@@ -13,7 +13,8 @@ export async function capabilities(cx) {
   catch (error) { if (error?.status === 401) throw error; return { installed: false, failed: true, routes: null }; }
   const guard = plugins.find(plugin => plugin.id === 'guard');
   if (!guard) return { installed: false, failed: false, routes: null };
-  const routes = Array.isArray(guard.routes) ? new Set(guard.routes.map(route => `${route.path}:${route.method}`)) : null;
+  // Contract v2 patterns (`asn/proposals/*`) are listed beside plain routes as `prefix/*:METHOD`.
+  const routes = Array.isArray(guard.routes) ? new Set([...guard.routes, ...(Array.isArray(guard.route_patterns) ? guard.route_patterns : [])].map(route => `${route.path}:${route.method}`)) : null;
   return { installed: true, failed: false, routes, version: guard.version || null };
 }
 
