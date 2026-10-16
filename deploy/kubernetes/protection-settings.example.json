@@ -1,0 +1,41 @@
+{
+  "require_protection": true,
+  "identity_profiles": {
+    "corp-sso": {
+      "auth": {
+        "url": "https://hopae.hangang-world.svc/_hopae/verify",
+        "native": {
+          "transport": "grpc",
+          "address": "hopae.hangang-world.svc:9443",
+          "tls": {
+            "server_name": "hopae.hangang-world.svc",
+            "ca": "/etc/hangang/world-mtls/ca.crt",
+            "certificate": "/etc/hangang/world-mtls/tls.crt",
+            "key": "/etc/hangang/world-mtls/tls.key"
+          }
+        },
+        "request_headers": ["authorization", "cookie"],
+        "response_headers": ["x-forwarded-user", "x-hopae-aal", "x-hopae-principal-kind"],
+        "forward_response": true,
+        "static_request_headers": {
+          "x-hopae-gateway-key": {"env": "HOPAE_GATEWAY_KEY"},
+          "x-hopae-contract": "1"
+        }
+      }
+    }
+  },
+  "pumgye_authority": {
+    "transport": "grpc",
+    "decision_address": "pumgye.hangang-world.svc:9444",
+    "management_address": "pumgye.hangang-world.svc:9445",
+    "tls": {
+      "server_name": "pumgye.hangang-world.svc",
+      "ca": "/etc/hangang/world-mtls/ca.crt",
+      "certificate": "/etc/hangang/world-mtls/tls.crt",
+      "key": "/etc/hangang/world-mtls/tls.key"
+    },
+    "decision_token_env": "PUMGYE_DECISION_TOKEN",
+    "admin_token_env": "PUMGYE_ADMIN_TOKEN"
+  },
+  "client_address": {"mode": "service_local", "namespace": "hangang", "name": "hangang"}
+}

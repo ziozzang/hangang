@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
 const read = (relative) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
 const source = {
   app: read('../app.js'), console: read('../console.js'), operations: read('../operations.js'),
-  docker: read('../docker.js'),
+  docker: read('../docker.js'), pumgye: read('../pumgye.js'),
 };
 
 // Each management operation needs a feature-specific UI surface and a real caller.
@@ -19,6 +19,11 @@ const coverage = new Map([
   ['GET /v1/certificates', ['#certificate-inventory', 'app', '/v1/certificates?offset=']],
   ['GET /v1/geoip/status', ['#geoip-refresh-status', 'app', "api('/v1/geoip/status'"]],
   ['GET /v1/geoip/lookup', ['#geoip-lookup-form', 'app', '/v1/geoip/lookup?ip=']],
+  ['GET /v1/pumgye/policy', ['#pumgye-refresh', 'pumgye', "host.api('/v1/pumgye/policy')"]],
+  ['GET /v1/pumgye/status', ['#pumgye-authority-status', 'pumgye', "host.api('/v1/pumgye/status')"]],
+  ['GET /v1/pumgye/audit', ['#pumgye-audit', 'pumgye', "host.api('/v1/pumgye/audit')"]],
+  ['PUT /v1/pumgye/policy', ['#pumgye-service-form', 'pumgye', "independent?'/v1/pumgye/policy':'/v1/config',{method:'PUT'"]],
+  ['GET /v1/kubernetes/protection', ['#kubernetes-protection-refresh', 'app', "api('/v1/kubernetes/protection'"]],
   ['GET /v1/security/bans', ['#security-ban-search-form', 'app', '/v1/security/bans${ip']],
   ['POST /v1/security/bans/release', ['#security-ban-release-form', 'app', "api('/v1/security/bans/release', { method: 'POST'"]],
   ['POST /v1/cache/purge', ['#purge-cache', 'app', "api('/v1/cache/purge'"]],

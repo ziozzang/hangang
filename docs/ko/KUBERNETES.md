@@ -38,6 +38,8 @@ kubectl apply -k deploy/kubernetes
 - `--kubernetes-publish-address ADDRESS`: 허용된 모든 Ingress의 상태에 IP 주소 또는 호스트 이름 하나를 게시하고, 다른 복제본이나 컨트롤러가 쓴 항목과 병합합니다. 클라이언트가 실제로 연결하는 주소(복제본 집합 앞의 Service 또는 로드 밸런서)를 모든 복제본에서 동일하게 사용하세요. 복제본별 주소를 유지하지 않는 이유는 [여러 복제본 실행](#여러-복제본-실행)을 참조하세요.
 - `--kubernetes-stale-seconds N`: 감시 대상 리소스 유형에 목록 조회, 감시 이벤트, 북마크 또는 감시 종료가 없는 상태를 얼마 동안 허용할지 지정합니다. 이 시간이 지나면 복제본은 준비되지 않은 것으로 보고합니다(기본값 60초, 30초의 감시 시간 제한보다 커야 함). 어느 경우든 복제본은 마지막 스냅샷을 계속 제공합니다.
 - `--health-path PATH`: 공개 리스너의 인증 없는 준비 상태 엔드포인트입니다. 제공된 준비 상태 프로브는 `/-/ready`를 사용합니다. 첫 스냅샷 게시 전, 컨트롤러에 권위가 없을 때, 드레이닝 중에는 503을 반환합니다.
+- `--kubernetes-protection-config FILE`: `ProtectionPolicy` 객체를 감시하고 Hopae/Pumgye/Sumunjang 보호를 Ingress 경로에 컴파일합니다. 유효한 정책이 없는 Ingress는 기본적으로 보류합니다. [제로 트러스트 경로 보호](#제로-트러스트-경로-보호)를 참조하세요.
+- `--proxy-protocol-from CIDR`: 공개 리스너에서 이 로드 밸런서 범위로부터 PROXY protocol v2 헤더를 요구하여 게이트웨이가 실제 클라이언트 주소를 보게 합니다.
 
 제공된 매니페스트에서 Secret 기반 TLS를 활성화하려면 다음을 실행합니다.
 
@@ -47,6 +49,10 @@ kubectl patch deployment hangang --type strategic \
 ```
 
 선택된 Ingress의 각 TLS 항목은 `kubernetes.io/tls` Secret의 이름을 지정하고 하나 이상의 호스트를 나열해야 합니다. Hangang은 `tls.crt`와 `tls.key`를 base64 디코딩하고 PEM 인증서/키 쌍을 검증하며, 주장한 모든 호스트가 인증서 범위에 포함되는지 확인한 다음, 게시 전에 완전한 정확 일치/와일드카드 SNI 확인기를 구성합니다. `*.example.test` 같은 와일드카드 주장은 실제로 그 와일드카드 주체 대체 이름을 포함한 인증서가 필요합니다. 내부 검사 이름만 포함한 인증서는 거부됩니다. 인증서 발급과 갱신은 cert-manager 또는 다른 발급자의 책임입니다. 주장된 Secret이 삭제되거나 형식이 잘못되면 영향을 받는 각 Ingress와 인증서가 함께 철회되고 다른 Ingress는 계속 제공됩니다. Secret을 복구하면 경로도 복구됩니다. `kubernetes.io/tls` 유형의 Secret만 목록 조회 및 감시하므로(API 필드 선택자 `type=kubernetes.io/tls`), 네임스페이스의 관련 없는 Secret은 전송되지 않습니다.
+
+## 제로 트러스트 경로 보호
+
+`--kubernetes-protection-config`를 주면 컨트롤러는 `ProtectionPolicy`(`world.hangang.dev/v1alpha1`, ADR 0022)도 감시하며, 이를 준비 상태와 완전한 목록 조회에 필요한 종류로 취급합니다. 정책은 `targetRefs` 또는 네임스페이스 기본 정책으로 Ingress에 붙고, 생성되는 모든 경로에 컴파일됩니다. 즉 운영자가 승인한 프로필로 Hopae 인증, HTTP 메서드별 강제 Pumgye 리소스 결정, 그리고 네트워크 강제가 필요하면 보존된 클라이언트 주소에 대한 실패 시 닫히는 Sumunjang 승인을 적용합니다. 유효한 정책이 없거나, 적용되는 정책이 여럿이거나, 참조를 해석할 수 없거나, 네트워크 요구 조건을 충족할 수 없는 Ingress는 보호 없이 게시하지 않고 보류하며, 그 이유를 정책 상태, `/v1/kubernetes/protection` 관리 엔드포인트, 지표에 기록합니다. 설치, 정책 스키마, 실패 시 닫힘 규칙, PROXY protocol v2, 이전 절차는 [Kubernetes 경로 보호](KUBERNETES_PROTECTION.md)에서 설명합니다.
 
 ## 호스트 이름 소유권
 
@@ -65,7 +71,7 @@ kubectl patch deployment hangang --type strategic \
 
 초기 시작 시에는 게시 전에 Service와 Ingress를 목록 조회하고, TLS가 활성화되었다면 Secret도 조회합니다. 목록 조회는 일관된 페이지별 스냅샷을 사용하고 서버가 제공한 `continue` 토큰과 컬렉션 `resourceVersion`을 보존합니다. 기본 제한은 페이지당 객체 500개(Secret은 50개), 리소스 유형별 총 객체 10,000개, 응답당 8 MiB, 감시 이벤트당 4 MiB, 디코딩된 인증서 또는 키당 1 MiB입니다. Secret 목록은 API 서버의 감시 캐시가 `limit`을 무시하므로 저장소에서 제공받습니다. 그래도 응답 제한을 넘는 Secret 페이지는 페이지 크기를 절반으로 줄여 객체 한 개까지 다시 요청합니다. 따라서 크기가 큰 Secret 몇 개가 시작이나 재조회 작업을 막지 못합니다.
 
-캐시된 객체에는 컨트롤러가 읽는 필드만 남깁니다. Secret에는 식별 정보, 유형, `tls.crt`, `tls.key`만 남고, Service에는 유형과 포트, Ingress에는 spec, 클래스 어노테이션, 로드 밸런서 상태가 남습니다. 관리 필드와 다른 어노테이션은 버립니다. 객체 수 외에도 보관하는 바이트 수를 리소스 유형당 64 MiB로 제한합니다. 어느 제한이든 초과한 목록 조회는 실패하고 마지막 정상 설정을 유지합니다. 제한을 초과하는 감시 `ADDED` 이벤트나 크기가 커진 `MODIFIED` 객체는 거부하고 캐시를 불완전한 것으로 표시한 뒤 재조회를 예약합니다. 재조회는 다음 삭제로 용량이 확보되면 즉시, 또는 최대 5초에 한 번, 또는 캐시가 추가 객체를 수용할 수 있을 때만 동작하는 60초 타이머에 따라 시작합니다. 불완전한 캐시의 내용은 계속 제공하지만 재조회가 성공하기 전까지 권위 있는 상태로 취급하지 않습니다.
+캐시된 객체에는 컨트롤러가 읽는 필드만 남깁니다. Secret에는 식별 정보, 유형, `tls.crt`, `tls.key`만 남고, Service에는 유형, 포트, `externalTrafficPolicy`, ProtectionPolicy에는 식별 정보, spec, status, Ingress에는 spec, 클래스 어노테이션, 로드 밸런서 상태가 남습니다. 관리 필드와 다른 어노테이션은 버립니다. 객체 수 외에도 보관하는 바이트 수를 리소스 유형당 64 MiB로 제한합니다. 어느 제한이든 초과한 목록 조회는 실패하고 마지막 정상 설정을 유지합니다. 제한을 초과하는 감시 `ADDED` 이벤트나 크기가 커진 `MODIFIED` 객체는 거부하고 캐시를 불완전한 것으로 표시한 뒤 재조회를 예약합니다. 재조회는 다음 삭제로 용량이 확보되면 즉시, 또는 최대 5초에 한 번, 또는 캐시가 추가 객체를 수용할 수 있을 때만 동작하는 60초 타이머에 따라 시작합니다. 불완전한 캐시의 내용은 계속 제공하지만 재조회가 성공하기 전까지 권위 있는 상태로 취급하지 않습니다.
 
 독립적인 감시는 각 목록의 컬렉션 `resourceVersion`부터 시작합니다. 추가, 수정, 삭제된 객체는 완전한 캐시를 갱신하고, 북마크는 객체를 변경하지 않고 버전만 진행시킵니다. `410 Gone` 이벤트가 오면 [Kubernetes API 리소스 버전 의미 체계](https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions)에 따라 캐시를 버리고 전체 목록을 다시 조회합니다. 전체 재조회는 원인이나 직전 결과에 관계없이 최소 5초 간격으로 시작하므로 `410`을 계속 받는 복제본도 매 구간에 최대 한 번만 목록을 조회합니다. 다른 API 오류는 200 ms에서 10초까지 제한된 지수 백오프로 다시 연결합니다. 서버가 열린 지 1초 이내에 닫은 감시도 즉시 다시 연결하는 대신 최대 5초까지 같은 백오프를 적용합니다. 재조회 간격, 재연결, 백오프, 상태 재시도의 모든 지연에 프로세스별 무작위 계수로 ±20 %의 지터를 적용하여, 같은 만료나 장애를 겪는 복제본들이 API 서버에 동시에 요청하지 않게 합니다. 감시 요청에는 서버 시간 제한 30초와 클라이언트 시간 제한 40초를 사용하여 토큰 및 CA 순환 갱신을 무한정 기다리지 않고 관찰합니다. 취소는 목록 조회, 감시, 재시도, 상태 대기를 중단하며 모든 감시자의 전송은 취소를 인지하므로, 조정이 느리고 내부 이벤트 큐가 가득 찬 경우에도 종료가 완료됩니다.
 
@@ -116,7 +122,7 @@ cargo run --quiet --bin hangang -- --import-ingress examples/kubernetes/ingress-
   | python3 -c 'import json,sys; d=json.load(sys.stdin); assert [r["path_match"] for r in d["http"]]==["exact","segment_prefix"]; assert all(r["backends"]==["http://api.demo.svc:8080"] for r in d["http"]); print("Ingress import: 2 ordered routes")'
 ```
 
-이 명령은 변환만 검증합니다. 예시 Service에는 연결된 Pod가 없습니다. 아래의 [일회용 kind 검증](#검증)은 실행 중인 컨트롤러와 실제 백엔드를 시험합니다. 제공된 `deploy/kubernetes` 매니페스트도 프록시 컨트롤러와 공개 Service를 제공할 뿐, 애플리케이션 백엔드나 Ingress 객체는 제공하지 않습니다. 위와 같이 자리표시자 이미지를 교체하고 관리자 Secret을 만든 다음 실제 애플리케이션 Service와 Ingress를 제공하세요. 현재 컨트롤러는 IngressClass 객체를 읽지 않고 클래스 이름 문자열을 선택하므로 클러스터의 클래스 등록은 별도로 검토하세요. 현재 Gateway API 리소스는 조정하지 않습니다.
+이 명령은 변환만 검증합니다. 예시 Service에는 연결된 Pod가 없습니다. 아래의 [일회용 kind 검증](#검증)은 실행 중인 컨트롤러와 실제 백엔드를 시험합니다. 제공된 `deploy/kubernetes` 매니페스트도 프록시 컨트롤러와 공개 Service를 제공할 뿐, 애플리케이션 백엔드나 Ingress 객체는 제공하지 않습니다. 위와 같이 자리표시자 이미지를 교체하고 관리자 Secret을 만든 다음 실제 애플리케이션 Service와 Ingress를 제공하세요. 현재 컨트롤러는 IngressClass 객체를 읽지 않고 클래스 이름 문자열을 선택하므로 클러스터의 클래스 등록은 별도로 검토하세요. 현재 Gateway API 리소스는 조정하지 않습니다. `ProtectionPolicy`는 이미 `HTTPRoute`나 `Gateway` 대상을 지정할 수 있으며, 이런 대상은 `Unsupported`로 보고합니다.
 
 ## 검증
 

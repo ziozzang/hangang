@@ -1298,6 +1298,7 @@ impl Admin {
                 || path == "/v1/fleet/observations"
                 || path == "/v1/fleet/observer-status"
                 || path == "/v1/geoip/status"
+                || path == "/v1/kubernetes/protection"
                 || path == "/v1/geoip/lookup"
                 || path == "/v1/connections/tcp/active"
                 || path == "/v1/connections/tcp/recent"
@@ -1604,6 +1605,29 @@ impl Admin {
             return Ok(auth_json(
                 200,
                 &serde_json::json!({"ip":ip,"released":cleared,"distributed":distributed}),
+            ));
+        }
+        if path == "/v1/kubernetes/protection" {
+            if req.method() != hyper::Method::GET {
+                return Ok(problem(405, "Method Not Allowed", "GET required"));
+            }
+            if req.uri().query().is_some() {
+                return Ok(problem(
+                    400,
+                    "Invalid Protection Query",
+                    "query parameters are not accepted",
+                ));
+            }
+            // Read-only diagnostics without secrets: viewers may read them.
+            let _ = &actor;
+            let report = self.manager.metrics.kubernetes_protection.current();
+            return Ok(auth_json(
+                200,
+                &serde_json::json!({
+                    "scope": "instance",
+                    "enabled": report.is_some(),
+                    "report": report.as_deref(),
+                }),
             ));
         }
         if path == "/v1/geoip/status" {
@@ -3017,7 +3041,11 @@ fn viewer_allowed(path: &str, method: &hyper::Method) -> bool {
     *method == hyper::Method::GET
         && matches!(
             path,
-            "/v1/status" | "/v1/update/status" | "/healthz" | "/metrics"
+            "/v1/status"
+                | "/v1/update/status"
+                | "/healthz"
+                | "/metrics"
+                | "/v1/kubernetes/protection"
         )
 }
 

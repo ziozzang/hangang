@@ -7547,3 +7547,62 @@ async fn admin_mutation_restores_readiness_after_unavailable_route() {
     assert_eq!(request(address, "GET", "/healthz", None, None).await.0, 200);
     manager.policy.shutdown().await;
 }
+
+#[tokio::test]
+async fn viewer_reads_kubernetes_protection_diagnostics_but_not_admin_endpoints() {
+    let fixture = security_ban_api_fixture().await;
+    let _operator = account_admin_token(fixture.admin).await;
+    assert_eq!(
+        request(
+            fixture.admin,
+            "POST",
+            "/v1/users",
+            Some(r#"{"username":"viewer","password":"viewer password 123","role":"viewer"}"#),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    let (_, _, login) = request_with_token(
+        fixture.admin,
+        "POST",
+        "/v1/auth/login",
+        Some(r#"{"username":"viewer","password":"viewer password 123"}"#),
+        None,
+        None,
+    )
+    .await;
+    let viewer = json(&login)["token"].as_str().unwrap().to_owned();
+    let path = "/v1/kubernetes/protection";
+    assert_eq!(
+        request_with_token(fixture.admin, "GET", path, None, None, None)
+            .await
+            .0,
+        401
+    );
+    let (status, _, body) =
+        request_with_token(fixture.admin, "GET", path, None, None, Some(&viewer)).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&body)["enabled"], false);
+    assert_eq!(
+        request_with_token(fixture.admin, "POST", path, Some("{}"), None, Some(&viewer))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        request_with_token(
+            fixture.admin,
+            "GET",
+            "/v1/geoip/status",
+            None,
+            None,
+            Some(&viewer)
+        )
+        .await
+        .0,
+        403
+    );
+    fixture.manager.policy.shutdown().await;
+}

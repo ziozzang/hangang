@@ -1,0 +1,29 @@
+# Aggregated roles for ProtectionPolicy (ADR 0022). Namespace editors and
+# administrators may manage the policies of their own namespace; viewers may
+# read them. The status subresource is written only by the controller.
+# A policy can only reference identity profiles and Pumgye services the
+# gateway operator permitted for that namespace (controller-side check).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: world-protectionpolicy-editor
+  labels:
+    app.kubernetes.io/part-of: hangang-world
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+  - apiGroups: ["world.hangang.dev"]
+    resources: ["protectionpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: world-protectionpolicy-viewer
+  labels:
+    app.kubernetes.io/part-of: hangang-world
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["world.hangang.dev"]
+    resources: ["protectionpolicies", "protectionpolicies/status"]
+    verbs: ["get", "list", "watch"]

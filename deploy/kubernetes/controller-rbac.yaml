@@ -24,6 +24,15 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]
     verbs: ["get", "patch", "update"]
+  # Required only with --kubernetes-protection-config (ADR 0022). Install
+  # deploy/kubernetes/crds first; without the CRD the controller never
+  # publishes and stays not ready.
+  - apiGroups: ["world.hangang.dev"]
+    resources: ["protectionpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["world.hangang.dev"]
+    resources: ["protectionpolicies/status"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

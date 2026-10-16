@@ -1,0 +1,16 @@
+# Client address preservation for network-conditioned ProtectionPolicies:
+# a LoadBalancer Service with externalTrafficPolicy: Local delivers traffic
+# only to nodes running a gateway Pod and keeps the client source address
+# (no kube-proxy SNAT). Pair it with client_address
+# {"mode":"service_local","namespace":...,"name":"hangang"} in the protection
+# settings; the controller checks this Service and reports
+# ClientAddressPreserved on every policy that requires network enforcement.
+# Use enough replicas (or a DaemonSet) that every node the load balancer
+# targets runs a ready gateway Pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hangang
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local

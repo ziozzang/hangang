@@ -679,10 +679,68 @@ function showGlobalError(text) {
   alert.hidden = false;
 }
 
+function ensureProtectionPanel() {
+  const existing = $('#kubernetes-protection-panel');
+  if (existing) { existing.hidden = !state.token; return; }
+  const anchor = $('#activity-panel'); if (!anchor) return;
+  const panel = document.createElement('section'); panel.id = 'kubernetes-protection-panel'; panel.className = 'panel';
+  panel.hidden = !state.token;
+  const heading = document.createElement('div'); heading.className = 'section-heading';
+  const text = document.createElement('div');
+  const title = document.createElement('h2'); copy(title, 'Kubernetes route protection');
+  const note = document.createElement('p'); copy(note, 'ProtectionPolicy outcome of the snapshot this instance published. Withheld Ingresses are not served.');
+  text.append(title, note);
+  const refresh = document.createElement('button'); refresh.id = 'kubernetes-protection-refresh'; refresh.className = 'button button-secondary'; refresh.type = 'button';
+  copy(refresh, 'Refresh protection status'); refresh.addEventListener('click', loadProtectionStatus);
+  heading.append(text, refresh);
+  const output = document.createElement('div'); output.id = 'kubernetes-protection-status'; output.className = 'field-help-inline';
+  output.style.whiteSpace = 'pre-line'; output.setAttribute('aria-live', 'polite');
+  panel.append(heading, output); anchor.after(panel);
+}
+
+function renderProtection(data) {
+  if (!isObject(data) || data.scope !== 'instance' || typeof data.enabled !== 'boolean') return t('The server returned invalid protection status.');
+  if (!data.enabled || !isObject(data.report)) return t('Kubernetes route protection is not enabled on this instance.');
+  const report = data.report; const counts = isObject(report.counts) ? report.counts : {};
+  const count = (value) => formatNumber(Number.isSafeInteger(value) ? value : 0);
+  const lines = [
+    t('Protected {protected} · unprotected {unprotected} · withheld {withheld}', { protected: count(counts.protected), unprotected: count(counts.unprotected), withheld: count(counts.withheld) }),
+    t('Invalid policies {invalid} · conflicted policies {conflicted}', { invalid: count(counts.invalid_policies), conflicted: count(counts.conflicted_policies) }),
+    report.require_protection ? t('Ingresses without a policy are withheld.') : t('Ingresses without a policy are published unprotected.'),
+    report.client_address_preserved ? t('Client address preserved') : t('Client address not preserved: {detail}', { detail: String(report.client_address_message || '—').slice(0, 1024) }),
+    report.guard_enforcing ? t('Sumunjang admission is fail-closed') : t('Sumunjang admission is not fail-closed'),
+  ];
+  const rows = Array.isArray(report.ingresses) ? report.ingresses : [];
+  for (const row of rows.filter((row) => isObject(row) && row.state === 'withheld').slice(0, 50)) {
+    lines.push(t('Withheld {namespace}/{name}: {reason}', { namespace: String(row.namespace), name: String(row.name), reason: String(row.reason || '—') }));
+  }
+  return lines.join('\n');
+}
+
+async function loadProtectionStatus() {
+  if (!state.token) return;
+  const button = $('#kubernetes-protection-refresh'); const output = $('#kubernetes-protection-status');
+  if (!button || !output) return;
+  const generation = state.authGeneration;
+  button.disabled = true; output.textContent = '';
+  try {
+    const { data } = await api('/v1/kubernetes/protection');
+    if (generation !== state.authGeneration) return;
+    output.textContent = renderProtection(data);
+  } catch (error) {
+    if (error instanceof StaleSessionError) return;
+    if (error.status === 401 || error.status === 403) return logout(t('Your session is no longer authorized.'));
+    output.textContent = t('Protection status unavailable: {detail}', { detail: error.message });
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadStatus() {
   if (!state.token) return;
   const { data } = await api('/v1/status');
   if (!isLive()) renderStatus(data);
+  ensureProtectionPanel();
   try {
     const { data: update } = await api('/v1/update/status');
     state.lastUpdateStatus = update;
@@ -6539,6 +6597,7 @@ window.addEventListener('beforeunload', () => { stopBackendFreshness(); state.to
 
 initLocale();
 ensureGeoIpPanel();
+ensureProtectionPanel();
 state.view = normalizeView(location.hash);
 if (!location.hash) history.replaceState(null, '', '#status');
 switchView();

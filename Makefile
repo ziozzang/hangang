@@ -9,10 +9,12 @@ check-docs:
 	python3 tools/check_publish.py
 	python3 -m unittest discover -s tests -p test_publish_policy.py
 	python3 -m unittest discover -s tests -p test_docs_translation.py
+	python3 -m unittest discover -s tests -p test_world_crds.py
 test:
 	cargo test --locked
 	cargo build --locked
 	python3 tests/smoke.py
+	python3 tests/proxy_protocol_smoke.py
 	python3 tests/docker_smoke.py
 	python3 tests/sql_smoke.py
 	python3 tests/acme_runtime.py

@@ -1,0 +1,68 @@
+# A protected Ingress (ADR 0022). Apply in the namespace the gateway watches
+# after the ProtectionPolicy CRD is installed and the gateway runs with
+# --kubernetes-protection-config. Without a policy (and with the default
+# require_protection: true) the Ingress is withheld, not published.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orders
+spec:
+  ingressClassName: hangang
+  rules:
+    - host: orders.example.test
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: orders
+                port:
+                  name: http
+---
+apiVersion: world.hangang.dev/v1alpha1
+kind: ProtectionPolicy
+metadata:
+  name: orders
+spec:
+  targetRefs:
+    - group: networking.k8s.io
+      kind: Ingress
+      name: orders
+  identity:
+    profileRef:
+      name: corp-sso
+  authorization:
+    pumgye:
+      serviceId: orders
+      resource: http:orders
+      actions:
+        - method: GET
+          action: read
+        - method: HEAD
+          action: read
+        - method: POST
+          action: write
+  network:
+    enforcement: Required
+---
+# Namespace default: protects every other Ingress of this namespace that no
+# policy targets. Identity and authorization only, no network claim.
+apiVersion: world.hangang.dev/v1alpha1
+kind: ProtectionPolicy
+metadata:
+  name: namespace-default
+spec:
+  namespaceDefault: true
+  identity:
+    profileRef:
+      name: corp-sso
+  authorization:
+    pumgye:
+      serviceId: internal-tools
+      resource: http:internal-tools
+      actions:
+        - method: GET
+          action: read
+  network:
+    enforcement: None
