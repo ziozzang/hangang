@@ -9,7 +9,13 @@ import { fileURLToPath } from 'node:url';
 const web = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shots = process.env.IDENTITIES_SCREENS || path.join(web, 'test-results', 'identities-screens');
 const NOW = Math.floor(Date.UTC(2026, 9, 16, 9, 0) / 1000);
-const ROUTES = ['status:GET', 'authentication/profiles:GET', 'authentication/profiles/publish:POST', 'authentication/projections:GET', 'authentication/projections/publish:POST', 'users/query:POST', 'sessions/query:POST', 'events/query:POST', 'users/disable:POST', 'users/enable:POST', 'users/sessions-terminate:POST', 'sessions/terminate:POST', 'subjects/resolve:POST', 'subjects/search:POST', 'explain/authentication:POST', 'groups/search:POST', 'groups/get:POST', 'subjects/groups:POST', 'groups/create:POST', 'groups/update:POST', 'groups/delete:POST', 'groups/members/add:POST', 'groups/members/remove:POST'];
+const LEGACY_ROUTES = ['status:GET', 'authentication/profiles:GET', 'authentication/profiles/publish:POST', 'authentication/projections:GET', 'authentication/projections/publish:POST', 'users/query:POST', 'sessions/query:POST', 'events/query:POST', 'users/disable:POST', 'users/enable:POST', 'users/sessions-terminate:POST', 'sessions/terminate:POST', 'subjects/resolve:POST', 'subjects/search:POST', 'explain/authentication:POST', 'groups/search:POST', 'groups/get:POST', 'subjects/groups:POST', 'groups/create:POST', 'groups/update:POST', 'groups/delete:POST', 'groups/members/add:POST', 'groups/members/remove:POST'];
+// Hopae console package 0.1.10 (Hopae ADMIN.md, "Hangang console routes").
+const ROUTES = [...LEGACY_ROUTES, 'users/get:POST', 'users/factors:POST', 'users/factors/reset:POST', 'users/bulk-disable:POST', 'authentication/profiles/validate:POST'];
+const FACTORS = { user_id: 'u_kim', second_factors: 3, passkeys: [
+  { factor_id: 'pk_1a2b3c4d5e6f7a8b', label: 'YubiKey 5 (desk)', aaguid: 'cb69481e-8ff7-4039-93ec-0a2729a154a8', authenticator: 'YubiKey 5 Series', kind: 'device_bound', backup_eligible: false, backup_state: false, user_verified: true, attested: true, attestation_format: 'packed', assurance: 'aal3', transports: ['usb', 'nfc'], created_at: NOW - 86400 * 40, last_used_at: NOW - 600 },
+  { factor_id: 'pk_9f8e7d6c5b4a3f2e', label: 'MacBook', aaguid: null, authenticator: null, kind: 'synced', backup_eligible: true, backup_state: true, user_verified: true, attested: false, attestation_format: 'none', assurance: 'aal2', transports: ['internal', 'hybrid'], created_at: NOW - 86400 * 3, last_used_at: null }],
+  totp: { active: true }, recovery_codes: { remaining: 7, generated_at: NOW - 86400 * 40, reenrollment_required_at: null } };
 
 const blank = { reason: null, kind: 'human', human_subject: null, display_name: null, email: null, providers: [], created_at: null, last_login_at: null, last_seen_at: null, service_id: null, realm: null, expires_at: null };
 const PEOPLE = {
@@ -32,7 +38,11 @@ const PROFILES = { revision: 3, digest: 'ab'.repeat(32), configuration: { author
   { service_id: 'billing', host: 'billing.example.test', ports: [443, 8443], realm: 'billing', api_keys: [], networks: [], session_fallback: true, api_relay: { url: 'https://verifier.example.test', issuer: 'corp' } },
 ] } };
 
-async function setup(page, { conflict = false, noHopae = false, partialRoutes = null } = {}) {
+function filterEvents(body, items) {
+  return items.filter(event => (!body.user_id || event.user_id === body.user_id) && (!body.kind_prefix || event.kind.startsWith(body.kind_prefix)));
+}
+
+async function setup(page, { conflict = false, noHopae = false, partialRoutes = null, invalidProfiles = false } = {}) {
   const calls = [];
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
@@ -40,14 +50,25 @@ async function setup(page, { conflict = false, noHopae = false, partialRoutes = 
     const body = request.postData() ? JSON.parse(request.postData()) : null;
     calls.push({ path: p, method: request.method(), body, reason: request.headers()['x-hangang-change-reason'] || null });
     if (p === '/v1/auth/setup') return route.fulfill({ status: 404, body: '' });
-    if (p === '/v1/plugins') return route.fulfill({ json: { api_version: 1, plugins: noHopae ? [] : [{ id: 'hopae', name: 'Hopae', version: '0.1.9', authentication: 'hangang', api_base: '/v1/plugins/hopae', routes: (partialRoutes || ROUTES).map(entry => { const [path_, method] = entry.split(':'); return { path: path_, method, mutation: !/query|search|resolve|get|status|groups$|profiles$|projections$|explain/.test(path_) }; }) }] } });
+    if (p === '/v1/plugins') return route.fulfill({ json: { api_version: 1, plugins: noHopae ? [] : [{ id: 'hopae', name: 'Hopae', version: (partialRoutes || ROUTES).includes('users/get:POST') ? '0.1.10' : '0.1.9', authentication: 'hangang', api_base: '/v1/plugins/hopae', routes: (partialRoutes || ROUTES).map(entry => { const [path_, method] = entry.split(':'); return { path: path_, method, mutation: !/query|search|resolve|get|status|groups$|profiles$|projections$|explain/.test(path_) }; }) }] } });
     if (p === '/v1/status') return route.fulfill({ json: { revision: 270, http_routes: 1, tcp_routes: 0, metrics: {}, uptime_seconds: 1, state: {} } });
     if (p === '/v1/config') return route.fulfill({ json: { revision: 270, pumgye: { version: 1, information_classes: ['public', 'internal', 'restricted'], services: {
       reports: { permissions: ['read', 'write'], roles: { reader: { permissions: ['read'], information_classes: ['internal'], inherits: [], minimum_aal: 1 }, analyst: { permissions: ['write'], information_classes: ['restricted'], inherits: ['reader'], minimum_aal: 2 } }, users: { u_kim: ['analyst'] }, groups: { 'grp1:LOCALANALYSTS0000000000000': ['reader'] }, networks: [] },
       billing: { permissions: ['read'], roles: { viewer: { permissions: ['read'], information_classes: ['internal'], inherits: [], minimum_aal: 1 } }, users: {}, groups: { 'grp1:LOCALANALYSTS0000000000000': ['viewer'] }, networks: [] } } } } });
     if (p === '/v1/observability/decisions') return route.fulfill({ json: { state: 'enabled', profile: 'standard', items: [], next_cursor: null } });
     const op = p.startsWith('/v1/plugins/hopae/') ? p.slice('/v1/plugins/hopae/'.length) : null;
-    if (op === 'users/query') return route.fulfill({ json: { items: Object.values(PEOPLE).map(person => ({ user_id: person.user_id, primary_email: person.email.replace('***', 'x'), email_verified: true, display_name: person.display_name, username: null, status: person.status, created_at: person.created_at, last_login_at: person.last_login_at, live_sessions: sessions.filter(s => s.user_id === person.user_id).length, role: null })), next_cursor: null } });
+    if (op === 'users/query') {
+      const groupMembers = { 'grp1:LOCALANALYSTS0000000000000': ['u_kim', 'u_lee'], 'grp1:LDAPENGINEERING00000000000': ['u_lee'] };
+      const mfaEnrolled = new Set(['u_kim']);
+      const items = Object.values(PEOPLE).filter(person => (!body.q || person.display_name.toLowerCase().includes(body.q.toLowerCase())) && (!body.status || person.status === body.status) && (!body.provider || person.providers.includes(body.provider)) && (!body.mfa || (body.mfa === 'enrolled') === mfaEnrolled.has(person.user_id)) && (!body.group || (groupMembers[body.group] || []).includes(person.user_id)))
+        .map(person => ({ user_id: person.user_id, primary_email: person.email.replace('***', 'x'), email_verified: true, display_name: person.display_name, username: null, status: person.status, created_at: person.created_at, last_login_at: person.last_login_at, live_sessions: sessions.filter(s => s.user_id === person.user_id).length, role: null }));
+      return route.fulfill({ json: { items, next_cursor: null } });
+    }
+    if (op === 'users/get') return route.fulfill({ json: { user: { user_id: body.id }, identities: body.id === 'u_kim' ? [{ provider_id: 'corp', subject: 'kim.analyst@corp-idp|00u1a2b3c4', email: 'kim@corp.example', email_verified: true, name: 'Kim Analyst', first_seen_at: NOW - 86400 * 90, last_seen_at: NOW - 3600 }] : [], sessions_live: [], sessions_live_total: 0, sessions_terminated: [], events: [], grant: null } });
+    if (op === 'users/factors') return route.fulfill({ json: { ...FACTORS, user_id: body.id } });
+    if (op === 'users/factors/reset') return body.id === 'u_self' ? route.fulfill({ status: 403, json: { error: 'self_target' } }) : route.fulfill({ json: { changed: true, scope: body.scope, passkeys_revoked: body.scope === 'passkey' ? 1 : body.scope === 'all' ? 2 : 0, totp_revoked: body.scope === 'totp' || body.scope === 'all', recovery_codes_removed: body.scope === 'recovery_codes' ? 7 : 0, sessions_terminated: body.scope === 'all' ? 2 : 1 }, headers: { 'x-hangang-plugin-operation': '81' } });
+    if (op === 'users/bulk-disable') return route.fulfill({ json: { bulk_operation: 'r_bulk1', requested: body.ids.length, disabled: body.ids.length - 1, failed: 1, halted: null, items: body.ids.map((id, index) => index === body.ids.length - 1 ? { id, result: 'error', error: 'self_target' } : { id, result: 'disabled', sessions_terminated: 2 }) }, headers: { 'x-hangang-plugin-operation': '80' } });
+    if (op === 'authentication/profiles/validate') return route.fulfill({ json: invalidProfiles ? { valid: false, errors: [{ path: 'profiles[0].ports[1]', code: 'invalid_profile', message: 'port 70000 is out of range' }, { path: 'profiles[0].api_keys[0].token_env', code: 'undeclared_reference', message: 'REPORTS_BATCH_TOKEN2 is not declared' }] } : { valid: true, errors: [] } });
     if (op === 'subjects/search') return route.fulfill({ json: { items: Object.values(PEOPLE).filter(person => person.display_name.toLowerCase().includes(String(body.q).toLowerCase()) && (!body.status || person.status === body.status)), next_cursor: null, privacy_profile: 'standard' } });
     if (op === 'subjects/resolve') {
       const items = body.ids.map(id => PEOPLE[id] ? { ...PEOPLE[id], ...(body.include_groups ? { groups: id === 'u_kim' ? [{ group_id: 'grp1:LOCALANALYSTS0000000000000', name: 'Analysts', source: 'local' }, { group_id: 'grp1:LDAPENGINEERING00000000000', name: 'engineering', source: 'ldap' }] : [], groups_truncated: false } : {}) } : { ...blank, kind: null, id, status: 'unknown', reason: 'not_found' });
@@ -61,16 +82,17 @@ async function setup(page, { conflict = false, noHopae = false, partialRoutes = 
       return route.fulfill({ json: { group, members: body.members_limit === 0 ? [] : members, next_members_cursor: null, privacy_profile: 'standard' } });
     }
     if (op === 'subjects/groups') return route.fulfill({ json: { id: body.id, user_id: body.id, status: 'resolved', items: body.id === 'u_kim' ? [{ ...GROUPS['grp1:LOCALANALYSTS0000000000000'], membership: membership() }, { ...GROUPS['grp1:LDAPENGINEERING00000000000'], membership: membership({ source: 'ldap', provider_id: 'directory' }) }] : [], next_cursor: null } });
-    if (op === 'sessions/query') return route.fulfill({ json: { items: sessions, next_cursor: null } });
-    if (op === 'events/query') return route.fulfill({ json: { items: [
+    if (op === 'sessions/query') return route.fulfill({ json: { items: sessions.filter(session => (!body.user_id || session.user_id === body.user_id) && (!body.aal || session.aal === body.aal)), next_cursor: null } });
+    if (op === 'events/query') return route.fulfill({ json: { items: filterEvents(body, [
       { event_id: 'e_3', at: NOW - 600, kind: 'factor.webauthn_used', outcome: 'success', reason: null, user_id: 'u_kim', session_id: 's_KIM1', app_id: 'reports', provider_id: null, client_ip: '198.51.100.7', attrs: {} },
       { event_id: 'e_2', at: NOW - 3600, kind: 'login.succeeded', outcome: 'success', reason: null, user_id: 'u_kim', session_id: 's_KIM1', app_id: null, provider_id: 'corp', client_ip: '198.51.100.7', attrs: {} },
       { event_id: 'e_1', at: NOW - 86400 * 3, kind: 'factor.webauthn_registered', outcome: 'success', reason: null, user_id: 'u_kim', session_id: null, app_id: null, provider_id: null, client_ip: '198.51.100.7', attrs: {} },
-      { event_id: 'e_0', at: NOW - 86400 * 3, kind: 'login.failed', outcome: 'failure', reason: 'provider_error', user_id: 'u_lee', attrs: {} }], next_cursor: null } });
+      { event_id: 'e_0', at: NOW - 86400 * 3, kind: 'login.failed', outcome: 'failure', reason: 'provider_error', user_id: 'u_lee', attrs: {} }]), next_cursor: null } });
     if (op === 'status') return route.fulfill({ json: { providers: [
       { provider_id: 'corp', kind: 'oidc', display_name: 'Corporate SSO', enabled: true, managed_by: 'file', health: 'ok', reauth: 'max_age', client_secret_env: 'CORP_CLIENT_SECRET', secret_present: true },
       { provider_id: 'directory', kind: 'ldap', display_name: 'Directory', enabled: true, managed_by: 'file', health: 'degraded', reason: 'bind timed out after 5s', reauth: 'unsupported', client_secret_env: null, secret_present: false },
       { provider_id: 'partner', kind: 'oidc', display_name: 'Partner login', enabled: false, managed_by: 'api', health: 'disabled', reauth: 'unsupported', client_secret_env: 'PARTNER_SECRET', secret_present: false }],
+      portal: { public_url: 'https://auth.example.test', passkeys: true, passwordless: false }, console: { public_url: 'https://hopae-admin.example.test', authority: { mode: 'hangang', delegation: 'hangang' } },
       authentication_gateway: { revision: 3, available: true, enabled: true, connectors: [{ service_id: 'billing', connector: 'api-relay', circuit: 'open', available_capacity: 0 }, { service_id: 'reports-api', connector: 'kubernetes-tokenreview', circuit: 'closed', available_capacity: 8 }] } } });
     if (op === 'authentication/profiles') return route.fulfill({ json: PROFILES });
     if (op === 'authentication/profiles/publish') return conflict ? route.fulfill({ status: 409, json: { error: 'revision_conflict' } }) : route.fulfill({ json: { ...PROFILES, revision: 4, configuration: body.configuration } });
@@ -137,18 +159,31 @@ test('users list searches on the server, keeps filters in the URL and links peop
   await expect(view.locator('tbody tr').first()).toContainText('Kim Analyst');
   await expect(view.locator('tbody tr').first()).toContainText('Analysts');
   await expect(view.locator('tbody tr').nth(2)).toContainText('Disabled');
-  // Provider and multi-factor filters explain the missing Hopae API.
-  await expect(view.locator('.zt-field-off select')).toHaveCount(2);
-  await expect(view.locator('.zt-field-off select').first()).toBeDisabled();
+  // Hopae 0.1.10 filters on the server: every filter is live, none explains a gap.
+  await expect(view.locator('.zt-field-off')).toHaveCount(0);
+  await expect(view.locator('.zt-subnav [data-authority="hangang"]')).toContainText('Hangang console');
   await expectNoSnakeCase(view);
   await view.getByRole('searchbox', { name: 'Search' }).fill('lee');
   await view.getByRole('button', { name: 'Apply filters' }).click();
   await expect(page).toHaveURL(/#identities\/users\?q=lee$/);
   await expect(view.locator('tbody tr')).toHaveCount(1);
-  expect(calls.filter(call => call.path.endsWith('/subjects/search')).at(-1).body).toMatchObject({ q: 'lee', kind: 'human' });
+  expect(calls.filter(call => call.path.endsWith('/users/query')).at(-1).body).toMatchObject({ q: 'lee', limit: 50 });
+  expect(calls.some(call => call.path.endsWith('/subjects/search'))).toBe(false);
+  await page.goto('/ui/#identities/users');
+  await view.locator('select[name=provider]').selectOption('directory');
+  await view.locator('select[name=mfa]').selectOption('none');
+  await view.locator('select[name=status]').selectOption('active');
+  await view.getByRole('button', { name: 'Apply filters' }).click();
+  await expect(page).toHaveURL(/status=active&provider=directory&mfa=none/);
+  await expect(view.locator('tbody tr')).toHaveCount(1);
+  await expect(view.locator('tbody tr').first()).toContainText('Lee Operator');
+  expect(calls.filter(call => call.path.endsWith('/users/query')).at(-1).body).toMatchObject({ status: 'active', provider: 'directory', mfa: 'none' });
+  await page.goto('/ui/#identities/users');
   await view.locator('select[name=group]').selectOption('grp1:LOCALANALYSTS0000000000000');
   await view.getByRole('button', { name: 'Apply filters' }).click();
   await expect(page).toHaveURL(/group=grp1/);
+  await expect(view.locator('tbody tr')).toHaveCount(2);
+  expect(calls.filter(call => call.path.endsWith('/users/query')).at(-1).body.group).toBe('grp1:LOCALANALYSTS0000000000000');
   await expect(view.locator('.zt-notes')).toContainText('Analysts');
 });
 
@@ -170,24 +205,50 @@ test('bulk disable requires the typed count and a reason, then reports each outc
   await expect(confirm).toBeDisabled();
   await dialog.getByLabel('Reason').fill('left the company — 퇴사');
   await confirm.click();
-  await expect(view.locator('.zt-bulk-results')).toContainText('2 disabled, 0 refused, 0 uncertain');
-  const disables = calls.filter(call => call.path.endsWith('/users/disable'));
-  expect(disables.map(call => call.body.id)).toEqual(['u_kim', 'u_lee']);
-  expect(decodeURIComponent(disables[0].reason)).toBe('left the company — 퇴사');
+  // One bulk call with per-item results (the fixture refuses the last as a self-target).
+  await expect(view.locator('.zt-bulk-results')).toContainText('1 disabled, 1 refused, 0 uncertain');
+  await expect(view.locator('.zt-result-list li').nth(1)).toContainText('You cannot disable your own account.');
+  const bulk = calls.filter(call => call.path.endsWith('/users/bulk-disable'));
+  expect(bulk).toHaveLength(1);
+  expect(bulk[0].body).toEqual({ ids: ['u_kim', 'u_lee'], reason: 'left the company — 퇴사' });
+  expect(decodeURIComponent(bulk[0].reason)).toBe('left the company — 퇴사');
+  expect(calls.some(call => call.path.endsWith('/users/disable'))).toBe(false);
 });
 
-test('user detail: authentication shows factor gaps honestly and tests access as the user', async ({ page }) => {
+test('user detail: authentication lists factors with reset and tests access as the user', async ({ page }) => {
   const calls = await setup(page);
   await page.goto('/ui/#identities/users/u_kim/authentication');
   const view = page.locator('#view-identities');
   await expect(view.getByRole('heading', { name: 'Kim Analyst', level: 1 })).toBeVisible();
   await expect(view.locator('.zt-tabs [aria-current="page"]')).toHaveText('Authentication');
-  await expect(view.locator('.zt-factor')).toHaveCount(3);
-  await expect(view.locator('.zt-factor').first()).toContainText('Not reported');
-  await expect(view.getByRole('button', { name: 'Reset factors' })).toBeDisabled();
-  await expect(view.locator('.kit-action-off', { hasText: 'Reset factors' })).toHaveAttribute('aria-label', /hopae admin factors reset/);
+  // Hopae 0.1.10 users/factors: two passkeys (one AAL 3), the authenticator app, recovery codes.
+  await expect(view.locator('.zt-factor')).toHaveCount(4);
+  const high = view.locator('.zt-passkey.is-high');
+  await expect(high).toContainText('YubiKey 5 (desk)');
+  await expect(high).toContainText('YubiKey 5 Series');
+  await expect(high).toContainText('Device-bound');
+  await expect(high).toContainText('AAL 3');
+  await expect(high).toContainText('High assurance');
+  await expect(view.locator('.zt-passkey').nth(1)).toContainText('Authenticator not disclosed · Synced · backed up');
+  await expect(view.locator('.zt-passkey').nth(1)).toContainText('Last used never');
+  await expect(view.locator('[data-factor="recovery"]')).toContainText('7 unused codes left');
+  await expect(view.locator('.zt-gap')).toHaveCount(0);
   await expect(view.locator('.zt-panel', { hasText: 'Assurance seen in live sessions' })).toContainText('AAL 2');
   await expect(view.locator('.zt-panel', { hasText: 'Factor activity' }).locator('tbody tr')).toHaveCount(2);
+  expect(calls.filter(call => call.path.endsWith('/events/query')).at(-1).body).toMatchObject({ user_id: 'u_kim', kind_prefix: 'factor.' });
+  await view.locator('.zt-passkey').nth(1).getByRole('button', { name: 'Remove' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await expect(dialog).toContainText('MacBook');
+  await dialog.getByLabel(/Reason/).fill('lost laptop');
+  await dialog.getByRole('button', { name: 'Remove' }).click();
+  await expect(view.locator('.zt-outcome')).toContainText('Factors removed: 1 passkeys, 1 sessions ended (operation 81)');
+  expect(calls.filter(call => call.path.endsWith('/users/factors/reset')).at(-1).body).toEqual({ id: 'u_kim', scope: 'passkey', factor_id: 'pk_9f8e7d6c5b4a3f2e', reason: 'lost laptop' });
+  await view.getByRole('button', { name: 'Reset all factors' }).click();
+  await expect(dialog.getByRole('button', { name: 'Reset all factors' })).toBeDisabled();
+  await dialog.getByLabel('Type Kim Analyst to confirm').fill('Kim Analyst');
+  await dialog.getByLabel(/Reason/).fill('account recovery after phone loss');
+  await dialog.getByRole('button', { name: 'Reset all factors' }).click();
+  expect(calls.filter(call => call.path.endsWith('/users/factors/reset')).at(-1).body).toMatchObject({ id: 'u_kim', scope: 'all', reason: 'account recovery after phone loss' });
   await view.getByLabel('URL').fill('https://reports.example.test/admin');
   await view.getByRole('button', { name: 'Run test' }).click();
   await expect(view.locator('.zt-explain-result')).toContainText('Step-up required');
@@ -225,12 +286,21 @@ test('user sessions: device, address, assurance and terminate with a reason', as
   await dialog.getByRole('button', { name: 'End session' }).click();
   await expect(view.locator('.zt-outcome')).toContainText('Session ended (operation 78)');
   const call = calls.filter(entry => entry.path.endsWith('/sessions/terminate')).at(-1);
-  expect(call.body).toEqual({ id: 's_KIM1' });
+  // 0.1.10 records the reason in Hopae's audit too.
+  expect(call.body).toEqual({ id: 's_KIM1', reason: 'lost laptop' });
   expect(call.reason).toBe('lost%20laptop');
+  expect(calls.filter(entry => entry.path.endsWith('/sessions/query')).every(entry => entry.body.user_id === 'u_kim')).toBe(true);
 });
 
 test('user groups, access and activity tabs cross-link groups, Pumgye grants and events', async ({ page }) => {
   await setup(page);
+  // Profile: linked identities from users/get with provider subject and times.
+  await page.goto('/ui/#identities/users/u_kim/profile');
+  const identity = page.locator('#view-identities .zt-identity');
+  await expect(identity).toContainText('Corporate SSO');
+  await expect(identity).toContainText('kim.analyst@corp-idp|00u1a2b3c4');
+  await expect(identity).toContainText('Verified');
+  await expect(page.locator('#view-identities .zt-gap')).toHaveCount(0);
   await page.goto('/ui/#identities/users/u_kim/groups');
   const view = page.locator('#view-identities');
   await expect(view.locator('tbody tr')).toHaveCount(2);
@@ -281,7 +351,11 @@ test('providers render as cards with health, kind and redirect URI, never raw fi
   const view = page.locator('#view-identities');
   await expect(view.locator('.zt-provider')).toHaveCount(3);
   await expect(view.locator('.zt-provider').first()).toContainText('OpenID Connect');
-  await expect(view.locator('.zt-provider').first()).toContainText('/callback/corp');
+  // Hopae 0.1.10 reports the portal origin: full redirect URIs, no gap note.
+  await expect(view.locator('.zt-provider').first().locator('.zt-redirect code')).toHaveText('https://auth.example.test/callback/corp');
+  await expect(view.locator('.zt-provider .kit-action-off')).toHaveCount(0);
+  await expect(view.locator('.zt-provider-summary')).toContainText('https://auth.example.test');
+  await expect(view.locator('.zt-provider-summary')).toContainText('Passkeys on');
   await expect(view.locator('.zt-provider').nth(1)).toContainText('Degraded');
   await expect(view.locator('.zt-provider').nth(1)).toContainText('bind timed out after 5s');
   await expect(view.locator('.zt-provider').nth(2)).toContainText('Missing');
@@ -321,6 +395,48 @@ test('authentication profiles: form edit, structured change list, publish with r
   await expect(view.getByRole('status').filter({ hasText: 'unsaved draft was restored' })).toBeVisible();
 });
 
+
+test('profile validation marks fields inline before review and blocks publishing', async ({ page }) => {
+  const calls = await setup(page, { invalidProfiles: true });
+  await page.goto('/ui/#identities/authentication');
+  const view = page.locator('#view-identities');
+  await view.locator('.zt-profile').first().getByLabel('Ports').fill('443, 7000');
+  await view.getByRole('button', { name: 'Review and publish' }).click();
+  await expect(view.locator('.zt-validation')).toContainText('Hopae found 2 problems');
+  await expect(view.locator('.zt-validation code').first()).toHaveText('profiles[0].ports[1]');
+  await expect(view.locator('.zt-profile').first().getByLabel('Ports')).toHaveAttribute('aria-invalid', 'true');
+  await expect(view.locator('.zt-profile').first().locator('[name=key_env]')).toHaveAttribute('aria-invalid', 'true');
+  await expect(view.locator('.zt-profile').first()).toContainText('not declared in Hopae');
+  await expect(page.locator('dialog.zt-dialog')).toHaveCount(0);
+  expect(calls.filter(call => call.path.endsWith('/authentication/profiles/validate')).at(-1).body.configuration.profiles[0].ports).toEqual([443, 7000]);
+  expect(calls.some(call => call.path.endsWith('/authentication/profiles/publish'))).toBe(false);
+});
+
+test('older Hopae packages (0.1.9) keep the bounded scans, sequential bulk disable and factor gaps', async ({ page }) => {
+  const calls = await setup(page, { partialRoutes: LEGACY_ROUTES });
+  await page.goto('/ui/#identities/users');
+  const view = page.locator('#view-identities');
+  await expect(view.locator('.zt-field-off select')).toHaveCount(2);
+  await view.getByRole('checkbox', { name: 'Select Kim Analyst' }).check();
+  await view.getByRole('checkbox', { name: 'Select Lee Operator' }).check();
+  await view.getByRole('button', { name: 'Disable selected' }).click();
+  const dialog = page.locator('dialog.kit-dialog');
+  await dialog.getByLabel('Type 2 users to confirm').fill('2 users');
+  await dialog.getByLabel('Reason').fill('left');
+  await dialog.getByRole('button', { name: 'Disable users' }).click();
+  await expect(view.locator('.zt-bulk-results')).toContainText('2 disabled, 0 refused, 0 uncertain');
+  const disables = calls.filter(call => call.path.endsWith('/users/disable'));
+  expect(disables.map(call => call.body)).toEqual([{ id: 'u_kim' }, { id: 'u_lee' }]);
+  await page.goto('/ui/#identities/users/u_kim/authentication');
+  await expect(view.locator('.zt-factor')).toHaveCount(3);
+  await expect(view.locator('.zt-factor').first()).toContainText('Not reported');
+  await expect(view.locator('.kit-action-off', { hasText: 'Reset factors' })).toHaveAttribute('aria-label', /hopae admin factors reset/);
+  await page.goto('/ui/#identities/users/u_kim/profile');
+  await expect(view.locator('.zt-gap')).toContainText('user detail operation');
+  await page.goto('/ui/#identities/providers');
+  await expect(view.locator('.zt-provider').first()).toContainText('/callback/corp');
+  expect(calls.filter(call => call.path.endsWith('/sessions/query')).every(call => call.body.user_id === undefined)).toBe(true);
+});
 test('access test panel explains the outcome and keeps the test in the URL', async ({ page }) => {
   await setup(page);
   await page.goto('/ui/#identities/authentication/test?subject=u_kim&url=https%3A%2F%2Freports.example.test%2Fadmin');
@@ -369,7 +485,7 @@ test('screens: Korean light, English dark and Korean 390 px', async ({ page }) =
   const view = page.locator('#view-identities');
   const pages = [
     ['users', '#identities/users', () => expect(view.locator('tbody tr')).toHaveCount(3)],
-    ['user-authentication', '#identities/users/u_kim/authentication', () => expect(view.locator('.zt-factor')).toHaveCount(3)],
+    ['user-authentication', '#identities/users/u_kim/authentication', () => expect(view.locator('.zt-factor')).toHaveCount(4)],
     ['user-sessions', '#identities/users/u_kim/sessions', () => expect(view.locator('tbody tr')).toHaveCount(2)],
     ['group-detail', '#identities/groups/grp1%3ALOCALANALYSTS0000000000000', () => expect(view.locator('tbody tr')).toHaveCount(2)],
     ['providers', '#identities/providers', () => expect(view.locator('.zt-provider')).toHaveCount(3)],

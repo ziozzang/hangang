@@ -53,15 +53,21 @@ for the other writes the console sends it in the host-only
 which the broker records in its private operation journal (shown in the
 unified audit) and never forwards.
 
-Hopae API follow-ups the pages state in place: factor listing and reset have
-no HTTP API (CLI `hopae admin factors list|reset` only); the delegated
-`users/query`, `sessions/query` and `events/query` accept only `cursor` and
-`limit` (no status, provider, MFA or user filter, so user sessions and events
-come from a bounded scan of the newest records, labelled when partial); the
-per-user detail with linked identities is not delegated; user and session
-writes take no reason; `status` does not report the portal origin for
-redirect URIs; the authority mode (Hopae-native or Hangang-delegated) is not
-reported; there is no batch disable.
+With Hopae console package 0.1.10 (Hopae `ADMIN.md`, "Hangang console
+routes") the pages also use: server-side user filters (search, status,
+provider, multi-factor, group), session filters (user, assurance) and event
+filters (user, kind prefix) instead of bounded scans; `users/get` for linked
+identities (provider subject, e-mail, first and last seen); `users/factors`
+(passkeys with authenticator, synced or device-bound, backup state, AAL 3
+high-assurance keys, last use; authenticator app; recovery codes) and
+`users/factors/reset` (one passkey, the app, recovery codes or all, with a
+reason; Hopae refuses self-targets); `users/bulk-disable` (up to 100 users,
+per-item results); reasons in Hopae's own audit for disable, enable,
+terminate and publications; `authentication/profiles/validate` with findings
+marked on the form fields before review; the portal origin for full redirect
+URIs and the console authority mode badge; AAL 3 in the access test. Packages
+0.1.8 and 0.1.9 keep the previous behaviour (bounded scans, sequential bulk
+disable, factor and linked-identity notes).
 
 ## Policies
 

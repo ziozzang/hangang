@@ -135,3 +135,21 @@ a.kit-tag { text-decoration: none; color: var(--text); }
 #view-identities .zt-entity-summary .zt-dl { margin: 0; }
 .zt-editor > .kit-field { max-width: 28rem; }
 .zt-keys:has(tbody:empty) thead { display: none; }
+/* Hopae 0.1.10: factors, linked identities, validation, authority mode. */
+.zt-factor-side { display: inline-flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: .4rem; }
+.zt-passkey.is-high .zt-factor-icon { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); }
+.zt-high { color: var(--green); }
+.zt-identity .zt-dl { margin-top: .4rem; font-size: .88rem; }
+.zt-field-error { color: var(--red); font-size: .78rem; font-weight: 600; }
+[aria-invalid="true"] { border-color: var(--red) !important; box-shadow: 0 0 0 1px var(--red) inset; }
+.zt-field-errors { margin: .25rem 0 0; padding-inline-start: 1.1rem; font-size: .86rem; display: flex; flex-direction: column; gap: .2rem; }
+.zt-validation:empty { display: none; }
+.zt-subnav { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; }
+.zt-authority-mode { display: inline-flex; align-items: center; gap: .3rem; padding: .15rem .6rem; border-radius: 999px; border: 1px solid var(--line-bright); font-size: .8rem; white-space: nowrap; }
+.zt-authority-hangang { border-color: color-mix(in srgb, var(--cyan) 50%, var(--line)); }
+.zt-provider-summary { display: flex; flex-direction: column; gap: .2rem; }
+@media (max-width: 720px) { .zt-factor-side { grid-column: 2; justify-content: flex-start; } .zt-subnav { flex-wrap: nowrap; } .zt-authority-mode { display: none; } }
+.zt-subnav ul { min-width: 0; overflow-x: auto; }
+.zt-subnav { flex-wrap: nowrap; }
+.zt-subnav ul { flex: 1 1 auto; }
+.kit-dense .kit-col-select { width: 4.75rem; }
