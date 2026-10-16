@@ -2,7 +2,7 @@
 // Sumunjang console package broker (`/v1/plugins/guard/<route>`); nothing here
 // talks to Sumunjang directly.
 const BASE = '/v1/plugins/guard/';
-const GET_ROUTES = new Set(['status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status']);
+const GET_ROUTES = new Set(['status', 'policy/document', 'candidates', 'blocks', 'rules', 'update/status', 'audit', 'reasons', 'kubernetes/authority', 'kubernetes/status', 'rules/document', 'allowlist']);
 export const PAGES = Object.freeze(['overview', 'threats', 'blocks', 'rules', 'policy', 'asn']);
 const PAGE_ICONS = Object.freeze({ overview: '◍', threats: '⚠', blocks: '⛔', rules: '▤', policy: '⚙', asn: '⌘' });
 
@@ -141,10 +141,31 @@ export function asnText(cx, asn) {
 }
 
 /** Block origin from Sumunjang's reason text (core constants). */
+/** Block origin as recorded by Sumunjang (`source`); blocks from before provenance are unknown. */
+export const BLOCK_KINDS = Object.freeze(['manual', 'approved', 'automatic', 'kubernetes', 'unknown']);
 export function blockKind(block) {
-  if (block?.reason === 'automatic threshold') return 'automatic';
-  if (block?.reason === 'manual candidate approval') return 'approved';
-  return 'manual';
+  const source = block?.source === 'auto' ? 'automatic' : block?.source;
+  return BLOCK_KINDS.includes(source) ? source : 'unknown';
+}
+
+/** Address families: the exact host network of an IP. */
+export function exactNetwork(ip) { return `${ip}/${ip.includes(':') ? 128 : 32}`; }
+
+/** Actor label for Sumunjang provenance (`admin-credential` is the shared credential). */
+export function actorText(cx, value) {
+  if (!value) return cx.t('network.actor.unknown');
+  if (value === 'admin-credential') return cx.t('network.actor.credential');
+  if (value === 'system') return cx.t('network.actor.system');
+  return value;
+}
+
+export const SIGNAL_KINDS = Object.freeze(['honeypot', 'scanner', 'auth_failure', 'invalid_request']);
+/** Per-signal counts as compact chips; zero counts are omitted. */
+export function signalChips(cx, signals) {
+  const { t, ui } = cx;
+  const entries = SIGNAL_KINDS.filter(kind => Number(signals?.[kind]) > 0);
+  if (!entries.length) return ui.el('span', { class: 'kit-muted', text: t('network.signals.none') });
+  return ui.el('span', { class: 'zt-chips zt-signals' }, entries.map(kind => ui.el('span', { class: `kit-tag zt-signal zt-signal-${kind}`, title: t(`network.signal.${kind}`), text: t('network.signal.count', { name: t(`network.signal.${kind}.short`), count: signals[kind] }) })));
 }
 
 export const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;

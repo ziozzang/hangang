@@ -21,6 +21,6 @@ export async function renderNetwork(cx, root, route) {
   if (page === 'blocks') return renderBlocks(cx, root, route.parts.slice(1), route.params);
   if (page === 'rules') return renderRules(cx, root, route.parts.slice(1), route.params);
   if (page === 'policy') return renderPolicy(cx, root);
-  if (page === 'asn') return renderAsn(cx, root);
+  if (page === 'asn') return renderAsn(cx, root, route.params);
   return renderNetworkOverview(cx, root);
 }
