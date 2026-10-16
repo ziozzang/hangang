@@ -63,6 +63,46 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
         }
     } else {
         let asset: Option<(&str, &'static [u8])> = match path {
+            "/ui/kit/ui.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/kit/ui.js"),
+            )),
+            "/ui/kit/i18n.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/kit/i18n.js"),
+            )),
+            "/ui/kit/kit.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/kit/kit.css"),
+            )),
+            "/ui/zt/shell.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/shell.js"),
+            )),
+            "/ui/zt/overview.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/overview.js"),
+            )),
+            "/ui/zt/access.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/access.js"),
+            )),
+            "/ui/zt/audit.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/audit.js"),
+            )),
+            "/ui/zt/entities.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/entities.js"),
+            )),
+            "/ui/zt/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/en.json"),
+            )),
+            "/ui/zt/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/ko.json"),
+            )),
             "/ui/lua-editor.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/lua-editor.js"),
@@ -226,6 +266,16 @@ mod tests {
             "/ui/locales/ko-operations.js",
             "/ui/docker.js",
             "/ui/locales/ko-docker.js",
+            "/ui/kit/ui.js",
+            "/ui/kit/i18n.js",
+            "/ui/kit/kit.css",
+            "/ui/zt/shell.js",
+            "/ui/zt/overview.js",
+            "/ui/zt/access.js",
+            "/ui/zt/audit.js",
+            "/ui/zt/entities.js",
+            "/ui/zt/messages/en.json",
+            "/ui/zt/messages/ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);

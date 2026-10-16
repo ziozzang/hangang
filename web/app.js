@@ -5,6 +5,7 @@ import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
 import { loadOperations, pauseObserver, refreshOperationsCopy, resetOperations } from './operations.js';
 import { loadDockerPanel, refreshDockerCopy, resetDockerPanel } from './docker.js';
 import { createLuaEditor } from './lua-editor.js';
+import { ztView, loadZeroTrust, pauseZeroTrust, resetZeroTrust, canonicalHash, prepareZeroTrust } from './zt/shell.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const luaFields = [
@@ -455,6 +456,7 @@ function scrubRenderedData() {
 function logout(reason = '') {
   resetPlugins();
   resetPumgye();
+  resetZeroTrust();
   stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
@@ -593,8 +595,8 @@ async function login(event) {
 
 const pumgyeDestinations = Object.freeze({ services: 'pumgye-service-form', resources: 'pumgye-resources-panel', policy: 'pumgye-policy-panel' });
 function normalizeView(hash) {
-  const name = (hash || '').replace(/^#/, '').split('/')[0];
-  if (pluginView(name)) return name;
+  const name = (hash || '').replace(/^#/, '').split(/[/?]/)[0];
+  if (pluginView(name) || ztView(name)) return name;
   return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
 }
 let navigationGeneration = 0;
@@ -610,10 +612,11 @@ async function switchView() {
   const section = name === 'pumgye' && requested.length === 2 && Object.hasOwn(pumgyeDestinations, requested[1]) ? requested[1] : '';
   // Preserve a signed-out deep link until installed capabilities are discovered.
   if (state.token) {
-    const canonical = '#' + name + (section ? '/' + section : '');
+    const canonical = ztView(name) ? (canonicalHash(location.hash) || '#' + name) : '#' + name + (section ? '/' + section : '');
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
   }
   pausePlugins();
+  if (!ztView(name)) pauseZeroTrust();
   state.view = name;
   if (name !== 'lua') state.luaPolicySequence++;
   if (name !== 'operations') pauseObserver();
@@ -645,6 +648,7 @@ async function switchView() {
 async function loadView(name, quiet = false) {
   try {
     if (pluginView(name) && isAdmin()) await loadPlugin(name);
+    if (ztView(name) && isAdmin()) await loadZeroTrust(name, { api });
     if (name === 'status') await loadStatus();
     if (name === 'lua' && isAdmin()) await loadLuaPolicies();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);
@@ -6538,6 +6542,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', () => { stopBackendFreshness(); state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
+prepareZeroTrust();
 ensureGeoIpPanel();
 state.view = normalizeView(location.hash);
 if (!location.hash) history.replaceState(null, '', '#status');
