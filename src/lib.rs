@@ -27,6 +27,7 @@ pub mod path_failure_bans;
 pub mod path_rate_limits;
 pub mod policy;
 pub mod pool_member;
+pub mod private_file;
 pub mod proxy;
 pub mod public_http;
 pub mod public_listener_config;

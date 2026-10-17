@@ -1,5 +1,7 @@
 //! Serve the current native console and trusted extensions over an existing
 //! Hangang admin authority. The authority still owns accounts/configuration.
+#[path = "../console_operator_audit.rs"]
+mod operator_audit;
 #[path = "../console_sso.rs"]
 mod sso;
 use anyhow::{Result, ensure};
@@ -32,10 +34,31 @@ struct Args {
     listen: SocketAddr,
     #[arg(long)]
     upstream: String,
+    /// Trust only this private CA (PEM) for an HTTPS --upstream, e.g. the
+    /// gateway admin API on loopback over TLS; re-read when it changes.
+    #[arg(long)]
+    upstream_ca: Option<PathBuf>,
     #[arg(long)]
     plugins: PathBuf,
     #[arg(long)]
     hopae_sso: Option<PathBuf>,
+    /// Refuse the break-glass local administrator login (and local
+    /// sessions); only Hopae console SSO remains. Requires --hopae-sso.
+    #[arg(long)]
+    disable_local_login: bool,
+    /// Also append console operator audit records (JSON lines) here.
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+    /// The console operator audit store (SQLite, created 0600); in memory
+    /// when absent. Administrators read it at /v1/console/operator-audit.
+    #[arg(long)]
+    operator_audit_db: Option<PathBuf>,
+    /// Records the operator audit store keeps (100 to 1000000).
+    #[arg(long, default_value_t = operator_audit::DEFAULT_MAX_RECORDS)]
+    operator_audit_max_records: i64,
+    /// Days the operator audit store keeps a record (1 to 3650).
+    #[arg(long, default_value_t = operator_audit::DEFAULT_RETENTION_DAYS)]
+    operator_audit_retention_days: i64,
     #[arg(long)]
     allow_insecure_public: bool,
     #[arg(long)]
@@ -43,13 +66,109 @@ struct Args {
 }
 struct State {
     sso: Option<sso::Sso>,
+    local_login: bool,
+    audit: Audit,
     origin: reqwest::Url,
-    client: reqwest::Client,
+    client: arc_swap::ArcSwap<reqwest::Client>,
     plugins: Registry,
     requests: Arc<Semaphore>,
     public: Arc<Semaphore>,
     login: Arc<Semaphore>,
     streams: Arc<Semaphore>,
+}
+/// Console operator audit records: SSO sign-in with the operator's
+/// assurance, step-up refusals, changes, and every break-glass local sign-in
+/// and local-session change. Kept in the bounded store (read through the
+/// admin API) and, optionally, appended to a JSON-lines file.
+struct Audit {
+    store: operator_audit::Store,
+    file: Option<std::sync::Mutex<std::fs::File>>,
+}
+impl Audit {
+    fn open(path: Option<&std::path::Path>, store: operator_audit::Store) -> Result<Self> {
+        let file = match path {
+            None => None,
+            Some(p) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                Some(std::sync::Mutex::new(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(p)?,
+                ))
+            }
+        };
+        Ok(Self { store, file })
+    }
+    fn record(&self, value: serde_json::Value) {
+        use std::io::Write;
+        let line = match self.store.record(value.clone()) {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("console operator audit store failed: {e}");
+                value.to_string()
+            }
+        };
+        if let Some(f) = &self.file {
+            let _ = f
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write_all(format!("{line}\n").as_bytes());
+        }
+    }
+}
+impl State {
+    /// The upstream client (rebuilt when the --upstream-ca file changes).
+    fn client(&self) -> reqwest::Client {
+        (**self.client.load()).clone()
+    }
+}
+/// The upstream client: no proxy, no redirects, bounded timeouts; with a
+/// private CA, only that CA is trusted.
+fn upstream_client(ca: Option<&[u8]>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .read_timeout(Duration::from_secs(20));
+    if let Some(pem) = ca {
+        let roots = reqwest::Certificate::from_pem_bundle(pem)?;
+        ensure!(
+            !roots.is_empty() && roots.len() <= 16,
+            "upstream CA must hold 1 to 16 certificates"
+        );
+        builder = builder.tls_built_in_root_certs(false);
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+    }
+    Ok(builder.build()?)
+}
+/// The CA file: a regular file (symlinks allowed: public material, such as a
+/// Kubernetes Secret volume), at most 64 KiB.
+fn read_ca(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "upstream CA must be a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "upstream CA too large");
+    Ok(bytes)
+}
+fn step_up_response(e: &sso::StepUp) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body(
+            serde_json::json!({"error":e.code,"step_up_url":e.step_up_url}).to_string(),
+        ))
+        .unwrap()
 }
 fn body(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into())
@@ -79,7 +198,7 @@ fn bearer(req: &Request<Incoming>) -> Option<reqwest::header::HeaderValue> {
 }
 async fn actor(state: &State, authorization: &reqwest::header::HeaderValue) -> Result<User> {
     let mut response = state
-        .client
+        .client()
         .get(state.origin.join("v1/auth/me")?)
         .header(header::AUTHORIZATION, authorization.clone())
         .timeout(Duration::from_secs(3))
@@ -167,6 +286,35 @@ async fn handle(
             .body(body(""))
             .unwrap());
     }
+    // The step-up landing (Hopae ADR-0021): reaching it through the gateway
+    // means Hopae's step-up rule passed; go back inside the console.
+    if let Some(policy) = state.sso.as_ref().and_then(|s| s.policy())
+        && req.method() == hyper::Method::GET
+        && req.uri().path() == policy.step_up_path
+    {
+        let back = req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("return=")))
+            .map(percent_decode)
+            .filter(|b| b.starts_with("/ui/") && !b.contains("//") && !b.contains('\\'))
+            .unwrap_or_else(|| "/ui/".into());
+        // The step-up rotated the Hopae handle: the console signs in again
+        // (`sso=hopae`) and returns to the view.
+        let (path, fragment) = back.split_once('#').unwrap_or((back.as_str(), ""));
+        let path = path.split('?').next().unwrap_or("/ui/");
+        let back = if fragment.is_empty() {
+            format!("{path}?sso=hopae")
+        } else {
+            format!("{path}?sso=hopae#{fragment}")
+        };
+        return Ok(Response::builder()
+            .status(303)
+            .header(header::LOCATION, back)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(body(""))
+            .unwrap());
+    }
     if let Some(response) = state
         .plugins
         .asset(&req)
@@ -176,6 +324,44 @@ async fn handle(
     }
     if req.uri().path() == "/v1/auth/sso-lease" {
         return Ok(error(StatusCode::NOT_FOUND, "unknown console endpoint"));
+    }
+    let req_ip = req
+        .extensions()
+        .get::<hangang::admin_plugins::ClientContext>()
+        .map(|c| c.ip.to_string())
+        .unwrap_or_default();
+    // The break-glass local administrator sign-in: audited, and refused when
+    // disabled.
+    if req.uri().path() == "/v1/auth/login" && !state.local_login {
+        state.audit.record(serde_json::json!({"event":"console.break_glass_login","outcome":"disabled","client_ip":req_ip}));
+        return Ok(error(StatusCode::FORBIDDEN, "local_login_disabled"));
+    }
+    // The operator's session and assurance, for the console header.
+    if req.uri().path() == "/v1/auth/sso/session" && req.method() == hyper::Method::GET {
+        let token = bearer(&req).and_then(|v| v.to_str().ok().map(str::to_owned));
+        let info = match (
+            token.as_deref().and_then(|t| t.strip_prefix("Bearer ")),
+            &state.sso,
+        ) {
+            (Some(t), Some(sso)) if t.starts_with("hsso_") => match sso.session_info(t) {
+                Some((account, assurance)) => serde_json::json!({
+                    "method": "hopae",
+                    "account": account,
+                    "assurance": assurance,
+                    "policy": sso.policy().map(|p| serde_json::json!({"minimum_aal": p.minimum_aal, "require_factor": if p.require_webauthn {"webauthn"} else {"any"}, "sensitive_max_age_seconds": p.max_age, "step_up_url": p.step_up_url("/ui/")})),
+                }),
+                None => return Ok(error(StatusCode::UNAUTHORIZED, "SSO session expired")),
+            },
+            (Some(_), _) => {
+                serde_json::json!({"method":"local","break_glass": state.sso.is_some(), "local_login": state.local_login})
+            }
+            (None, _) => return Ok(error(StatusCode::UNAUTHORIZED, "identity required")),
+        };
+        return Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(body(info.to_string()))
+            .unwrap());
     }
     if matches!(
         req.uri().path(),
@@ -218,23 +404,39 @@ async fn handle(
                     "SSO body must be empty object",
                 ));
             }
-            sso.exchange(&headers, &context, &state.client, &state.origin)
+            sso.exchange(&headers, &context, &state.client(), &state.origin)
                 .await
         } else {
             return Ok(error(StatusCode::METHOD_NOT_ALLOWED, "invalid SSO method"));
         };
+        let ip = req_ip.clone();
         return Ok(match result {
-            Ok(value) => Response::builder()
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(body(value.to_string()))
-                .unwrap(),
-            Err(_) => error(
-                StatusCode::UNAUTHORIZED,
-                "SSO login or account mapping unavailable",
-            ),
+            Ok(value) => {
+                if value.get("token").is_some() {
+                    state.audit.record(serde_json::json!({"event":"console.sso_login","outcome":"success","account":value["user"]["username"],"assurance":value["assurance"],"client_ip":ip}));
+                }
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(body(value.to_string()))
+                    .unwrap()
+            }
+            Err(e) => match e.downcast_ref::<sso::StepUp>() {
+                Some(step) => {
+                    state.audit.record(serde_json::json!({"event":"console.sso_login","outcome":"step_up_required","reason":step.code,"client_ip":ip}));
+                    step_up_response(step)
+                }
+                None => {
+                    state.audit.record(serde_json::json!({"event":"console.sso_login","outcome":"refused","client_ip":ip}));
+                    error(
+                        StatusCode::UNAUTHORIZED,
+                        "SSO login or account mapping unavailable",
+                    )
+                }
+            },
         });
     }
+    let mut sso_session = false;
     if let Some(token) = bearer(&req).and_then(|v| {
         v.to_str()
             .ok()
@@ -249,17 +451,37 @@ async fn handle(
             .get::<hangang::admin_plugins::ClientContext>()
             .unwrap();
         let authorization = match sso
-            .authorization(&token, req.headers(), context, &state.client, &state.origin)
+            .authorization(
+                &token,
+                req.headers(),
+                context,
+                &state.client(),
+                &state.origin,
+                req.method(),
+                req.uri().path(),
+            )
             .await
         {
             Ok(v) => v,
-            Err(_) => return Ok(error(StatusCode::UNAUTHORIZED, "SSO session rejected")),
+            Err(e) => {
+                if let Some(step) = e.downcast_ref::<sso::StepUp>() {
+                    state.audit.record(serde_json::json!({"event":"console.step_up_required","reason":step.code,"method":req.method().as_str(),"path":req.uri().path(),"client_ip":req_ip}));
+                    return Ok(step_up_response(step));
+                }
+                return Ok(error(StatusCode::UNAUTHORIZED, "SSO session rejected"));
+            }
         };
+        if sso::OperatorPolicy::is_mutation(req.method(), req.uri().path())
+            && let Some((account, assurance)) = sso.session_info(&token)
+        {
+            state.audit.record(serde_json::json!({"event":"console.change","method":req.method().as_str(),"path":req.uri().path(),"account":account,"aal":assurance.as_ref().map(|a| a.aal),"factor":assurance.as_ref().and_then(|a| a.factor.clone()),"client_ip":req_ip}));
+        }
         if req.uri().path() == "/v1/auth/logout" && req.method() == hyper::Method::POST {
             sso.logout(&token);
         }
         req.headers_mut()
             .insert(header::AUTHORIZATION, authorization);
+        sso_session = true;
     }
     if req.uri().path() == "/v1/plugins" || req.uri().path().starts_with("/v1/plugins/") {
         let Some(authorization) = bearer(&req) else {
@@ -279,7 +501,7 @@ async fn handle(
             }
         };
         let authority = Authority::Remote {
-            client: state.client.clone(),
+            client: state.client(),
             endpoint: state.origin.join("v1/auth/me").unwrap(),
             authorization,
             actor_id: user.id,
@@ -304,8 +526,46 @@ async fn handle(
         let Some(authorization) = bearer(&req) else {
             return Ok(error(StatusCode::UNAUTHORIZED, "identity required"));
         };
-        if actor(&state, &authorization).await.is_err() {
-            return Ok(error(StatusCode::UNAUTHORIZED, "identity unavailable"));
+        let user = match actor(&state, &authorization).await {
+            Ok(u) => u,
+            Err(_) => return Ok(error(StatusCode::UNAUTHORIZED, "identity unavailable")),
+        };
+        // A local (non-SSO) session is the break-glass path when SSO is configured.
+        let local = !authorization.as_bytes().starts_with(b"Bearer hsso_") && !sso_session;
+        if local && state.sso.is_some() {
+            if !state.local_login {
+                return Ok(error(StatusCode::UNAUTHORIZED, "local_sessions_disabled"));
+            }
+            if sso::OperatorPolicy::is_mutation(req.method(), req.uri().path()) {
+                state.audit.record(serde_json::json!({"event":"console.break_glass_change","method":req.method().as_str(),"path":req.uri().path(),"account":user.username,"client_ip":req_ip}));
+            }
+        }
+        // The console operator audit (the unified audit view's source):
+        // administrators only, read-only.
+        if req.uri().path() == "/v1/console/operator-audit" {
+            if req.method() != hyper::Method::GET {
+                return Ok(error(StatusCode::METHOD_NOT_ALLOWED, "read-only endpoint"));
+            }
+            if user.role != Role::Admin {
+                return Ok(error(StatusCode::FORBIDDEN, "administrator role required"));
+            }
+            let Ok((before, limit)) = operator_audit::query(req.uri().query()) else {
+                return Ok(error(StatusCode::BAD_REQUEST, "invalid audit query"));
+            };
+            return Ok(match state.audit.store.list(before, limit) {
+                Ok((records, next)) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(body(
+                        serde_json::json!({"records": records, "next_before": next}).to_string(),
+                    ))
+                    .unwrap(),
+                Err(_) => error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "operator audit unavailable",
+                ),
+            });
         }
     }
     let path = req.uri().path_and_query().unwrap().as_str().to_owned();
@@ -324,6 +584,14 @@ async fn handle(
             ));
         }
     };
+    let login_account = (path == "/v1/auth/login")
+        .then(|| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .flatten()
+        .and_then(|v| {
+            v["username"]
+                .as_str()
+                .map(|u| u.chars().take(64).collect::<String>())
+        });
     // Build the fixed upstream origin ourselves; URI joins must never replace its authority.
     let mut target = state.origin.clone();
     let (path, query) = path
@@ -331,7 +599,7 @@ async fn handle(
         .map_or((path.as_str(), None), |(p, q)| (p, Some(q)));
     target.set_path(path);
     target.set_query(query);
-    let mut request = state.client.request(parts.method, target).body(bytes);
+    let mut request = state.client().request(parts.method, target).body(bytes);
     for name in [
         header::AUTHORIZATION,
         header::CONTENT_TYPE,
@@ -356,6 +624,20 @@ async fn handle(
             ));
         }
     };
+    // The break-glass local sign-in's result (the attempt is audited either way).
+    if path == "/v1/auth/login" {
+        let outcome = if response.status().is_success() {
+            "success"
+        } else {
+            "refused"
+        };
+        let event = if state.sso.is_some() {
+            "console.break_glass_login"
+        } else {
+            "console.local_login"
+        };
+        state.audit.record(serde_json::json!({"event":event,"outcome":outcome,"status":response.status().as_u16(),"account":login_account,"client_ip":req_ip}));
+    }
     let mut builder = Response::builder().status(response.status());
     for name in [
         header::CONTENT_TYPE,
@@ -415,27 +697,71 @@ async fn main() -> Result<()> {
         origin.scheme() == "https" || (origin.scheme() == "http" && local),
         "upstream requires HTTPS or literal loopback HTTP"
     );
+    ensure!(
+        args.upstream_ca.is_none() || origin.scheme() == "https",
+        "--upstream-ca requires an HTTPS upstream"
+    );
+    let upstream_ca = args.upstream_ca.as_deref().map(read_ca).transpose()?;
+    upstream_client(upstream_ca.as_deref())?;
     let plugins = Registry::load(&args.plugins)?;
     let sso = args.hopae_sso.as_deref().map(sso::Sso::load).transpose()?;
+    ensure!(
+        !args.disable_local_login || sso.is_some(),
+        "--disable-local-login requires --hopae-sso"
+    );
+    let audit = Audit::open(
+        args.audit_log.as_deref(),
+        operator_audit::Store::open(
+            args.operator_audit_db.as_deref(),
+            args.operator_audit_max_records,
+            args.operator_audit_retention_days,
+        )?,
+    )?;
     if args.check {
         println!("console plugin configuration is valid");
         return Ok(());
     }
     let state = Arc::new(State {
         sso,
+        local_login: !args.disable_local_login,
+        audit,
         origin,
         plugins,
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(3))
-            .read_timeout(Duration::from_secs(20))
-            .build()?,
+        client: arc_swap::ArcSwap::from_pointee(upstream_client(upstream_ca.as_deref())?),
         requests: Arc::new(Semaphore::new(40)),
         public: Arc::new(Semaphore::new(16)),
         login: Arc::new(Semaphore::new(8)),
         streams: Arc::new(Semaphore::new(8)),
     });
+    if let Some(path) = args.upstream_ca.clone() {
+        // Re-read the CA (a renewed Secret or file) and swap the client when
+        // it changes; a broken file keeps the current trust.
+        let state = state.clone();
+        let mut current = upstream_ca.clone().unwrap_or_default();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let result = read_ca(&path).and_then(|ca| {
+                    if ca == current {
+                        return Ok(None);
+                    }
+                    Ok(Some((upstream_client(Some(&ca))?, ca)))
+                });
+                match result {
+                    Ok(Some((client, ca))) => {
+                        state.client.store(Arc::new(client));
+                        current = ca;
+                        eprintln!("upstream CA reloaded");
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("upstream CA reload failed; keeping the current trust: {e}")
+                    }
+                }
+            }
+        });
+    }
     let listener = TcpListener::bind(args.listen).await?;
     let connections = Arc::new(Semaphore::new(128));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -452,4 +778,24 @@ async fn main() -> Result<()> {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(if b[i] == b'+' { b' ' } else { b[i] });
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| "/ui/".into())
 }

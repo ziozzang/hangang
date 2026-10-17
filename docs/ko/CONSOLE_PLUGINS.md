@@ -18,6 +18,14 @@ Hangang의 --admin-plugins /private/console-plugins.json 또는 기존 네이티
 필요합니다. 인증된 TLS 게이트웨이와 직접 접근 제한으로 보호하고 생성된 forwarding
 context는 로컬 relay만 제공하도록 합니다.
 
+권위의 관리자 리스너를 TLS 전용(`--admin-tls-cert`/`--admin-tls-key`)으로 두려면 어댑터가
+HTTPS로 연결하고 비공개 CA를 신뢰하게 합니다:
+`--upstream https://127.0.0.1:49000 --upstream-ca /private/admin-ca.pem`.
+`--upstream-ca`를 주면 그 CA(PEM 인증서 1–16개, 최대 64 KiB)만 신뢰하며, 권위의 인증서는
+upstream 호스트를 이름으로 가져야 합니다(`127.0.0.1`이면 IP SAN). 파일은 10초마다 다시 읽어
+새 연결부터 적용하고, 깨진 파일이면 현재 신뢰를 유지합니다. `--upstream-ca`에는 HTTPS
+upstream이 필요합니다. 검증: `tests/console_upstream_tls_smoke.py`.
+
 설정 예제의 pin은 실제 검토한 manifest digest로 교체합니다.
 
 ```json
@@ -38,7 +46,8 @@ context는 로컬 relay만 제공하도록 합니다.
 각 컴포넌트의 tools/build_console_plugin.py로 패키지를 만들고 manifest.json 해시를
 고정합니다. 파일은 group/world 쓰기를 허용하지 않습니다. 제한된 manifest·assets를
 해시 검증 후 불변 startup registry에 복사합니다. 수정은 새 pin으로 검증된 reload/restart
-후 적용합니다. --check는 콘솔 시작 없이 검사합니다. registry·감사 저장소는 비공개입니다.
+후 적용합니다. --check는 콘솔 시작 없이 검사합니다. registry·감사 저장소는 비공개입니다. registry 파일(`--plugins`, `--admin-plugins`)도 아래 SSO
+설정과 같은 파일 규칙(프로세스 전용 또는 Kubernetes 볼륨 파일)을 따릅니다.
 
 GET /v1/plugins는 이름·entry만 공개하며 backend origin·자격을 공개하지 않습니다.
 GET /ui/plugins/<id>/<asset>는 pin한 목록만 제공합니다. 활성 관리자만 manifest의
@@ -172,7 +181,12 @@ grant·세션·신선도·assurance를 유지합니다. 통합 패키지는 별�
 숨깁니다. 콘솔 권위는 Hangang, provider 자격·신원·세션은 Hopae 소유입니다.
 
 --hopae-sso /private/console-sso.json으로 계정 로그인 아래 SSO 로그인 버튼을 추가합니다.
-설정은 비공개 regular file(0600)입니다.
+설정은 비공개 regular file입니다. 콘솔 사용자 소유이고 그룹·기타 권한이 없거나(0600,
+0400), `fsGroup`을 쓰는 Kubernetes ConfigMap·Secret 볼륨처럼 root 소유이고 프로세스
+그룹 중 하나에 속하며 쓰기·기타 권한이 없어야 합니다(0440, 0400). 누구나 읽거나 쓸 수 있는
+파일은 거부합니다. 심볼릭 링크는 Kubernetes atomic writer 구조(`sso.json` ->
+`..data/sso.json`, `..data` -> 같은 디렉터리의 `..<version>` 디렉터리)에서만 받고 그 밖의
+링크는 거부합니다.
 
 ```json
 {
@@ -208,6 +222,70 @@ fallback하지 않습니다. 연결은 Hopae 300초보다 빠른 240초에 회�
 선택적 콘솔 SSO 설정의 native_tls도 같은 server_name·ca·certificate·key를 지원합니다.
 공유 native client·고정 native_address를 사용하고 명시적 Hopae→Hangang 계정 매핑과
 세션/lease 검사를 유지합니다. 원격은 mTLS이며 이전 과정의 loopback 평문은 지원합니다.
+
+## 운영자 보증(패스키)과 비상 접근
+
+호패의 `console_operators` 정책(호패 ADR-0021)을 쓰면 콘솔은 운영자가 피싱에 강한
+인증 요소로 로그인했는지 요구할 수 있습니다. SSO 설정에 `operator_policy`를 추가하고,
+호패 운영자 단언 공개 키(`console_operators.assertion_public_key`)를 그 키 ID
+(`console_operators.assertion_key_id`)로 고정합니다.
+
+```json
+"operator_policy": {
+  "assertion_public_keys": { "op-2026-10": "<base64 Ed25519 공개 키>" },
+  "minimum_aal": 2,
+  "require_factor": "webauthn",
+  "accept_enrollment_grace": false,
+  "sensitive_max_age_seconds": 300,
+  "step_up_path": "/ui/step-up"
+}
+```
+
+- 모든 SSO 요청(교환과 이후 각 요청)에는 호패가 전용 Ed25519 키로 서명한 운영자
+  단언(`x-hopae-operator-assertion`)이 필요합니다. 콘솔은 공개 키만 가지며, 단언의
+  `kid`가 고정된 키를 가리켜야 합니다. 없거나 위조되었거나 만료되었거나 다른
+  사용자·호스트의 단언, 또는 고정되지 않은 키의 단언이면 요청을 거부합니다.
+- **키 교체.** 현재 키 옆에 다음 키를 고정하고(최대 두 개), 호패를 다음 시드·키 ID·공개
+  키로 바꾼 뒤, 이전 키 고정을 지웁니다.
+- **로그인과 읽기**에는 단언의 정책 충족(`satisfied`), `minimum_aal`(1–3) 이상, 그리고
+  `require_factor: webauthn`이면 패스키가 필요합니다. `accept_enrollment_grace`를 켜면
+  호패의 등록 유예로 들어온 운영자도 로그인과 읽기는 할 수 있지만 변경은 할 수 없습니다.
+- **모든 변경**에는 유예 없는 정책 충족이 필요합니다. **민감한 변경**(경로에
+  `/publish`, `/activate`, `/factors/reset`, `/bulk-disable`가 있거나 `/v1/admin-users`,
+  `/v1/users`, `/v1/config`, `/v1/plugins`, `/v1/audit/policy` 아래. `sensitive_paths`로
+  목록을 바꿀 수 있음)에는 `sensitive_max_age_seconds`(30–3600) 안에 사용한 인증 요소도
+  필요합니다.
+- 거부는 `403`과 `operator_step_up_required` 또는 `operator_reauthentication_required`,
+  그리고 `step_up_url`로 답합니다. 콘솔 UI는 그곳으로 이동하고, 콘솔 호스트의
+  게이트웨이 라우트(`/_hopae/login`처럼 호패가 보호)가 `step_up_path`에서 호패의 패스키
+  단계 상승을 실행한 뒤, 콘솔은 원래 화면(`/ui/?sso=hopae`, `/ui/` 안으로만)으로 돌아가
+  바뀐 호패 세션으로 다시 로그인합니다. 호패가 직접 단계 상승을 요구하면
+  (`x-hopae-reason: step_up_required`) 같은 방식으로 답합니다.
+- 헤더는 운영자의 수준과 인증 요소(`AAL2 · 패스키`)를, 로컬 관리자 세션이면
+  **비상 접근(로컬)**을 보여 줍니다. `GET /v1/auth/sso/session`도 같은 정보를 돌려줍니다.
+
+**비상 접근.** 로컬 관리자 로그인(`/v1/auth/login`)은 비상 경로로 남습니다.
+`--disable-local-login`(`--hopae-sso` 필요)은 이것과 모든 로컬 세션을 거부합니다.
+
+**콘솔 운영자 감사.** 기록: `console.sso_login`(보증 정보 또는 거부),
+`console.step_up_required`, `console.change`(수준과 인증 요소가 있는 SSO 변경),
+`console.break_glass_login`(`success`, `refused`, `disabled`와 계정),
+`console.break_glass_change`, `console.local_login`(콘솔 SSO가 없을 때의 로컬 로그인).
+콘솔은 이를 권위의 계정 감사와 분리된 자체 한정 저장소에 둡니다.
+`--operator-audit-max-records`(기본 10000, 100–1000000)개까지,
+`--operator-audit-retention-days`(기본 90, 1–3650)일보다 오래되지 않은 기록만 남기는
+링이며 기록할 때마다 정리합니다. `--operator-audit-db <path>`는 SQLite 파일(0600으로 생성,
+심볼릭 링크는 따르지 않음)에 저장하고, 없으면 메모리에 두어 재시작하면 사라집니다.
+관리자는 `GET /v1/console/operator-audit?limit=&before=`(최신순, `limit` 1–500, 기본
+100, `before`는 이전 페이지의 `next_before` 커서)로 읽고, 통합 감사 화면은 이를 **콘솔
+운영자** 출처로 보여 줍니다(콘솔에 이 엔드포인트가 없으면 연결 안 됨).
+`--audit-log <path>`(JSON 줄, 0600)는 선택적인 추가 기록처입니다.
+
+검증: `tests/console_operator_aal_smoke.py`(실제 권위와 콘솔, Ed25519 서명 단언
+픽스처, 운영자 감사 API), `web/tests/operator_assurance.spec.js`(헤더 배지, 단계 상승
+이동, 비상 접근 표시)와 호패의
+브라우저 검증(`tools/browser-qual/run-operator.sh`: 실제 호패, 실제 한강 권위와 콘솔,
+가상 인증기를 쓰는 Chrome).
 
 ## 백엔드 mTLS
 

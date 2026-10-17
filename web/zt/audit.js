@@ -2,9 +2,13 @@
 // own journals. Each source keeps its ownership; a failed source is labelled
 // and never shown as "no activity"; a source whose operation is not installed
 // is shown as not connected.
-const SOURCES = Object.freeze(['accounts', 'plugins', 'pumgye', 'hopae', 'sumunjang']);
+const SOURCES = Object.freeze(['accounts', 'console', 'plugins', 'pumgye', 'hopae', 'sumunjang']);
 const OUTCOMES = Object.freeze(['committed', 'refused', 'uncertain']);
 const PLUGIN_LABELS = Object.freeze({ hopae: 'ui.owner.hopae', guard: 'ui.owner.sumunjang' });
+// Console operator audit events (hangang-console, docs/CONSOLE_PLUGINS.md) and
+// the outcome each stated result means.
+const CONSOLE_EVENTS = Object.freeze(['console.sso_login', 'console.step_up_required', 'console.change', 'console.break_glass_login', 'console.break_glass_change', 'console.local_login']);
+const CONSOLE_REFUSED = Object.freeze(['step_up_required', 'refused', 'disabled']);
 const HOPAE_KINDS = Object.freeze(['admin.user_disable', 'admin.user_enable', 'admin.session_terminate', 'admin.sessions_terminate', 'admin.grant', 'admin.revoke', 'admin.denied']);
 
 function outcomeFromStatus(status) {
@@ -35,8 +39,8 @@ export async function loadAuditRecords(cx) {
   const { t } = cx;
   const failures = [], disconnected = [];
   const records = [];
-  const [accounts, users, plugins, pumgye, hopae, sumunjang] = await Promise.all([
-    settle(cx, '/v1/audit/users?limit=100'), settle(cx, '/v1/users'), settle(cx, '/v1/plugins/audit'), settle(cx, '/v1/pumgye/audit'),
+  const [accounts, users, operators, plugins, pumgye, hopae, sumunjang] = await Promise.all([
+    settle(cx, '/v1/audit/users?limit=100'), settle(cx, '/v1/users'), settle(cx, '/v1/console/operator-audit?limit=200'), settle(cx, '/v1/plugins/audit'), settle(cx, '/v1/pumgye/audit'),
     settle(cx, '/v1/plugins/hopae/events/query', { method: 'POST', json: { limit: 200 } }),
     settle(cx, '/v1/plugins/guard/audit/query', { method: 'POST', json: { limit: 200 } }),
   ]);
@@ -54,6 +58,28 @@ export async function loadAuditRecords(cx) {
       records.push({ id: `accounts:${record.id}`, source: 'accounts', time: new Date(record.time_unix_ms), actor: record.actor_user_id ? account(record.actor_user_id) : t(`audit.actor.${record.actor_kind || 'unknown'}`), action: `account.${record.action}`, target: target ? { type: 'account', id: target } : null, outcome: 'committed', summary, before: record.before, after: record.after, operation: String(record.id) });
     }
   } else failures.push('accounts');
+  // Console operator audit: SSO sign-ins with the assurance, step-ups,
+  // changes and break-glass local sign-ins (the console's bounded store).
+  if (operators.ok && Array.isArray(operators.data?.records)) {
+    for (const record of operators.data.records) {
+      if (!record || !CONSOLE_EVENTS.includes(record.event) || !Number.isFinite(record.id)) continue;
+      const event = record.event.slice('console.'.length);
+      const refused = record.event === 'console.step_up_required' || CONSOLE_REFUSED.includes(record.outcome);
+      const assurance = record.assurance && typeof record.assurance === 'object' ? record.assurance : null;
+      const aal = assurance?.aal ?? record.aal;
+      const factor = assurance?.factor ?? record.factor;
+      const level = Number.isFinite(aal) ? t('audit.console.assurance', { aal, factor: factor || '—' }) : '—';
+      const endpoint = typeof record.path === 'string' ? `${record.method || ''} ${record.path}`.trim() : null;
+      const breakGlass = record.event.startsWith('console.break_glass');
+      const summaryKey = record.outcome && ['sso_login', 'break_glass_login', 'local_login'].includes(event) ? `audit.summary.console.${event}.${record.outcome}` : `audit.summary.console.${event}`;
+      records.push({ id: `console:${record.id}`, source: 'console', time: new Date(Number(record.time_unix_ms)), actor: typeof record.account === 'string' && record.account ? record.account : t('audit.actor.unknown'), action: record.event,
+        target: endpoint ? { type: 'endpoint', id: endpoint } : null, outcome: refused ? 'refused' : 'committed',
+        summary: t(summaryKey, { endpoint: endpoint ?? '—', assurance: level, reason: record.reason ?? '—' }),
+        facts: [['audit.console.assurance_label', level === '—' ? null : level], ['audit.console.break_glass', breakGlass ? t('audit.console.break_glass_yes') : null], ['audit.reason', record.reason], ['audit.console.client_ip', record.client_ip || null]].filter(([, value]) => value !== null && value !== undefined && value !== ''),
+        operation: String(record.id) });
+    }
+  } else if (operators.missing) disconnected.push('console');
+  else failures.push('console');
   if (plugins.ok) {
     for (const operation of plugins.data?.operations || []) {
       const label = t(PLUGIN_LABELS[operation.plugin] || 'ui.owner.host');

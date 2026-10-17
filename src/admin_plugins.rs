@@ -301,7 +301,18 @@ fn problem(status: StatusCode, detail: &str) -> Response<Body> {
 }
 impl Registry {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Configuration = serde_json::from_slice(&bounded_file(path, 64 * 1024)?)?;
+        let config: Configuration = serde_json::from_slice(&{
+            let mut bytes = Vec::new();
+            crate::private_file::open_private_config(path, 64 * 1024)
+                .context("console plugin configuration must be a private bounded regular file")?
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= 64 * 1024,
+                "console plugin configuration too large"
+            );
+            bytes
+        })?;
         ensure!(config.plugins.len() <= 8, "too many console plugins");
         let mut plugins = BTreeMap::new();
         for binding in config.plugins {
@@ -948,6 +959,10 @@ mod tests {
         let config = root.join("plugins.json");
         let m = fs::read(root.join("manifest.json")).unwrap();
         fs::write(&config,serde_json::to_vec(&json!({"plugins":[{"id":"guard","directory":root,"manifest_sha256":sha(&m),"backend":"http://127.0.0.1:9080","token_env":"HOME"}]})).unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1190,6 +1205,34 @@ mod tests {
         backend_task.abort();
     }
     #[test]
+    fn the_registry_configuration_is_a_private_file_or_a_kubernetes_volume_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plugins.json");
+        fs::write(&plain, br#"{"plugins":[]}"#).unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Registry::load(&plain).is_err(), "world-readable");
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Registry::load(&plain).is_ok());
+        let vol = dir.path().join("vol");
+        let version = vol.join("..2026_10_17_10_00_00.1");
+        fs::create_dir_all(&version).unwrap();
+        fs::write(version.join("plugins.json"), br#"{"plugins":[]}"#).unwrap();
+        fs::set_permissions(
+            version.join("plugins.json"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        symlink("..2026_10_17_10_00_00.1", vol.join("..data")).unwrap();
+        symlink("..data/plugins.json", vol.join("plugins.json")).unwrap();
+        assert!(Registry::load(&vol.join("plugins.json")).is_ok());
+        symlink(&plain, vol.join("escape.json")).unwrap();
+        assert!(
+            Registry::load(&vol.join("escape.json")).is_err(),
+            "a link out of the volume"
+        );
+    }
+    #[test]
     fn mutual_tls_requires_https_matching_dns_and_absolute_paths() {
         let (_dir, path) = package();
         let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1412,6 +1455,10 @@ mod tests {
         fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":id,"directory":root,"manifest_sha256":sha(&manifest),"backend":format!("http://{backend}"),"token_env":"PATH","delegate_actor":true,"delegation_authority":"hangang"}]})).unwrap()).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
             for file in fs::read_dir(root).unwrap() {
                 fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o600))
                     .unwrap();
@@ -1600,6 +1647,10 @@ mod tests {
             fs::write(root.join("manifest.json"), &bytes).unwrap();
             let config = root.join("plugins.json");
             fs::write(&config, serde_json::to_vec(&json!({"plugins":[{"id":"guard","directory":root,"manifest_sha256":sha(&bytes),"backend":"http://127.0.0.1:9080","token_env":"HOME"}]})).unwrap()).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+            }
             use std::os::unix::fs::PermissionsExt;
             for file in fs::read_dir(root).unwrap() {
                 fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o600))

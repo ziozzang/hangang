@@ -213,6 +213,30 @@ function isRevisionConflict(error) { return error.status === 409 && (!error.titl
 /** The shared store did not acknowledge a write: it may have been applied, so the caller must reload before retrying. */
 function isIndeterminate(error) { return error.status === 500 && error.title === 'Indeterminate Outcome'; }
 
+const STEP_UP_ERRORS = new Set(['operator_step_up_required', 'operator_reauthentication_required']);
+
+/** The operator's assurance (Hopae ADR-0021) or the break-glass local session, in the header. */
+async function refreshAssurance() {
+  const pill = $('#operator-assurance');
+  if (!pill) return;
+  pill.hidden = true; pill.classList.remove('is-strong', 'is-warning');
+  let info;
+  try { ({ data: info } = await api('/v1/auth/sso/session', { noStepUpRedirect: true })); } catch { return; }
+  if (info?.method === 'hopae' && info.assurance) {
+    const a = info.assurance;
+    const factor = a.factor === 'webauthn' ? (a.high_assurance ? t('Security key') : t('Passkey')) : a.factor ? t(a.factor === 'totp' ? 'Authenticator app' : 'Second factor') : t('No second factor');
+    pill.textContent = a.grace && !a.satisfied ? t('AAL{aal} · passkey enrollment pending', { aal: a.aal }) : t('AAL{aal} · {factor}', { aal: a.aal, factor });
+    pill.title = t('Signed in through Hopae. Sensitive changes need your passkey within {seconds} seconds.', { seconds: info.policy?.sensitive_max_age_seconds ?? 300 });
+    pill.classList.add(a.satisfied ? 'is-strong' : 'is-warning');
+    pill.hidden = false;
+  } else if (info?.method === 'local' && info.break_glass) {
+    pill.textContent = t('Break-glass (local)');
+    pill.title = t('Signed in with a local administrator account. Every change is audited.');
+    pill.classList.add('is-warning');
+    pill.hidden = false;
+  }
+}
+
 async function api(path, options = {}) {
   const generation = state.authGeneration;
   const token = state.token;
@@ -235,6 +259,13 @@ async function api(path, options = {}) {
     payload = type.includes('json') ? await response.json().catch(() => null) : await response.text().catch(() => '');
   }
   if (generation !== state.authGeneration || token !== state.token) throw new StaleSessionError();
+  if (!response.ok && isObject(payload) && STEP_UP_ERRORS.has(payload.error) && typeof payload.step_up_url === 'string' && payload.step_up_url.startsWith('/ui/step-up?')) {
+    // Hopae operator assurance (ADR-0021): verify with the passkey through
+    // Hopae, then come back to this view.
+    const back = encodeURIComponent(location.pathname + location.hash);
+    if (!options.noStepUpRedirect) location.assign(`${payload.step_up_url.split('?')[0]}?return=${back}`);
+    throw new ApiError(t(payload.error === 'operator_reauthentication_required' ? 'Verify with your passkey again to continue.' : 'This console requires your passkey. Verify with it to continue.'), response.status, response, payload);
+  }
   if (!response.ok) {
     const title = isObject(payload) && typeof payload.title === 'string' && payload.title ? payload.title : null;
     const detail = payload?.detail || payload?.title || payload?.error || (typeof payload === 'string' && payload.trim()) || `${response.status} ${response.statusText}`;
@@ -534,6 +565,7 @@ async function activateSession(token, user, mode) {
     $$('.nav-link').forEach((link) => link.classList.toggle('is-active', link.dataset.view === 'status'));
   }
   renderStatus(data);
+  refreshAssurance();
   const session = state.authGeneration;
   let discoveryError;
   if(isAdmin()) { try { await discoverPlugins({api,locale:getLocale}); } catch(error) { if(!(error instanceof StaleSessionError)) discoveryError = error.message; } }
