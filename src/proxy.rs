@@ -3380,11 +3380,49 @@ impl Proxy {
             );
         }
 
+        // Route filters, after every authenticator and authorization gate.
+        if let Some(redirect) = &runtime.route.redirect {
+            let location = redirect.location(
+                edge.proto,
+                &crate::resource_guard::request_host(&request).unwrap_or_default(),
+                Some(edge.forwarded_port),
+                runtime.route.path_prefix.as_deref(),
+                request.uri().path(),
+                request.uri().query(),
+            );
+            let mut redirected = response(redirect.status_code, "");
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&location) {
+                redirected.headers_mut().insert(hyper::header::LOCATION, value);
+            }
+            return Ok(redirected);
+        }
+        if let Some(modifier) = &runtime.route.request_headers {
+            modifier.apply(request.headers_mut());
+        }
+        if let Some(path) = runtime.route.rewrite.as_ref().and_then(|r| r.path.as_ref()) {
+            let rewritten = path.apply(runtime.route.path_prefix.as_deref(), request.uri().path());
+            let pq = match request.uri().query() {
+                Some(query) => format!("{rewritten}?{query}"),
+                None => rewritten,
+            };
+            match pq.parse::<hyper::http::uri::PathAndQuery>() {
+                Ok(pq) => {
+                    let mut parts = request.uri().clone().into_parts();
+                    parts.path_and_query = Some(pq);
+                    if let Ok(uri) = Uri::from_parts(parts) {
+                        *request.uri_mut() = uri;
+                    }
+                }
+                Err(_) => return Ok(response(500, "invalid rewritten path")),
+            }
+        }
+        let rewrite_host = runtime.route.rewrite.as_ref().and_then(|r| r.hostname.clone());
         let custom_outbound = docker_target.is_some()
             || runtime.route.upstream != Default::default()
             || runtime.route.upstream_host.is_some()
-            || runtime.route.preserve_host;
-        let host_override: Option<String> = runtime.route.upstream_host.clone().or_else(|| {
+            || runtime.route.preserve_host
+            || rewrite_host.is_some();
+        let host_override: Option<String> = rewrite_host.or_else(|| runtime.route.upstream_host.clone()).or_else(|| {
             runtime
                 .route
                 .preserve_host
@@ -4191,6 +4229,12 @@ fn basic_match_path<B>(
         ))
         || !crate::resource_guard::path_matches(route, path)
     {
+        return false;
+    }
+    if !route.methods.is_empty() && !route.methods.iter().any(|m| m == request.method().as_str()) {
+        return false;
+    }
+    if !crate::route_filters::query_matches(request.uri().query(), &route.query) {
         return false;
     }
     route.headers.iter().all(|(name, value)| {
@@ -5853,6 +5897,11 @@ mod tests {
             balance: Default::default(),
             response_set_headers: std::collections::BTreeMap::new(),
             response_remove_headers: Vec::new(),
+            methods: Vec::new(),
+            query: Default::default(),
+            request_headers: None,
+            redirect: None,
+            rewrite: None,
         }
     }
 

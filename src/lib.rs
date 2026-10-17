@@ -53,6 +53,7 @@ pub mod workload_tls;
 pub mod ingress;
 pub mod kubernetes;
 pub mod protection;
+pub mod route_filters;
 pub mod proxy_protocol;
 pub mod tls_reload;
 

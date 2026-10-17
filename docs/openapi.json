@@ -4309,6 +4309,11 @@
             "default": [],
             "description": "Streaming-safe response header removals (e.g. server)."
           },
+          "methods": {"type": "array", "maxItems": 16, "items": {"type": "string", "pattern": "^[A-Z]{1,32}$"}, "default": [], "description": "Match only these request methods (empty: any)."},
+          "query": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": "string"}, "default": {}, "description": "Match only requests whose query has these parameters with exactly these values (first occurrence)."},
+          "request_headers": {"type": ["object", "null"], "additionalProperties": false, "default": null, "description": "Set, then add, then remove headers of the request sent upstream; reserved forwarding, identity and hop-by-hop names are refused.", "properties": {"set": {"type": "object", "additionalProperties": {"type": "string"}}, "add": {"type": "object", "additionalProperties": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}}}},
+          "redirect": {"type": ["object", "null"], "additionalProperties": false, "default": null, "description": "Answer with a redirect instead of proxying, after authentication.", "properties": {"scheme": {"enum": ["http", "https"]}, "hostname": {"type": "string"}, "port": {"type": "integer", "minimum": 1, "maximum": 65535}, "path": {"oneOf":[{"type":"object","additionalProperties":false,"required":["full"],"properties":{"full":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["prefix"],"properties":{"prefix":{"type":"string"}}}]}, "status_code": {"enum": [301, 302, 303, 307, 308], "default": 302}}},
+          "rewrite": {"type": ["object", "null"], "additionalProperties": false, "default": null, "description": "Rewrite the host and/or path sent upstream (prefix replacement needs a prefix path match).", "properties": {"hostname": {"type": "string"}, "path": {"oneOf":[{"type":"object","additionalProperties":false,"required":["full"],"properties":{"full":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["prefix"],"properties":{"prefix":{"type":"string"}}}]}}},
           "basic_auth": {
             "type": [
               "object",

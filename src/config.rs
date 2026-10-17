@@ -411,6 +411,22 @@ pub struct HttpRoute {
     /// Streaming-safe response header removals (e.g. removing `server`).
     #[serde(default)]
     pub response_remove_headers: Vec<String>,
+    /// Match only these request methods (empty: any).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Match only requests whose query has these parameters with exactly
+    /// these values (first occurrence).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query: BTreeMap<String, String>,
+    /// Set, add and remove headers of the request sent upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<crate::route_filters::HeaderModifier>,
+    /// Answer with a redirect instead of proxying (after authentication).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<crate::route_filters::RouteRedirect>,
+    /// Rewrite the host and/or path sent upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<crate::route_filters::RouteRewrite>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1120,6 +1136,25 @@ impl Config {
             }
         }
         for route in &self.http {
+            crate::route_filters::validate_matches(&route.methods, &route.query)?;
+            if let Some(modifier) = &route.request_headers {
+                modifier.validate()?;
+            }
+            if let Some(redirect) = &route.redirect {
+                redirect.validate()?;
+            }
+            if let Some(rewrite) = &route.rewrite {
+                rewrite.validate()?;
+                ensure!(
+                    !matches!(rewrite.path, Some(crate::route_filters::PathModifier::Prefix(_)))
+                        || matches!(route.path_match, PathMatch::Prefix | PathMatch::SegmentPrefix),
+                    "a prefix path rewrite needs a prefix path match"
+                );
+            }
+            ensure!(
+                route.redirect.is_none() || route.rewrite.is_none(),
+                "a route cannot both redirect and rewrite"
+            );
             for name in route
                 .response_remove_headers
                 .iter()

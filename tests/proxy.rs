@@ -1481,6 +1481,11 @@ fn route(backends: Vec<String>) -> HttpRoute {
         balance: Default::default(),
         response_set_headers: std::collections::BTreeMap::new(),
         response_remove_headers: Vec::new(),
+        methods: Vec::new(),
+        query: Default::default(),
+        request_headers: None,
+        redirect: None,
+        rewrite: None,
     }
 }
 
@@ -7983,4 +7988,103 @@ async fn stale_kubernetes_snapshot_fails_protected_routes_closed_and_keeps_publi
     front_task.abort();
     verify_task.abort();
     origin_task.abort();
+}
+
+/// Origin that answers with `<host> <path-and-query> <x-set> <x-gone>`.
+async fn echo_target() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| async move {
+                    let header = |name: &str| {
+                        request
+                            .headers()
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-")
+                            .to_owned()
+                    };
+                    let body = format!(
+                        "{} {} {} {}",
+                        header("host"),
+                        request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                        header("x-set"),
+                        header("x-gone")
+                    );
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (address, task)
+}
+
+#[tokio::test]
+async fn route_filters_match_methods_and_query_modify_headers_rewrite_and_redirect() {
+    let (origin, origin_task) = echo_target().await;
+    let mut matched = route(vec![format!("http://{origin}")]);
+    matched.id = "matched".into();
+    matched.path_prefix = Some("/api".into());
+    matched.path_match = hangang::config::PathMatch::SegmentPrefix;
+    matched.methods = vec!["GET".into()];
+    matched.query = [("v".to_owned(), "2".to_owned())].into();
+    matched.request_headers = Some(hangang::route_filters::HeaderModifier {
+        set: [("x-set".to_owned(), "yes".to_owned())].into(),
+        add: Default::default(),
+        remove: vec!["x-gone".into()],
+    });
+    matched.rewrite = Some(hangang::route_filters::RouteRewrite {
+        hostname: Some("internal.example.test".into()),
+        path: Some(hangang::route_filters::PathModifier::Prefix("/v2".into())),
+    });
+    let mut moved = route(vec![format!("http://{origin}")]);
+    moved.id = "moved".into();
+    moved.path_prefix = Some("/old".into());
+    moved.path_match = hangang::config::PathMatch::SegmentPrefix;
+    moved.redirect = Some(hangang::route_filters::RouteRedirect {
+        scheme: Some(hangang::route_filters::RedirectScheme::Https),
+        hostname: Some("new.example.test".into()),
+        port: None,
+        path: Some(hangang::route_filters::PathModifier::Prefix("/new".into())),
+        status_code: 301,
+    });
+    let (proxy, policy) = proxy(vec![matched, moved]);
+    let (address, front_task, _) = frontend(proxy).await;
+    let client = client();
+    let send = |method: &str, path: &str| {
+        Request::builder()
+            .method(method)
+            .uri(format!("http://{address}{path}"))
+            .header("host", "app.example.test")
+            .header("x-gone", "secret")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let reply = client.request(send("GET", "/api/items?v=2")).await.unwrap();
+    assert_eq!(reply.status(), 200);
+    let body = reply.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        "internal.example.test /v2/items?v=2 yes -"
+    );
+    // Method and query conditions do not match: no route.
+    assert_eq!(client.request(send("POST", "/api/items?v=2")).await.unwrap().status(), 404);
+    assert_eq!(client.request(send("GET", "/api/items?v=1")).await.unwrap().status(), 404);
+    let redirect = client.request(send("GET", "/old/page?q=1")).await.unwrap();
+    assert_eq!(redirect.status(), 301);
+    assert_eq!(
+        redirect.headers()["location"],
+        "https://new.example.test/new/page?q=1"
+    );
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
 }
