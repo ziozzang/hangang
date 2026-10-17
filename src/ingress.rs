@@ -11,6 +11,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// its own instead of freezing every other update behind a global failure.
 pub(crate) const MAX_ROUTES: usize = 1024;
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+/// Route ID suffix of the internal Hopae handoff routes.
+pub(crate) const HANDOFF_SUFFIX: &str = "hopae-handoff";
+
+/// Internal handoff routes: tenant paths under `/_hopae` are refused on
+/// protected Ingresses, so a protected `/_hopae` route is always internal.
+fn is_handoff(route: &HttpRoute) -> bool {
+    route.access_mode == AccessMode::Protected
+        && route.path_prefix.as_deref() == Some(crate::protection::HOPAE_RESERVED_PATH)
+}
 
 /// Offline adapter (`--import-ingress`): any invalid selected object fails the
 /// whole conversion so an operator sees the problem with their input.
@@ -107,6 +116,7 @@ fn build(
     let mut route_bytes = 0usize;
     let mut route_count = 0usize;
     let mut any_protected = false;
+    let mut handoff_hosts: BTreeSet<Option<String>> = BTreeSet::new();
     for resource in selected_ingresses {
         // With protection enabled, an Ingress without a decision is withheld:
         // it never falls back to unprotected routing.
@@ -119,6 +129,10 @@ fn build(
         };
         match ingress_routes(resource, &services, protection) {
             Ok((mut ingress_routes, default)) => {
+                // One handoff route per host: the first protected Ingress (in
+                // namespace/name order) provides it.
+                ingress_routes
+                    .retain(|route| !is_handoff(route) || !handoff_hosts.contains(&route.host));
                 let added_count = ingress_routes.len() + usize::from(default.is_some());
                 let added_bytes: usize = ingress_routes
                     .iter()
@@ -148,6 +162,12 @@ fn build(
                 route_bytes += added_bytes;
                 any_protected |= matches!(protection, Some((RouteProtection::Protected(_), _)));
                 accepted.insert(ingress_identity(resource));
+                handoff_hosts.extend(
+                    ingress_routes
+                        .iter()
+                        .filter(|route| is_handoff(route))
+                        .map(|route| route.host.clone()),
+                );
                 routes.append(&mut ingress_routes);
                 if let Some(default) = default {
                     defaults.push(default);
@@ -342,6 +362,33 @@ fn ingress_routes(
     };
     let mut default = default;
     let mut authority = None;
+    if let Some((RouteProtection::Protected(_), _)) = protection {
+        ensure!(
+            !routes.iter().any(|route| route
+                .path_prefix
+                .as_deref()
+                .is_some_and(crate::protection::is_hopae_reserved)),
+            "paths under {} are reserved for the Hopae sign-in handoff on protected hosts",
+            crate::protection::HOPAE_RESERVED_PATH
+        );
+        // Hopae's sign-in handoff lands on `/_hopae/...` of the application
+        // host; the gateway answers it during verification. One internal
+        // route per host of this Ingress, protected like the tenant routes.
+        let mut hosts: Vec<Option<String>> = Vec::new();
+        let mut handoff = Vec::new();
+        for route in &routes {
+            if hosts.contains(&route.host) {
+                continue;
+            }
+            hosts.push(route.host.clone());
+            let mut internal = route.clone();
+            internal.id = identifier(&prefix, &format!("{HANDOFF_SUFFIX}.{}", hosts.len() - 1));
+            internal.path_prefix = Some(crate::protection::HOPAE_RESERVED_PATH.into());
+            internal.path_match = PathMatch::SegmentPrefix;
+            handoff.push(internal);
+        }
+        routes.extend(handoff);
+    }
     if let Some((protection, pumgye_authority)) = protection {
         for route in routes.iter_mut().chain(default.iter_mut()) {
             match protection {

@@ -110,6 +110,8 @@ enum Mode {
     Protection,
     /// A protected and an explicitly public (`access: Public`) Ingress.
     ProtectionPublic,
+    /// A protected Ingress that claims a path under Hopae's `/_hopae`.
+    ProtectionReserved,
     /// The ProtectionPolicy CRD is not installed: its list answers 404.
     ProtectionMissing,
 }
@@ -400,8 +402,31 @@ async fn protection_policy_is_compiled_reported_and_fails_closed_when_removed() 
 
     // Only the targeted Ingress is published, and only with protection.
     let first = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
-    assert_eq!(first.config.http.len(), 1);
-    let route = &first.config.http[0];
+    // The tenant route plus the internal Hopae handoff route of its host.
+    assert_eq!(first.config.http.len(), 2);
+    let handoff = first
+        .config
+        .http
+        .iter()
+        .find(|r| r.path_prefix.as_deref() == Some("/_hopae"))
+        .expect("internal handoff route");
+    assert_eq!(handoff.host.as_deref(), Some("api.example.test"));
+    assert_eq!(
+        handoff.path_match,
+        hangang::config::PathMatch::SegmentPrefix
+    );
+    assert_eq!(handoff.access_mode, hangang::config::AccessMode::Protected);
+    assert!(handoff.auth.is_some());
+    assert!(
+        handoff.path_case_insensitive(),
+        "Hopae's reserved namespace is case-insensitive"
+    );
+    let route = first
+        .config
+        .http
+        .iter()
+        .find(|r| r.path_prefix.as_deref() != Some("/_hopae"))
+        .unwrap();
     assert_eq!(route.host.as_deref(), Some("api.example.test"));
     assert_eq!(route.access_mode, hangang::config::AccessMode::Protected);
     assert!(route.auth.is_some());
@@ -471,8 +496,17 @@ async fn explicitly_public_ingress_is_published_public_and_withheld_once_its_pol
     let first = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
     assert_eq!(
         first.config.http.len(),
-        2,
-        "require_protection still applies; both Ingresses have a policy"
+        3,
+        "both Ingresses have a policy; the protected host also gets its handoff route"
+    );
+    assert!(
+        !first
+            .config
+            .http
+            .iter()
+            .any(|r| r.host.as_deref() == Some("auth.example.test")
+                && r.path_prefix.as_deref() == Some("/_hopae")),
+        "no handoff route on public hosts"
     );
     let portal = first
         .config
@@ -491,10 +525,13 @@ async fn explicitly_public_ingress_is_published_public_and_withheld_once_its_pol
     assert_eq!(api.access_mode, hangang::config::AccessMode::Protected);
     // Without its public policy the portal is withheld, never unprotected.
     let second = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
-    assert_eq!(second.config.http.len(), 1);
-    assert_eq!(
-        second.config.http[0].host.as_deref(),
-        Some("api.example.test")
+    assert_eq!(second.config.http.len(), 2);
+    assert!(
+        second
+            .config
+            .http
+            .iter()
+            .all(|r| r.host.as_deref() == Some("api.example.test"))
     );
     let log = harness.state.patch_log.lock().unwrap().clone();
     let (_, patch) = log
@@ -509,6 +546,45 @@ async fn explicitly_public_ingress_is_published_public_and_withheld_once_its_pol
         .unwrap()
         .clone();
     assert_eq!(programmed["status"], "True");
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task).await??;
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn tenant_paths_under_the_hopae_handoff_namespace_withhold_a_protected_ingress() -> Result<()>
+{
+    let mut harness = harness(Mode::ProtectionReserved, Some("blue")).await?;
+    harness.options.protection = Some(Arc::new(protection_options()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let controller = Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx)))?;
+    let (cancel, task) = spawn(controller);
+    let mut status = None;
+    for _ in 0..400 {
+        if let Some((_, patch)) = harness
+            .state
+            .patch_log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| path.ends_with("/protectionpolicies/secure/status"))
+        {
+            status = Some(patch["status"].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = status.expect("policy status was written");
+    let programmed = status["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "Programmed")
+        .unwrap()
+        .clone();
+    assert_eq!(programmed["status"], "False");
+    assert_eq!(programmed["reason"], "ReservedPath");
+    assert!(programmed["message"].as_str().unwrap().contains("/_hopae"));
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(2), task).await??;
     harness.stop().await
@@ -1421,8 +1497,10 @@ async fn handle(
         if matches!(state.mode, Mode::Recreated) {
             return Ok(handle_recreated_patch(&patch));
         }
-        if matches!(state.mode, Mode::Protection | Mode::ProtectionPublic)
-            && path.contains("/protectionpolicies/")
+        if matches!(
+            state.mode,
+            Mode::Protection | Mode::ProtectionPublic | Mode::ProtectionReserved
+        ) && path.contains("/protectionpolicies/")
         {
             let mut object = protection_policy("8");
             object["status"] = patch["status"].clone();
@@ -1480,6 +1558,7 @@ async fn handle(
         Mode::LateWatch => handle_late_watch(&path, &query),
         Mode::Protection => handle_protection(&path, &query, &state).await,
         Mode::ProtectionPublic => handle_protection_public(&path, &query, &state).await,
+        Mode::ProtectionReserved => handle_protection_reserved(&path, &query),
         Mode::ProtectionMissing => handle_protection_missing(&path, &query),
     };
     Ok(response)
@@ -2259,6 +2338,39 @@ async fn handle_protection_public(
             StatusCode::OK,
             serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[
                 ingress_in("blue", "main", "11", "api.example.test", &["/"], None), bare]}),
+        );
+    }
+    response(StatusCode::NOT_FOUND, "not found")
+}
+fn handle_protection_reserved(path: &str, query: &str) -> Response<Full<Bytes>> {
+    if query.contains("watch=true") {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if path.ends_with("/protectionpolicies") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"7"},"items":[protection_policy("7")]}),
+        );
+    }
+    if path.ends_with("/services") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"10"},"items":[service()]}),
+        );
+    }
+    if path.ends_with("/ingresses") {
+        let main = ingress_in(
+            "blue",
+            "main",
+            "11",
+            "api.example.test",
+            &["/", "/_HOPAE/login"],
+            None,
+        );
+        let bare = ingress_in("blue", "bare", "11", "bare.example.test", &["/"], None);
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[main, bare]}),
         );
     }
     response(StatusCode::NOT_FOUND, "not found")
