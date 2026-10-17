@@ -17,6 +17,7 @@ administrator-only and read data through the existing management API.
 | Access | `#access/requests/{request_id}` | Request detail: stage timeline with the deciding stage, localized reason and remediation, revision vector with *changed since* |
 | Identities | `#identities/…` | Users, user detail, sessions, groups, providers, authentication policies and credential projections through the Hopae package (see below) |
 | Network | `#network/…` | Overview, threat queue, IP detail, blocks & allowlist, rules, policy and ASN pools through the Sumunjang package (see below) |
+| Devices & Workloads | `#workloads/…` | Kubernetes workload principals with Pumgye grants, workload detail with re-grant proposals, protected routes and the device posture state (see below) |
 | Policies | `#policies` | Pumgye service catalog (context, Sumunjang requirement, role, assignment, network and resource counts, highest class), access matrix and advanced JSON |
 | Policies | `#policies/services/{id}` | Service detail tabs: overview, resources and actions, roles, assignments, access simulator and change history |
 | Policies | `#policies/publish` | Review and publish: structured diff, what-if impact, required reason, typed confirmation and conflict resolution |
@@ -24,7 +25,7 @@ administrator-only and read data through the existing management API.
 | Audit | `#audit` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff. Console-account audit retention, policy and export moved to `#account-audit`; earlier `#audit-trail` links redirect |
 | System | `#system` | Components, packages, decision events, exporter and privacy profile; raw JSON only behind *View raw diagnostics* |
 
-Network and Devices & Workloads otherwise show an entity
+Network otherwise shows an entity
 opener and links to the current component pages. When decision events are off,
 every decision view states *Decision events disabled* instead of showing an
 empty list. Actions that need later phases (simulator, reveal) are shown
@@ -163,6 +164,32 @@ to a proposal with the `annotate` action as aggregate counts only (7-day
 window from the console's decision facets filtered by ASN: events, estimated
 requests, outcomes, stages, country count); no addresses or subjects leave
 Hangang. Packages without these routes keep the read-only ASN page.
+
+## Devices & Workloads
+
+| Route | Page | Sources |
+| --- | --- | --- |
+| `#workloads[/workloads]?q=&namespace=&status=` | Workload principals (one per ServiceAccount incarnation): namespace/ServiceAccount, SPIFFE ID, live or retired with the cause, last observed, legacy Pod-bound mappings, Pumgye grants (direct, plus those still on Pod-bound subjects) | Hopae `subjects/lifecycle` with `include_workloads` (or `subjects/workloads/snapshot` when declared), `/v1/pumgye/v2/workloads`, `/v1/pumgye/v2/policy` |
+| `#workloads/w/{principal}` | Identity (principal, SPIFFE ID, wire subject, cluster, namespace, ServiceAccount and UID, first/last observed, retirement and replacement), legacy mappings, grants by match (principal, SPIFFE ID, Pod-bound subject), recent decisions filtered by the wire subject, re-grant proposals with apply (typed count, reason, optional approval reference, compare-and-set on `policy_revision` from `/v2/workloads`, else the v2 document revision) | as above, `/v1/observability/decisions?subject=` |
+| `#workloads/routes?state=` | Kubernetes route protection: protected/unprotected/withheld counts, withheld Ingresses with the localized reason and the controller message, ProtectionPolicy acceptance, snapshot staleness meter and fail-closed state, client address preservation, Sumunjang prerequisite | `/v1/kubernetes/protection` |
+| `#workloads/devices` | Device posture is not configured: no inventory or posture source exists, so nothing is shown or simulated | — |
+
+Hopae console package 0.1.10 declares `subjects/lifecycle` but not
+`subjects/workloads/snapshot`, so the list folds the retained lifecycle feed
+(up to 2,000 events) and says so; the snapshot route is shown as a disabled
+*Hopae manifest gap* with its reason, and is used automatically once a package
+declares it. Each source is optional: a missing Hopae package, Pumgye
+authority or protection report is stated on the page. The report does not
+carry the client address mode, only whether it is preserved; full
+ProtectionPolicy conditions stay on the Kubernetes objects.
+
+The management API brokers the Pumgye model v2 workload operations for the
+console: `GET /v1/pumgye/v2/workloads`, `GET /v1/pumgye/v2/policy` and
+`POST /v1/pumgye/v2/workloads/regrants/apply`. They are administrator-only and
+share the per-account rate limit of the explain broker. An application must
+carry `base_revision`, 1–1,024 proposal IDs and the operator `reason` (unknown
+fields are refused before Pumgye); it is recorded in the Hangang audit log with
+the actor and the resulting revision, and the answer omits the echoed document.
 
 ## Shared UI kit
 

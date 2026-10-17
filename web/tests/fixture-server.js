@@ -9,6 +9,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const IDENTITIES = ['index.js', 'common.js', 'users.js', 'user.js', 'sessions.js', 'groups.js', 'providers.js', 'authentication.js', 'explain.js', 'editor.js', 'projections.js', 'identities.css', 'messages/en.json', 'messages/ko.json'].map(name => `zt/identities/${name}`);
 // Network section modules (web/zt/network).
 const NETWORK = ["index.js", "common.js", "trace.js", "actions.js", "diff.js", "overview.js", "threats.js", "ip.js", "blocks.js", "rules.js", "policy.js", "asn.js", "system.js", "zones.js", "asn_workflow.js", "network.css", "messages/en.json", "messages/ko.json"].map(name => `zt/network/${name}`);
+// Devices & Workloads section modules (web/zt/workloads).
+const WORKLOADS = ["index.js", "common.js", "workloads.js", "routes.js", "workloads.css", "messages/en.json", "messages/ko.json"].map(name => `zt/workloads/${name}`);
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json' };
 // Match src/ui.rs: fresh HTML style nonce, same-origin scripts, no unsafe-inline/eval.
 const server = http.createServer(async (request, response) => {
@@ -26,7 +28,7 @@ const server = http.createServer(async (request, response) => {
     if (url.pathname === `/ui/locales/${name}`) return file(response, path.join('locales', name));
   }
   if (url.pathname === '/ui/style.css') return file(response, 'style.css');
-  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json', 'zt/policies/index.js', 'zt/policies/model.js', 'zt/policies/store.js', 'zt/policies/service.js', 'zt/policies/simulator.js', 'zt/policies/publish.js', 'zt/policies/policies.css', 'zt/messages/policies.en.json', 'zt/messages/policies.ko.json', 'zt/messages/pumgye.en.json', 'zt/messages/pumgye.ko.json', ...IDENTITIES, ...NETWORK]) {
+  for (const name of ['kit/ui.js', 'kit/i18n.js', 'kit/kit.css', 'zt/shell.js', 'zt/overview.js', 'zt/access.js', 'zt/audit.js', 'zt/entities.js', 'zt/messages/en.json', 'zt/messages/ko.json', 'zt/policies/index.js', 'zt/policies/model.js', 'zt/policies/store.js', 'zt/policies/service.js', 'zt/policies/simulator.js', 'zt/policies/publish.js', 'zt/policies/policies.css', 'zt/messages/policies.en.json', 'zt/messages/policies.ko.json', 'zt/messages/pumgye.en.json', 'zt/messages/pumgye.ko.json', ...IDENTITIES, ...NETWORK, ...WORKLOADS]) {
     if (url.pathname === `/ui/${name}`) return file(response, name);
   }
   response.writeHead(404); response.end('fixture route missing');
