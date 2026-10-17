@@ -60,6 +60,32 @@ struct Args {
     guard_source_id: String,
     #[arg(long, default_value = "HANGANG_GUARD_COLLECTOR_TOKEN")]
     guard_token_env: String,
+    /// Send Hopae a signed risk context (Hopae ADR-0023) on routes with
+    /// `auth.risk_context`: the variable holding the dedicated key (32 to
+    /// 4096 bytes, the same as Hopae's `risk.context_key_env`). Needs the
+    /// gRPC decision transport, which then asks Sumunjang for evidence.
+    #[arg(long, requires = "guard_decision_grpc")]
+    risk_context_key_env: Option<String>,
+    /// A Sumunjang reason code that makes a request `elevated`; repeatable.
+    #[arg(long, requires = "risk_context_key_env")]
+    risk_elevated_reason: Vec<String>,
+    /// A country (ISO 3166-1 alpha-2) whose requests are `elevated`; repeatable.
+    #[arg(long, requires = "risk_context_key_env")]
+    risk_elevated_country: Vec<String>,
+    /// An ASN whose requests are `elevated`; repeatable.
+    #[arg(long, requires = "risk_context_key_env")]
+    risk_elevated_asn: Vec<u32>,
+    /// A request allowed only by the policy default (no allowlist or rule
+    /// matched) is `elevated`.
+    #[arg(long, requires = "risk_context_key_env")]
+    risk_unlisted_elevated: bool,
+    /// A Sumunjang risk stage (`watch`, `suspicious`, `high`, `blocked`) at or
+    /// above which a request is `elevated`.
+    #[arg(long, requires = "risk_context_key_env", value_parser = parse_risk_stage)]
+    risk_elevated_stage: Option<hangang::risk_context::RiskStage>,
+    /// A Sumunjang risk stage at or above which a request is `high`.
+    #[arg(long, requires = "risk_context_key_env", value_parser = parse_risk_stage)]
+    risk_high_stage: Option<hangang::risk_context::RiskStage>,
     /// Exact path generating honeypot evidence; repeat for multiple paths.
     #[arg(long, requires = "guard_url")]
     guard_honeypot_path: Vec<String>,
@@ -1155,6 +1181,7 @@ async fn run(args: Args) -> Result<()> {
                 hangang::guard::Config {
                     decision_tcp: args.guard_decision_tcp,
                     decision_grpc: args.guard_decision_grpc,
+                    include_evidence: args.risk_context_key_env.is_some(),
                     decision_tls: args.guard_decision_server_name.as_ref().map(|name| {
                         hangang::guard::NativeTls {
                             server_name: name.clone(),
@@ -1175,6 +1202,26 @@ async fn run(args: Args) -> Result<()> {
                 },
                 cancel.clone(),
             )
+        })
+        .transpose()?;
+    let risk_context = args
+        .risk_context_key_env
+        .as_ref()
+        .map(|name| {
+            let key = std::env::var(name)
+                .map_err(|_| anyhow::anyhow!("risk context key variable {name} is not set"))?;
+            hangang::risk_context::Settings::new(
+                key.into_bytes(),
+                hangang::risk_context::Thresholds {
+                    elevated_reasons: args.risk_elevated_reason.iter().cloned().collect(),
+                    elevated_countries: args.risk_elevated_country.iter().cloned().collect(),
+                    elevated_asns: args.risk_elevated_asn.iter().copied().collect(),
+                    unlisted_elevated: args.risk_unlisted_elevated,
+                    elevated_stage: args.risk_elevated_stage,
+                    high_stage: args.risk_high_stage,
+                },
+            )
+            .map(Arc::new)
         })
         .transpose()?;
     let decisions = match &args.decision_events_config {
@@ -1217,6 +1264,7 @@ async fn run(args: Args) -> Result<()> {
     .with_traffic_history(traffic.clone())
     .with_access_log(args.access_log)
     .with_guard(guard)
+    .with_risk_context(risk_context)
     .with_decision_events(decisions.clone())
     .with_route_owner_queries(args.route_owner_config.is_some())
     .with_tunnel_idle_timeout(Duration::from_secs(args.connection_idle_seconds));
@@ -2049,4 +2097,9 @@ impl hangang::kubernetes::ConfigSink for KubernetesSink {
             }
         }
     }
+}
+
+fn parse_risk_stage(s: &str) -> Result<hangang::risk_context::RiskStage, String> {
+    hangang::risk_context::RiskStage::parse(s)
+        .ok_or_else(|| "expected normal, watch, suspicious, high or blocked".into())
 }

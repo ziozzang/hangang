@@ -96,7 +96,7 @@ hangang-decision-exporter \
 | 단계 | 출처 | 기록 내용 |
 | --- | --- | --- |
 | `network` | 수문장 입장 판단 | 판정(`allow`, `deny`, `observe`, `unavailable`), 모드, 정책 리비전, 전송 방식, 지연 시간, 가명 IP·프리픽스 참조, 국가 |
-| `identity` | 호패(`hop1` 또는 HTTP 인증) 또는 한강(JWT, Basic, 워크로드 인증서) | 판정, 주체 종류, AAL, 인증 요소, 가명 주체 참조, 지연 시간 |
+| `identity` | 호패(`hop1` 또는 HTTP 인증) 또는 한강(JWT, Basic, 워크로드 인증서) | 판정, 주체 종류, AAL, 인증 요소, 가명 주체 참조, 지연 시간, `risk_level`(`low`, `elevated`, `high`: 한강이 서명한 위험 컨텍스트로 호패에 보낸 수준, [가드](GUARD.md#호패-위험-컨텍스트). 보내지 않았으면 `null`) |
 | `authorization` | 품계 원격 판단 또는 컴파일된 정책 | 정확한 `pumgye_core::Decision` 변형(추가로 `UnknownResource`, `UnknownAction`, `Unavailable`, `NotMapped`), 정보 등급, 정책 리비전, 전송 방식, 지연 시간 |
 | `enforcement` | 한강 | `refused`, `challenged`, `forwarded`, `redirected`, 펜스, 한강 설정 리비전, 업스트림 상태 등급 |
 

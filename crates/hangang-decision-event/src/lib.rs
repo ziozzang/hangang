@@ -17,8 +17,8 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use v1::{
     Authority, AuthorizationDecision, DecisionEvent, EnforcementAction, Factor, Fence, GuardMode,
-    IdentityVerdict, Kind, NetworkVerdict, PrincipalKind, PrivacyProfile, SampleClass, Stage,
-    Transport, stage_verdict,
+    IdentityVerdict, Kind, NetworkVerdict, PrincipalKind, PrivacyProfile, RiskLevel, SampleClass,
+    Stage, Transport, stage_verdict,
 };
 
 pub const SCHEMA: &str = "hangang.decision.v1";
@@ -520,6 +520,7 @@ pub fn to_json(event: &DecisionEvent) -> Value {
                 "generation": optional(i.generation),
                 "latency_us": i.latency_us,
                 "transport": enum_text!(Transport, i.transport),
+                "risk_level": if i.risk_level == 0 { Value::Null } else { Value::String(enum_text!(RiskLevel, i.risk_level)) },
             }),
             stage_verdict::Stage::Authorization(a) => json!({
                 "stage": "authorization",

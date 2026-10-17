@@ -341,6 +341,8 @@ fn security_denied(status: u16) -> Response<Body> {
 #[derive(Clone)]
 pub struct Proxy {
     guard: Option<Arc<crate::guard::GuardClient>>,
+    /// Hopae risk contexts (ADR-0023): key and level thresholds.
+    risk_context: Option<Arc<crate::risk_context::Settings>>,
     /// ADR 0019 decision events; `None` (the default) captures nothing.
     decisions: Option<Arc<crate::decision::Emitter>>,
     request_inspectors: Arc<tokio::sync::Semaphore>,
@@ -748,6 +750,7 @@ impl Proxy {
         Self {
             active,
             guard: None,
+            risk_context: None,
             decisions: None,
             request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
             native_bodies: Arc::new(tokio::sync::Semaphore::new(128)),
@@ -816,6 +819,14 @@ impl Proxy {
 
     pub fn with_guard(mut self, guard: Option<Arc<crate::guard::GuardClient>>) -> Self {
         self.guard = guard;
+        self
+    }
+
+    pub fn with_risk_context(
+        mut self,
+        settings: Option<Arc<crate::risk_context::Settings>>,
+    ) -> Self {
+        self.risk_context = settings;
         self
     }
 
@@ -940,6 +951,7 @@ impl Proxy {
         redirect
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn authorize(
         &self,
         auth: &crate::config::ExternalAuth,
@@ -948,6 +960,7 @@ impl Proxy {
         expected: Option<NativeAuthorization<'_>>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
+        risk: Option<&crate::risk_context::Evidence>,
     ) -> AuthOutcome {
         let expected_class = expected.map(|scope| scope.class);
         let started = std::time::Instant::now();
@@ -960,6 +973,26 @@ impl Proxy {
             *request.headers_mut() = auth_request_headers(auth, static_headers, original, edge)?;
             if let Some(scope) = expected {
                 scope.apply(request.headers_mut())?;
+            }
+            // The signed risk context (Hopae ADR-0023), bound to the very
+            // headers of this verify call; omitted without evidence.
+            if auth.risk_context
+                && let Some(settings) = &self.risk_context
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                match risk.and_then(|e| {
+                    crate::risk_context::header_for(settings, e, request.headers(), now)
+                }) {
+                    Some((level, value)) => {
+                        request
+                            .headers_mut()
+                            .insert(crate::risk_context::HEADER, value);
+                        self.metrics.risk_context_sent(level);
+                    }
+                    None => self.metrics.risk_context_omitted(),
+                }
             }
             let renewal_context = auth
                 .renew_native_evidence
@@ -1751,6 +1784,9 @@ impl Proxy {
         // The terminal marker has meaning only on a response from the
         // configured authorization service, never as a client request field.
         request.headers_mut().remove("x-hangang-auth-terminal");
+        // Only Hangang produces a risk context, only for an authorization
+        // call (Hopae ADR-0023); a client copy never reaches a service.
+        request.headers_mut().remove(crate::risk_context::HEADER);
         if request.headers().keys().any(|name| {
             snapshot.http_match_headers.contains(name)
                 && has_duplicate_header(request.headers(), name.as_str())
@@ -1798,6 +1834,7 @@ impl Proxy {
         }
         decision.client(edge.client_ip);
         let mut guard_evidence = None;
+        let mut risk_level: Option<crate::risk_context::Level> = None;
         if let Some(guard) = &self.guard {
             let started = decision.clock();
             let (rejected, evidence, unavailable) =
@@ -2227,6 +2264,7 @@ impl Proxy {
                             .map(|identity| crate::decision::Subject::new(identity.uri.as_bytes())),
                         latency_us: 0,
                         transport: crate::decision::Transport::Local,
+                        risk: None,
                     });
                 }
                 match outcome {
@@ -2585,6 +2623,7 @@ impl Proxy {
                     }),
                     latency_us: crate::decision::elapsed_us(jwt_started),
                     transport: crate::decision::Transport::Local,
+                    risk: None,
                 });
                 if let Err(error) = &authenticated {
                     decision.refuse(
@@ -2722,6 +2761,7 @@ impl Proxy {
                         .map(|a| crate::decision::Subject::new(a.username.as_bytes())),
                     latency_us: 0,
                     transport: crate::decision::Transport::Local,
+                    risk: None,
                 });
                 if verified.is_none() {
                     decision.refuse(Stage::Identity, Reason::BasicDenied);
@@ -2838,6 +2878,18 @@ impl Proxy {
                     };
             }
             let auth_started = decision.clock();
+            // Sumunjang's evidence of this request, when the route sends Hopae a risk context.
+            let risk_evidence = if auth.risk_context && self.risk_context.is_some() {
+                guard_evidence.as_ref().and_then(|e| e.network().cloned())
+            } else {
+                None
+            };
+            if auth.risk_context
+                && let Some(settings) = &self.risk_context
+                && let Some(e) = &risk_evidence
+            {
+                risk_level = Some(settings.level(e));
+            }
             let authorization = tokio::select! {
                 biased;
                 retired = auth_retired(auth_route_lease.as_ref()) => {
@@ -2845,7 +2897,7 @@ impl Proxy {
                     decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), native_authorization, &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), native_authorization, &mut request, &edge, risk_evidence.as_ref()) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
                 decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
@@ -2899,6 +2951,7 @@ impl Proxy {
                     } else {
                         crate::decision::Transport::Http
                     },
+                    risk: risk_level,
                 });
                 match &authorization {
                     AuthOutcome::Allow(..) => {}

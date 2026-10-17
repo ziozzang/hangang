@@ -206,6 +206,7 @@ async fn decision_apis_are_admin_only_filtered_paginated_and_pseudonymous() {
             subject: Some(decision::Subject::new(subject.as_bytes())),
             latency_us: 12,
             transport: decision::Transport::Hop1,
+            risk: None,
         });
         capture.authorization(
             decision::Authorization::ClassDenied,

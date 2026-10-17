@@ -91,6 +91,7 @@ pub mod retired_members;
 
 mod resource_guard;
 pub mod resource_policy;
+pub mod risk_context;
 
 pub mod jwks_remote;
 pub mod jwt_auth;

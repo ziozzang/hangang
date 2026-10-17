@@ -185,6 +185,12 @@ pub fn encode(record: &Record, cx: &Context<'_>) -> Result<Vec<u8>, Dropped> {
             aal: identity.aal.filter(|a| *a <= 3).map(u32::from),
             latency_us: identity.latency_us,
             transport: identity.transport.wire() as i32,
+            risk_level: match identity.risk {
+                None => v1::RiskLevel::Unspecified,
+                Some(crate::risk_context::Level::Low) => v1::RiskLevel::Low,
+                Some(crate::risk_context::Level::Elevated) => v1::RiskLevel::Elevated,
+                Some(crate::risk_context::Level::High) => v1::RiskLevel::High,
+            } as i32,
             ..Default::default()
         };
         let factor = match identity.factor {

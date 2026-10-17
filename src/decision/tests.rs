@@ -65,6 +65,7 @@ fn allow(emitter: &Emitter, route: &Arc<crate::config::HttpRuntime>) {
         subject: Some(Subject::new(b"u_alice")),
         latency_us: 10,
         transport: Transport::Hop1,
+        risk: None,
     });
     capture.forwarded();
     emitter.finish(capture, 200);

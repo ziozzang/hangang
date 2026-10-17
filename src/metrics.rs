@@ -27,8 +27,17 @@ pub struct Metrics {
     pub policy_capacity_rejections: AtomicU64,
     pub body_transform_errors: AtomicU64,
     pub config_updates: AtomicU64,
+    /// Risk contexts sent to Hopae by level (low, elevated, high), and omitted.
+    pub risk_context_sent: [AtomicU64; 3],
+    pub risk_context_omitted: AtomicU64,
 }
 impl Metrics {
+    pub fn risk_context_sent(&self, level: crate::risk_context::Level) {
+        self.risk_context_sent[level as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn risk_context_omitted(&self) {
+        self.risk_context_omitted.fetch_add(1, Ordering::Relaxed);
+    }
     pub fn render(&self) -> String {
         let mut out = String::new();
         for (name, kind, value) in [
@@ -113,6 +122,14 @@ impl Metrics {
         ] {
             out.push_str(&format!("# HELP hangang_{name} Hangang {name}.\n# TYPE hangang_{name} {kind}\nhangang_{name} {}\n", value.load(Ordering::Relaxed)));
         }
+        out.push_str("# HELP hangang_risk_context_sent_total Signed risk contexts sent to Hopae by level.\n# TYPE hangang_risk_context_sent_total counter\n");
+        for (i, level) in ["low", "elevated", "high"].iter().enumerate() {
+            out.push_str(&format!(
+                "hangang_risk_context_sent_total{{level=\"{level}\"}} {}\n",
+                self.risk_context_sent[i].load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(&format!("# HELP hangang_risk_context_omitted_total Risk contexts omitted for lack of Sumunjang evidence.\n# TYPE hangang_risk_context_omitted_total counter\nhangang_risk_context_omitted_total {}\n", self.risk_context_omitted.load(Ordering::Relaxed)));
         self.geoip.render(&mut out);
         out
     }
