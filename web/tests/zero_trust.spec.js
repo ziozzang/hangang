@@ -26,7 +26,7 @@ function event(index, overrides = {}) {
   };
 }
 
-async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false, hopaeEvents = false, guardAudit = false } = {}) {
+async function setup(page, { disabled = false, resolve = 'ok', auditFailure = false, pumgyeFailure = false, hopaeEvents = false, guardAudit = false, consoleAudit = false } = {}) {
   const calls = [];
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
@@ -82,6 +82,13 @@ async function setup(page, { disabled = false, resolve = 'ok', auditFailure = fa
       { event_id: 'e_1', at: Date.UTC(2026, 9, 16, 9, 30) / 1000, kind: 'admin.user_disable', outcome: 'success', reason: null, user_id: 'u_kim', session_id: null, attrs: { actor: 'u_admin', actor_session: 's_x', count: 3 } },
       { event_id: 'e_2', at: Date.UTC(2026, 9, 16, 9, 31) / 1000, kind: 'login.succeeded', outcome: 'success', reason: null, user_id: 'u_kim', attrs: {} },
       { event_id: 'e_3', at: Date.UTC(2026, 9, 16, 9, 32) / 1000, kind: 'admin.denied', outcome: 'failure', reason: null, user_id: 'u_bob', attrs: { endpoint: '/v1/users/{id}/disable', reason: 'role_insufficient' } }], next_cursor: null } }) : route.fulfill({ status: 404, json: { detail: 'unknown plugin route' } });
+    if (p === '/v1/console/operator-audit') return consoleAudit ? route.fulfill({ json: { records: [
+      { id: 14, event: 'console.break_glass_change', method: 'PUT', path: '/v1/config', account: 'operator', client_ip: '192.0.2.9', time_unix_ms: Date.UTC(2026, 9, 16, 9, 50) },
+      { id: 13, event: 'console.break_glass_login', outcome: 'success', status: 200, account: 'operator', client_ip: '192.0.2.9', time_unix_ms: Date.UTC(2026, 9, 16, 9, 49) },
+      { id: 12, event: 'console.change', method: 'POST', path: '/v1/routes', account: 'kim', aal: 2, factor: 'webauthn', client_ip: '192.0.2.8', time_unix_ms: Date.UTC(2026, 9, 16, 9, 48) },
+      { id: 11, event: 'console.step_up_required', reason: 'operator_reauthentication_required', method: 'PUT', path: '/v1/config', client_ip: '192.0.2.8', time_unix_ms: Date.UTC(2026, 9, 16, 9, 47) },
+      { id: 10, event: 'console.sso_login', outcome: 'success', account: 'kim', assurance: { aal: 2, factor: 'webauthn' }, client_ip: '192.0.2.8', time_unix_ms: Date.UTC(2026, 9, 16, 9, 46) },
+      { id: 9, event: 'console.unrelated', time_unix_ms: Date.UTC(2026, 9, 16, 9, 45) }], next_before: null } }) : route.fulfill({ status: 404, json: { error: 'unknown console endpoint' } });
     if (p === '/v1/geoip/lookup') return route.fulfill({ json: { ip: '198.51.100.7', country: 'KR', revision: 1 } });
     return route.fulfill({ status: 404, json: { detail: 'not found' } });
   });
@@ -388,6 +395,37 @@ test('Hopae admin events join the unified audit with summaries', async ({ page }
   await expect(view.locator('tbody tr').nth(1).getByRole('link', { name: 'u_kim' })).toHaveAttribute('href', '#identities/users/u_kim');
   await expect(view.locator('.zt-sources li', { hasText: 'Hopae administration' }).locator('[data-status="healthy"]')).toBeVisible();
   await expect(view.locator('.zt-sources li', { hasText: 'Sumunjang policy' })).toContainText('Not yet connected');
+});
+
+test('console operator audit joins the unified audit with assurance and break-glass', async ({ page }) => {
+  const calls = await setup(page, { consoleAudit: true });
+  await page.goto('/ui/#audit?source=console');
+  const view = page.locator('#view-audit');
+  await expect(view.locator('tbody tr')).toHaveCount(5);
+  expect(calls.find(c => c.path === '/v1/console/operator-audit').query).toBe('?limit=200');
+  const rows = view.locator('tbody tr');
+  await expect(rows.nth(0)).toContainText('Break-glass change PUT /v1/config');
+  await expect(rows.nth(1)).toContainText('Break-glass local sign-in');
+  await expect(rows.nth(2)).toContainText('Changed POST /v1/routes (AAL2 · webauthn)');
+  await expect(rows.nth(3)).toContainText('PUT /v1/config needs a step-up: operator_reauthentication_required');
+  await expect(rows.nth(3).locator('[data-status="refused"]')).toBeVisible();
+  await expect(rows.nth(4)).toContainText('Signed in with Hopae (AAL2 · webauthn)');
+  await expect(rows.nth(4).locator('[data-status="committed"]')).toBeVisible();
+  await expect(view.locator('.zt-sources li', { hasText: 'Console operators' }).locator('[data-status="healthy"]')).toBeVisible();
+  await rows.nth(0).locator('td.kit-col-source').click();
+  const detail = view.locator('.kit-expansion');
+  await expect(detail).toContainText('Local administrator (break-glass)');
+  await expect(detail).toContainText('192.0.2.9');
+  await page.locator('#locale-select').selectOption('ko');
+  await expect(view.locator('.zt-sources')).toContainText('콘솔 운영자');
+});
+
+test('without the console operator audit store the source is not connected', async ({ page }) => {
+  await setup(page);
+  await page.goto('/ui/#audit');
+  const view = page.locator('#view-audit');
+  await expect(view.locator('.zt-sources li', { hasText: 'Console operators' })).toContainText('Not yet connected');
+  await expect(view.getByRole('alert')).toBeHidden();
 });
 
 test('request detail actions are real disabled buttons with an explanation', async ({ page }) => {

@@ -45,8 +45,9 @@ struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorPolicyConfig {
-    /// The variable holding the HMAC key Hopae signs operator assertions with.
-    assertion_key_env: String,
+    /// Hopae's operator assertion public keys (base64 Ed25519) by key id:
+    /// the current one, and the next one during a rotation (1 or 2 entries).
+    assertion_public_keys: std::collections::BTreeMap<String, String>,
     /// `1` to `3`; default `2`.
     #[serde(default)]
     minimum_aal: Option<u8>,
@@ -84,7 +85,7 @@ pub const DEFAULT_SENSITIVE: [&str; 9] = [
 
 /// The operator policy as enforced.
 pub struct OperatorPolicy {
-    key: Vec<u8>,
+    keys: Vec<(String, ed25519_dalek::VerifyingKey)>,
     pub minimum_aal: u8,
     pub require_webauthn: bool,
     pub accept_grace: bool,
@@ -98,6 +99,7 @@ pub struct OperatorPolicy {
 #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct Assurance {
     pub v: u8,
+    pub kid: String,
     pub aud: String,
     pub app: String,
     pub host: String,
@@ -129,29 +131,40 @@ impl std::fmt::Display for StepUp {
 }
 impl std::error::Error for StepUp {}
 
-const ASSERTION_DOMAIN: &str = "hopae-operator-assertion.v1.";
+const ASSERTION_DOMAIN: &str = "hopae-operator-assertion.v2.";
 
-/// Verify an operator assertion: format, HMAC in constant time, audience,
-/// lifetime (`now` within `[iat - 5, exp]`).
-pub fn verify_assertion(key: &[u8], token: &str, now: i64) -> Result<Assurance> {
-    use hmac::{Hmac, Mac};
+/// Verify an operator assertion: format, the Ed25519 signature under the
+/// pinned key its `kid` names, audience, lifetime (`now` within
+/// `[iat - 5, exp]`).
+pub fn verify_assertion(
+    keys: &[(String, ed25519_dalek::VerifyingKey)],
+    token: &str,
+    now: i64,
+) -> Result<Assurance> {
+    use ed25519_dalek::Verifier;
     ensure!(token.len() <= 4096, "operator assertion too large");
     let mut parts = token.split('.');
-    let (Some("v1"), Some(payload), Some(tag), None) =
+    let (Some("v2"), Some(payload), Some(sig), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         anyhow::bail!("malformed operator assertion");
     };
-    let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(tag)?;
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key)?;
-    mac.update(ASSERTION_DOMAIN.as_bytes());
-    mac.update(payload.as_bytes());
-    mac.verify_slice(&tag)
-        .map_err(|_| anyhow::anyhow!("operator assertion signature rejected"))?;
+    let sig = ed25519_dalek::Signature::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig)?,
+    )?;
     let claims: Assurance =
         serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload)?)?;
+    let (_, key) = keys
+        .iter()
+        .find(|(kid, _)| *kid == claims.kid)
+        .ok_or_else(|| anyhow::anyhow!("operator assertion key not pinned"))?;
+    key.verify(
+        &[ASSERTION_DOMAIN.as_bytes(), payload.as_bytes()].concat(),
+        &sig,
+    )
+    .map_err(|_| anyhow::anyhow!("operator assertion signature rejected"))?;
     ensure!(
-        claims.v == 1 && claims.aud == "hangang-console",
+        claims.v == 2 && claims.aud == "hangang-console",
         "operator assertion audience rejected"
     );
     ensure!(
@@ -159,6 +172,42 @@ pub fn verify_assertion(key: &[u8], token: &str, now: i64) -> Result<Assurance> 
         "operator assertion expired"
     );
     Ok(claims)
+}
+
+/// The pinned public keys: 1 or 2 (current and next), key ids of
+/// `A-Za-z0-9._-` (1 to 64), base64 Ed25519 public keys.
+fn pinned_keys(
+    keys: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, ed25519_dalek::VerifyingKey)>> {
+    ensure!(
+        (1..=2).contains(&keys.len()),
+        "assertion_public_keys must pin 1 or 2 keys (current and next)"
+    );
+    keys.iter()
+        .map(|(kid, key)| {
+            ensure!(
+                !kid.is_empty()
+                    && kid.len() <= 64
+                    && kid
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+                "assertion_public_keys key id must be 1 to 64 of A-Za-z0-9._-"
+            );
+            let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "assertion_public_keys.{kid} is not a base64 Ed25519 public key"
+                    )
+                })?;
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| {
+                anyhow::anyhow!("assertion_public_keys.{kid} is not an Ed25519 public key")
+            })?;
+            Ok((kid.clone(), key))
+        })
+        .collect()
 }
 
 fn unix_now() -> i64 {
@@ -169,12 +218,7 @@ fn unix_now() -> i64 {
 
 impl OperatorPolicy {
     fn from_config(c: &OperatorPolicyConfig) -> Result<Self> {
-        let key =
-            std::env::var(&c.assertion_key_env).context("operator assertion key unavailable")?;
-        ensure!(
-            (32..=4096).contains(&key.len()),
-            "operator assertion key must be 32 to 4096 bytes"
-        );
+        let keys = pinned_keys(&c.assertion_public_keys)?;
         let minimum_aal = c.minimum_aal.unwrap_or(2);
         ensure!((1..=3).contains(&minimum_aal), "minimum_aal must be 1 to 3");
         let require_webauthn = match c.require_factor.as_deref() {
@@ -206,7 +250,7 @@ impl OperatorPolicy {
             "invalid sensitive_paths"
         );
         Ok(Self {
-            key: key.into_bytes(),
+            keys,
             minimum_aal,
             require_webauthn,
             accept_grace: c.accept_enrollment_grace,
@@ -217,9 +261,13 @@ impl OperatorPolicy {
     }
 
     #[cfg(test)]
-    pub fn for_tests(key: &[u8], minimum_aal: u8, accept_grace: bool) -> Self {
+    pub fn for_tests(
+        key: ed25519_dalek::VerifyingKey,
+        minimum_aal: u8,
+        accept_grace: bool,
+    ) -> Self {
         Self {
-            key: key.to_vec(),
+            keys: vec![("op-1".into(), key)],
             minimum_aal,
             require_webauthn: true,
             accept_grace,
@@ -345,18 +393,100 @@ fn secret(value: String) -> Result<HeaderValue> {
     v.set_sensitive(true);
     Ok(v)
 }
+/// Whether a configuration file's owner and mode keep it private to this
+/// process: (a) owned by the effective user with no group or other bits, or
+/// (b) root-owned, in one of the process's groups (a Kubernetes ConfigMap or
+/// Secret volume with `fsGroup`), with no write bits and no other bits (0440,
+/// 0400). World-readable or writable files never qualify.
+fn private_owner_mode(uid: u32, gid: u32, mode: u32, euid: u32, gids: &[u32]) -> bool {
+    let mode = mode & 0o7777;
+    (uid == euid && mode & 0o077 == 0)
+        || (uid == 0 && gids.contains(&gid) && mode & 0o222 == 0 && mode & 0o007 == 0)
+}
+
+fn process_groups() -> Vec<u32> {
+    // SAFETY: getegid/getgroups only write into the buffer of the stated size.
+    let mut groups = vec![unsafe { libc::getegid() }];
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count > 0 {
+        let mut more = vec![0 as libc::gid_t; count as usize];
+        let n = unsafe { libc::getgroups(count, more.as_mut_ptr()) };
+        if n > 0 {
+            more.truncate(n as usize);
+            groups.extend(more);
+        }
+    }
+    groups
+}
+
+/// The real file behind `path`: `path` itself when it is not a symlink, or
+/// the Kubernetes atomic-writer layout (`<dir>/<name>` -> `..data/<name>`,
+/// `<dir>/..data` -> `..<version>`, a real directory in `<dir>`). Any other
+/// symlink is refused, so a file cannot be pulled from outside its volume.
+fn kubernetes_volume_file(path: &Path) -> Result<std::path::PathBuf> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    let name = path
+        .file_name()
+        .context("configuration path has no file name")?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    ensure!(
+        std::fs::read_link(path)? == Path::new("..data").join(name),
+        "configuration symlink is not the Kubernetes volume layout"
+    );
+    let version = std::fs::read_link(dir.join("..data"))?;
+    let mut parts = version.components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(v)), None)
+            if v.to_str().is_some_and(|v| v.starts_with("..") && v.len() > 2 && !v.contains('/'))
+    );
+    ensure!(
+        single,
+        "configuration volume ..data must name a version directory beside it"
+    );
+    let version_dir = dir.join(&version);
+    ensure!(
+        std::fs::symlink_metadata(&version_dir)?
+            .file_type()
+            .is_dir(),
+        "configuration volume version is not a directory"
+    );
+    Ok(version_dir.join(name))
+}
+
+/// Open a private, bounded regular configuration file (see
+/// `private_owner_mode` and `kubernetes_volume_file`).
+pub fn open_private_config(path: &Path, limit: u64) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let real = kubernetes_volume_file(path)?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&real)?;
+    let meta = f.metadata()?;
+    ensure!(
+        meta.is_file() && meta.len() <= limit,
+        "not a bounded regular file"
+    );
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    ensure!(
+        private_owner_mode(meta.uid(), meta.gid(), meta.mode(), euid, &process_groups()),
+        "file is readable or writable beyond its owner (or a root-owned volume group)"
+    );
+    Ok(f)
+}
+
 impl Sso {
     pub fn load(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let meta = f.metadata()?;
-        ensure!(
-            meta.is_file() && meta.permissions().mode() & 0o077 == 0 && meta.len() <= 65536,
-            "SSO configuration must be a private bounded regular file"
-        );
+        let mut f = open_private_config(path, 65536)
+            .context("SSO configuration must be a private bounded regular file")?;
         let mut bytes = Vec::new();
         Read::by_ref(&mut f).take(65537).read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 65536, "SSO configuration too large");
@@ -541,7 +671,7 @@ impl Sso {
                     .get("x-hopae-operator-assertion")
                     .context("Hopae operator assertion missing")?
                     .to_str()?;
-                let a = verify_assertion(&policy.key, token, unix_now())?;
+                let a = verify_assertion(&policy.keys, token, unix_now())?;
                 let host = self.origin.split_once("://").map_or("", |(_, h)| h);
                 ensure!(
                     a.sub == id
@@ -806,26 +936,127 @@ mod tests {
 }
 
 #[cfg(test)]
+mod private_file_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn owner_and_mode_rules() {
+        let me = 1000;
+        // (a) the process's own file, private.
+        assert!(private_owner_mode(me, 50, 0o100600, me, &[50]));
+        assert!(private_owner_mode(me, 50, 0o400, me, &[]));
+        assert!(!private_owner_mode(me, 50, 0o640, me, &[]));
+        assert!(!private_owner_mode(me, 50, 0o604, me, &[50]));
+        // (b) root-owned volume file in one of our groups, no write, no other.
+        assert!(private_owner_mode(0, 2000, 0o440, me, &[1000, 2000]));
+        assert!(private_owner_mode(0, 2000, 0o400, me, &[2000]));
+        assert!(
+            !private_owner_mode(0, 2000, 0o444, me, &[2000]),
+            "world-readable"
+        );
+        assert!(
+            !private_owner_mode(0, 2000, 0o460, me, &[2000]),
+            "group-writable"
+        );
+        assert!(
+            !private_owner_mode(0, 2000, 0o640, me, &[2000]),
+            "owner-writable"
+        );
+        assert!(
+            !private_owner_mode(0, 3000, 0o440, me, &[2000]),
+            "another group"
+        );
+        assert!(
+            !private_owner_mode(1234, 2000, 0o440, me, &[2000]),
+            "another non-root owner"
+        );
+    }
+
+    fn write(path: &Path, mode: u32) {
+        std::fs::write(path, b"{}").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn plain_files_and_the_kubernetes_volume_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("sso.json");
+        write(&plain, 0o600);
+        assert!(open_private_config(&plain, 1024).is_ok());
+        write(&plain, 0o644);
+        assert!(open_private_config(&plain, 1024).is_err(), "world-readable");
+        write(&plain, 0o600);
+        assert!(open_private_config(&plain, 1).is_err(), "over the bound");
+
+        // <vol>/..2026_10_17/sso.json, ..data -> ..2026_10_17, sso.json -> ..data/sso.json
+        let vol = dir.path().join("vol");
+        let version = vol.join("..2026_10_17_09_00_00.1");
+        std::fs::create_dir_all(&version).unwrap();
+        write(&version.join("sso.json"), 0o600);
+        symlink("..2026_10_17_09_00_00.1", vol.join("..data")).unwrap();
+        symlink("..data/sso.json", vol.join("sso.json")).unwrap();
+        assert!(open_private_config(&vol.join("sso.json"), 1024).is_ok());
+        write(&version.join("sso.json"), 0o644);
+        assert!(open_private_config(&vol.join("sso.json"), 1024).is_err());
+        write(&version.join("sso.json"), 0o600);
+
+        // A symlink out of the volume, or ..data pointing elsewhere: refused.
+        symlink(&plain, vol.join("escape.json")).unwrap();
+        assert!(open_private_config(&vol.join("escape.json"), 1024).is_err());
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(other.join("..x")).unwrap();
+        write(&other.join("..x").join("sso.json"), 0o600);
+        symlink(&version, other.join("..data")).unwrap();
+        symlink("..data/sso.json", other.join("sso.json")).unwrap();
+        assert!(
+            open_private_config(&other.join("sso.json"), 1024).is_err(),
+            "absolute ..data target"
+        );
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        symlink("../vol/..2026_10_17_09_00_00.1", nested.join("..data")).unwrap();
+        symlink("..data/sso.json", nested.join("sso.json")).unwrap();
+        assert!(
+            open_private_config(&nested.join("sso.json"), 1024).is_err(),
+            "..data escaping the volume"
+        );
+    }
+}
+
+#[cfg(test)]
 mod operator_tests {
     use super::*;
-    use hmac::{Hmac, Mac};
+    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
-    const KEY: &[u8] = b"console-operator-assertion-key-0123456789";
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[42; 32])
+    }
+    fn other() -> SigningKey {
+        SigningKey::from_bytes(&[7; 32])
+    }
 
-    fn sign(claims: &serde_json::Value, key: &[u8]) -> String {
+    fn public(k: &SigningKey) -> VerifyingKey {
+        k.verifying_key()
+    }
+
+    fn pinned(k: &SigningKey) -> Vec<(String, VerifyingKey)> {
+        vec![("op-1".into(), public(k))]
+    }
+
+    fn sign(claims: &serde_json::Value, key: &SigningKey) -> String {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(claims).unwrap());
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).unwrap();
-        mac.update(ASSERTION_DOMAIN.as_bytes());
-        mac.update(payload.as_bytes());
-        let tag =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-        format!("v1.{payload}.{tag}")
+        let sig = key.sign(&[ASSERTION_DOMAIN.as_bytes(), payload.as_bytes()].concat());
+        format!(
+            "v2.{payload}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        )
     }
 
     fn claims(now: i64) -> serde_json::Value {
         serde_json::json!({
-            "v": 1, "aud": "hangang-console", "app": "console", "host": "console.example.test",
+            "v": 2, "kid": "op-1", "aud": "hangang-console", "app": "console", "host": "console.example.test",
             "sub": "u_op", "sid": "s_op", "aal": 2, "factor": "webauthn", "factor_at": now - 10,
             "high_assurance": false, "auth_time": now - 100, "require_aal": 2,
             "require_factor": "webauthn", "satisfied": true, "grace": false,
@@ -837,34 +1068,73 @@ mod operator_tests {
     fn assertions_are_verified_strictly() {
         let now = 1_000_000;
         let c = claims(now);
-        let a = verify_assertion(KEY, &sign(&c, KEY), now).unwrap();
+        let a = verify_assertion(&pinned(&key()), &sign(&c, &key()), now).unwrap();
         assert_eq!((a.aal, a.factor.as_deref()), (2, Some("webauthn")));
         // Another key, a changed claim, expiry, the wrong audience.
-        assert!(
-            verify_assertion(
-                b"another-key-of-at-least-thirty-two-bytes",
-                &sign(&c, KEY),
-                now
-            )
-            .is_err()
-        );
-        let t = sign(&c, KEY);
-        let forged = t.replacen("v1.", "v1.e", 1);
-        assert!(verify_assertion(KEY, &forged, now).is_err());
-        assert!(verify_assertion(KEY, &t, now + 61).is_err());
-        let mut other = c.clone();
-        other["aud"] = "elsewhere".into();
-        assert!(verify_assertion(KEY, &sign(&other, KEY), now).is_err());
+        assert!(verify_assertion(&pinned(&other()), &sign(&c, &key()), now).is_err());
+        assert!(verify_assertion(&pinned(&key()), &sign(&c, &other()), now).is_err());
+        let t = sign(&c, &key());
+        let forged = t.replacen("v2.", "v2.e", 1);
+        assert!(verify_assertion(&pinned(&key()), &forged, now).is_err());
+        assert!(verify_assertion(&pinned(&key()), &t, now + 61).is_err());
+        let mut elsewhere = c.clone();
+        elsewhere["aud"] = "elsewhere".into();
+        assert!(verify_assertion(&pinned(&key()), &sign(&elsewhere, &key()), now).is_err());
         // Unknown future claims are ignored.
         let mut more = c.clone();
         more["new_claim"] = 1.into();
-        assert!(verify_assertion(KEY, &sign(&more, KEY), now).is_ok());
+        assert!(verify_assertion(&pinned(&key()), &sign(&more, &key()), now).is_ok());
+        // Rotation: the next key pinned beside the current one; an unpinned kid.
+        let both = vec![
+            ("op-0".into(), public(&other())),
+            ("op-1".into(), public(&key())),
+        ];
+        assert!(verify_assertion(&both, &t, now).is_ok());
+        let mut next = c.clone();
+        next["kid"] = "op-0".into();
+        assert!(verify_assertion(&both, &sign(&next, &other()), now).is_ok());
+        assert!(verify_assertion(&both, &sign(&next, &key()), now).is_err());
+        let mut unknown = c.clone();
+        unknown["kid"] = "op-9".into();
+        assert!(verify_assertion(&both, &sign(&unknown, &key()), now).is_err());
+        // The old HMAC form (v1) is not accepted.
+        assert!(verify_assertion(&both, &t.replacen("v2.", "v1.", 1), now).is_err());
+    }
+
+    #[test]
+    fn pinned_keys_are_checked() {
+        use base64::Engine;
+        let b =
+            |k: &SigningKey| base64::engine::general_purpose::STANDARD.encode(public(k).to_bytes());
+        let map = |e: &[(&str, String)]| {
+            e.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(pinned_keys(&map(&[("op-1", b(&key()))])).unwrap().len(), 1);
+        assert_eq!(
+            pinned_keys(&map(&[("op-1", b(&key())), ("op-2", b(&other()))]))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(pinned_keys(&map(&[])).is_err());
+        assert!(
+            pinned_keys(&map(&[
+                ("a", b(&key())),
+                ("b", b(&key())),
+                ("c", b(&key()))
+            ]))
+            .is_err()
+        );
+        assert!(pinned_keys(&map(&[("a b", b(&key()))])).is_err());
+        assert!(pinned_keys(&map(&[("op-1", "c2hvcnQ=".into())])).is_err());
     }
 
     #[test]
     fn sign_in_mutations_and_sensitive_actions_need_the_policy_and_freshness() {
         let now = 1_000_000;
-        let p = OperatorPolicy::for_tests(KEY, 2, false);
+        let p = OperatorPolicy::for_tests(public(&key()), 2, false);
         let a: Assurance = serde_json::from_value(claims(now)).unwrap();
         let get = hyper::Method::GET;
         let post = hyper::Method::POST;
@@ -902,7 +1172,7 @@ mod operator_tests {
             "operator_step_up_required"
         );
         // AAL 3 required.
-        let p3 = OperatorPolicy::for_tests(KEY, 3, false);
+        let p3 = OperatorPolicy::for_tests(public(&key()), 3, false);
         assert!(p3.admit(&a).is_err());
         // The grace admits reads only when accepted, never mutations.
         let mut grace = a.clone();
@@ -911,7 +1181,7 @@ mod operator_tests {
         grace.factor = None;
         grace.factor_at = None;
         assert!(p.admit(&grace).is_err());
-        let pg = OperatorPolicy::for_tests(KEY, 2, true);
+        let pg = OperatorPolicy::for_tests(public(&key()), 2, true);
         assert!(pg.admit(&grace).is_ok());
         assert!(pg.allow(&grace, &get, "/v1/routes", now).is_ok());
         assert!(pg.allow(&grace, &post, "/v1/routes", now).is_err());

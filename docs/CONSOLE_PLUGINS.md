@@ -19,6 +19,15 @@ to that authority. Public plaintext requires explicit `--allow-insecure-public`;
 protect it behind an authenticated TLS gateway and restrict direct network access.
 Only a local relay may supply the adapter's generated client forwarding context.
 
+To keep the authority's admin listener TLS-only (`--admin-tls-cert`/`--admin-tls-key`),
+point the adapter at it over HTTPS and trust a private CA:
+`--upstream https://127.0.0.1:49000 --upstream-ca /private/admin-ca.pem`. With
+`--upstream-ca` only that CA (1 to 16 PEM certificates, at most 64 KiB) is
+trusted; the authority's certificate must name the upstream host (an IP SAN for
+`127.0.0.1`). The file is re-read every 10 s and the new trust applies to new
+connections; a broken file keeps the current trust. `--upstream-ca` requires an
+HTTPS upstream. Validation: `tests/console_upstream_tls_smoke.py`.
+
 Configuration (replace pins with the exact locally reviewed manifest digests):
 
 ```json
@@ -197,7 +206,13 @@ package hides its separate login/logout links in unified mode. Hangang owns the
 console authority; Hopae still owns provider credentials, identities and sessions.
 
 Run the adapter with `--hopae-sso /private/console-sso.json` to add **Sign in with
-SSO** beneath account sign-in. The configuration is a private regular file (0600):
+SSO** beneath account sign-in. The configuration is a private regular file:
+owned by the console's user with no group or other bits (0600, 0400), or, as a
+Kubernetes ConfigMap or Secret volume with `fsGroup`, root-owned, in one of the
+process's groups, with no write and no other bits (0440, 0400). World-readable or
+writable files are refused. A symlink is accepted only in the Kubernetes
+atomic-writer layout (`sso.json` -> `..data/sso.json`, `..data` -> a `..<version>`
+directory beside it); any other symlink is refused:
 
 ```json
 {
@@ -247,12 +262,13 @@ mTLS; loopback plaintext remains available during migration.
 
 With Hopae's `console_operators` policy (Hopae ADR-0021) the console can require
 that operators signed in with a phishing-resistant factor. Add `operator_policy`
-to the SSO configuration and give the console the same assertion key as Hopae's
-`console_operators.assertion_key_env`:
+to the SSO configuration and pin Hopae's operator assertion public key
+(`console_operators.assertion_public_key`) under its key id
+(`console_operators.assertion_key_id`):
 
 ```json
 "operator_policy": {
-  "assertion_key_env": "CONSOLE_OPERATOR_ASSERTION_KEY",
+  "assertion_public_keys": { "op-2026-10": "<base64 Ed25519 public key>" },
   "minimum_aal": 2,
   "require_factor": "webauthn",
   "accept_enrollment_grace": false,
@@ -262,8 +278,12 @@ to the SSO configuration and give the console the same assertion key as Hopae's
 ```
 
 - Every SSO request (the exchange and each later request) needs Hopae's
-  HMAC-signed operator assertion (`x-hopae-operator-assertion`). A missing,
-  forged, expired or foreign assertion (another user or host) refuses the request.
+  operator assertion (`x-hopae-operator-assertion`), signed with Hopae's
+  dedicated Ed25519 key. The console holds only public keys: the assertion's
+  `kid` must name a pinned key. A missing, forged, expired or foreign assertion
+  (another user or host), or one under an unpinned key, refuses the request.
+- **Rotation.** Pin the next key beside the current one (at most two), switch
+  Hopae to the next seed, key id and public key, then remove the old pin.
 - **Sign-in and reads** need the assertion's policy met (`satisfied`), at least
   `minimum_aal` (1 to 3) and, with `require_factor: webauthn`, a passkey. With
   `accept_enrollment_grace`, operators Hopae admits during its enrollment grace
@@ -286,14 +306,29 @@ to the SSO configuration and give the console the same assertion key as Hopae's
 
 **Break-glass.** The local administrator sign-in (`/v1/auth/login`) stays as the
 break-glass path. `--disable-local-login` (requires `--hopae-sso`) refuses it and
-every local session. Audit records (JSON lines, `--audit-log <path>` 0600 or
-stderr): `console.sso_login` (with the assurance or the refusal),
-`console.step_up_required`, `console.change` (SSO changes with the level and
-factor), `console.break_glass_login` (`attempt` or `disabled`) and
-`console.break_glass_change`.
+every local session.
+
+**Console operator audit.** Records: `console.sso_login` (with the assurance or
+the refusal), `console.step_up_required`, `console.change` (SSO changes with the
+level and factor), `console.break_glass_login` (`success`, `refused` or
+`disabled`, with the account), `console.break_glass_change`, and
+`console.local_login` (a local sign-in without console SSO). The console keeps
+them in its own bounded store, separate from the authority's account audit: a
+ring of `--operator-audit-max-records` (default 10000, 100 to 1000000) records
+none older than `--operator-audit-retention-days` (default 90, 1 to 3650),
+pruned on each insert. `--operator-audit-db <path>` keeps it in a SQLite file
+(created 0600, never through a symlink); without it the store is in memory and
+lost on restart. Administrators read it at
+`GET /v1/console/operator-audit?limit=&before=` (newest first, `limit` 1 to 500,
+default 100; `before` is the `next_before` cursor of the previous page), and the
+unified audit view shows it as the **Console operators** source (not connected
+when the console serves no such endpoint). `--audit-log <path>` (JSON lines,
+0600) is an optional extra sink.
 
 Validation: `tests/console_operator_aal_smoke.py` (real authority and console,
-signed-assertion fixture) and Hopae's browser qualification
+Ed25519-signed assertion fixture, the operator audit API),
+`web/tests/operator_assurance.spec.js` (header badge, step-up redirect,
+break-glass label) and Hopae's browser qualification
 (`tools/browser-qual/run-operator.sh`: real Hopae, real Hangang authority and
 console, Chrome with a virtual authenticator).
 
