@@ -81,6 +81,10 @@ spec:
 
 Every generated route of the Ingress (all host/path rules and the default backend) is compiled to `access_mode: protected` with the profile's `auth` and an enforced `resource_policy` whose `pumgye_resource` is the policy's mapping, and the document carries the configured `pumgye_authority`. Each route gets its own `resource_id`, derived from its route ID and scope.
 
+## Hopae sign-in handoff route
+
+Hopae finishes a browser sign-in by redirecting to `https://<application host>/_hopae/login?...` with a handoff code, which the gateway answers during verification. For every host of a protected Ingress the controller therefore adds one internal route `/_hopae` (segment prefix, case-insensitive, protected exactly like the tenant routes); operators do not add the path themselves. It is longer than any tenant `/` or short prefix and so cannot be shadowed, and only one route per host is generated even when several protected Ingresses share the host (the first in namespace/name order provides it). A tenant path under `/_hopae` on a protected Ingress (also `/_HOPAE/...` or `/%5Fhopae...`) withholds that Ingress with reason `ReservedPath`. Diagnostics list the hosts per Ingress (`handoff_hosts`) and the total (`counts.handoff_routes`, `hangang_kubernetes_handoff_routes`). Public and unprotected Ingresses get no handoff route.
+
 ## Explicitly public routes
 
 Some routes must be reachable before anyone is authenticated: an identity portal's sign-in and provider callbacks, `/.well-known` documents, health checks. Turning `require_protection` off for them would publish every unprotected Ingress. Instead, give such an Ingress a policy with `access: Public`:
@@ -122,6 +126,7 @@ spec:
 | Withdrawn later by hostname ownership, TLS, route validation or budget | Not published | `Pending` |
 | `HTTPRoute` or `Gateway` target | Nothing programmed for that target | `Unsupported` |
 | `access: Public` policy and an Ingress path outside `public.paths` (or a `defaultBackend`) | Ingress withheld | `PublicPathNotAllowed` |
+| Protected Ingress with a path under Hopae's reserved `/_hopae` | Ingress withheld | `ReservedPath` |
 | Snapshot unconfirmed by the API server beyond `--kubernetes-max-staleness-seconds` (default 5 minutes) | Protected routes answer `503`, `x-hangang-reason: kubernetes-authority-stale`; public routes keep serving | [Bounded staleness](KUBERNETES.md#bounded-staleness) |
 
 A withheld Ingress keeps its hostname ownership (it still claims its hosts), never receives the `--kubernetes-publish-address` status entry, and loses it if it carried one. Withholding never touches other Ingresses.

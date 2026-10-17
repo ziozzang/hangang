@@ -81,6 +81,10 @@ spec:
 
 Ingress가 생성하는 모든 경로(모든 호스트·경로 규칙과 기본 백엔드)는 `access_mode: protected`, 프로필의 `auth`, 그리고 정책의 매핑을 `pumgye_resource`로 가진 강제 `resource_policy`로 컴파일되며, 문서에는 구성된 `pumgye_authority`가 들어갑니다. 각 경로는 경로 ID와 범위에서 유도한 고유 `resource_id`를 받습니다.
 
+## Hopae 로그인 handoff 경로
+
+Hopae는 브라우저 로그인을 handoff 코드와 함께 `https://<애플리케이션 호스트>/_hopae/login?...`으로 리디렉션해 마치며, 게이트웨이가 검증 중에 이 요청에 응답합니다. 그래서 컨트롤러는 보호된 Ingress의 호스트마다 내부 경로 `/_hopae`(세그먼트 접두사, 대소문자 무시, 테넌트 경로와 똑같이 보호) 하나를 추가하며, 운영자가 직접 경로를 넣지 않습니다. 이 경로는 테넌트의 `/`나 짧은 접두사보다 길어 가려지지 않고, 여러 보호된 Ingress가 같은 호스트를 써도 호스트마다 하나만 만듭니다(namespace/name 순서상 첫 Ingress가 제공). 보호된 Ingress에 `/_hopae` 아래 테넌트 경로(`/_HOPAE/...`, `/%5Fhopae...` 포함)가 있으면 그 Ingress를 `ReservedPath` 이유로 보류합니다. 진단은 Ingress별 호스트(`handoff_hosts`)와 합계(`counts.handoff_routes`, `hangang_kubernetes_handoff_routes`)를 보여 줍니다. 공개 Ingress와 미보호 Ingress에는 handoff 경로가 없습니다.
+
 ## 명시적 공개 경로
 
 인증 전에 닿아야 하는 경로가 있습니다. 신원 포털의 로그인과 공급자 콜백, `/.well-known` 문서, 상태 확인입니다. 이를 위해 `require_protection`을 끄면 보호되지 않은 모든 Ingress가 게시됩니다. 대신 그런 Ingress에 `access: Public` 정책을 붙입니다.
@@ -122,6 +126,7 @@ spec:
 | 이후 호스트 이름 소유, TLS, 경로 검증, 예산으로 철회됨 | 게시되지 않음 | `Pending` |
 | `HTTPRoute` 또는 `Gateway` 대상 | 그 대상에는 아무것도 프로그래밍하지 않음 | `Unsupported` |
 | `access: Public` 정책과 `public.paths` 밖의 Ingress 경로(또는 `defaultBackend`) | Ingress 보류 | `PublicPathNotAllowed` |
+| Hopae 예약 경로 `/_hopae` 아래 경로가 있는 보호된 Ingress | Ingress 보류 | `ReservedPath` |
 | API 서버가 `--kubernetes-max-staleness-seconds`(기본값 5분)를 넘도록 스냅샷을 확인하지 못함 | 보호 경로는 `503`, `x-hangang-reason: kubernetes-authority-stale`로 응답하고 공개 경로는 계속 제공 | [제한된 오래됨](KUBERNETES.md#제한된-오래됨) |
 
 보류된 Ingress는 호스트 이름 소유를 유지하고(여전히 호스트를 주장함), `--kubernetes-publish-address` 상태 항목을 받지 않으며, 이미 가지고 있었다면 잃습니다. 보류는 다른 Ingress에 영향을 주지 않습니다.
