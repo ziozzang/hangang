@@ -41,7 +41,10 @@ fn reserved_request_header(name: &str) -> bool {
 }
 
 fn valid_value(value: &str) -> bool {
-    value.len() <= 4096 && value.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+    value.len() <= 4096
+        && value
+            .bytes()
+            .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
 }
 
 /// Set, add and remove request headers before the request is sent upstream.
@@ -340,7 +343,10 @@ mod tests {
         assert_eq!(root.apply(Some("/foo"), "/foo"), "/");
         let into_root = PathModifier::Prefix("/xyz".into());
         assert_eq!(into_root.apply(Some("/"), "/bar"), "/xyz/bar");
-        assert_eq!(PathModifier::Full("/one".into()).apply(Some("/foo"), "/foo/x"), "/one");
+        assert_eq!(
+            PathModifier::Full("/one".into()).apply(Some("/foo"), "/foo/x"),
+            "/one"
+        );
     }
 
     #[test]
@@ -353,7 +359,14 @@ mod tests {
             status_code: 301,
         };
         assert_eq!(
-            r.location("http", "a.example.test", Some(8080), None, "/x", Some("q=1")),
+            r.location(
+                "http",
+                "a.example.test",
+                Some(8080),
+                None,
+                "/x",
+                Some("q=1")
+            ),
             "https://a.example.test/x?q=1"
         );
         let r = RouteRedirect {
@@ -364,7 +377,14 @@ mod tests {
             status_code: 302,
         };
         assert_eq!(
-            r.location("https", "a.example.test", None, Some("/old"), "/old/p", None),
+            r.location(
+                "https",
+                "a.example.test",
+                None,
+                Some("/old"),
+                "/old/p",
+                None
+            ),
             "https://b.example.test:8443/new/p"
         );
         let keep = RouteRedirect {
@@ -378,7 +398,14 @@ mod tests {
             keep.location("http", "a.example.test", Some(8080), None, "/", None),
             "http://a.example.test:8080/"
         );
-        assert!(RouteRedirect { status_code: 200, ..keep.clone() }.validate().is_err());
+        assert!(
+            RouteRedirect {
+                status_code: 200,
+                ..keep.clone()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -397,7 +424,13 @@ mod tests {
         assert_eq!(headers["x-set"], "one");
         assert_eq!(headers.get_all("x-add").iter().count(), 2);
         assert!(headers.get("x-gone").is_none());
-        for name in ["host", "X-Forwarded-User", "x-hopae-session", "x-hangang-reason", "connection"] {
+        for name in [
+            "host",
+            "X-Forwarded-User",
+            "x-hopae-session",
+            "x-hangang-reason",
+            "connection",
+        ] {
             let bad = HeaderModifier {
                 set: BTreeMap::from([(name.into(), "v".into())]),
                 ..Default::default()
@@ -410,7 +443,10 @@ mod tests {
     fn query_conditions_match_exactly_on_the_first_value() {
         let conditions = BTreeMap::from([("animal".to_owned(), "whale".to_owned())]);
         assert!(query_matches(Some("animal=whale&x=1"), &conditions));
-        assert!(!query_matches(Some("animal=dolphin&animal=whale"), &conditions));
+        assert!(!query_matches(
+            Some("animal=dolphin&animal=whale"),
+            &conditions
+        ));
         assert!(!query_matches(None, &conditions));
         assert!(query_matches(Some("animal=wh%61le"), &conditions));
     }

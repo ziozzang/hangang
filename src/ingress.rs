@@ -24,7 +24,7 @@ fn is_handoff(route: &HttpRoute) -> bool {
 /// Offline adapter (`--import-ingress`): any invalid selected object fails the
 /// whole conversion so an operator sees the problem with their input.
 pub fn import(document: &Value, class: &str) -> Result<Config> {
-    build(document, class, false, None).map(|result| result.0)
+    build(document, class, false, None, (0, 0)).map(|result| result.0)
 }
 
 /// Live controller conversion: a single invalid selected Ingress (bad name,
@@ -33,7 +33,7 @@ pub fn import(document: &Value, class: &str) -> Result<Config> {
 /// controller on startup. Only a malformed document or an over-limit result
 /// still fails.
 pub fn import_tolerant(document: &Value, class: &str) -> Result<Config> {
-    build(document, class, true, None).map(|result| result.0)
+    build(document, class, true, None, (0, 0)).map(|result| result.0)
 }
 
 pub(crate) type IngressIdentities = BTreeSet<(String, String)>;
@@ -41,14 +41,17 @@ pub(crate) fn import_validated(
     document: &Value,
     class: &str,
     protections: Option<&Protections>,
+    reserved: (usize, usize),
 ) -> Result<(Config, IngressIdentities)> {
-    build(document, class, true, protections)
+    build(document, class, true, protections, reserved)
 }
 fn build(
     document: &Value,
     class: &str,
     tolerant: bool,
     protections: Option<&Protections>,
+    // Routes and bytes already budgeted for Gateway API routes.
+    reserved: (usize, usize),
 ) -> Result<(Config, IngressIdentities)> {
     let items = document
         .as_array()
@@ -113,8 +116,8 @@ fn build(
         settings: Default::default(),
         cache_generation_floor: 0,
     });
-    let mut route_bytes = 0usize;
-    let mut route_count = 0usize;
+    let mut route_bytes = reserved.1;
+    let mut route_count = reserved.0;
     let mut any_protected = false;
     let mut handoff_hosts: BTreeSet<Option<String>> = BTreeSet::new();
     for resource in selected_ingresses {
@@ -252,7 +255,7 @@ fn build(
 }
 
 /// Lower sorts first: exact host, one-label wildcard, any other glob, none.
-fn host_specificity(host: Option<&str>) -> u8 {
+pub(crate) fn host_specificity(host: Option<&str>) -> u8 {
     match host {
         Some(host) if !crate::host_match::is_glob(host) => 0,
         Some(host)
@@ -469,7 +472,7 @@ fn dns_label(value: &str) -> bool {
         && !value.starts_with('-')
         && !value.ends_with('-')
 }
-fn identifier(prefix: &str, suffix: &str) -> String {
+pub(crate) fn identifier(prefix: &str, suffix: &str) -> String {
     use sha2::{Digest, Sha256};
     let full = format!("{prefix}.{suffix}");
     if full.len() <= 128 {
@@ -622,7 +625,7 @@ mod isolation_tests {
         ]});
         // Each object is individually valid, so only the aggregate overflows.
         assert!(import(&input, "hangang").is_err());
-        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None, (0, 0)).unwrap();
         assert_eq!(config.http.len(), 1);
         assert_eq!(config.http[0].host.as_deref(), Some("small.example.test"));
         assert_eq!(
@@ -636,7 +639,7 @@ mod isolation_tests {
             ingress_with_paths("blue", "a-big", Some("big.example.test"), &many),
             ingress_with_paths("blue", "z-small", Some("small.example.test"), &["/"]),
         ]});
-        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None, (0, 0)).unwrap();
         assert_eq!(config.http.len(), MAX_ROUTES);
         assert_eq!(
             accepted,
@@ -657,7 +660,7 @@ mod isolation_tests {
             ingress_with_paths("blue", "z-large", Some("large.example.test"), &long),
         ]});
         assert!(import(&input, "hangang").is_err());
-        let (config, accepted) = import_validated(&input, "hangang", None).unwrap();
+        let (config, accepted) = import_validated(&input, "hangang", None, (0, 0)).unwrap();
         assert_eq!(config.http.len(), 1);
         assert_eq!(accepted.len(), 1);
         assert!(serialized_len(&config) <= MAX_CONFIG_BYTES);

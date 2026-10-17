@@ -18,7 +18,7 @@
 //! can stop routing to this replica while it keeps serving its last snapshot.
 //! The deadline is checked while lists and snapshot preparation are in
 //! progress too, so a stalled relist cannot hold readiness past it.
-use crate::{config::Config, ingress, protection, tls};
+use crate::{config::Config, gateway_api, ingress, protection, tls};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -104,11 +104,20 @@ pub struct ControllerOptions {
     /// the Ingresses they attach to (ADR 0022). `None` keeps the historical
     /// unprotected Ingress semantics.
     pub protection: Option<Arc<protection::Options>>,
+    /// Implement the Gateway API (`gateway.networking.k8s.io/v1`):
+    /// GatewayClasses naming [`gateway_api::CONTROLLER_NAME`], their
+    /// Gateways, HTTPRoutes and ReferenceGrants. The CRDs must be installed:
+    /// a missing kind keeps the controller from ever publishing.
+    pub gateway_api: bool,
 }
 
 impl ControllerOptions {
     fn kinds(&self) -> Vec<ResourceKind> {
-        ResourceKind::enabled(self.watch_secrets, self.protection.is_some())
+        ResourceKind::enabled(
+            self.watch_secrets,
+            self.protection.is_some(),
+            self.gateway_api,
+        )
     }
     pub fn in_cluster(ingress_class: impl Into<String>) -> Result<Self> {
         let host = std::env::var("KUBERNETES_SERVICE_HOST")
@@ -140,6 +149,7 @@ impl ControllerOptions {
             list_timeout: Duration::from_secs(15),
             freshness: None,
             protection: None,
+            gateway_api: false,
         })
     }
 
@@ -341,6 +351,7 @@ struct Published {
     admitted: ingress::IngressIdentities,
     owners: HostOwners,
     protection: Option<Arc<protection::Resolution>>,
+    gateway: Option<Arc<gateway_api::Translation>>,
 }
 
 /// Result of building and validating one publication.
@@ -348,6 +359,7 @@ struct Admission {
     admitted: ingress::IngressIdentities,
     owners: HostOwners,
     protection: Option<Arc<protection::Resolution>>,
+    gateway: Option<Arc<gateway_api::Translation>>,
 }
 
 enum Outcome {
@@ -456,7 +468,11 @@ pub struct Controller {
     client_ca: Arc<std::sync::Mutex<Vec<u8>>>,
     sink: Arc<dyn ConfigSink>,
     policy_statuses: Arc<PolicyStatusQueue>,
+    gateway_statuses: Arc<PolicyStatusQueue<StatusKey>>,
 }
+
+/// A Gateway API object whose status the controller writes.
+type StatusKey = (ResourceKind, String, String);
 
 impl Controller {
     pub fn new(options: ControllerOptions, sink: Arc<dyn ConfigSink>) -> Result<Self> {
@@ -464,12 +480,14 @@ impl Controller {
         let ca = read_bounded(&options.ca_path, MAX_CA_BYTES).context("read Kubernetes API CA")?;
         let client = build_client(&ca)?;
         let policy_statuses = Arc::new(PolicyStatusQueue::new(options.max_objects));
+        let gateway_statuses = Arc::new(PolicyStatusQueue::new(options.max_objects));
         Ok(Self {
             options,
             client: Arc::new(arc_swap::ArcSwap::from_pointee(client)),
             client_ca: Arc::new(std::sync::Mutex::new(ca)),
             sink,
             policy_statuses,
+            gateway_statuses,
         })
     }
 
@@ -495,6 +513,11 @@ impl Controller {
             let controller = self.clone_for_task();
             let cancel = cancel.clone();
             tokio::spawn(async move { controller.policy_status_worker(cancel).await })
+        });
+        let gateway_worker = self.options.gateway_api.then(|| {
+            let controller = self.clone_for_task();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { controller.gateway_status_worker(cancel).await })
         });
         let none = BTreeSet::new();
         while !cancel.is_cancelled() {
@@ -662,6 +685,9 @@ impl Controller {
         if let Some(worker) = policy_worker {
             let _ = worker.await;
         }
+        if let Some(worker) = gateway_worker {
+            let _ = worker.await;
+        }
     }
 
     fn clone_for_task(&self) -> Self {
@@ -671,6 +697,7 @@ impl Controller {
             client_ca: self.client_ca.clone(),
             sink: self.sink.clone(),
             policy_statuses: self.policy_statuses.clone(),
+            gateway_statuses: self.gateway_statuses.clone(),
         }
     }
 
@@ -812,6 +839,9 @@ impl Controller {
         for ((namespace, name), base, current) in self.policy_statuses.take_results() {
             cache.update_policy_status(&namespace, &name, &base, &current);
         }
+        for ((kind, namespace, name), base, current) in self.gateway_statuses.take_results() {
+            cache.update_owned_status(kind, &namespace, &name, &base, &current);
+        }
         let published = last_good.is_some();
         let outcome = self
             .drive(
@@ -854,6 +884,12 @@ impl Controller {
                 .report_protection(resolution.report(&published.admitted))
                 .await;
         }
+        if !matches!(outcome, Outcome::Rejected)
+            && let Some(published) = last_good.as_ref()
+            && let Some(translation) = &published.gateway
+        {
+            sync_gateway_statuses(&self.gateway_statuses, cache, translation);
+        }
         self.assess(
             health,
             &cache.incomplete,
@@ -880,6 +916,7 @@ impl Controller {
                     published.admitted = admission.admitted;
                     published.owners = admission.owners;
                     published.protection = admission.protection;
+                    published.gateway = admission.gateway;
                     return Outcome::Unchanged;
                 }
                 match self.sink.apply(snapshot.clone()).await {
@@ -889,6 +926,7 @@ impl Controller {
                             admitted: admission.admitted,
                             owners: admission.owners,
                             protection: admission.protection,
+                            gateway: admission.gateway,
                         });
                         Outcome::Applied
                     }
@@ -1176,6 +1214,21 @@ impl Controller {
     }
 
     fn resource_url(&self, kind: ResourceKind) -> Result<Url> {
+        if let Some((plural, version)) = kind.gateway_resource() {
+            let group = gateway_api::GROUP;
+            let path = match (&self.options.namespace, kind) {
+                // GatewayClass is cluster-scoped.
+                (_, ResourceKind::GatewayClass) | (None, _) => {
+                    format!("apis/{group}/{version}/{plural}")
+                }
+                (Some(ns), _) => format!("apis/{group}/{version}/namespaces/{ns}/{plural}"),
+            };
+            return self
+                .options
+                .api_server
+                .join(&path)
+                .context("build Kubernetes API URL");
+        }
         let path = match (&self.options.namespace, kind) {
             (Some(ns), ResourceKind::Service) => format!("api/v1/namespaces/{ns}/services"),
             (None, ResourceKind::Service) => "api/v1/services".into(),
@@ -1197,6 +1250,7 @@ impl Controller {
                 protection::VERSION,
                 protection::PLURAL
             ),
+            (_, kind) => bail!("{kind:?} has no core resource URL"),
         };
         self.options
             .api_server
@@ -1225,6 +1279,92 @@ impl Controller {
             .api_server
             .join(&path)
             .context("build Kubernetes API URL")
+    }
+
+    fn gateway_status_url(&self, (kind, namespace, name): &StatusKey) -> Result<Url> {
+        let (plural, version) = kind.gateway_resource().context("not a Gateway API kind")?;
+        let group = gateway_api::GROUP;
+        let path = if *kind == ResourceKind::GatewayClass {
+            format!("apis/{group}/{version}/{plural}/{name}/status")
+        } else {
+            format!("apis/{group}/{version}/namespaces/{namespace}/{plural}/{name}/status")
+        };
+        self.options
+            .api_server
+            .join(&path)
+            .context("build Kubernetes API URL")
+    }
+
+    /// Drain the Gateway API status queue until cancelled.
+    async fn gateway_status_worker(self, cancel: CancellationToken) {
+        let queue = self.gateway_statuses.clone();
+        let mut tasks = JoinSet::new();
+        loop {
+            while tasks.len() < STATUS_PATCH_CONCURRENCY {
+                let Some((key, object, status)) = queue.start() else {
+                    break;
+                };
+                let controller = self.clone_for_task();
+                let cancel = cancel.clone();
+                tasks.spawn(async move {
+                    let base = resource_version(&object);
+                    let outcome = tokio::select! {
+                        _ = cancel.cancelled() => Ok(None),
+                        outcome = controller.patch_gateway_status(&key, &object, status) => outcome,
+                    };
+                    (key, base, outcome)
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = queue.notify.notified() => {}
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    match finished {
+                        Some(Ok((key, base, outcome))) => queue.complete(key, base, outcome),
+                        Some(Err(error)) => tracing::warn!(%error, "Gateway API status worker failed"),
+                        None => {}
+                    }
+                }
+            }
+        }
+        tasks.shutdown().await;
+    }
+
+    /// Merge-patch the controller's status fields with the cached
+    /// `resourceVersion` as precondition; `None` on 409 or 404 (the watch
+    /// event for that change decides again from the cache).
+    async fn patch_gateway_status(
+        &self,
+        key: &StatusKey,
+        object: &Value,
+        status: Value,
+    ) -> Result<Option<Value>> {
+        let rv = resource_version(object);
+        ensure!(!rv.is_empty(), "{:?} resourceVersion missing", key.0);
+        let body = serde_json::json!({"metadata":{"resourceVersion":rv},"status":status});
+        let response = self
+            .authorize(
+                self.api_client()
+                    .await?
+                    .patch(self.gateway_status_url(key)?)
+                    .header("content-type", "application/merge-patch+json")
+                    .body(serde_json::to_vec(&body)?),
+            )
+            .await?
+            .timeout(self.options.list_timeout)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = bounded_body(response, MAX_WATCH_EVENT_BYTES).await?;
+        if status.is_success() {
+            return Ok(serde_json::from_slice(&bytes).ok());
+        }
+        if status == StatusCode::CONFLICT || status == StatusCode::NOT_FOUND {
+            tracing::debug!(kind=?key.0, namespace=%key.1, name=%key.2, %status, "Gateway API status write dropped; the next event decides again");
+            return Ok(None);
+        }
+        bail!("{:?} status patch returned {status}", key.0)
     }
 
     /// Drain the ProtectionPolicy status queue until cancelled.
@@ -1498,41 +1638,116 @@ fn sync_policy_statuses(
     queue.sync(desired);
 }
 
+/// Bring the Gateway API status queue in line with the published
+/// translation: GatewayClasses and Gateways of this controller, and the
+/// HTTPRoutes attached to them (including routes that carry a stale entry of
+/// ours). Only objects whose status disagrees, ignoring timestamps, are
+/// queued; the fields written are compared on their own so status fields of
+/// other writers never cause churn.
+fn sync_gateway_statuses(
+    queue: &PolicyStatusQueue<StatusKey>,
+    cache: &ResourceCache,
+    translation: &gateway_api::Translation,
+) {
+    let mut desired = Vec::new();
+    let mut want = |kind: ResourceKind, object: &Arc<Value>, status: Value| {
+        let current = object.get("status").cloned().unwrap_or(Value::Null);
+        let mut merged = match &current {
+            Value::Object(_) => current.clone(),
+            _ => serde_json::json!({}),
+        };
+        for (field, value) in status.as_object().into_iter().flatten() {
+            merged[field] = value.clone();
+        }
+        if protection::same_status(Some(&current), &merged) {
+            return;
+        }
+        if let Ok((namespace, name)) = object_key(object) {
+            desired.push(((kind, namespace, name), object.clone(), status));
+        }
+    };
+    for object in cache.entries(ResourceKind::GatewayClass) {
+        let Ok(key) = object_key(object) else {
+            continue;
+        };
+        if let Some(status) = translation.classes.get(&key) {
+            want(
+                ResourceKind::GatewayClass,
+                object,
+                gateway_api::owned_status(object, status.clone()),
+            );
+        }
+    }
+    for object in cache.entries(ResourceKind::Gateway) {
+        let Ok(key) = object_key(object) else {
+            continue;
+        };
+        if let Some(status) = translation.gateways.get(&key) {
+            want(
+                ResourceKind::Gateway,
+                object,
+                gateway_api::owned_status(object, status.clone()),
+            );
+        }
+    }
+    let none = gateway_api::RouteStatus::default();
+    for object in cache.entries(ResourceKind::HttpRoute) {
+        let Ok(key) = object_key(object) else {
+            continue;
+        };
+        let ours = match translation.routes_status.get(&key) {
+            Some(ours) => ours,
+            None if gateway_api::has_our_parents(object) => &none,
+            None => continue,
+        };
+        want(
+            ResourceKind::HttpRoute,
+            object,
+            gateway_api::route_status(object, ours),
+        );
+    }
+    queue.sync(desired);
+}
+
 /// Coalescing queue of `ProtectionPolicy` status writes: at most one entry
 /// per live policy (the latest desired status wins), bounded by the object
 /// limit. A conflict or a vanished object drops the work; the watch event
 /// that caused it triggers a new reconciliation that decides again.
-struct PolicyStatusQueue {
-    state: std::sync::Mutex<PolicyStatusState>,
+struct PolicyStatusQueue<K = ObjectKey> {
+    state: std::sync::Mutex<PolicyStatusState<K>>,
     notify: tokio::sync::Notify,
     limit: usize,
 }
-#[derive(Default)]
-struct PolicyStatusState {
-    queued: BTreeMap<ObjectKey, (Arc<Value>, Value)>,
-    in_flight: BTreeSet<ObjectKey>,
+struct PolicyStatusState<K> {
+    queued: BTreeMap<K, (Arc<Value>, Value)>,
+    in_flight: BTreeSet<K>,
     /// `resourceVersion` a completed patch was based on, until the cache
     /// absorbs the result.
-    satisfied: BTreeMap<ObjectKey, String>,
+    satisfied: BTreeMap<K, String>,
     /// (object, base `resourceVersion`, server response view).
-    results: Vec<(ObjectKey, String, Value)>,
+    results: Vec<(K, String, Value)>,
 }
-impl PolicyStatusQueue {
+impl<K: Ord + Clone + std::fmt::Debug> PolicyStatusQueue<K> {
     fn new(limit: usize) -> Self {
         Self {
-            state: std::sync::Mutex::new(PolicyStatusState::default()),
+            state: std::sync::Mutex::new(PolicyStatusState {
+                queued: BTreeMap::new(),
+                in_flight: BTreeSet::new(),
+                satisfied: BTreeMap::new(),
+                results: Vec::new(),
+            }),
             notify: tokio::sync::Notify::new(),
             limit,
         }
     }
-    fn lock(&self) -> std::sync::MutexGuard<'_, PolicyStatusState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PolicyStatusState<K>> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    fn sync(&self, desired: Vec<(ObjectKey, Arc<Value>, Value)>) {
+    fn sync(&self, desired: Vec<(K, Arc<Value>, Value)>) {
         let mut state = self.lock();
-        let keep: BTreeSet<ObjectKey> = desired.iter().map(|(key, _, _)| key.clone()).collect();
+        let keep: BTreeSet<K> = desired.iter().map(|(key, _, _)| key.clone()).collect();
         state.queued.retain(|key, _| keep.contains(key));
         let mut wake = false;
         for (key, object, status) in desired {
@@ -1540,7 +1755,7 @@ impl PolicyStatusQueue {
                 continue;
             }
             if state.queued.len() >= self.limit && !state.queued.contains_key(&key) {
-                tracing::warn!(namespace=%key.0, name=%key.1, "ProtectionPolicy status queue is full; the update is deferred");
+                tracing::warn!(object=?key, "status queue is full; the update is deferred");
                 continue;
             }
             state.queued.insert(key, (object, status));
@@ -1555,7 +1770,7 @@ impl PolicyStatusQueue {
     fn queued_len(&self) -> usize {
         self.lock().queued.len()
     }
-    fn start(&self) -> Option<(ObjectKey, Arc<Value>, Value)> {
+    fn start(&self) -> Option<(K, Arc<Value>, Value)> {
         let mut state = self.lock();
         let key = state
             .queued
@@ -1566,7 +1781,7 @@ impl PolicyStatusQueue {
         state.in_flight.insert(key.clone());
         Some((key, object, status))
     }
-    fn complete(&self, key: ObjectKey, base: String, outcome: Result<Option<Value>>) {
+    fn complete(&self, key: K, base: String, outcome: Result<Option<Value>>) {
         let mut state = self.lock();
         state.in_flight.remove(&key);
         match outcome {
@@ -1580,11 +1795,11 @@ impl PolicyStatusQueue {
             }
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(namespace=%key.0, name=%key.1, %error, "ProtectionPolicy status update failed; it will be retried on the next event");
+                tracing::warn!(object=?key, %error, "status update failed; it will be retried on the next event");
             }
         }
     }
-    fn take_results(&self) -> Vec<(ObjectKey, String, Value)> {
+    fn take_results(&self) -> Vec<(K, String, Value)> {
         let mut state = self.lock();
         let results = std::mem::take(&mut state.results);
         for (key, _, _) in &results {
@@ -1845,9 +2060,13 @@ enum ResourceKind {
     Ingress,
     Secret,
     ProtectionPolicy,
+    GatewayClass,
+    Gateway,
+    HttpRoute,
+    ReferenceGrant,
 }
 impl ResourceKind {
-    fn enabled(secrets: bool, protection: bool) -> Vec<Self> {
+    fn enabled(secrets: bool, protection: bool, gateway_api: bool) -> Vec<Self> {
         let mut kinds = vec![Self::Service, Self::Ingress];
         if secrets {
             kinds.push(Self::Secret);
@@ -1855,7 +2074,25 @@ impl ResourceKind {
         if protection {
             kinds.push(Self::ProtectionPolicy);
         }
+        if gateway_api {
+            kinds.extend([
+                Self::GatewayClass,
+                Self::Gateway,
+                Self::HttpRoute,
+                Self::ReferenceGrant,
+            ]);
+        }
         kinds
+    }
+    /// Plural and version of a Gateway API kind.
+    fn gateway_resource(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::GatewayClass => Some(("gatewayclasses", gateway_api::VERSION)),
+            Self::Gateway => Some(("gateways", gateway_api::VERSION)),
+            Self::HttpRoute => Some(("httproutes", gateway_api::VERSION)),
+            Self::ReferenceGrant => Some(("referencegrants", gateway_api::GRANT_VERSION)),
+            _ => None,
+        }
     }
 }
 #[derive(Clone, Copy)]
@@ -2061,11 +2298,25 @@ impl ResourceCache {
     /// controller just patched, unless the cache already moved past the
     /// version the patch was based on (a watch event got there first).
     fn update_policy_status(&mut self, namespace: &str, name: &str, base: &str, current: &Value) {
-        let key = (
+        self.update_owned_status(
             ResourceKind::ProtectionPolicy,
-            namespace.to_owned(),
-            name.to_owned(),
+            namespace,
+            name,
+            base,
+            current,
         );
+    }
+    /// [`Self::update_policy_status`] for any kind whose status the
+    /// controller writes as a whole.
+    fn update_owned_status(
+        &mut self,
+        kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        base: &str,
+        current: &Value,
+    ) {
+        let key = (kind, namespace.to_owned(), name.to_owned());
         let Some(cached) = self.values.get_mut(&key) else {
             return;
         };
@@ -2079,10 +2330,7 @@ impl ResourceCache {
         object["metadata"]["resourceVersion"] = rv;
         object["status"] = current.get("status").cloned().unwrap_or(Value::Null);
         let bytes = ingress::serialized_len(&*object);
-        let usage = self
-            .usage
-            .entry(ResourceKind::ProtectionPolicy)
-            .or_default();
+        let usage = self.usage.entry(kind).or_default();
         usage.bytes = usage.bytes - cached.bytes + bytes;
         cached.bytes = bytes;
     }
@@ -2105,7 +2353,29 @@ impl ResourceCache {
             .objects(ResourceKind::Ingress)
             .filter(|ingress| selected(ingress, &options.ingress_class) == Some(true))
             .collect();
-        let (authorized, owners) = authorize_hosts(&selected_ingresses);
+        let gateway_service =
+            |namespace: &str, name: &str| self.get(ResourceKind::Service, namespace, name);
+        let secret = |namespace: &str, name: &str| self.get(ResourceKind::Secret, namespace, name);
+        let gateway_plan = options.gateway_api.then(|| {
+            gateway_api::plan(&gateway_api::Inputs {
+                classes: self.objects(ResourceKind::GatewayClass).collect(),
+                gateways: self.objects(ResourceKind::Gateway).collect(),
+                routes: self.objects(ResourceKind::HttpRoute).collect(),
+                grants: self.objects(ResourceKind::ReferenceGrant).collect(),
+                service: &gateway_service,
+                secret: &secret,
+                certificate: &|secret| {
+                    tls_secret(secret)
+                        .map(|(cert, _)| certificate_dns_names(&cert).unwrap_or_default())
+                },
+                tls: options.watch_secrets,
+                publish_address: options.publish_address.as_deref(),
+            })
+        });
+        let gateway_keys: BTreeSet<ObjectKey> = gateway_plan
+            .iter()
+            .flat_map(|plan| plan.gateways.iter().map(|gateway| gateway.key.clone()))
+            .collect();
         // Protection is decided for every selected Ingress, owned or not, so
         // status reports a withheld Ingress whatever withdrew it first.
         let resolution = options.protection.as_ref().map(|settings| {
@@ -2124,8 +2394,57 @@ impl ResourceCache {
                     policies: self.objects(ResourceKind::ProtectionPolicy).collect(),
                     service: &service,
                     ingress: &ingress,
+                    gateway_units: gateway_plan
+                        .as_ref()
+                        .map_or(&[], |plan| plan.units.as_slice()),
+                    gateways: &gateway_keys,
                 },
             ))
+        });
+        let translation = gateway_plan.as_ref().map(|plan| {
+            Arc::new(gateway_api::finalize(
+                plan,
+                resolution
+                    .as_ref()
+                    .map(|resolution| &resolution.gateway_decisions),
+                options
+                    .protection
+                    .as_ref()
+                    .and_then(|protection| protection.settings.pumgye_authority.as_ref()),
+            ))
+        });
+        // ADR 0022: an Ingress may not claim a host a Gateway route serves.
+        // Gateway routes are the primary model, so the Ingress is withheld.
+        let selected_ingresses: Vec<&Value> = match &translation {
+            None => selected_ingresses,
+            Some(translation) => selected_ingresses
+                .into_iter()
+                .filter(|ingress| {
+                    let claims = host_claims(ingress).unwrap_or_default();
+                    let overlapping: Vec<&String> = claims
+                        .iter()
+                        .filter(|claim| translation.hosts.iter().any(|host| hosts_overlap(claim, host)))
+                        .collect();
+                    if overlapping.is_empty() {
+                        return true;
+                    }
+                    if let Ok((namespace, name)) = object_key(ingress) {
+                        tracing::warn!(%namespace, %name, hosts=?overlapping, "Ingress withdrawn: a Gateway API route serves the same host");
+                    }
+                    false
+                })
+                .collect(),
+        };
+        let (authorized, owners) = authorize_hosts(&selected_ingresses);
+        let reserved = translation.as_ref().map_or((0, 0), |translation| {
+            (
+                translation.routes.len(),
+                translation
+                    .routes
+                    .iter()
+                    .map(|route| ingress::serialized_len(route) + 1)
+                    .sum(),
+            )
         });
         let protections = resolution
             .as_ref()
@@ -2147,8 +2466,11 @@ impl ResourceCache {
             &Value::Array(resources.clone()),
             &options.ingress_class,
             protections.as_ref(),
+            reserved,
         )?;
         if !options.watch_secrets {
+            let config =
+                merge_gateway_routes(config, translation.as_deref(), protections.as_ref())?;
             return Ok((
                 ControllerSnapshot {
                     config,
@@ -2158,6 +2480,7 @@ impl ResourceCache {
                     admitted: valid,
                     owners,
                     protection: resolution,
+                    gateway: translation,
                 },
             ));
         }
@@ -2265,7 +2588,70 @@ impl ResourceCache {
             &Value::Array(resources),
             &options.ingress_class,
             protections.as_ref(),
+            reserved,
         )?;
+        let config = merge_gateway_routes(config, translation.as_deref(), protections.as_ref())?;
+        // Gateway listener certificates. A host an Ingress certificate
+        // already serves is not taken over (Ingresses overlapping Gateway
+        // routes were withdrawn above, so this only meets TLS-only claims).
+        for (hosts, (namespace, name)) in translation
+            .iter()
+            .flat_map(|translation| translation.certificates.iter())
+        {
+            let checked = (|| -> Result<(Vec<u8>, TlsCertificate)> {
+                use sha2::{Digest, Sha256};
+                let secret = self
+                    .get(ResourceKind::Secret, namespace, name)
+                    .with_context(|| format!("TLS Secret {namespace}/{name} is missing"))?;
+                let (cert, key) = tls_secret(secret)?;
+                let mut hash = Sha256::new();
+                for der in rustls_pemfile::certs(&mut std::io::Cursor::new(&cert)) {
+                    let der = der?;
+                    hash.update((der.len() as u64).to_be_bytes());
+                    hash.update(der.as_ref());
+                }
+                let fingerprint = hash.finalize().to_vec();
+                for host in hosts {
+                    ensure!(
+                        claims.get(host).is_none_or(|old| old == &fingerprint),
+                        "host {host} is already served by another certificate"
+                    );
+                }
+                let mut combined: BTreeSet<String> = hosts.iter().cloned().collect();
+                if let Some(old) = certificates.get(&fingerprint) {
+                    combined.extend(old.hosts.iter().cloned());
+                }
+                ensure!(combined.len() <= 128, "TLS host count exceeds 128");
+                ensure!(
+                    certificates.contains_key(&fingerprint)
+                        || (material_bytes + cert.len() + key.len() <= 16 * 1024 * 1024
+                            && certificates.len() < 1024),
+                    "TLS material budget exceeded"
+                );
+                Ok((
+                    fingerprint,
+                    TlsCertificate {
+                        hosts: combined.into_iter().collect(),
+                        cert_pem: cert,
+                        key_pem: key,
+                    },
+                ))
+            })();
+            match checked {
+                Ok((fingerprint, certificate)) => {
+                    for host in &certificate.hosts {
+                        claims.insert(host.clone(), fingerprint.clone());
+                    }
+                    if !certificates.contains_key(&fingerprint) {
+                        material_bytes += certificate.cert_pem.len() + certificate.key_pem.len();
+                    }
+                    certificates.insert(fingerprint, certificate);
+                }
+                Err(error) => {
+                    tracing::warn!(%namespace, %name, %error, "Gateway listener certificate not served");
+                }
+            }
+        }
         Ok((
             ControllerSnapshot {
                 config,
@@ -2275,6 +2661,7 @@ impl ResourceCache {
                 admitted,
                 owners,
                 protection: resolution,
+                gateway: translation,
             },
         ))
     }
@@ -2351,6 +2738,78 @@ impl ResourceCache {
         }
         Ok(result)
     }
+}
+
+/// Validate a `kubernetes.io/tls` Secret: its certificate chain and key.
+fn tls_secret(secret: &Value) -> Result<(Vec<u8>, Vec<u8>)> {
+    ensure!(
+        secret.get("type").and_then(Value::as_str) == Some("kubernetes.io/tls"),
+        "the Secret is not kubernetes.io/tls"
+    );
+    let cert = decode_secret(secret, "tls.crt")?;
+    let key = decode_secret(secret, "tls.key")?;
+    tls::server_config(&cert, &key).context("invalid TLS Secret")?;
+    Ok((cert, key))
+}
+
+/// Whether an Ingress host claim and a Gateway route host can match the
+/// same request host. Gateway wildcards cover any number of labels; Ingress
+/// wildcards one; the catch-all `*` only meets the catch-all.
+fn hosts_overlap(claim: &str, gateway: &str) -> bool {
+    if claim == gateway {
+        return true;
+    }
+    if claim == CATCH_ALL_HOST || gateway == CATCH_ALL_HOST {
+        return false;
+    }
+    if let Some(suffix) = gateway.strip_prefix('*')
+        && suffix.starts_with('.')
+        && claim.len() > suffix.len()
+        && claim.ends_with(suffix)
+    {
+        return true;
+    }
+    claim.strip_prefix("*.").is_some_and(|suffix| {
+        !gateway.starts_with('*')
+            && gateway
+                .split_once('.')
+                .is_some_and(|(_, rest)| rest == suffix)
+    })
+}
+
+/// Add the Gateway API routes to the Ingress configuration. Hosts are
+/// disjoint (overlapping Ingresses were withdrawn), so routes are merged by
+/// host specificity only, keeping each side's own order.
+fn merge_gateway_routes(
+    mut config: Config,
+    translation: Option<&gateway_api::Translation>,
+    protections: Option<&protection::Protections>,
+) -> Result<Config> {
+    let Some(translation) = translation.filter(|t| !t.routes.is_empty()) else {
+        return Ok(config);
+    };
+    config.http.extend(translation.routes.iter().cloned());
+    config.http.sort_by_key(|route| {
+        if route.host_regex.is_some() {
+            1
+        } else {
+            ingress::host_specificity(route.host.as_deref())
+        }
+    });
+    if config.pumgye_authority.is_none()
+        && config
+            .http
+            .iter()
+            .any(|route| route.access_mode == crate::config::AccessMode::Protected)
+    {
+        config.pumgye_authority = protections.and_then(|p| p.pumgye_authority.clone());
+    }
+    config.validate()?;
+    ensure!(
+        ingress::serialized_len(&config) <= ingress::MAX_CONFIG_BYTES,
+        "generated configuration exceeds 1 MiB"
+    );
+    Ok(config)
 }
 
 /// Decide which selected Ingresses may publish their hostnames.
@@ -2546,6 +3005,36 @@ fn strip(kind: ResourceKind, object: &Value) -> Value {
             stripped.insert("spec".to_owned(), Value::Object(spec));
         }
         ResourceKind::ProtectionPolicy => {}
+        ResourceKind::ReferenceGrant => {
+            if let Some(spec) = object.get("spec") {
+                stripped.insert("spec".to_owned(), spec.clone());
+            }
+        }
+        ResourceKind::GatewayClass | ResourceKind::Gateway | ResourceKind::HttpRoute => {
+            // Age decides hostname ownership and precedence; uid and
+            // generation bind status to the incarnation it was decided for.
+            for field in ["creationTimestamp", "uid", "generation"] {
+                if let Some(value) = object.pointer(&format!("/metadata/{field}")) {
+                    metadata.insert(field.to_owned(), value.clone());
+                }
+            }
+            let annotation = gateway_api::REQUIRE_PROTECTION_ANNOTATION;
+            if kind == ResourceKind::Gateway
+                && let Some(value) = object
+                    .pointer("/metadata/annotations")
+                    .and_then(|annotations| annotations.get(annotation))
+            {
+                metadata.insert(
+                    "annotations".to_owned(),
+                    serde_json::json!({ annotation: value }),
+                );
+            }
+            for field in ["spec", "status"] {
+                if let Some(value) = object.get(field) {
+                    stripped.insert(field.to_owned(), value.clone());
+                }
+            }
+        }
         ResourceKind::Ingress => {
             // Creation time and uid decide hostname ownership; uid and
             // generation bind queued status work to the object it was
@@ -3010,6 +3499,7 @@ mod tls_isolation_tests {
             client_ca: Arc::new(std::sync::Mutex::new(Vec::new())),
             sink: sink.clone(),
             policy_statuses: Arc::new(PolicyStatusQueue::new(options.max_objects)),
+            gateway_statuses: Arc::new(PolicyStatusQueue::new(options.max_objects)),
         };
         let mut health = Health::new(&options);
         for kind in options.kinds() {
@@ -3081,6 +3571,7 @@ mod tls_isolation_tests {
             list_timeout: Duration::from_secs(40),
             freshness: None,
             protection: None,
+            gateway_api: false,
         }
     }
     fn ingress(name: &str, host: &str, secret: &str) -> Value {

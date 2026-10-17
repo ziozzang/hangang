@@ -3392,7 +3392,9 @@ impl Proxy {
             );
             let mut redirected = response(redirect.status_code, "");
             if let Ok(value) = hyper::header::HeaderValue::from_str(&location) {
-                redirected.headers_mut().insert(hyper::header::LOCATION, value);
+                redirected
+                    .headers_mut()
+                    .insert(hyper::header::LOCATION, value);
             }
             return Ok(redirected);
         }
@@ -3416,24 +3418,30 @@ impl Proxy {
                 Err(_) => return Ok(response(500, "invalid rewritten path")),
             }
         }
-        let rewrite_host = runtime.route.rewrite.as_ref().and_then(|r| r.hostname.clone());
+        let rewrite_host = runtime
+            .route
+            .rewrite
+            .as_ref()
+            .and_then(|r| r.hostname.clone());
         let custom_outbound = docker_target.is_some()
             || runtime.route.upstream != Default::default()
             || runtime.route.upstream_host.is_some()
             || runtime.route.preserve_host
             || rewrite_host.is_some();
-        let host_override: Option<String> = rewrite_host.or_else(|| runtime.route.upstream_host.clone()).or_else(|| {
-            runtime
-                .route
-                .preserve_host
-                .then(|| {
-                    original_host
-                        .as_ref()
-                        .and_then(|h| h.to_str().ok())
-                        .map(str::to_owned)
-                })
-                .flatten()
-        });
+        let host_override: Option<String> = rewrite_host
+            .or_else(|| runtime.route.upstream_host.clone())
+            .or_else(|| {
+                runtime
+                    .route
+                    .preserve_host
+                    .then(|| {
+                        original_host
+                            .as_ref()
+                            .and_then(|h| h.to_str().ok())
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            });
         // A request is safe to replay to another backend only if it carries no
         // body and no side-effecting semantics, and is not being transformed or
         // upgraded. This never replays a request that may have taken effect.

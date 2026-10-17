@@ -8012,7 +8012,11 @@ async fn echo_target() -> (SocketAddr, JoinHandle<()>) {
                     let body = format!(
                         "{} {} {} {}",
                         header("host"),
-                        request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                        request
+                            .uri()
+                            .path_and_query()
+                            .map(|p| p.as_str())
+                            .unwrap_or("/"),
                         header("x-set"),
                         header("x-gone")
                     );
@@ -8076,8 +8080,22 @@ async fn route_filters_match_methods_and_query_modify_headers_rewrite_and_redire
         "internal.example.test /v2/items?v=2 yes -"
     );
     // Method and query conditions do not match: no route.
-    assert_eq!(client.request(send("POST", "/api/items?v=2")).await.unwrap().status(), 404);
-    assert_eq!(client.request(send("GET", "/api/items?v=1")).await.unwrap().status(), 404);
+    assert_eq!(
+        client
+            .request(send("POST", "/api/items?v=2"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        client
+            .request(send("GET", "/api/items?v=1"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
     let redirect = client.request(send("GET", "/old/page?q=1")).await.unwrap();
     assert_eq!(redirect.status(), 301);
     assert_eq!(

@@ -651,6 +651,9 @@ pub struct Resolution {
     /// Hosts of each protected Ingress that get the internal Hopae handoff
     /// route (`None` for hostless rules).
     pub handoff: BTreeMap<ObjectKey, Vec<Option<String>>>,
+    /// Gateway API route rule decisions and the policy each one uses.
+    pub gateway_decisions: BTreeMap<UnitKey, Decision>,
+    pub gateway_attached: BTreeMap<UnitKey, ObjectKey>,
 }
 impl Resolution {
     /// The protection input for route generation.
@@ -684,6 +687,30 @@ pub struct Inputs<'a> {
     pub service: &'a dyn Fn(&str, &str) -> Option<&'a Value>,
     /// Looks up a cached Ingress by namespace/name (public path checks).
     pub ingress: &'a dyn Fn(&str, &str) -> Option<&'a Value>,
+    /// Gateway API route rules to decide (empty without Gateway API).
+    pub gateway_units: &'a [GatewayUnit],
+    /// Gateways of this controller's classes (policy target existence).
+    pub gateways: &'a BTreeSet<ObjectKey>,
+}
+
+/// One rule of an HTTPRoute: `(namespace, route name, rule index)`.
+pub type UnitKey = (String, String, usize);
+
+/// A Gateway API route rule as a protection subject. Policies attach, most
+/// specific first, to the rule (`HTTPRoute` + `sectionName` = rule name), the
+/// route, a parent listener (`Gateway` + `sectionName`), a parent Gateway, or
+/// the namespace default.
+#[derive(Clone, Debug)]
+pub struct GatewayUnit {
+    pub key: UnitKey,
+    pub rule_name: Option<String>,
+    /// Accepted parents: (Gateway, listener name).
+    pub parents: Vec<(ObjectKey, Option<String>)>,
+    /// A parent Gateway requires protection (or `require_protection`).
+    pub require: bool,
+    /// Ingress-shaped view of the rule's hosts and paths, for the public path
+    /// and reserved path checks.
+    pub paths: Value,
 }
 
 /// Decide protection for every selected Ingress and record the per-policy
@@ -728,6 +755,8 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
         require_protection: settings.require_protection,
         facts: options.facts,
         handoff: BTreeMap::new(),
+        gateway_decisions: BTreeMap::new(),
+        gateway_attached: BTreeMap::new(),
     };
     // Ingress -> applying policy index, or a conflict.
     let mut by_policy: BTreeMap<usize, Vec<ObjectKey>> = BTreeMap::new();
@@ -778,6 +807,106 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
         resolution.decisions.insert(ingress.clone(), decision);
     }
 
+    // Gateway API route rules: the most specific attachment level that has
+    // any policy decides; several policies at that level are a conflict.
+    let mut route_targets: BTreeMap<(String, String, Option<String>), Vec<usize>> = BTreeMap::new();
+    let mut gateway_targets: BTreeMap<(String, String, Option<String>), Vec<usize>> =
+        BTreeMap::new();
+    for (index, policy) in parsed.iter().enumerate() {
+        for target in &policy.targets {
+            if target.group != GATEWAY_GROUP {
+                continue;
+            }
+            let entry = (
+                policy.key.0.clone(),
+                target.name.clone(),
+                target.section_name.clone(),
+            );
+            match target.kind.as_str() {
+                "HTTPRoute" => route_targets.entry(entry).or_default().push(index),
+                "Gateway" => gateway_targets.entry(entry).or_default().push(index),
+                _ => {}
+            }
+        }
+    }
+    let mut unit_conflicts: BTreeMap<usize, Vec<UnitKey>> = BTreeMap::new();
+    for unit in inputs.gateway_units {
+        let (namespace, route, _) = &unit.key;
+        let dedup = |mut list: Vec<usize>| {
+            list.sort_unstable();
+            list.dedup();
+            list
+        };
+        let rule = unit
+            .rule_name
+            .as_ref()
+            .and_then(|name| {
+                route_targets.get(&(namespace.clone(), route.clone(), Some(name.clone())))
+            })
+            .cloned()
+            .unwrap_or_default();
+        let whole = route_targets
+            .get(&(namespace.clone(), route.clone(), None))
+            .cloned()
+            .unwrap_or_default();
+        let listener: Vec<usize> = unit
+            .parents
+            .iter()
+            .filter_map(|((gw_ns, gw), listener)| {
+                listener.as_ref().and_then(|l| {
+                    gateway_targets.get(&(gw_ns.clone(), gw.clone(), Some(l.clone())))
+                })
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let gateway: Vec<usize> = unit
+            .parents
+            .iter()
+            .filter_map(|((gw_ns, gw), _)| gateway_targets.get(&(gw_ns.clone(), gw.clone(), None)))
+            .flatten()
+            .copied()
+            .collect();
+        let default = defaults.get(namespace).cloned().unwrap_or_default();
+        let candidates = [rule, whole, listener, gateway, default]
+            .into_iter()
+            .map(dedup)
+            .find(|level| !level.is_empty())
+            .unwrap_or_default();
+        let subject = (namespace.clone(), route.clone());
+        let decision = match candidates.as_slice() {
+            [] if unit.require || settings.require_protection => Decision::Withheld(Withheld {
+                reason: "ProtectionRequired",
+                message: "no ProtectionPolicy applies to this route rule (route, listener, Gateway or namespace default) and protection is required".into(),
+            }),
+            [] => Decision::Public,
+            [single] => {
+                resolution
+                    .gateway_attached
+                    .insert(unit.key.clone(), parsed[*single].key.clone());
+                let paths = &unit.paths;
+                decide(&parsed[*single], &subject, options, &client_address, &|_, _| Some(paths))
+            }
+            several => {
+                for index in several {
+                    unit_conflicts.entry(*index).or_default().push(unit.key.clone());
+                }
+                let names: Vec<&str> = several.iter().map(|i| parsed[*i].key.1.as_str()).collect();
+                Decision::Withheld(Withheld {
+                    reason: "Conflicted",
+                    message: bounded(&format!(
+                        "{} policies apply ({}); ambiguous attachments are refused",
+                        names.len(),
+                        names.join(", ")
+                    )),
+                })
+            }
+        };
+        resolution
+            .gateway_decisions
+            .insert(unit.key.clone(), decision);
+    }
+
     for (index, policy) in parsed.iter().enumerate() {
         let mut finding = PolicyFinding {
             generation: policy.generation,
@@ -824,6 +953,7 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
                 &resolution,
                 &conflicted,
                 inputs.ingresses,
+                (inputs.gateway_units, inputs.gateways, &unit_conflicts),
             ));
         }
         resolution.policies.insert(policy.key.clone(), finding);
@@ -838,6 +968,11 @@ fn target_finding(
     resolution: &Resolution,
     conflicted: &BTreeMap<usize, Vec<(ObjectKey, Vec<ObjectKey>)>>,
     ingresses: &BTreeSet<ObjectKey>,
+    (units, gateways, unit_conflicts): (
+        &[GatewayUnit],
+        &BTreeSet<ObjectKey>,
+        &BTreeMap<usize, Vec<UnitKey>>,
+    ),
 ) -> TargetFinding {
     let ok = |reason: &'static str| (true, reason, String::new());
     let mut finding = TargetFinding {
@@ -853,6 +988,48 @@ fn target_finding(
             "Invalid",
             "the policy is invalid; a targeted Ingress is withheld".into(),
         ));
+        return finding;
+    }
+    if target.group == GATEWAY_GROUP && matches!(target.kind.as_str(), "HTTPRoute" | "Gateway") {
+        let namespace = &policy.key.0;
+        let exists = match target.kind.as_str() {
+            "HTTPRoute" => units
+                .iter()
+                .any(|u| &u.key.0 == namespace && u.key.1 == target.name),
+            _ => gateways.contains(&(namespace.clone(), target.name.clone())),
+        };
+        if !exists {
+            let message = format!(
+                "no {} of this controller with this name exists in the policy's namespace",
+                target.kind
+            );
+            finding.accepted = (false, "TargetNotFound", message.clone());
+            finding.programmed = Some(("TargetNotFound", message));
+            return finding;
+        }
+        if unit_conflicts.contains_key(&index) {
+            let message = "another policy applies to the same route rules at the same level; they are withheld until exactly one applies".to_owned();
+            finding.accepted = (false, "Conflicted", message.clone());
+            finding.programmed = Some(("Conflicted", message));
+            return finding;
+        }
+        // Programmed when every rule this policy decides is served.
+        for unit in units {
+            if resolution.gateway_attached.get(&unit.key) != Some(&policy.key) {
+                continue;
+            }
+            if let Some(Decision::Withheld(withheld)) = resolution.gateway_decisions.get(&unit.key)
+            {
+                if matches!(
+                    withheld.reason,
+                    "InvalidIdentityProfile" | "RefNotPermitted" | "AuthorityUnavailable"
+                ) {
+                    finding.resolved = (false, withheld.reason, withheld.message.clone());
+                }
+                finding.programmed = Some((withheld.reason, withheld.message.clone()));
+                break;
+            }
+        }
         return finding;
     }
     if !target.is_ingress() {
@@ -1149,7 +1326,7 @@ fn client_address_preserved<'a>(
 // Status
 // ---------------------------------------------------------------------------
 
-fn condition(
+pub(crate) fn condition(
     kind: &str,
     status: bool,
     reason: &str,
@@ -1195,7 +1372,9 @@ impl Resolution {
             let ingress = (key.0.clone(), target.target.name.clone());
             let programmed = match &target.programmed {
                 Some((reason, message)) => (false, *reason, message.clone()),
-                None if admitted.contains(&ingress) => (true, "Programmed", String::new()),
+                None if !target.target.is_ingress() || admitted.contains(&ingress) => {
+                    (true, "Programmed", String::new())
+                }
                 None => (false, "Pending", "the Ingress was withdrawn by route validation, hostname ownership, TLS, or the route budget; see the controller log".to_owned()),
             };
             if !programmed.0 {
@@ -1690,7 +1869,7 @@ pub fn release_plan(previous: &Config, next: &Config) -> Option<Config> {
 
 // ---------------------------------------------------------------------------
 
-fn bounded(message: &str) -> String {
+pub(crate) fn bounded(message: &str) -> String {
     if message.len() <= MAX_MESSAGE {
         return message.to_owned();
     }
@@ -1829,6 +2008,8 @@ mod tests {
                 policies: policies.iter().collect(),
                 service: &lookup,
                 ingress: &ingress,
+                gateway_units: &[],
+                gateways: &BTreeSet::new(),
             },
         )
     }
@@ -2174,7 +2355,8 @@ mod tests {
              "spec":{"ingressClassName":"hangang","rules":[{"host":"other.example.test","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"api","port":{"number":80}}}}]}}]}}
         ]});
         let (config, admitted) =
-            crate::ingress::import_validated(&document, "hangang", Some(&protections)).unwrap();
+            crate::ingress::import_validated(&document, "hangang", Some(&protections), (0, 0))
+                .unwrap();
         assert_eq!(
             admitted,
             keys(&[("blue", "app")]),
@@ -2500,7 +2682,8 @@ mod tests {
             by_name("missing")["conditions"][0]["reason"],
             "TargetNotFound"
         );
-        assert_eq!(by_name("web")["conditions"][0]["reason"], "Unsupported");
+        // Gateway API targets are programmed when they exist; this one does not.
+        assert_eq!(by_name("web")["conditions"][0]["reason"], "TargetNotFound");
         assert_eq!(by_name("app")["ancestorRef"]["namespace"], "blue");
         for condition in status["conditions"].as_array().unwrap() {
             assert_eq!(condition["observedGeneration"], 3);
@@ -2561,6 +2744,7 @@ mod tests {
             &document,
             "hangang",
             Some(&resolution.protections(&options)),
+            (0, 0),
         )
         .unwrap();
         // The Ingress is deleted: the scope must be released first.
@@ -2579,6 +2763,7 @@ mod tests {
             &moved,
             "hangang",
             Some(&resolution.protections(&options)),
+            (0, 0),
         )
         .unwrap();
         assert!(next.validate_transition_from(&previous).is_err());

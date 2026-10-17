@@ -1146,8 +1146,13 @@ impl Config {
             if let Some(rewrite) = &route.rewrite {
                 rewrite.validate()?;
                 ensure!(
-                    !matches!(rewrite.path, Some(crate::route_filters::PathModifier::Prefix(_)))
-                        || matches!(route.path_match, PathMatch::Prefix | PathMatch::SegmentPrefix),
+                    !matches!(
+                        rewrite.path,
+                        Some(crate::route_filters::PathModifier::Prefix(_))
+                    ) || matches!(
+                        route.path_match,
+                        PathMatch::Prefix | PathMatch::SegmentPrefix
+                    ),
                     "a prefix path rewrite needs a prefix path match"
                 );
             }

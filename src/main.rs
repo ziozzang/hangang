@@ -125,6 +125,12 @@ struct Args {
     /// then defaults to on and withholds unprotected Ingresses.
     #[arg(long, requires = "kubernetes_controller")]
     kubernetes_protection_config: Option<PathBuf>,
+    /// Implement the Gateway API (gateway.networking.k8s.io/v1):
+    /// GatewayClasses with controllerName hangang.dev/gateway-controller,
+    /// their Gateways, HTTPRoutes and ReferenceGrants. The standard-channel
+    /// CRDs must be installed; without them nothing is published.
+    #[arg(long, requires = "kubernetes_controller")]
+    kubernetes_gateway_api: bool,
     /// Require a PROXY protocol v2 header from these load balancer CIDRs on
     /// the public listener (repeatable or comma separated). Other peers are
     /// served as direct connections and never parsed.
@@ -862,6 +868,7 @@ async fn run(args: Args) -> Result<()> {
                 list_timeout: Duration::from_secs(15),
                 freshness: None,
                 protection: None,
+                gateway_api: false,
             }
         } else {
             hangang::kubernetes::ControllerOptions::in_cluster(args.ingress_class.clone())?
@@ -881,6 +888,7 @@ async fn run(args: Args) -> Result<()> {
         options.namespace = args.kubernetes_namespace.clone();
         options.watch_secrets = args.kubernetes_tls;
         options.publish_address = args.kubernetes_publish_address.clone();
+        options.gateway_api = args.kubernetes_gateway_api;
         if let Some(path) = &args.kubernetes_protection_config {
             let settings = hangang::protection::Settings::load(path)?;
             let facts = hangang::protection::GatewayFacts {

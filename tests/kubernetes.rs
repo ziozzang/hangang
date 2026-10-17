@@ -192,6 +192,7 @@ async fn harness(mode: Mode, namespace: Option<&str>) -> Result<Harness> {
         list_timeout: Duration::from_secs(3),
         freshness: None,
         protection: None,
+        gateway_api: false,
     };
     Ok(Harness {
         state,
@@ -281,6 +282,7 @@ async fn tls_api_paginates_rotates_token_and_applies_watch_deletion() -> Result<
         list_timeout: Duration::from_secs(3),
         freshness: None,
         protection: None,
+        gateway_api: false,
     };
     let controller = Controller::new(options, Arc::new(ChannelSink(tx)))?;
     let cancel = CancellationToken::new();

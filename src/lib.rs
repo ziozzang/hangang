@@ -50,11 +50,12 @@ pub mod upstream;
 pub mod workload_material;
 pub mod workload_tls;
 
+pub mod gateway_api;
 pub mod ingress;
 pub mod kubernetes;
 pub mod protection;
-pub mod route_filters;
 pub mod proxy_protocol;
+pub mod route_filters;
 pub mod tls_reload;
 
 pub mod active_probe;
