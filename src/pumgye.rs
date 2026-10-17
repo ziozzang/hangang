@@ -6,6 +6,12 @@ use std::collections::BTreeMap;
 pub const SIMULATION_REQUEST_LIMIT: usize = 1024 * 1024 + 256 * 1024;
 /// Bound of one explain/batch/diff answer relayed to the console.
 pub const SIMULATION_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+/// Bound of a re-grant application request (Pumgye accepts at most 1,024
+/// proposal IDs and a 512-byte reason).
+pub const WORKLOAD_REQUEST_LIMIT: usize = 64 * 1024;
+/// Bound of a model v2 workload answer: the principal list, the v2 document
+/// (bindings) and a re-grant publication that echoes the document.
+pub const WORKLOAD_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,8 +290,53 @@ mod tests {
                     .is_err()
             );
         }
+        runtime
+            .workloads(reqwest::Method::GET, "v2/workloads", None)
+            .await
+            .unwrap();
+        runtime
+            .workloads(reqwest::Method::GET, "v2/policy", None)
+            .await
+            .unwrap();
+        let regrant = br#"{"base_revision":7,"proposals":["rg_1"],"reason":"migrate"}"#.to_vec();
+        runtime
+            .workloads(
+                reqwest::Method::POST,
+                "v2/workloads/regrants/apply",
+                Some(regrant.clone()),
+            )
+            .await
+            .unwrap();
+        for refused in [
+            (reqwest::Method::POST, "v2/workloads", Some(b"{}".to_vec())),
+            (reqwest::Method::GET, "v2/workloads/regrants/apply", None),
+            (reqwest::Method::PUT, "v2/policy", Some(b"{}".to_vec())),
+            (reqwest::Method::POST, "v2/cutover", Some(b"{}".to_vec())),
+            (
+                reqwest::Method::POST,
+                "v2/workloads/regrants/apply",
+                Some(vec![b' '; WORKLOAD_REQUEST_LIMIT + 1]),
+            ),
+        ] {
+            assert!(
+                runtime
+                    .workloads(refused.0, refused.1, refused.2)
+                    .await
+                    .is_err()
+            );
+        }
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.len(), 7);
+        assert_eq!(
+            (seen[4].0.as_str(), seen[4].1.as_str()),
+            ("GET", "/v2/workloads")
+        );
+        assert_eq!(seen[5].1, "/v2/policy");
+        assert_eq!(
+            (seen[6].0.as_str(), seen[6].1.as_str()),
+            ("POST", "/v2/workloads/regrants/apply")
+        );
+        assert_eq!(seen[6].3, regrant);
         assert_eq!(
             (seen[0].0.as_str(), seen[0].1.as_str()),
             ("POST", "/v1/explain")
@@ -1249,6 +1300,53 @@ impl AuthorityRuntime {
             ensure!(
                 bytes.len() + chunk.len() <= SIMULATION_RESPONSE_LIMIT,
                 "Pumgye simulation response exceeds bound"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((status, bytes))
+    }
+
+    /// Model v2 Kubernetes workload operations of the owning Pumgye authority
+    /// (Pumgye docs/MODEL_V2.md, "Kubernetes workload principals"): the
+    /// principal and re-grant proposal listing, the v2 document read, and the
+    /// explicit re-grant application (a compare-and-set publication on
+    /// `base_revision`). Fixed paths only; bodies are forwarded unchanged.
+    pub async fn workloads(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>)> {
+        ensure!(
+            (matches!(path, "v2/workloads" | "v2/policy")
+                && method == reqwest::Method::GET
+                && body.is_none())
+                || (path == "v2/workloads/regrants/apply"
+                    && method == reqwest::Method::POST
+                    && body
+                        .as_ref()
+                        .is_some_and(|b| b.len() <= WORKLOAD_REQUEST_LIMIT)),
+            "invalid Pumgye workload operation"
+        );
+        let url = self.base_url.join(path)?;
+        let mut request = self.management.request(method, url).header(
+            hyper::header::AUTHORIZATION,
+            self.admin
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Pumgye management credential unavailable"))?,
+        );
+        if let Some(body) = body {
+            request = request
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let mut response = request.send().await?;
+        let status = response.status().as_u16();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= WORKLOAD_RESPONSE_LIMIT,
+                "Pumgye workload response exceeds bound"
             );
             bytes.extend_from_slice(&chunk);
         }

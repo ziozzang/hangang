@@ -1441,6 +1441,9 @@ impl Admin {
         if path.starts_with("/v1/pumgye/explain") || path == "/v1/pumgye/audit/simulations" {
             return Ok(self.handle_pumgye_simulation(req, actor).await);
         }
+        if path.starts_with("/v1/pumgye/v2/") {
+            return Ok(self.handle_pumgye_workloads(req, actor).await);
+        }
         if path.starts_with("/v1/pumgye/") {
             return Ok(self.handle_pumgye(req, actor).await);
         }
@@ -3051,6 +3054,67 @@ fn pumgye_on_behalf_of(username: &str) -> String {
     value
 }
 
+/// Shape check of a re-grant application before it leaves Hangang: a v2
+/// `base_revision`, 1–1,024 proposal IDs, the operator reason (1–512 bytes, no
+/// control characters) and an optional `approval_ref`. Pumgye validates again.
+fn regrant_request(payload: &serde_json::Value) -> Result<(usize, String), &'static str> {
+    let Some(object) = payload.as_object() else {
+        return Err("re-grant request must be a JSON object");
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "base_revision" | "proposals" | "reason" | "approval_ref"
+        )
+    }) {
+        return Err("unknown re-grant field");
+    }
+    if object
+        .get("base_revision")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|v| v > i64::MAX as u64)
+    {
+        return Err("base_revision required");
+    }
+    let Some(proposals) = object.get("proposals").and_then(|v| v.as_array()) else {
+        return Err("proposals required");
+    };
+    if proposals.is_empty()
+        || proposals.len() > 1024
+        || !proposals
+            .iter()
+            .all(|p| p.as_str().is_some_and(|p| !p.is_empty() && p.len() <= 128))
+    {
+        return Err("invalid proposals");
+    }
+    let reason = object
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if reason.trim().is_empty() || reason.len() > 512 || reason.chars().any(char::is_control) {
+        return Err("change reason required");
+    }
+    if let Some(approval) = object.get("approval_ref")
+        && !approval.is_null()
+        && !approval
+            .as_str()
+            .is_some_and(|a| !a.is_empty() && a.len() <= 128 && !a.chars().any(char::is_control))
+    {
+        return Err("invalid approval_ref");
+    }
+    Ok((proposals.len(), reason.to_owned()))
+}
+
+/// Re-grant publication answer without the echoed v2 document.
+fn regrant_reply(document: &serde_json::Value, applied: usize) -> serde_json::Value {
+    serde_json::json!({
+        "revision": document.get("revision").cloned().unwrap_or(serde_json::Value::Null),
+        "applied": applied,
+        "warnings": document.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "orphaned": document.get("orphaned").cloned().unwrap_or_else(|| serde_json::json!([])),
+    })
+}
+
 /// Per-console-account simulation token bucket (burst 20, 2 per second),
 /// applied before Pumgye's process-wide bucket. Bounded to 1,024 accounts.
 fn pumgye_simulation_admit(account: &str) -> bool {
@@ -3667,6 +3731,152 @@ impl Admin {
                 "Authority Unavailable",
                 "invalid Pumgye simulation response",
             );
+        };
+        let mut response = json_value(status, &document, None);
+        if status == 429 {
+            response
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+        }
+        response
+    }
+
+    /// Console broker for Pumgye model v2 Kubernetes workload principals
+    /// (Pumgye docs/MODEL_V2.md): the principal and re-grant proposal listing,
+    /// the v2 document (bindings, revision) and the explicit re-grant
+    /// application. Administrator only, per-account rate limited like the
+    /// explain broker. An application needs the operator reason and the v2
+    /// `base_revision` (compare-and-set in Pumgye); it is recorded in the
+    /// Hangang audit log with the actor and the resulting revision, and its
+    /// answer omits the echoed document.
+    async fn handle_pumgye_workloads(
+        &self,
+        req: Request<Incoming>,
+        actor: AdminActor,
+    ) -> Response<Body> {
+        if actor.role() != crate::admin_users::Role::Admin {
+            return problem(403, "Forbidden", "administrator role required");
+        }
+        let (target, method) = match req.uri().path() {
+            "/v1/pumgye/v2/workloads" => ("v2/workloads", hyper::Method::GET),
+            "/v1/pumgye/v2/policy" => ("v2/policy", hyper::Method::GET),
+            "/v1/pumgye/v2/workloads/regrants/apply" => {
+                ("v2/workloads/regrants/apply", hyper::Method::POST)
+            }
+            _ => return problem(404, "Not Found", "unknown Pumgye workload operation"),
+        };
+        if req.method() != method {
+            return problem(
+                405,
+                "Method Not Allowed",
+                "unsupported method for this operation",
+            );
+        }
+        if req.uri().query().is_some() {
+            return problem(400, "Bad Request", "query parameters unsupported");
+        }
+        let user = actor.user();
+        if !pumgye_simulation_admit(&user.username) {
+            let mut limited = problem(
+                429,
+                "Too Many Requests",
+                "Pumgye rate limit for this console account",
+            );
+            limited
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+            return limited;
+        }
+        let mut application = None;
+        let body = if method == hyper::Method::POST {
+            let payload: serde_json::Value =
+                match read_json(req, crate::pumgye::WORKLOAD_REQUEST_LIMIT as u64).await {
+                    Ok(payload) => payload,
+                    Err(response) => return response,
+                };
+            match regrant_request(&payload) {
+                Ok(summary) => application = Some(summary),
+                Err(message) => return problem(400, "Bad Request", message),
+            }
+            match serde_json::to_vec(&payload) {
+                Ok(bytes) if bytes.len() <= crate::pumgye::WORKLOAD_REQUEST_LIMIT => Some(bytes),
+                _ => return problem(413, "Payload Too Large", "re-grant request exceeds bound"),
+            }
+        } else {
+            None
+        };
+        let authority = actor.mutation_authority();
+        if let Err(error) = self.users.authorize_admin(authority.clone()).await {
+            return account_problem(error);
+        }
+        let Some(remote) = self.manager.active.load().pumgye_remote.clone() else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "independent Pumgye authority is not available",
+            );
+        };
+        let verb = if method == hyper::Method::POST {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        let outcome = remote.workloads(verb, target, body).await;
+        // A revoked account may not observe the result.
+        if let Err(error) = self.users.authorize_admin(authority).await {
+            return account_problem(error);
+        }
+        let Ok((status, bytes)) = outcome else {
+            return problem(
+                503,
+                "Authority Unavailable",
+                if application.is_some() {
+                    "Pumgye re-grant unconfirmed; reload authoritative state"
+                } else {
+                    "Pumgye workload state unavailable"
+                },
+            );
+        };
+        if !matches!(status, 200 | 400 | 404 | 409 | 413 | 422 | 429) {
+            return problem(
+                503,
+                "Authority Unavailable",
+                "Pumgye workload state unavailable",
+            );
+        }
+        let document = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(document) => document,
+            // Bare refusals (Kubernetes-owned 409, missing v2 route 404).
+            Err(_) if status != 200 => {
+                return problem(
+                    status,
+                    "Pumgye Operation Rejected",
+                    "owning authority rejected the operation; reload before retrying",
+                );
+            }
+            Err(_) => {
+                return problem(
+                    503,
+                    "Authority Unavailable",
+                    "invalid Pumgye workload response",
+                );
+            }
+        };
+        let document = match (&application, status) {
+            (Some((proposals, reason)), 200) => {
+                let reply = regrant_reply(&document, *proposals);
+                tracing::info!(
+                    target: "hangang::audit",
+                    actor = %user.username,
+                    operation = "pumgye.workloads.regrant",
+                    proposals = *proposals,
+                    revision = ?reply.get("revision").and_then(|v| v.as_u64()),
+                    reason = %reason,
+                    "Pumgye workload re-grants applied"
+                );
+                reply
+            }
+            _ => document,
         };
         let mut response = json_value(status, &document, None);
         if status == 429 {
@@ -5045,6 +5255,70 @@ pub async fn watch_config(manager: Arc<Manager>, cancel: tokio_util::sync::Cance
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-grant applications leave Hangang only with a CAS base revision,
+    /// bounded proposal IDs and the operator reason; the answer drops the
+    /// echoed v2 document.
+    #[test]
+    fn pumgye_regrant_requests_need_revision_proposals_and_reason() {
+        let ok = serde_json::json!({"base_revision": 7, "proposals": ["rg_1", "rg_2"], "reason": "migrate pods", "approval_ref": "CHG-7"});
+        assert_eq!(regrant_request(&ok), Ok((2, "migrate pods".to_owned())));
+        for (bad, message) in [
+            (
+                serde_json::json!([]),
+                "re-grant request must be a JSON object",
+            ),
+            (
+                serde_json::json!({"proposals": ["rg_1"], "reason": "x"}),
+                "base_revision required",
+            ),
+            (
+                serde_json::json!({"base_revision": -1, "proposals": ["rg_1"], "reason": "x"}),
+                "base_revision required",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": [], "reason": "x"}),
+                "invalid proposals",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": [7], "reason": "x"}),
+                "invalid proposals",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": ["rg_1"], "reason": " "}),
+                "change reason required",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": ["rg_1"], "reason": "a\nb"}),
+                "change reason required",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": ["rg_1"]}),
+                "change reason required",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": ["rg_1"], "reason": "x", "approval_ref": ""}),
+                "invalid approval_ref",
+            ),
+            (
+                serde_json::json!({"base_revision": 1, "proposals": ["rg_1"], "reason": "x", "policy": {}}),
+                "unknown re-grant field",
+            ),
+        ] {
+            assert_eq!(regrant_request(&bad), Err(message), "{bad}");
+        }
+        let too_many =
+            serde_json::json!({"base_revision": 1, "proposals": vec!["rg"; 1025], "reason": "x"});
+        assert_eq!(regrant_request(&too_many), Err("invalid proposals"));
+        let reply = regrant_reply(
+            &serde_json::json!({"revision": 8, "policy": {"bindings": []}, "warnings": ["w"], "orphaned": []}),
+            2,
+        );
+        assert_eq!(
+            reply,
+            serde_json::json!({"revision": 8, "applied": 2, "warnings": ["w"], "orphaned": []})
+        );
+    }
 
     #[test]
     fn pumgye_simulation_actor_is_sanitized_and_rate_limited_per_account() {
