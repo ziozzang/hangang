@@ -341,6 +341,10 @@ fn security_denied(status: u16) -> Response<Body> {
 #[derive(Clone)]
 pub struct Proxy {
     guard: Option<Arc<crate::guard::GuardClient>>,
+    /// Hopae risk contexts (ADR-0023): key and level thresholds.
+    risk_context: Option<Arc<crate::risk_context::Settings>>,
+    /// ADR 0019 decision events; `None` (the default) captures nothing.
+    decisions: Option<Arc<crate::decision::Emitter>>,
     request_inspectors: Arc<tokio::sync::Semaphore>,
     native_bodies: Arc<tokio::sync::Semaphore>,
     native_routes: Arc<crate::native_route_owner::Registry>,
@@ -746,6 +750,8 @@ impl Proxy {
         Self {
             active,
             guard: None,
+            risk_context: None,
+            decisions: None,
             request_inspectors: Arc::new(tokio::sync::Semaphore::new(4)),
             native_bodies: Arc::new(tokio::sync::Semaphore::new(128)),
             native_routes,
@@ -806,8 +812,21 @@ impl Proxy {
         )
         .await
     }
+    pub fn with_decision_events(mut self, emitter: Option<Arc<crate::decision::Emitter>>) -> Self {
+        self.decisions = emitter;
+        self
+    }
+
     pub fn with_guard(mut self, guard: Option<Arc<crate::guard::GuardClient>>) -> Self {
         self.guard = guard;
+        self
+    }
+
+    pub fn with_risk_context(
+        mut self,
+        settings: Option<Arc<crate::risk_context::Settings>>,
+    ) -> Self {
+        self.risk_context = settings;
         self
     }
 
@@ -932,6 +951,7 @@ impl Proxy {
         redirect
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn authorize(
         &self,
         auth: &crate::config::ExternalAuth,
@@ -940,6 +960,7 @@ impl Proxy {
         expected: Option<NativeAuthorization<'_>>,
         original: &mut Request<Body>,
         edge: &EdgeContext,
+        risk: Option<&crate::risk_context::Evidence>,
     ) -> AuthOutcome {
         let expected_class = expected.map(|scope| scope.class);
         let started = std::time::Instant::now();
@@ -952,6 +973,26 @@ impl Proxy {
             *request.headers_mut() = auth_request_headers(auth, static_headers, original, edge)?;
             if let Some(scope) = expected {
                 scope.apply(request.headers_mut())?;
+            }
+            // The signed risk context (Hopae ADR-0023), bound to the very
+            // headers of this verify call; omitted without evidence.
+            if auth.risk_context
+                && let Some(settings) = &self.risk_context
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                match risk.and_then(|e| {
+                    crate::risk_context::header_for(settings, e, request.headers(), now)
+                }) {
+                    Some((level, value)) => {
+                        request
+                            .headers_mut()
+                            .insert(crate::risk_context::HEADER, value);
+                        self.metrics.risk_context_sent(level);
+                    }
+                    None => self.metrics.risk_context_omitted(),
+                }
             }
             let renewal_context = auth
                 .renew_native_evidence
@@ -1343,10 +1384,34 @@ impl Proxy {
 
     async fn handle_unfinalized(
         &self,
+        request: Request<Incoming>,
+        peer: SocketAddr,
+        snapshot: Arc<Snapshot>,
+        response_context: Option<crate::response_security::Context>,
+    ) -> Result<Response<Body>, Infallible> {
+        // Decision capture is a fixed-size stack value. With decision events
+        // off it stays inactive and every recording call is a branch.
+        let Some(emitter) = &self.decisions else {
+            let mut inactive = crate::decision::Capture::disabled();
+            return self
+                .handle_captured(request, peer, snapshot, response_context, &mut inactive)
+                .await;
+        };
+        let mut decision = emitter.capture(request.method(), snapshot.config.revision);
+        let response = self
+            .handle_captured(request, peer, snapshot, response_context, &mut decision)
+            .await?;
+        emitter.finish(decision, response.status().as_u16());
+        Ok(response)
+    }
+
+    async fn handle_captured(
+        &self,
         mut request: Request<Incoming>,
         peer: SocketAddr,
         snapshot: Arc<Snapshot>,
         response_context: Option<crate::response_security::Context>,
+        decision: &mut crate::decision::Capture,
     ) -> Result<Response<Body>, Infallible> {
         // Canonicalize the peer address so an IPv4-mapped IPv6 address
         // (`::ffff:a.b.c.d`, produced by a dual-stack `[::]` listener for an
@@ -1456,6 +1521,11 @@ impl Proxy {
             };
             if let Err(status) = result {
                 crate::security_events::record("ip_ban_rejected", edge.client_ip, status, None);
+                decision.client(edge.client_ip);
+                decision.refuse(
+                    crate::decision::Stage::Enforcement,
+                    crate::decision::Reason::IpBanned,
+                );
                 return Ok(security_denied(status));
             }
         }
@@ -1524,7 +1594,7 @@ impl Proxy {
             request.extensions_mut().insert(capture.clone());
         }
         let mut response = self
-            .handle_inner(request, peer, snapshot.clone(), traffic.as_mut())
+            .handle_inner(request, peer, snapshot.clone(), traffic.as_mut(), decision)
             .await?;
         response = crate::response_security::apply(
             response,
@@ -1644,7 +1714,9 @@ impl Proxy {
         peer: SocketAddr,
         snapshot: Arc<Snapshot>,
         mut traffic: Option<&mut TrafficContext>,
+        decision: &mut crate::decision::Capture,
     ) -> Result<Response<Body>, Infallible> {
+        use crate::decision::{Reason, Stage};
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
         let workload_evidence = request
             .extensions()
@@ -1712,6 +1784,9 @@ impl Proxy {
         // The terminal marker has meaning only on a response from the
         // configured authorization service, never as a client request field.
         request.headers_mut().remove("x-hangang-auth-terminal");
+        // Only Hangang produces a risk context, only for an authorization
+        // call (Hopae ADR-0023); a client copy never reaches a service.
+        request.headers_mut().remove(crate::risk_context::HEADER);
         if request.headers().keys().any(|name| {
             snapshot.http_match_headers.contains(name)
                 && has_duplicate_header(request.headers(), name.as_str())
@@ -1757,10 +1832,30 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.client_ip = edge.client_ip;
         }
+        decision.client(edge.client_ip);
         let mut guard_evidence = None;
+        let mut risk_level: Option<crate::risk_context::Level> = None;
         if let Some(guard) = &self.guard {
-            let (rejected, evidence) = guard.admission(edge.client_ip, request.uri().path()).await;
+            let started = decision.clock();
+            let (rejected, evidence, unavailable) =
+                guard.admission(edge.client_ip, request.uri().path()).await;
+            if decision.active() {
+                decision.network(guard.decision_stage(
+                    rejected,
+                    evidence.as_ref(),
+                    unavailable,
+                    started,
+                ));
+            }
             if let Some(status) = rejected {
+                decision.refuse(
+                    Stage::Network,
+                    if unavailable {
+                        Reason::NetworkUnavailable
+                    } else {
+                        Reason::NetworkDenied
+                    },
+                );
                 return Ok(security_denied(status));
             }
             guard_evidence = evidence;
@@ -1813,6 +1908,14 @@ impl Proxy {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observation);
                 }
                 Err(status) => {
+                    decision.refuse(
+                        Stage::Enforcement,
+                        if status == 429 {
+                            Reason::IpBanned
+                        } else {
+                            Reason::Error
+                        },
+                    );
                     crate::security_events::record(
                         if status == 429 {
                             "ip_ban_rejected"
@@ -1836,6 +1939,7 @@ impl Proxy {
             edge.proto,
             edge.explicit_forwarded_port,
         ) {
+            decision.refuse(Stage::Enforcement, Reason::RequestBlocked);
             crate::security_events::record("url_csrf_denied", edge.client_ip, status, None);
             return Ok(security_denied(status));
         }
@@ -1851,6 +1955,7 @@ impl Proxy {
                 .as_ref()
                 .and_then(|host| host.to_str().ok()),
         ) {
+            decision.refuse(Stage::Enforcement, Reason::RequestBlocked);
             crate::security_events::record("path_blocked", edge.client_ip, status, None);
             let mut denied = response(
                 status,
@@ -1880,6 +1985,7 @@ impl Proxy {
             }
             Ok(None) => {}
             Err(status) => {
+                decision.refuse(Stage::Enforcement, Reason::UrlNotAllowlisted);
                 crate::security_events::record(
                     "url_allowlist_rejected",
                     edge.client_ip,
@@ -1915,6 +2021,14 @@ impl Proxy {
             )
         };
         if let Err(status) = rate_result {
+            decision.refuse(
+                Stage::Enforcement,
+                if status == 429 {
+                    Reason::RateLimited
+                } else {
+                    Reason::Error
+                },
+            );
             crate::security_events::record(
                 if status == 429 {
                     "url_rate_limited"
@@ -1972,6 +2086,7 @@ impl Proxy {
         {
             Ok(request) => request,
             Err(status) => {
+                decision.refuse(Stage::Enforcement, Reason::RequestBlocked);
                 crate::security_events::record("request_blocked", edge.client_ip, status, None);
                 return Ok(security_denied(status));
             }
@@ -2004,7 +2119,10 @@ impl Proxy {
                 .and_then(|host| host.to_str().ok()),
         ) {
             Ok(guard) => guard,
-            Err(status) => return Ok(response(status, "resource namespace refused")),
+            Err(status) => {
+                decision.refuse(Stage::Enforcement, Reason::ResourceNamespaceRefused);
+                return Ok(response(status, "resource namespace refused"));
+            }
         };
         let mut inspected = None;
         let mut selected: Option<Arc<HttpRuntime>> = None;
@@ -2093,6 +2211,7 @@ impl Proxy {
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.clone());
         }
+        decision.route(&runtime);
         // This node could not prepare the route's external authorization
         // (a static header variable is unusable here). Fail closed before any
         // authorization call, Lua, cache or upstream contact.
@@ -2100,6 +2219,7 @@ impl Proxy {
             self.metrics
                 .rejected_requests
                 .fetch_add(1, Ordering::Relaxed);
+            decision.refuse(Stage::Enforcement, Reason::RouteAuthorizationUnavailable);
             return Ok(response(503, "route authorization unavailable"));
         }
         if protected_resource.is_some_and(|id| {
@@ -2109,6 +2229,7 @@ impl Proxy {
                 .as_ref()
                 .is_some_and(|policy| policy.enforce && policy.resource_id == id)
         }) {
+            decision.refuse(Stage::Enforcement, Reason::ResourceNamespaceRefused);
             return Ok(response(403, "resource namespace refused"));
         }
         if workload_evidence.is_some() && runtime.workload_auth.is_none() {
@@ -2117,6 +2238,7 @@ impl Proxy {
             self.metrics
                 .workload_auth_rejections
                 .fetch_add(1, Ordering::Relaxed);
+            decision.refuse(Stage::Identity, Reason::WorkloadDenied);
             return Ok(response(
                 403,
                 "route is not bound to this workload listener",
@@ -2124,7 +2246,28 @@ impl Proxy {
         }
         let (workload_identity, workload_route_lease) =
             if let Some(prepared) = &runtime.workload_auth {
-                match prepared.authorize(workload_evidence.as_ref(), &snapshot) {
+                let outcome = prepared.authorize(workload_evidence.as_ref(), &snapshot);
+                if decision.active() {
+                    decision.identity(crate::decision::Identity {
+                        authority: crate::decision::IdentityAuthority::Hangang,
+                        verdict: if outcome.is_ok() {
+                            crate::decision::IdentityVerdict::Authenticated
+                        } else {
+                            crate::decision::IdentityVerdict::Denied
+                        },
+                        principal: crate::decision::Principal::Workload,
+                        aal: None,
+                        factor: crate::decision::FactorKind::Certificate,
+                        subject: outcome
+                            .as_ref()
+                            .ok()
+                            .map(|identity| crate::decision::Subject::new(identity.uri.as_bytes())),
+                        latency_us: 0,
+                        transport: crate::decision::Transport::Local,
+                        risk: None,
+                    });
+                }
+                match outcome {
                     Ok(identity) => (
                         Some(identity.clone()),
                         Some(WorkloadRouteLease {
@@ -2141,6 +2284,14 @@ impl Proxy {
                         self.metrics
                             .workload_auth_rejections
                             .fetch_add(1, Ordering::Relaxed);
+                        decision.refuse(
+                            Stage::Identity,
+                            if matches!(denial, crate::workload_auth::Denial::Retired) {
+                                Reason::AuthorizationRetired
+                            } else {
+                                Reason::WorkloadDenied
+                            },
+                        );
                         let (status, message) = match denial {
                             crate::workload_auth::Denial::Forbidden => {
                                 (403, "workload identity is not allowed")
@@ -2239,6 +2390,9 @@ impl Proxy {
             });
         if let Some(context) = traffic {
             context.geoip = geoip.clone();
+        }
+        if decision.active() {
+            decision.country(geoip.policy_country().ok().flatten());
         }
         let country_decision = runtime
             .country_policy
@@ -2439,6 +2593,7 @@ impl Proxy {
             {
                 request.headers_mut().remove(name);
             }
+            let jwt_started = decision.clock();
             let authenticated = match bearer_token(request.headers()) {
                 Some(token) => match &runtime.jwt_auth {
                     Some(prepared) => {
@@ -2450,6 +2605,36 @@ impl Proxy {
                 },
                 None => Err(crate::jwt_runtime::AuthFailure::Invalid),
             };
+            if decision.active() {
+                use crate::jwt_runtime::AuthFailure;
+                decision.identity(crate::decision::Identity {
+                    authority: crate::decision::IdentityAuthority::Hangang,
+                    verdict: match &authenticated {
+                        Ok(_) => crate::decision::IdentityVerdict::Authenticated,
+                        Err(AuthFailure::Invalid) => crate::decision::IdentityVerdict::Challenge,
+                        Err(AuthFailure::Forbidden) => crate::decision::IdentityVerdict::Denied,
+                        Err(_) => crate::decision::IdentityVerdict::Unavailable,
+                    },
+                    principal: crate::decision::Principal::Unknown,
+                    aal: None,
+                    factor: crate::decision::FactorKind::Bearer,
+                    subject: authenticated.as_ref().ok().map(|session| {
+                        crate::decision::Subject::new(session.verified().subject.as_bytes())
+                    }),
+                    latency_us: crate::decision::elapsed_us(jwt_started),
+                    transport: crate::decision::Transport::Local,
+                    risk: None,
+                });
+                if let Err(error) = &authenticated {
+                    decision.refuse(
+                        Stage::Identity,
+                        match error {
+                            AuthFailure::Invalid | AuthFailure::Forbidden => Reason::JwtDenied,
+                            _ => Reason::AuthenticationUnavailable,
+                        },
+                    );
+                }
+            }
             let session = match authenticated {
                 Ok(session) => session,
                 Err(error) => {
@@ -2560,6 +2745,28 @@ impl Proxy {
             } else {
                 crate::basic_auth::verify(prepared, request.headers())
             };
+            if decision.active() {
+                decision.identity(crate::decision::Identity {
+                    authority: crate::decision::IdentityAuthority::Hangang,
+                    verdict: if verified.is_some() {
+                        crate::decision::IdentityVerdict::Authenticated
+                    } else {
+                        crate::decision::IdentityVerdict::Challenge
+                    },
+                    principal: crate::decision::Principal::Unknown,
+                    aal: None,
+                    factor: crate::decision::FactorKind::Password,
+                    subject: verified
+                        .as_ref()
+                        .map(|a| crate::decision::Subject::new(a.username.as_bytes())),
+                    latency_us: 0,
+                    transport: crate::decision::Transport::Local,
+                    risk: None,
+                });
+                if verified.is_none() {
+                    decision.refuse(Stage::Identity, Reason::BasicDenied);
+                }
+            }
             match verified {
                 Some(authenticated) => {
                     if let Some(policy) = resource_policy
@@ -2656,6 +2863,7 @@ impl Proxy {
                             if native_authorization
                                 .is_some_and(|scope| scope.apply(&mut headers).is_err())
                             {
+                                decision.refuse(Stage::Identity, Reason::NativeContextUnavailable);
                                 return Ok(response(
                                     503,
                                     "native Human ingress context unavailable",
@@ -2664,20 +2872,102 @@ impl Proxy {
                             Some(headers)
                         }
                         Err(_) => {
+                            decision.refuse(Stage::Identity, Reason::NativeContextUnavailable);
                             return Ok(response(503, "native authentication context unavailable"));
                         }
                     };
+            }
+            let auth_started = decision.clock();
+            // Sumunjang's evidence of this request, when the route sends Hopae a risk context.
+            let risk_evidence = if auth.risk_context && self.risk_context.is_some() {
+                guard_evidence.as_ref().and_then(|e| e.network().cloned())
+            } else {
+                None
+            };
+            if auth.risk_context
+                && let Some(settings) = &self.risk_context
+                && let Some(e) = &risk_evidence
+            {
+                risk_level = Some(settings.level(e));
             }
             let authorization = tokio::select! {
                 biased;
                 retired = auth_retired(auth_route_lease.as_ref()) => {
                     retired.record(&self.metrics);
+                    decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                     return Ok(response(503, "route authorization retired"));
                 }
-                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), native_authorization, &mut request, &edge) => outcome,
+                outcome = self.authorize(auth, &runtime.auth_static_headers, runtime.auth_native.as_ref(), native_authorization, &mut request, &edge, risk_evidence.as_ref()) => outcome,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
+            }
+            if decision.active() {
+                use crate::decision::IdentityVerdict as V;
+                let (verdict, principal, aal, subject) = match &authorization {
+                    AuthOutcome::Allow(headers, _, _, _, typed) => {
+                        let mut kinds = headers.get_all("x-hopae-principal-kind").iter();
+                        let kind = kinds.next().filter(|_| kinds.next().is_none());
+                        let identity = typed
+                            .as_ref()
+                            .map(|(subject, aal)| (subject.as_str(), *aal))
+                            .or_else(|| crate::pumgye::identity(headers));
+                        (
+                            V::Authenticated,
+                            crate::decision::Principal::parse(kind.map(HeaderValue::as_bytes)),
+                            identity.map(|(_, aal)| aal),
+                            identity.map(|(subject, _)| {
+                                crate::decision::Subject::new(subject.as_bytes())
+                            }),
+                        )
+                    }
+                    AuthOutcome::Deny(401) | AuthOutcome::Forward(_) => (
+                        V::Challenge,
+                        crate::decision::Principal::Unknown,
+                        None,
+                        None,
+                    ),
+                    AuthOutcome::Deny(status) if *status >= 500 => (
+                        V::Unavailable,
+                        crate::decision::Principal::Unknown,
+                        None,
+                        None,
+                    ),
+                    AuthOutcome::Deny(_) => {
+                        (V::Denied, crate::decision::Principal::Unknown, None, None)
+                    }
+                };
+                decision.identity(crate::decision::Identity {
+                    authority: crate::decision::IdentityAuthority::Hopae,
+                    verdict,
+                    principal,
+                    aal,
+                    factor: crate::decision::FactorKind::None,
+                    subject,
+                    latency_us: crate::decision::elapsed_us(auth_started),
+                    transport: if runtime.auth_native.is_some() {
+                        crate::decision::Transport::Hop1
+                    } else {
+                        crate::decision::Transport::Http
+                    },
+                    risk: risk_level,
+                });
+                match &authorization {
+                    AuthOutcome::Allow(..) => {}
+                    AuthOutcome::Forward(_) => {
+                        decision.refuse(Stage::Identity, Reason::AuthenticationRedirect)
+                    }
+                    AuthOutcome::Deny(401) => {
+                        decision.refuse(Stage::Identity, Reason::AuthenticationRequired)
+                    }
+                    AuthOutcome::Deny(status) if *status >= 500 => {
+                        decision.refuse(Stage::Identity, Reason::AuthenticationUnavailable)
+                    }
+                    AuthOutcome::Deny(_) => {
+                        decision.refuse(Stage::Identity, Reason::AuthenticationDenied)
+                    }
+                }
             }
             match authorization {
                 AuthOutcome::Allow(
@@ -2714,6 +3004,7 @@ impl Proxy {
                         if resource_policy.is_none_or(|policy| {
                             policy.pumgye_service() != Some(service_scope.as_str())
                         }) {
+                            decision.refuse(Stage::Authorization, Reason::ServiceScopeMismatch);
                             return Ok(response(
                                 403,
                                 "service identity requires an enforced Pumgye permission gate",
@@ -2728,6 +3019,7 @@ impl Proxy {
                             crate::resource_policy::PrincipalSource::External { .. }
                         )
                     {
+                        let authz_started = decision.clock();
                         resource_allowed = if let Some(gate) = &policy.pumgye_resource {
                             let identity = typed_identity
                                 .as_ref()
@@ -2748,7 +3040,7 @@ impl Proxy {
                                     (Some(remote), Some((subject, aal))) => {
                                         match if human_preliminary {
                                             remote
-                                                .authorize_human_resource(
+                                                .authorize_human_resource_traced(
                                                     gate,
                                                     request.method().as_str(),
                                                     subject,
@@ -2759,7 +3051,7 @@ impl Proxy {
                                                 .await
                                         } else if workload_preliminary {
                                             remote
-                                                .authorize_workload_resource(
+                                                .authorize_workload_resource_traced(
                                                     gate,
                                                     request.method().as_str(),
                                                     subject,
@@ -2770,7 +3062,7 @@ impl Proxy {
                                                 .await
                                         } else {
                                             remote
-                                                .authorize_resource(
+                                                .authorize_resource_traced(
                                                     gate,
                                                     request.method().as_str(),
                                                     subject,
@@ -2780,23 +3072,51 @@ impl Proxy {
                                                 )
                                                 .await
                                         } {
-                                            Ok(Some(revision)) => {
-                                                auth_route_lease
-                                                    .get_or_insert_with(Default::default)
-                                                    .pumgye_remote =
-                                                    Some((remote.clone(), revision));
-                                                true
+                                            Ok(decided) => {
+                                                decision.authorization(
+                                                    decided.decision,
+                                                    decided.revision,
+                                                    authz_started,
+                                                    remote.decision_transport(),
+                                                );
+                                                if let Some(revision) = decided.allowed_revision() {
+                                                    auth_route_lease
+                                                        .get_or_insert_with(Default::default)
+                                                        .pumgye_remote =
+                                                        Some((remote.clone(), revision));
+                                                    true
+                                                } else {
+                                                    false
+                                                }
                                             }
                                             Err(_) if policy.enforce => {
+                                                decision.authorization(
+                                                    crate::decision::Authorization::Unavailable,
+                                                    None,
+                                                    authz_started,
+                                                    remote.decision_transport(),
+                                                );
+                                                decision.refuse(
+                                                    Stage::Authorization,
+                                                    Reason::Pumgye(
+                                                        crate::decision::Authorization::Unavailable,
+                                                    ),
+                                                );
                                                 return Ok(response(
                                                     503,
                                                     "Pumgye authority unavailable",
                                                 ));
                                             }
-                                            _ => false,
+                                            Err(_) => false,
                                         }
                                     }
                                     (None, _) if policy.enforce => {
+                                        decision.refuse(
+                                            Stage::Authorization,
+                                            Reason::Pumgye(
+                                                crate::decision::Authorization::Unavailable,
+                                            ),
+                                        );
                                         return Ok(response(503, "Pumgye authority unavailable"));
                                     }
                                     _ => false,
@@ -2813,7 +3133,7 @@ impl Proxy {
                                     gate.actions.get(request.method().as_str()),
                                 ) {
                                     (Some(compiled), Some((subject, aal)), Some(action)) => {
-                                        compiled.evaluate_scoped_resource(
+                                        let decided = compiled.evaluate_scoped_resource(
                                             &gate.service_id,
                                             &gate.resource,
                                             action,
@@ -2821,9 +3141,17 @@ impl Proxy {
                                             edge.client_ip,
                                             aal,
                                             evidence,
-                                        ) == pumgye_core::ResourceDecision::Decided(
-                                            pumgye_core::Decision::Allow,
-                                        )
+                                        );
+                                        decision.authorization(
+                                            crate::decision::Authorization::from_resource(decided),
+                                            None,
+                                            authz_started,
+                                            crate::decision::Transport::Local,
+                                        );
+                                        decided
+                                            == pumgye_core::ResourceDecision::Decided(
+                                                pumgye_core::Decision::Allow,
+                                            )
                                     }
                                     _ => false,
                                 }
@@ -2843,7 +3171,7 @@ impl Proxy {
                             if snapshot.config.pumgye_authority.is_some() {
                                 match (snapshot.pumgye_remote.as_ref(), identity) {
                                     (Some(remote), Some((subject, aal))) => match remote
-                                        .authorize(
+                                        .authorize_traced(
                                             gate,
                                             request.method().as_str(),
                                             subject,
@@ -2853,17 +3181,39 @@ impl Proxy {
                                         )
                                         .await
                                     {
-                                        Ok(Some(revision)) => {
-                                            if policy.enforce {
-                                                auth_route_lease
-                                                    .get_or_insert_with(Default::default)
-                                                    .pumgye_remote =
-                                                    Some((remote.clone(), revision));
+                                        Ok(decided) => {
+                                            decision.authorization(
+                                                decided.decision,
+                                                decided.revision,
+                                                authz_started,
+                                                remote.decision_transport(),
+                                            );
+                                            match decided.allowed_revision() {
+                                                Some(revision) => {
+                                                    if policy.enforce {
+                                                        auth_route_lease
+                                                            .get_or_insert_with(Default::default)
+                                                            .pumgye_remote =
+                                                            Some((remote.clone(), revision));
+                                                    }
+                                                    true
+                                                }
+                                                None => false,
                                             }
-                                            true
                                         }
-                                        Ok(None) => false,
                                         Err(_) if policy.enforce => {
+                                            decision.authorization(
+                                                crate::decision::Authorization::Unavailable,
+                                                None,
+                                                authz_started,
+                                                remote.decision_transport(),
+                                            );
+                                            decision.refuse(
+                                                Stage::Authorization,
+                                                Reason::Pumgye(
+                                                    crate::decision::Authorization::Unavailable,
+                                                ),
+                                            );
                                             return Ok(response(
                                                 503,
                                                 "Pumgye authority unavailable",
@@ -2872,6 +3222,12 @@ impl Proxy {
                                         Err(_) => false,
                                     },
                                     (None, _) if policy.enforce => {
+                                        decision.refuse(
+                                            Stage::Authorization,
+                                            Reason::Pumgye(
+                                                crate::decision::Authorization::Unavailable,
+                                            ),
+                                        );
                                         return Ok(response(503, "Pumgye authority unavailable"));
                                     }
                                     _ => false,
@@ -2883,17 +3239,30 @@ impl Proxy {
                                     gate.permissions.get(request.method().as_str()),
                                 ) {
                                     (Some(compiled), Some((subject, aal)), Some(permissions)) => {
-                                        permissions.iter().all(|permission| {
-                                            compiled.evaluate(
-                                                &gate.service_id,
-                                                subject,
-                                                edge.client_ip,
-                                                permission,
-                                                &gate.information_class,
-                                                aal,
-                                                evidence,
-                                            ) == pumgye_core::Decision::Allow
-                                        })
+                                        let denied = permissions
+                                            .iter()
+                                            .map(|permission| {
+                                                compiled.evaluate(
+                                                    &gate.service_id,
+                                                    subject,
+                                                    edge.client_ip,
+                                                    permission,
+                                                    &gate.information_class,
+                                                    aal,
+                                                    evidence,
+                                                )
+                                            })
+                                            .find(|d| *d != pumgye_core::Decision::Allow);
+                                        decision.authorization(
+                                            denied.map_or(
+                                                crate::decision::Authorization::Allow,
+                                                crate::decision::Authorization::from_decision,
+                                            ),
+                                            None,
+                                            authz_started,
+                                            crate::decision::Transport::Local,
+                                        );
+                                        denied.is_none()
                                     }
                                     _ => false,
                                 }
@@ -2944,9 +3313,20 @@ impl Proxy {
         }
         if !resource_allowed {
             self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            match decision.authorization_decision() {
+                Some(denied) if denied != crate::decision::Authorization::Allow => {
+                    decision.refuse(Stage::Authorization, Reason::Pumgye(denied));
+                }
+                Some(_) => decision.refuse(Stage::Authorization, Reason::ResourcePolicyDenied),
+                None if resource_policy.is_some_and(|p| p.has_pumgye()) => {
+                    decision.refuse(Stage::Authorization, Reason::PumgyeIdentityMissing);
+                }
+                None => decision.refuse(Stage::Authorization, Reason::ResourcePolicyDenied),
+            }
             return Ok(response(403, "resource permission denied"));
         }
         let Some(mut index) = self.select_http_backend(&runtime) else {
+            decision.refuse(Stage::Enforcement, Reason::UpstreamUnavailable);
             return Ok(self.failure(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "all backends are unavailable",
@@ -2980,11 +3360,13 @@ impl Proxy {
                 biased;
                 retired = auth_retired(auth_route_lease.as_ref()) => {
                     retired.record(&self.metrics);
+                    decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                     return Ok(response(503, "route authorization retired"));
                 }
                 result = self.policy.evaluate(input) => result,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
             }
             match evaluation {
@@ -3061,6 +3443,7 @@ impl Proxy {
         }
 
         if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+            decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
             return Ok(denied);
         }
 
@@ -3150,6 +3533,7 @@ impl Proxy {
                 biased;
                 retired = auth_retired(auth_route_lease.as_ref()) => {
                     retired.record(&self.metrics);
+                    decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                     return Ok(response(503, "route authorization retired"));
                 }
                 result = crate::transform_body::transform_with_geoip(
@@ -3163,6 +3547,7 @@ impl Proxy {
                 ) => result,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
             }
             match transformed {
@@ -3229,6 +3614,7 @@ impl Proxy {
             {
                 Ok(request) => request,
                 Err(status) => {
+                    decision.refuse(Stage::Enforcement, Reason::RequestBlocked);
                     crate::security_events::record("request_blocked", edge.client_ip, status, None);
                     return Ok(security_denied(status));
                 }
@@ -3407,6 +3793,7 @@ impl Proxy {
         let mut attempt = 0usize;
         let upstream = loop {
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
             }
             attempt += 1;
@@ -3474,6 +3861,7 @@ impl Proxy {
                     snapshot.pumgye_remote.as_ref(),
                     native_auth_context.as_ref(),
                 ) else {
+                    decision.refuse(Stage::Authorization, Reason::NativeUnavailable);
                     return Ok(response(503, "native resource authority unavailable"));
                 };
                 let mut context = context.clone();
@@ -3501,6 +3889,7 @@ impl Proxy {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
                         retired.record(&self.metrics);
+                        decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                         return Ok(response(503, "route authorization retired"));
                     }
                     result = binding.prepare_for_origin(outgoing, self.native_bodies.clone(),&selected_origin) => match result {
@@ -3523,15 +3912,23 @@ impl Proxy {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
                         retired.record(&self.metrics);
+                        decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                         return Ok(response(503, "route authorization retired"));
                     }
                     result = binding.observe_after_preliminary(&prepared, &context, hopae, authority, edge.client_ip, route_reference.as_ref(), native_preliminary_identity.as_ref().map(|(subject, aal)| (subject.as_str(), *aal))) => match result {
                         Ok(observation) => observation,
-                        Err(error) if error.is::<crate::projection_permit::Denied>() => return Ok(response(403, "native resource permission denied")),
-                        Err(_) => return Ok(response(503, "native resource authority unavailable")),
+                        Err(error) if error.is::<crate::projection_permit::Denied>() => {
+                            decision.refuse(Stage::Authorization, Reason::NativePermissionDenied);
+                            return Ok(response(403, "native resource permission denied"));
+                        }
+                        Err(_) => {
+                            decision.refuse(Stage::Authorization, Reason::NativeUnavailable);
+                            return Ok(response(503, "native resource authority unavailable"));
+                        }
                     }
                 };
                 if !observation.allowed() {
+                    decision.refuse(Stage::Authorization, Reason::NativePermissionDenied);
                     return Ok(response(403, "native resource permission denied"));
                 }
                 let (dispatch, seal) = prepared.into_dispatch_sealed();
@@ -3665,15 +4062,20 @@ impl Proxy {
                 biased;
                 retired = auth_retired(auth_route_lease.as_ref()) => {
                     retired.record(&self.metrics);
+                    decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                     return Ok(response(503, "route authorization retired"));
                 }
                 result = timeout(dispatch_timeout, send) => result,
             };
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
             }
             match sent {
-                Ok(Ok(response)) => break response,
+                Ok(Ok(response)) => {
+                    decision.forwarded();
+                    break response;
+                }
                 Ok(Err(error)) => {
                     if let Some(lease) = &backend_lease {
                         lease.record_transport_failure();
@@ -3701,12 +4103,14 @@ impl Proxy {
                             continue;
                         }
                     }
+                    decision.refuse(Stage::Enforcement, Reason::UpstreamUnavailable);
                     return Ok(self.failure(StatusCode::BAD_GATEWAY, "upstream request failed"));
                 }
                 Err(_) => {
                     if let Some(lease) = &backend_lease {
                         lease.record_timeout();
                     }
+                    decision.refuse(Stage::Enforcement, Reason::UpstreamUnavailable);
                     return Ok(self.failure(
                         StatusCode::GATEWAY_TIMEOUT,
                         "upstream response header timed out",
@@ -3716,6 +4120,7 @@ impl Proxy {
         };
         let mut upstream = upstream;
         if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+            decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
             return Ok(denied);
         }
 
@@ -3800,6 +4205,7 @@ impl Proxy {
 
         if let (Some(downstream), Some(upstream)) = (downstream_upgrade, upstream_upgrade) {
             if let Some(denied) = retired_auth_response(auth_route_lease.as_ref(), &self.metrics) {
+                decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                 return Ok(denied);
             }
             // Register admission before checking closed. Shutdown must either
@@ -3950,6 +4356,7 @@ impl Proxy {
                     biased;
                     retired = auth_retired(auth_route_lease.as_ref()) => {
                         retired.record(&self.metrics);
+                        decision.refuse(Stage::Enforcement, Reason::AuthorizationRetired);
                         return Ok(crate::proxy::response(503, "route authorization retired"));
                     }
                     result = crate::transform_body::transform_with_geoip(

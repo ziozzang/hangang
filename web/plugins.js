@@ -1,7 +1,10 @@
 import { t } from './i18n.js';
+import { ui } from './kit/ui.js';
+import { t as kitT } from './zt/shell.js';
 // Host console lifecycle for trusted, hash-pinned operator-installed modules.
 let catalog = [], mounted = new Map(), generation = 0, host;
 const authorities = Object.freeze({ hopae: { label: 'Identity · Hopae', aliases: 'identity authentication 호패 신원 인증', order: 0 }, guard: { label: 'Network trust · Sumunjang', aliases: 'guard network trust 수문장 네트워크 신뢰', order: 1 } });
+export const SUPERSEDED = Object.freeze({ guard: '#network' });
 const authorityFor = id => Object.hasOwn(authorities, id) ? authorities[id] : undefined;
 export function pluginView(name) { return catalog.some(p => name === 'plugin-' + p.id); }
 export async function discoverPlugins(context) {
@@ -19,12 +22,13 @@ export async function discoverPlugins(context) {
     ids.add(p.id);
     if (!/^[a-z0-9-]{1,32}$/.test(p.id) || typeof p.name !== 'string' || typeof p.entry !== 'string' || !p.entry.startsWith(`/ui/plugins/${p.id}/`) || p.api_base !== `/v1/plugins/${p.id}`) throw Error('Invalid console plugin discovery');
   }
-  const sorted = [...data.plugins].sort((a,b) => (authorityFor(a.id)?.order ?? 3) - (authorityFor(b.id)?.order ?? 3) || a.id.localeCompare(b.id, 'en'));
+  // Packages superseded by Zero Trust task sections keep their broker routes but no page (ADR 0020).
+  const sorted = [...data.plugins].filter(p => !Object.hasOwn(SUPERSEDED, p.id)).sort((a,b) => (authorityFor(a.id)?.order ?? 3) - (authorityFor(b.id)?.order ?? 3) || a.id.localeCompare(b.id, 'en'));
   for (const p of sorted) {
     const name='plugin-'+p.id;
     const link=document.createElement('a');link.className='nav-link';link.dataset.view=name;link.dataset.adminOnly='';link.href='#'+name;link.dataset.consolePlugin=p.id;
     const icon=document.createElement('span');icon.setAttribute('aria-hidden','true');icon.textContent='◇';const label=document.createElement('bdi');const authority=authorityFor(p.id);label.textContent=authority ? t(authority.label) : p.name;if(authority)label.dataset.i18n=authority.label;link.dataset.searchAliases=authority?.aliases || p.id;link.append(icon,label);
-    navigation.insertBefore(link, authorityFor(p.id) ? navigation.querySelector('[data-view="pumgye"]') : anchor);
+    navigation.insertBefore(link, anchor);
     const section=document.createElement('section');section.id='view-'+name;section.className='view';section.hidden=true;section.dataset.consolePlugin=p.id;
     const head=document.createElement('div');head.className='page-head';const title=document.createElement('h1');title.id='plugin-'+p.id+'-title';title.textContent=authority ? t(authority.label) : p.name;if(authority)title.dataset.i18n=authority.label;section.setAttribute('aria-labelledby',title.id);head.append(title);const root=document.createElement('div');root.className='plugin-root';section.append(head,root);document.querySelector('#main').insertBefore(section,document.querySelector('#geoip-attribution'));
     catalog.push({...p,name,root});
@@ -51,6 +55,8 @@ export async function loadPlugin(name) {
         window.addEventListener('hangang:localechange',notify,{signal:controller.signal});
         return ()=>{record.localeListeners.delete(notify);window.removeEventListener('hangang:localechange',notify);};
       },authentication:p.authentication==='hangang'?'hangang':'native',
+      // Shared UI kit (ADR 0020). Additive: v1 packages that ignore it are unaffected.
+      ui,t:kitT,navigate:(hash)=>{if(typeof hash==='string'&&/^#[a-z0-9-]+(?:[/?][^\s]*)?$/i.test(hash))location.hash=hash;},link:(entity)=>ui.entityHref(entity?.type,entity?.id),
       api:(path,options={})=>{if(controller.signal.aborted) return Promise.reject(Error('Session ended'));if(!/^[a-z0-9-]+(?:\/[a-z0-9-]+)*$/.test(path))return Promise.reject(Error('Invalid plugin API path'));return host.api(p.api_base+'/'+path,{...options,signal:controller.signal});},
       asset:(file)=>{if(!/^[a-zA-Z0-9_-]+\.(html|css)$/.test(file))return Promise.reject(Error('Invalid plugin asset'));return fetch(base+file,{signal:controller.signal,cache:'no-store'}).then(r=>{if(!r.ok)throw Error('Plugin asset unavailable');return r;});}
     }));

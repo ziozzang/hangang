@@ -19,6 +19,15 @@ to that authority. Public plaintext requires explicit `--allow-insecure-public`;
 protect it behind an authenticated TLS gateway and restrict direct network access.
 Only a local relay may supply the adapter's generated client forwarding context.
 
+To keep the authority's admin listener TLS-only (`--admin-tls-cert`/`--admin-tls-key`),
+point the adapter at it over HTTPS and trust a private CA:
+`--upstream https://127.0.0.1:49000 --upstream-ca /private/admin-ca.pem`. With
+`--upstream-ca` only that CA (1 to 16 PEM certificates, at most 64 KiB) is
+trusted; the authority's certificate must name the upstream host (an IP SAN for
+`127.0.0.1`). The file is re-read every 10 s and the new trust applies to new
+connections; a broken file keeps the current trust. `--upstream-ca` requires an
+HTTPS upstream. Validation: `tests/console_upstream_tls_smoke.py`.
+
 Configuration (replace pins with the exact locally reviewed manifest digests):
 
 ```json
@@ -40,7 +49,9 @@ Run each component's `tools/build_console_plugin.py`; hash `manifest.json` and
 pin it. Files must not be group/world writable. Manifests/assets are bounded,
 hash-verified and copied into an immutable startup registry. Edits take effect
 only after a validated reload/restart with a new pin. `--check` validates packages
-without starting the console. Registry configuration and audit storage stay private.
+without starting the console. Registry configuration and audit storage stay private:
+the registry file (`--plugins`, `--admin-plugins`) follows the same file rule as
+the SSO configuration below (private to the process, or a Kubernetes volume file).
 
 Discovery `GET /v1/plugins` exposes names/entry points, never backend origins or
 credentials. `GET /ui/plugins/<id>/<asset>` serves only pinned listed assets.
@@ -63,6 +74,49 @@ already admitted operation; it grants no audit access or authority to retry. The
 403 discards the protected backend body and reports an uncertain outcome. The
 private audit retains the actual backend result, which may already be committed.
 Requests refused by the authority check before dispatch do not gain a new operation reference.
+
+## Routes and route patterns
+
+A manifest lists plain routes `{"path", "method", "mutation"}`: `path` is one
+to several `/`-separated identifiers (lowercase letters, digits, `-`, each ≤ 32
+bytes, ≤ 128 bytes in total), `method` is `GET`, `POST`, `PUT` or `DELETE`;
+`GET` never mutates and `PUT`/`DELETE` always do. A package may declare up to
+**64** plain routes (32 before contract v2): lookup is a linear comparison of
+short strings and the manifest stays operator-reviewed and at most 64 KiB, so
+the larger cap keeps review practical while letting owner APIs ship complete.
+
+Contract v2 (`"api_version": 2`) adds bounded **route patterns** for owner APIs
+keyed by an identifier:
+
+```json
+"route_patterns": [
+  {"path": "zones/*", "method": "GET", "mutation": false},
+  {"path": "zones/*", "method": "DELETE", "mutation": true, "max_depth": 1}
+]
+```
+
+- `path` is a valid route name followed by `/*`; `max_depth` (1–4, default 1)
+  is how many segments the `*` may span. `zones/*` matches `zones/corp`, not
+  `zones`, `zones/a/b` (depth 1) or `zones/`.
+- Each matched segment must be a valid identifier (as above): `..`, empty
+  segments, percent-encoded characters (so no encoded `/` or `.`), upper case
+  and over-long segments never match. The broker never decodes the path.
+- Each pattern names exactly one method and its own mutation flag, validated
+  like plain routes; a request with another method is `404`. Mutating patterns
+  are journaled exactly like mutating routes, with the concrete path.
+- Plain routes are matched first. A plain route below a pattern's prefix with
+  the same method is refused at load (ambiguous), as are duplicate patterns.
+- At most 16 patterns per package and at most 64 plain routes and patterns
+  together. `api_version: 1` manifests may not declare patterns and keep their
+  exact meaning; discovery lists `route_patterns` beside `routes`.
+
+The broker forwards a matched request to exactly `<backend>/v1/<path>`. For
+delegated packages the signed actor assertion binds that exact forwarded path,
+the method and the SHA-256 of the body, so a backend verifying the assertion
+cannot be steered to another resource (security review: path confusion — identifier-only segments, no decoding, no
+normalization; method smuggling — one method per entry, `HEAD`/`OPTIONS`/other
+methods unmatched; mutation-flag bypass — the flag comes from the matched
+entry, and plain routes cannot be shadowed by a pattern).
 
 ## Mounted package locale lifecycle
 
@@ -154,7 +208,13 @@ package hides its separate login/logout links in unified mode. Hangang owns the
 console authority; Hopae still owns provider credentials, identities and sessions.
 
 Run the adapter with `--hopae-sso /private/console-sso.json` to add **Sign in with
-SSO** beneath account sign-in. The configuration is a private regular file (0600):
+SSO** beneath account sign-in. The configuration is a private regular file:
+owned by the console's user with no group or other bits (0600, 0400), or, as a
+Kubernetes ConfigMap or Secret volume with `fsGroup`, root-owned, in one of the
+process's groups, with no write and no other bits (0440, 0400). World-readable or
+writable files are refused. A symlink is accepted only in the Kubernetes
+atomic-writer layout (`sso.json` -> `..data/sso.json`, `..data` -> a `..<version>`
+directory beside it); any other symlink is refused:
 
 ```json
 {
@@ -199,6 +259,80 @@ The optional console SSO configuration accepts `native_tls` with the same
 client and fixed `native_address`, preserving explicit Hopae-to-Hangang
 account mappings and existing session/lease checks. Remote SSO peers require
 mTLS; loopback plaintext remains available during migration.
+
+## Operator assurance (passkey) and break-glass
+
+With Hopae's `console_operators` policy (Hopae ADR-0021) the console can require
+that operators signed in with a phishing-resistant factor. Add `operator_policy`
+to the SSO configuration and pin Hopae's operator assertion public key
+(`console_operators.assertion_public_key`) under its key id
+(`console_operators.assertion_key_id`):
+
+```json
+"operator_policy": {
+  "assertion_public_keys": { "op-2026-10": "<base64 Ed25519 public key>" },
+  "minimum_aal": 2,
+  "require_factor": "webauthn",
+  "accept_enrollment_grace": false,
+  "sensitive_max_age_seconds": 300,
+  "step_up_path": "/ui/step-up"
+}
+```
+
+- Every SSO request (the exchange and each later request) needs Hopae's
+  operator assertion (`x-hopae-operator-assertion`), signed with Hopae's
+  dedicated Ed25519 key. The console holds only public keys: the assertion's
+  `kid` must name a pinned key. A missing, forged, expired or foreign assertion
+  (another user or host), or one under an unpinned key, refuses the request.
+- **Rotation.** Pin the next key beside the current one (at most two), switch
+  Hopae to the next seed, key id and public key, then remove the old pin.
+- **Sign-in and reads** need the assertion's policy met (`satisfied`), at least
+  `minimum_aal` (1 to 3) and, with `require_factor: webauthn`, a passkey. With
+  `accept_enrollment_grace`, operators Hopae admits during its enrollment grace
+  may sign in and read, never change anything.
+- **Every change** needs the policy without grace. A **sensitive change** (path
+  containing `/publish`, `/activate`, `/factors/reset`, `/bulk-disable`, or under
+  `/v1/admin-users`, `/v1/users`, `/v1/config`, `/v1/plugins`,
+  `/v1/audit/policy`; `sensitive_paths` replaces the list) also needs the factor
+  used within `sensitive_max_age_seconds` (30 to 3600).
+- A refusal answers `403` with `operator_step_up_required` or
+  `operator_reauthentication_required` and a `step_up_url`. The console UI goes
+  there: the gateway route of the console host (protected by Hopae, like
+  `/_hopae/login`) runs Hopae's passkey step-up for `step_up_path`, then the
+  console returns to the view (`/ui/?sso=hopae`, inside `/ui/` only) and signs in
+  again with the rotated Hopae session. When Hopae itself asks for a step-up
+  (`x-hopae-reason: step_up_required`) the console answers the same way.
+- The header shows the operator's level and factor (`AAL2 · Passkey`), or
+  **Break-glass (local)** for a local administrator session;
+  `GET /v1/auth/sso/session` returns the same facts.
+
+**Break-glass.** The local administrator sign-in (`/v1/auth/login`) stays as the
+break-glass path. `--disable-local-login` (requires `--hopae-sso`) refuses it and
+every local session.
+
+**Console operator audit.** Records: `console.sso_login` (with the assurance or
+the refusal), `console.step_up_required`, `console.change` (SSO changes with the
+level and factor), `console.break_glass_login` (`success`, `refused` or
+`disabled`, with the account), `console.break_glass_change`, and
+`console.local_login` (a local sign-in without console SSO). The console keeps
+them in its own bounded store, separate from the authority's account audit: a
+ring of `--operator-audit-max-records` (default 10000, 100 to 1000000) records
+none older than `--operator-audit-retention-days` (default 90, 1 to 3650),
+pruned on each insert. `--operator-audit-db <path>` keeps it in a SQLite file
+(created 0600, never through a symlink); without it the store is in memory and
+lost on restart. Administrators read it at
+`GET /v1/console/operator-audit?limit=&before=` (newest first, `limit` 1 to 500,
+default 100; `before` is the `next_before` cursor of the previous page), and the
+unified audit view shows it as the **Console operators** source (not connected
+when the console serves no such endpoint). `--audit-log <path>` (JSON lines,
+0600) is an optional extra sink.
+
+Validation: `tests/console_operator_aal_smoke.py` (real authority and console,
+Ed25519-signed assertion fixture, the operator audit API),
+`web/tests/operator_assurance.spec.js` (header badge, step-up redirect,
+break-glass label) and Hopae's browser qualification
+(`tools/browser-qual/run-operator.sh`: real Hopae, real Hangang authority and
+console, Chrome with a virtual authenticator).
 
 ## Backend mTLS
 

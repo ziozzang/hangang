@@ -16,6 +16,1321 @@
     }
   ],
   "paths": {
+    "/v1/pumgye/v2/workloads": {"get": {"summary": "Kubernetes workload principals, legacy mappings and re-grant proposals", "description": "Administrator-only broker for Pumgye model v2 (Pumgye docs/MODEL_V2.md, \"Kubernetes workload principals\"). Per-console-account token bucket (burst 20, 2/s) shared with the explain broker; no query parameters. Relays Pumgye `GET /v2/workloads`: `principals` (principal, subject_ref, spiffe_id, cluster, namespace, service_account, service_account_uid, status, cause?, replacement?), `legacy_mappings` (Pod-bound subject → principal) and report-only `regrant_proposals` ({id, binding, evidence}). Response bounded to 16 MiB.", "responses": {"200": {"description": "Pumgye answer (no-store).", "content": {"application/json": {"schema": {"type": "object"}}}}, "403": {"description": "Administrator role required.", "content": {"application/json": {"schema": {"type": "object"}}}}, "429": {"description": "Rate limited; `retry-after: 1`.", "content": {"application/json": {"schema": {"type": "object"}}}}, "503": {"description": "Independent Pumgye authority unavailable.", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/pumgye/v2/policy": {"get": {"summary": "Pumgye model v2 document (read)", "description": "Administrator-only broker for Pumgye model v2 (Pumgye docs/MODEL_V2.md, \"Kubernetes workload principals\"). Per-console-account token bucket (burst 20, 2/s) shared with the explain broker; no query parameters. Relays Pumgye `GET /v2/policy` (`{revision, policy}`); the console counts the bindings naming each workload and uses `revision` as the re-grant base when `/v2/workloads` carries no `policy_revision`. Response bounded to 16 MiB.", "responses": {"200": {"description": "Pumgye answer (no-store).", "content": {"application/json": {"schema": {"type": "object"}}}}, "403": {"description": "Administrator role required.", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "No model v2 document or route.", "content": {"application/json": {"schema": {"type": "object"}}}}, "429": {"description": "Rate limited; `retry-after: 1`.", "content": {"application/json": {"schema": {"type": "object"}}}}, "503": {"description": "Independent Pumgye authority unavailable.", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/pumgye/v2/workloads/regrants/apply": {"post": {"summary": "Apply Pod-bound re-grant proposals", "description": "Administrator-only broker for Pumgye model v2 (Pumgye docs/MODEL_V2.md, \"Kubernetes workload principals\"). Per-console-account token bucket (burst 20, 2/s) shared with the explain broker; no query parameters. Relays Pumgye `POST /v2/workloads/regrants/apply` after a shape check: `base_revision` (compare-and-set on the v2 document), 1–1,024 `proposals` IDs, the operator `reason` (1–512 bytes, no control characters) and optional `approval_ref`; unknown fields are refused. Recorded in the Hangang audit log with the actor, proposal count, reason and resulting revision. The answer omits the echoed document: `{revision, applied, warnings, orphaned}`.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["base_revision", "proposals", "reason"], "properties": {"base_revision": {"type": "integer", "minimum": 0}, "proposals": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"type": "string", "minLength": 1, "maxLength": 128}}, "reason": {"type": "string", "minLength": 1, "maxLength": 512}, "approval_ref": {"type": "string", "minLength": 1, "maxLength": 128}}}}}}, "responses": {"200": {"description": "Applied: `{revision, applied, warnings, orphaned}`.", "content": {"application/json": {"schema": {"type": "object"}}}}, "400": {"description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged. Also Hangang's own shape refusal (problem detail).", "content": {"application/json": {"schema": {"type": "object"}}}}, "403": {"description": "Administrator role required.", "content": {"application/json": {"schema": {"type": "object"}}}}, "409": {"description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged. `pumgye.error.revision_conflict` carries `current_revision`; a bare 409 means the policy is Kubernetes-owned.", "content": {"application/json": {"schema": {"type": "object"}}}}, "429": {"description": "Rate limited; `retry-after: 1`.", "content": {"application/json": {"schema": {"type": "object"}}}}, "503": {"description": "Independent Pumgye authority unavailable, or the publication outcome is unconfirmed (reload).", "content": {"application/json": {"schema": {"type": "object"}}}}}}},
+    "/v1/pumgye/explain": {
+      "post": {
+        "summary": "Explain one access decision (simulation)",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/explain/batch": {
+      "post": {
+        "summary": "Explain many cases or a candidate impact (simulation)",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain/batch` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/explain/diff": {
+      "post": {
+        "summary": "Diff a candidate policy against the published snapshot",
+        "description": "Administrator-only broker for Pumgye `POST /v1/explain/diff` (Pumgye docs/EXPLAIN.md). Read-only simulation: no permit, session or policy change; audited by Pumgye. Per-console-account token bucket (burst 20, 2/s); `on_behalf_of` is set to `console:<account>` from the session and any browser value is replaced. Body bounded to 1.25 MiB.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pumgye result (no-store).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Pumgye structured error ({\"error\":{code,message_key,details[{path,code,message_key}],current_revision?}}) relayed unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Console account or Pumgye simulation budget exhausted; Retry-After: 1."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/pumgye/audit/simulations": {
+      "get": {
+        "summary": "Read the Pumgye simulation audit",
+        "description": "Administrator-only broker for Pumgye `GET /v1/audit/simulations`; up to 100 rows in ID order.",
+        "parameters": [
+          {
+            "name": "after_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Simulation audit rows.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "description": "Rate limited."
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/observability/status": {
+      "get": {
+        "summary": "Read decision event status",
+        "description": "Administrator-only. Profile, ring capacity, drop and export counters, key epoch state and exporter store status; {\"state\":\"disabled\"} when off.",
+        "responses": {
+          "200": {
+            "description": "Result, or {\"state\":\"disabled\"} when decision events are off. no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        }
+      }
+    },
+    "/v1/observability/decisions": {
+      "get": {
+        "summary": "List decision events",
+        "description": "Administrator-only (viewers receive 403), GET only. Served by the decision exporter's read-only query service through the Hangang broker; never contains headers, bodies, query strings, raw paths, credentials or sealed values.",
+        "responses": {
+          "200": {
+            "description": "Result, or {\"state\":\"disabled\"} when decision events are off. no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "Window start, Unix milliseconds (default: 24 hours before to).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Window end, Unix milliseconds (default now); the window is at most 31 days.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size 1..200 (default 50).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "description": "desc (default) or asc.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor from next_cursor.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "enforced (default) or simulation.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "description": "allow, deny, challenge, error or unavailable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "required": false,
+            "description": "network, identity, authorization or enforcement.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "description": "Namespaced reason code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "route",
+            "in": "query",
+            "required": false,
+            "description": "Route ID.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "service",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye service.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "required": false,
+            "description": "Resource.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "class",
+            "in": "query",
+            "required": false,
+            "description": "Information class.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "principal",
+            "in": "query",
+            "required": false,
+            "description": "human, service or workload.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "asn",
+            "in": "query",
+            "required": false,
+            "description": "Autonomous system number.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "country",
+            "in": "query",
+            "required": false,
+            "description": "ISO 3166-1 alpha-2 code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "pumgye_revision",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye policy revision.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject_ref",
+            "in": "query",
+            "required": false,
+            "description": "Subject pseudonym (sub~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip_ref",
+            "in": "query",
+            "required": false,
+            "description": "Address pseudonym (ip~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix_ref",
+            "in": "query",
+            "required": false,
+            "description": "Prefix pseudonym (pfx~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup: raw Hopae subject ID, converted by Hangang into the pseudonyms of retained key epochs and never forwarded.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client address (converted to ip_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client prefix (converted to prefix_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          }
+        ]
+      }
+    },
+    "/v1/observability/decisions/facets": {
+      "get": {
+        "summary": "Count decision events by facet",
+        "description": "Administrator-only (viewers receive 403), GET only. Served by the decision exporter's read-only query service through the Hangang broker; never contains headers, bodies, query strings, raw paths, credentials or sealed values. Allow counts derived from sample rates are labelled estimates.",
+        "responses": {
+          "200": {
+            "description": "Result, or {\"state\":\"disabled\"} when decision events are off. no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionFacets"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "Window start, Unix milliseconds (default: 24 hours before to).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Window end, Unix milliseconds (default now); the window is at most 31 days.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "enforced (default) or simulation.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "description": "allow, deny, challenge, error or unavailable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "required": false,
+            "description": "network, identity, authorization or enforcement.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "description": "Namespaced reason code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "route",
+            "in": "query",
+            "required": false,
+            "description": "Route ID.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "service",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye service.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "required": false,
+            "description": "Resource.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "class",
+            "in": "query",
+            "required": false,
+            "description": "Information class.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "principal",
+            "in": "query",
+            "required": false,
+            "description": "human, service or workload.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "asn",
+            "in": "query",
+            "required": false,
+            "description": "Autonomous system number.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "country",
+            "in": "query",
+            "required": false,
+            "description": "ISO 3166-1 alpha-2 code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "pumgye_revision",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye policy revision.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject_ref",
+            "in": "query",
+            "required": false,
+            "description": "Subject pseudonym (sub~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip_ref",
+            "in": "query",
+            "required": false,
+            "description": "Address pseudonym (ip~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix_ref",
+            "in": "query",
+            "required": false,
+            "description": "Prefix pseudonym (pfx~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup: raw Hopae subject ID, converted by Hangang into the pseudonyms of retained key epochs and never forwarded.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client address (converted to ip_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client prefix (converted to prefix_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          }
+        ]
+      }
+    },
+    "/v1/observability/decisions/timeseries": {
+      "get": {
+        "summary": "Count decision events over time",
+        "description": "Administrator-only (viewers receive 403), GET only. Served by the decision exporter's read-only query service through the Hangang broker; never contains headers, bodies, query strings, raw paths, credentials or sealed values.",
+        "responses": {
+          "200": {
+            "description": "Result, or {\"state\":\"disabled\"} when decision events are off. no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionTimeseries"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "Window start, Unix milliseconds (default: 24 hours before to).",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Window end, Unix milliseconds (default now); the window is at most 31 days.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "enforced (default) or simulation.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "description": "allow, deny, challenge, error or unavailable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "stage",
+            "in": "query",
+            "required": false,
+            "description": "network, identity, authorization or enforcement.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "description": "Namespaced reason code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "route",
+            "in": "query",
+            "required": false,
+            "description": "Route ID.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "service",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye service.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "required": false,
+            "description": "Resource.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "class",
+            "in": "query",
+            "required": false,
+            "description": "Information class.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "principal",
+            "in": "query",
+            "required": false,
+            "description": "human, service or workload.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "asn",
+            "in": "query",
+            "required": false,
+            "description": "Autonomous system number.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "country",
+            "in": "query",
+            "required": false,
+            "description": "ISO 3166-1 alpha-2 code.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "pumgye_revision",
+            "in": "query",
+            "required": false,
+            "description": "Pumgye policy revision.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject_ref",
+            "in": "query",
+            "required": false,
+            "description": "Subject pseudonym (sub~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip_ref",
+            "in": "query",
+            "required": false,
+            "description": "Address pseudonym (ip~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix_ref",
+            "in": "query",
+            "required": false,
+            "description": "Prefix pseudonym (pfx~...).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup: raw Hopae subject ID, converted by Hangang into the pseudonyms of retained key epochs and never forwarded.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "ip",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client address (converted to ip_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "description": "Forward lookup by client prefix (converted to prefix_ref).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "description": "Bucket width in seconds, 60..86400.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/observability/requests/{request_id}": {
+      "get": {
+        "summary": "Read all decision events for one request",
+        "description": "Administrator-only (viewers receive 403), GET only. Served by the decision exporter's read-only query service through the Hangang broker; never contains headers, bodies, query strings, raw paths, credentials or sealed values.",
+        "responses": {
+          "200": {
+            "description": "Result, or {\"state\":\"disabled\"} when decision events are off. no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+            }
+          }
+        ]
+      }
+    },
     "/v1/pumgye/policy": {
       "get": {
         "summary": "Read independent Pumgye policy through Hangang",
@@ -2328,6 +3643,209 @@
       }
     },
     "schemas": {
+      "DecisionEvent": {
+        "type": "object",
+        "description": "JSON projection of hangang.decision.v1 (crates/hangang-decision-event).",
+        "required": [
+          "schema",
+          "event_id",
+          "kind",
+          "request_id",
+          "time",
+          "outcome",
+          "stages",
+          "revisions"
+        ],
+        "properties": {
+          "schema": {
+            "const": "hangang.decision.v1"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "emitter": {
+            "type": "object"
+          },
+          "route": {
+            "type": "object"
+          },
+          "outcome": {
+            "type": "object"
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "revisions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "sampling": {
+            "type": "object"
+          },
+          "privacy": {
+            "type": "object"
+          },
+          "suppressed": {
+            "type": "object"
+          },
+          "estimate_weight": {
+            "type": "number"
+          }
+        }
+      },
+      "DecisionStatus": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "enabled",
+              "disabled"
+            ]
+          },
+          "profile": {
+            "type": "string"
+          },
+          "rings": {
+            "type": "object"
+          },
+          "counters": {
+            "type": "object"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "store": {
+            "type": "object"
+          }
+        }
+      },
+      "DecisionPage": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "enabled",
+              "disabled"
+            ]
+          },
+          "profile": {
+            "type": "string"
+          },
+          "window": {
+            "type": "object"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionEvent"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DecisionFacets": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "enabled",
+              "disabled"
+            ]
+          },
+          "window": {
+            "type": "object"
+          },
+          "facets": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "DecisionTimeseries": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "enabled",
+              "disabled"
+            ]
+          },
+          "bucket_seconds": {
+            "type": "integer"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "DecisionRequest": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "enabled",
+              "disabled"
+            ]
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionEvent"
+            }
+          }
+        }
+      },
       "PumgyeResourceGate": {"type": "object", "additionalProperties": false, "required": ["service_id", "resource", "actions"], "properties": {"service_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "resource": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "actions": {"type": "object", "minProperties": 1, "maxProperties": 16, "propertyNames": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Z]+$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}}}, "description": "Native route scope. Mutually exclusive with pumgye. Independent authority requires mTLS gRPC. Class and permissions belong to the catalog."},
       "PumgyeResource": {"type": "object", "additionalProperties": false, "required": ["service", "information_class", "actions"], "properties": {"service": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "information_class": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "minimum_aal": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0}, "actions": {"type": "object", "minProperties": 1, "maxProperties": 64, "propertyNames": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}}}},
       "PumgyeGate": {
@@ -4660,6 +6178,11 @@
               "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             },
             "description": "Cookie names removed (exact, case-sensitive match) from every Cookie field of the upstream request after an allowed authorization. The authorization call still receives the full listed cookie header. Remaining pairs keep their order; the header is removed when none remain."
+          },
+          "risk_context": {
+            "type": "boolean",
+            "default": false,
+            "description": "Send the authorization service (Hopae) the HMAC-signed x-hopae-risk-context built from Sumunjang's evidence for the request (Hopae ADR-0023); needs --risk-context-key-env and the gRPC guard transport. Omitted without evidence; never sent upstream."
           }
         }
       },

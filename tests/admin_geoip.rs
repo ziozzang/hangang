@@ -67,6 +67,7 @@ async fn serve(
         store_health: Default::default(),
     });
     let admin = Arc::new(Admin {
+        decisions: None,
         plugins: None,
         fleet_observer: None,
         fleet_collector: None,

@@ -456,6 +456,7 @@ async fn server_on_with_observer(
         store_health: Default::default(),
     });
     let admin = Arc::new(Admin {
+        decisions: None,
         plugins: None,
         fleet_observer,
         fleet_collector,

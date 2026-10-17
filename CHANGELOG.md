@@ -4,6 +4,37 @@
 
 ## Unreleased
 
+- Console operator assurance (Hopae ADR-0021): with `operator_policy` the console
+  SSO verifies Hopae's Ed25519-signed operator assertion against pinned public
+  keys (`assertion_public_keys`, current and next) on every request, requires the
+  configured level and a passkey for sign-in and every change, and a factor used
+  within `sensitive_max_age_seconds` for sensitive changes (publish, activate,
+  factor reset, accounts, configuration), sending the operator to Hopae's step-up
+  path otherwise; the header shows the operator's AAL and factor.
+- Break-glass local administrator sign-in is audited and can be disabled with
+  `--disable-local-login`.
+- Console operator audit store: SSO sign-ins, step-ups, changes and break-glass
+  records are kept in a bounded ring (`--operator-audit-db`, max records and
+  retention days), read by administrators at `GET /v1/console/operator-audit`
+  and shown as the "Console operators" source of the unified audit;
+  `--audit-log` remains an optional JSON-lines sink.
+- `hangang-console --upstream-ca` trusts a private CA for an HTTPS upstream
+  (re-read when it changes), so the authority's admin listener can stay TLS-only.
+- `hangang-console` accepts Kubernetes ConfigMap/Secret volume files for the SSO
+  and console plugin registry configuration (one shared rule; the registry file
+  must now be private, no longer merely not group/world-writable) (root-owned, `fsGroup` group, 0440/0400, the `..data`
+  atomic-writer layout); world-readable files and other symlinks stay refused.
+- Hopae risk context (Hopae ADR-0023): with `--risk-context-key-env` the
+  gRPC guard query asks Sumunjang for its evidence (`include_evidence`),
+  Hangang maps it to `low`/`elevated`/`high` (configurable thresholds) and
+  sends the HMAC-signed `x-hopae-risk-context` on the Hopae verify of routes
+  with `auth.risk_context` (HTTP and HOP1), never upstream; client copies are
+  stripped; `hangang_risk_context_*` metrics and the decision events'
+  identity `risk_level`.
+- The risk context carries Sumunjang's `zones` and `score` (NetworkEvidence
+  fields 10–14) and can map its risk stage (`--risk-elevated-stage`,
+  `--risk-high-stage`).
+
 ## 0.3.6 — 2026-10-15
 
 - Add opt-in native credential projection through Hopae's authenticated mTLS RPC.

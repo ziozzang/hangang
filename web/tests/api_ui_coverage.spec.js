@@ -5,7 +5,9 @@ import { test, expect } from '@playwright/test';
 const read = (relative) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
 const source = {
   app: read('../app.js'), console: read('../console.js'), operations: read('../operations.js'),
-  docker: read('../docker.js'),
+  docker: read('../docker.js'), 'zt-policies': read('../zt/policies/store.js') + read('../zt/policies/service.js') + read('../zt/policies/simulator.js') + read('../zt/policies/publish.js'),
+  'zt-access': read('../zt/access.js'), 'zt-overview': read('../zt/overview.js'), 'zt-entities': read('../zt/entities.js'),
+  'zt-workloads': read('../zt/workloads/common.js') + read('../zt/workloads/workloads.js'),
 };
 
 // Each management operation needs a feature-specific UI surface and a real caller.
@@ -62,7 +64,7 @@ const coverage = new Map([
   ['POST /v1/users', ['#create-user-form', 'app', "api('/v1/users', { method: 'POST'"]],
   ['PUT /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
   ['DELETE /v1/users/{id}', ['#user-list', 'app', '/v1/users/${encodeURIComponent(user.id)}']],
-  ['GET /v1/audit/users', ['#view-audit', 'app', '/v1/audit/users?after=']],
+  ['GET /v1/audit/users', ['#view-account-audit', 'app', '/v1/audit/users?after=']],
   ['GET /v1/audit/policy', ['#audit-policy-panel', 'app', "api('/v1/audit/policy')"]],
   ['PUT /v1/audit/policy', ['#audit-policy-save', 'app', "api('/v1/audit/policy', { method: 'PUT'"]],
   ['GET /v1/config/operations', ['#view-config-operations', 'app', '/v1/config/operations?after=']],
@@ -73,6 +75,22 @@ const coverage = new Map([
   ['POST /v1/config/operations/release', ['#config-operations-rows', 'app', "api('/v1/config/operations/release', { method: 'POST'"]],
   ['POST /v1/config/operations/prune', ['#config-operations-prune', 'app', "api('/v1/config/operations/prune', { method: 'POST'"]],
   ['POST /v1/audit/users/prune', ['#audit-prune', 'app', "api('/v1/audit/users/prune', { method: 'POST'"]],
+  ['GET /v1/pumgye/policy', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/policy')"]],
+  ['PUT /v1/pumgye/policy', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/policy', { method: 'PUT'"]],
+  ['GET /v1/pumgye/status', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/status')"]],
+  ['GET /v1/pumgye/audit', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/audit')"]],
+  ['POST /v1/pumgye/explain', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/explain', { method: 'POST'"]],
+  ['POST /v1/pumgye/explain/batch', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/explain/batch', { method: 'POST'"]],
+  ['POST /v1/pumgye/explain/diff', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/explain/diff', { method: 'POST'"]],
+  ['GET /v1/pumgye/audit/simulations', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/audit/simulations"]],
+  ['GET /v1/pumgye/v2/workloads', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/workloads')"]],
+  ['GET /v1/pumgye/v2/policy', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/policy')"]],
+  ['POST /v1/pumgye/v2/workloads/regrants/apply', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/workloads/regrants/apply', { method: 'POST'"]],
+  ['GET /v1/observability/status', ['#view-system', 'zt-entities', "cx.api('/v1/observability/status')"]],
+  ['GET /v1/observability/decisions', ['#view-access', 'zt-access', '/v1/observability/decisions?${decisionQuery(']],
+  ['GET /v1/observability/decisions/facets', ['#view-overview', 'zt-overview', '/v1/observability/decisions/facets?${window}']],
+  ['GET /v1/observability/decisions/timeseries', ['#view-overview', 'zt-overview', '/v1/observability/decisions/timeseries?${window}']],
+  ['GET /v1/observability/requests/{request_id}', ['#view-access', 'zt-access', '/v1/observability/requests/${encodeURIComponent(requestId)}']],
 ]);
 
 // This endpoint uses a separate machine observer credential and is intentionally

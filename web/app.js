@@ -1,10 +1,10 @@
-import { loadPumgye, resetPumgye } from "./pumgye.js";
 import { discoverPlugins, pluginView, loadPlugin, pausePlugins, resetPlugins } from './plugins.js';
 import { recordStatus, resetConsole, startLive, stopLive, isLive, renderSecurity } from './console.js';
 import { t, getLocale, initLocale, formatNumberLocale } from './i18n.js';
 import { loadOperations, pauseObserver, refreshOperationsCopy, resetOperations } from './operations.js';
 import { loadDockerPanel, refreshDockerCopy, resetDockerPanel } from './docker.js';
 import { createLuaEditor } from './lua-editor.js';
+import { ztView, loadZeroTrust, pauseZeroTrust, resetZeroTrust, canonicalHash, prepareZeroTrust } from './zt/shell.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const luaFields = [
@@ -213,6 +213,30 @@ function isRevisionConflict(error) { return error.status === 409 && (!error.titl
 /** The shared store did not acknowledge a write: it may have been applied, so the caller must reload before retrying. */
 function isIndeterminate(error) { return error.status === 500 && error.title === 'Indeterminate Outcome'; }
 
+const STEP_UP_ERRORS = new Set(['operator_step_up_required', 'operator_reauthentication_required']);
+
+/** The operator's assurance (Hopae ADR-0021) or the break-glass local session, in the header. */
+async function refreshAssurance() {
+  const pill = $('#operator-assurance');
+  if (!pill) return;
+  pill.hidden = true; pill.classList.remove('is-strong', 'is-warning');
+  let info;
+  try { ({ data: info } = await api('/v1/auth/sso/session', { noStepUpRedirect: true })); } catch { return; }
+  if (info?.method === 'hopae' && info.assurance) {
+    const a = info.assurance;
+    const factor = a.factor === 'webauthn' ? (a.high_assurance ? t('Security key') : t('Passkey')) : a.factor ? t(a.factor === 'totp' ? 'Authenticator app' : 'Second factor') : t('No second factor');
+    pill.textContent = a.grace && !a.satisfied ? t('AAL{aal} · passkey enrollment pending', { aal: a.aal }) : t('AAL{aal} · {factor}', { aal: a.aal, factor });
+    pill.title = t('Signed in through Hopae. Sensitive changes need your passkey within {seconds} seconds.', { seconds: info.policy?.sensitive_max_age_seconds ?? 300 });
+    pill.classList.add(a.satisfied ? 'is-strong' : 'is-warning');
+    pill.hidden = false;
+  } else if (info?.method === 'local' && info.break_glass) {
+    pill.textContent = t('Break-glass (local)');
+    pill.title = t('Signed in with a local administrator account. Every change is audited.');
+    pill.classList.add('is-warning');
+    pill.hidden = false;
+  }
+}
+
 async function api(path, options = {}) {
   const generation = state.authGeneration;
   const token = state.token;
@@ -235,6 +259,13 @@ async function api(path, options = {}) {
     payload = type.includes('json') ? await response.json().catch(() => null) : await response.text().catch(() => '');
   }
   if (generation !== state.authGeneration || token !== state.token) throw new StaleSessionError();
+  if (!response.ok && isObject(payload) && STEP_UP_ERRORS.has(payload.error) && typeof payload.step_up_url === 'string' && payload.step_up_url.startsWith('/ui/step-up?')) {
+    // Hopae operator assurance (ADR-0021): verify with the passkey through
+    // Hopae, then come back to this view.
+    const back = encodeURIComponent(location.pathname + location.hash);
+    if (!options.noStepUpRedirect) location.assign(`${payload.step_up_url.split('?')[0]}?return=${back}`);
+    throw new ApiError(t(payload.error === 'operator_reauthentication_required' ? 'Verify with your passkey again to continue.' : 'This console requires your passkey. Verify with it to continue.'), response.status, response, payload);
+  }
   if (!response.ok) {
     const title = isObject(payload) && typeof payload.title === 'string' && payload.title ? payload.title : null;
     const detail = payload?.detail || payload?.title || payload?.error || (typeof payload === 'string' && payload.trim()) || `${response.status} ${response.statusText}`;
@@ -454,7 +485,7 @@ function scrubRenderedData() {
 
 function logout(reason = '') {
   resetPlugins();
-  resetPumgye();
+  resetZeroTrust();
   stopBackendFreshness();
   stopCertificatePolling();
   stopWorkloadMaterialPolling();
@@ -534,6 +565,7 @@ async function activateSession(token, user, mode) {
     $$('.nav-link').forEach((link) => link.classList.toggle('is-active', link.dataset.view === 'status'));
   }
   renderStatus(data);
+  refreshAssurance();
   const session = state.authGeneration;
   let discoveryError;
   if(isAdmin()) { try { await discoverPlugins({api,locale:getLocale}); } catch(error) { if(!(error instanceof StaleSessionError)) discoveryError = error.message; } }
@@ -591,36 +623,40 @@ async function login(event) {
   }
 }
 
-const pumgyeDestinations = Object.freeze({ services: 'pumgye-service-form', resources: 'pumgye-resources-panel', policy: 'pumgye-policy-panel' });
 function normalizeView(hash) {
-  const name = (hash || '').replace(/^#/, '').split('/')[0];
-  if (pluginView(name)) return name;
-  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'audit', 'config-operations', 'operations', 'utilities', 'docs', 'pumgye'].includes(name) ? name : 'status';
+  const name = (hash || '').replace(/^#/, '').split(/[/?]/)[0];
+  if (pluginView(name) || ztView(name)) return name;
+  return ['status', 'http', 'lua', 'tcp', 'udp', 'docker', 'cache', 'certificates', 'security', 'config', 'users', 'account-audit', 'config-operations', 'operations', 'utilities', 'docs'].includes(name) ? name : 'status';
 }
 let navigationGeneration = 0;
 
 async function switchView() {
+  // The unified audit owns #audit (ADR 0020); keep earlier #audit-trail links working.
+  if (/^#audit-trail(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#audit' + location.hash.slice('#audit-trail'.length));
+  // The embedded Pumgye page moved into the Policies section (ADR 0020).
+  if (/^#pumgye(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', location.hash.startsWith('#pumgye/policy') ? '#policies/advanced' : '#policies');
+  // The Sumunjang package page became the Network section (ADR 0020).
+  if (/^#plugin-guard(?=$|[/?])/.test(location.hash)) history.replaceState(null, '', '#network');
   const navigation = ++navigationGeneration;
   let name = normalizeView(location.hash);
   if (state.user && !isAdmin() && name !== 'status') {
     name = 'status';
     if (location.hash !== '#status') history.replaceState(null, '', '#status');
   }
-  const requested = location.hash.slice(1).split('/');
-  const section = name === 'pumgye' && requested.length === 2 && Object.hasOwn(pumgyeDestinations, requested[1]) ? requested[1] : '';
   // Preserve a signed-out deep link until installed capabilities are discovered.
   if (state.token) {
-    const canonical = '#' + name + (section ? '/' + section : '');
+    const canonical = ztView(name) ? (canonicalHash(location.hash) || '#' + name) : '#' + name;
     if (location.hash !== canonical) history.replaceState(null, '', canonical);
   }
   pausePlugins();
+  if (!ztView(name)) pauseZeroTrust();
   state.view = name;
   if (name !== 'lua') state.luaPolicySequence++;
   if (name !== 'operations') pauseObserver();
   if (name !== 'security') resetSecurityBans();
   if (name !== 'config') resetGeoIpRuntime(true);
-  if (name !== 'audit') state.audit.sequence += 1;
-  if (name !== 'audit') state.auditPolicy.sequence += 1;
+  if (name !== 'account-audit') state.audit.sequence += 1;
+  if (name !== 'account-audit') state.auditPolicy.sequence += 1;
   if (name !== 'config-operations') state.configOperations.sequence += 1;
   if (name !== 'config-operations') resetConfigProof();
   if (name !== 'config-operations') resetConfigReceipt();
@@ -630,28 +666,26 @@ async function switchView() {
     view.classList.toggle('is-active', active);
   });
   $$('.nav-link').forEach((link) => { const active = link.dataset.view === name; link.classList.toggle('is-active', active); if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current'); });
-  $$('#pumgye-section-nav a').forEach(link => { if(link.hash === location.hash)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current'); });
   if (name === 'status' && state.token) startStatusPolling(); else stopStatusPolling();
   if (name !== 'config' && name !== 'tcp') stopWorkloadMaterialPolling();
   if (name === 'certificates' && state.token && !document.hidden) startCertificatePolling(); else stopCertificatePolling();
   startBackendFreshness();
   if (state.token) await loadView(name);
   if (navigation !== navigationGeneration || !state.token) return;
-  const destination = section ? document.getElementById(pumgyeDestinations[section]) : $('#main');
-  if (section) { destination.tabIndex = -1; destination.scrollIntoView({block:'start'}); }
+  const destination = $('#main');
   destination.focus({ preventScroll: true });
 }
 
 async function loadView(name, quiet = false) {
   try {
     if (pluginView(name) && isAdmin()) await loadPlugin(name);
+    if (ztView(name) && isAdmin()) await loadZeroTrust(name, { api });
     if (name === 'status') await loadStatus();
     if (name === 'lua' && isAdmin()) await loadLuaPolicies();
     if (name === 'http' || name === 'tcp') await loadRoutes(name);
     if (name === 'udp') await loadUdpRelays();
     if (name === 'cache') await loadCache(false);
     if (name === 'certificates') await loadCertificates(false);
-    if (name === 'pumgye' && isAdmin()) await loadPumgye({ api }, { resume: true });
     if (name === 'config') await loadConfig(false);
     if (name === 'config' && isAdmin()) await loadGeoIpStatus();
     if (name === 'config' || name === 'tcp') {
@@ -659,7 +693,7 @@ async function loadView(name, quiet = false) {
       startWorkloadMaterialPolling();
     }
     if (name === 'users' && isAdmin()) await loadUsers();
-    if (name === 'audit' && isAdmin()) await Promise.all([loadAudit(0, []), loadAuditPolicy()]);
+    if (name === 'account-audit' && isAdmin()) await Promise.all([loadAudit(0, []), loadAuditPolicy()]);
     if (name === 'config-operations' && isAdmin()) await Promise.all([loadConfigOperations(0, []), loadConfigProof()]);
     if (name === 'operations' && isAdmin()) await loadOperations(api, () => logout(t('Your session is no longer authorized.')));
     if (name === 'docker' && isAdmin()) await loadDockerPanel(api, () => logout(t('Your session is no longer authorized.')));
@@ -5289,7 +5323,7 @@ async function loadAuditPolicy(force = false) {
   current.error = null; current.notice = null;
   try {
     const { data } = await api('/v1/audit/policy');
-    if (sequence !== current.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (sequence !== current.sequence || state.view !== 'account-audit' || !isAdmin()) return;
     if (!validAuditPolicyObservation(data)) throw new Error(t('Account audit policy response is invalid.'));
     current.observation = data; current.draft = auditPolicyDraftFromWire(data.policy); current.dirty = false;
   } catch (error) {
@@ -5308,7 +5342,7 @@ async function saveAuditPolicy() {
   catch (error) { current.error = error.message; renderAuditPolicy(); return; }
   const sequence = current.sequence; const generation = state.authGeneration; const token = state.token;
   const stillCurrent = () => sequence === current.sequence && generation === state.authGeneration &&
-    token === state.token && state.view === 'audit' && isAdmin();
+    token === state.token && state.view === 'account-audit' && isAdmin();
   const accepted = await confirmDialog({
     title: t('Publish account audit recording policy?'),
     body: policy.default_action === 'drop'
@@ -5422,7 +5456,7 @@ async function loadAudit(after = 0, previous = [], pageNumber = 1) {
   renderAudit();
   try {
     const { data } = await api(`/v1/audit/users?after=${after}&limit=100`);
-    if (sequence !== state.audit.sequence || state.view !== 'audit' || !isAdmin()) return;
+    if (sequence !== state.audit.sequence || state.view !== 'account-audit' || !isAdmin()) return;
     if (!isObject(data) || data.scope !== 'instance' || !Array.isArray(data.coverage) ||
       !['bootstrap', 'create', 'update', 'delete', 'prune', 'config_operations_prune'].every((action) => data.coverage.includes(action)) ||
       (data.policy_revision !== undefined && (!Number.isSafeInteger(data.policy_revision) || data.policy_revision < 0)) ||
@@ -6538,6 +6572,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', () => { stopBackendFreshness(); state.token = ''; stopStatusPolling(); stopWorkloadMaterialPolling(); });
 
 initLocale();
+prepareZeroTrust();
 ensureGeoIpPanel();
 state.view = normalizeView(location.hash);
 if (!location.hash) history.replaceState(null, '', '#status');

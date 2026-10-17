@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hangang-route-grpc"]
+members = ["crates/hangang-route-grpc", "crates/hangang-decision-event", "crates/hangang-decision-exporter"]
 resolver = "3"
 
 [package]
@@ -14,6 +14,9 @@ repository = "https://github.com/ziozzang/hangang"
 
 [dependencies]
 hangang-route-grpc = { path = "crates/hangang-route-grpc" }
+hangang-decision-event = { path = "crates/hangang-decision-event" }
+crossbeam-queue = "0.3"
+ring = "0.17"
 hangang-runtime = { git = "https://github.com/ziozzang/hangang-runtime", rev = "bf3ba2c0ccfb8603a34b14a30bc52d5112f0677a" }
 hopae-grpc = { git = "https://github.com/ziozzang/hopae", rev = "e1dd9728e184eb4975fbe1ce8dae0505571f4ff1", features = ["native-client"] }
 guard-grpc = { git = "https://github.com/ziozzang/sumunjang", rev = "65856ab40223138ab1d40e168e6f2a259a47b132" }
@@ -23,6 +26,7 @@ pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c
 pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c203b35d2e37aee9ce95a040d874" }
 pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c203b35d2e37aee9ce95a040d874" }
 prost = "0.14"
+tonic-prost = "0.14.6"
 zeroize = "1"
 hmac = "0.12"
 anyhow = "1"
@@ -76,6 +80,7 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["ring"
 x509-parser = "0.18.1"
 
 [dev-dependencies]
+hangang-decision-exporter = { path = "crates/hangang-decision-exporter" }
 rcgen = "0.14"
 rand = "0.8"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

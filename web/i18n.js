@@ -53,7 +53,6 @@ const urlDefenseKorean = {
   'Unreachable': '연결 불가',
   'Unknown': '알 수 없음',
   'Checking': '확인 중',
-  'Draining': '종료 대기',
   'Runtime probe snapshot. Unknown means no verified active probe evidence; availability alone does not prove reachability.': '런타임 검사 상태입니다. 알 수 없음은 검증된 활성 검사 결과가 없다는 의미이며, 요청 허용 여부만으로 연결 가능을 판단하지 않습니다.',
 
   "Security URL controls": "URL 보안 설정",

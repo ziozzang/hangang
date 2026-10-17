@@ -29,11 +29,12 @@ async function login(page, hash='') {
 }
 for(const ids of [['guard','hopae'],['hopae','guard']])test(`host order independent of discovery ${ids}`,async({page})=>{
   await fixture(page,{ids});await login(page);
-  await expect(page.locator('.sidebar a[data-console-plugin]')).toHaveCount(2);
-  expect(await page.locator('.sidebar .nav-link').evaluateAll(links=>links.filter(a=>['pumgye','plugin-hopae','plugin-guard'].includes(a.dataset.view)).map(a=>a.dataset.view))).toEqual(['plugin-hopae','plugin-guard','pumgye']);
+  // The Sumunjang package page is superseded by the Network section (ADR 0020).
+  await expect(page.locator('.sidebar a[data-console-plugin]')).toHaveCount(1);
+  expect(await page.locator('.sidebar .nav-link').evaluateAll(links=>links.filter(a=>['policies','plugin-hopae','plugin-guard'].includes(a.dataset.view)).map(a=>a.dataset.view))).toEqual(['policies','plugin-hopae']);
   await expect(page.locator('[data-view="plugin-hopae"]')).toContainText('Identity · Hopae');
-  await page.locator('#locale-select').selectOption('ko');await expect(page.locator('[data-view="plugin-guard"]')).toContainText('네트워크 신뢰 · 수문장');
-  await page.locator('#command-open').click();await page.locator('#command-search').fill('Guard');await expect(page.locator('.command-result')).toContainText('수문장');
+  await page.locator('#locale-select').selectOption('ko');await expect(page.locator('[data-view="plugin-hopae"]')).toContainText('신원 · 호패');
+  await page.evaluate(()=>{location.hash='#plugin-guard';});await expect(page).toHaveURL(/#network$/);
 });
 test('duplicate discovery cannot partially install or execute plugins',async({page})=>{
   const calls=await fixture(page,{duplicate:true});await login(page);
@@ -56,13 +57,10 @@ test('uninstalled and unknown nested destinations canonicalize without module ex
 test('viewer direct destination never discovers or imports administrator modules',async({page})=>{
   const calls=await fixture(page,{viewer:true});await login(page,'#plugin-hopae');await expect(page).toHaveURL(/#status$/);expect(calls.includes('/v1/plugins')).toBe(false);expect(calls.some(p=>p.startsWith('/ui/plugins/'))).toBe(false);await expect(page.locator('[data-view="pumgye"]')).toBeHidden();
 });
-test('bounded Pumgye section addresses retain drafts and browser history',async({page})=>{
-  await fixture(page);await login(page,'#pumgye/resources');await expect(page.locator('#pumgye-resources-panel')).toBeFocused();
-  await page.locator('#pumgye-document').fill('{"fixture":' );
-  await page.locator('#pumgye-section-nav a[href="#pumgye/policy"]').click();await expect(page.locator('#pumgye-policy-panel')).toBeFocused();
-  await expect(page.locator('#pumgye-document')).toHaveValue('{"fixture":' );
-  await page.goBack();await expect(page.locator('#pumgye-resources-panel')).toBeFocused();await expect(page.locator('#pumgye-document')).toHaveValue('{"fixture":' );
-  await page.evaluate(()=>location.hash='#pumgye/%2e%2e');await expect(page).toHaveURL(/#pumgye$/);
+test('legacy Pumgye addresses redirect into the Policies section',async({page})=>{
+  await fixture(page);await login(page,'#pumgye/resources');await expect(page).toHaveURL(/#policies$/);
+  await page.evaluate(()=>location.hash='#pumgye/policy');await expect(page).toHaveURL(/#policies\/advanced$/);
+  await page.evaluate(()=>location.hash='#pumgye/%2e%2e');await expect(page).toHaveURL(/#policies$/);
 });
 
 test('installed module unsupported subpage canonicalizes to installed root',async({page})=>{
@@ -70,18 +68,18 @@ test('installed module unsupported subpage canonicalizes to installed root',asyn
 });
 test('unknown installed capabilities follow stable IDs without prototype labels',async({page})=>{
   await fixture(page,{ids:['zeta','constructor','guard','alpha','hopae']});await login(page);
-  expect(await page.locator('.sidebar [data-console-plugin]').evaluateAll(a=>a.map(x=>x.dataset.consolePlugin))).toEqual(['hopae','guard','alpha','constructor','zeta']);
+  expect(await page.locator('.sidebar [data-console-plugin]').evaluateAll(a=>a.map(x=>x.dataset.consolePlugin))).toEqual(['hopae','alpha','constructor','zeta']);
   await expect(page.locator('[data-view="plugin-constructor"]')).toContainText('Discovery constructor');
 });
 test('390px navigation remains keyboard operable and within the host viewport',async({page})=>{
   await page.setViewportSize({width:390,height:900});await fixture(page);await login(page);
   const link=page.locator('[data-view="plugin-hopae"]');await link.focus();await link.press('Enter');await expect(page.locator('#view-plugin-hopae')).toBeVisible();await expect(link).toHaveAttribute('aria-current','page');
   expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-  await page.locator('#command-open').click();await page.locator('#command-search').fill('품계');await page.locator('#command-search').press('Enter');await expect(page).toHaveURL(/#pumgye$/);
+  await page.locator('#command-open').click();await page.locator('#command-search').fill('품계');await page.locator('#command-search').press('Enter');await expect(page).toHaveURL(/#policies$/);
 });
 
 test('localized command search reaches only administrator-owned section routes',async({page})=>{
-  await fixture(page);await login(page);await page.locator('#locale-select').selectOption('ko');await page.locator('#command-open').click();await page.locator('#command-search').fill('resources');await expect(page.locator('.command-result')).toContainText('자원 카탈로그');await page.locator('#command-search').press('Enter');await expect(page).toHaveURL(/#pumgye\/resources$/);await expect(page.locator('#pumgye-resources-panel')).toBeFocused();
+  await fixture(page);await login(page);await page.locator('#locale-select').selectOption('ko');await page.locator('#command-open').click();await page.locator('#command-search').fill('resources');await expect(page.locator('.command-result')).toContainText('정책');await page.locator('#command-search').press('Enter');await expect(page).toHaveURL(/#policies$/);
 });
 test('viewer command search cannot offer administrator section destinations',async({page})=>{
   await fixture(page,{viewer:true});await login(page);await page.locator('#command-open').click();await page.locator('#command-search').fill('resources');await expect(page.locator('.command-result')).toHaveCount(0);

@@ -65,6 +65,8 @@ The administrator console **Lua policies** menu lists HTTP route policy and requ
 - [TCP workload identity with mutual TLS](TCP_MTLS.md) — TCP workload certificates
 - [Country admission](GEOIP.md) — country-based admission
 - [Native hangang-guard admission](GUARD.md) — per-request decisions, optional short cache and snapshot mode
+- [Zero Trust console sections and the shared UI kit](ZERO_TRUST_CONSOLE.md) — task-oriented overview, decision log, request detail, unified audit and key-based i18n
+- [Decision events and the decision exporter](DECISION_EVENTS.md) — pseudonymous access-decision log, sampling, key epochs and console decision APIs
 - [URL security controls](PATH_BLOCKS.md) — path blocks, country/IP allowlists, simultaneous quotas, IP bans and shared Redis
 - [Native HTTP language preference](LANGUAGE_POLICY.md) — language selection policy
 - [Administrator accounts](ADMIN_USERS.md) — account setup and administration

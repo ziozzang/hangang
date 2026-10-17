@@ -27,6 +27,7 @@ pub mod path_failure_bans;
 pub mod path_rate_limits;
 pub mod policy;
 pub mod pool_member;
+pub mod private_file;
 pub mod proxy;
 pub mod public_http;
 pub mod public_listener_config;
@@ -90,6 +91,7 @@ pub mod retired_members;
 
 mod resource_guard;
 pub mod resource_policy;
+pub mod risk_context;
 
 pub mod jwks_remote;
 pub mod jwt_auth;
@@ -132,4 +134,5 @@ pub mod projection_receipt;
 
 mod native_route_owner;
 
+pub mod decision;
 pub mod route_owner_grpc;

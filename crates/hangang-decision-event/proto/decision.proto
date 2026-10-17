@@ -1,0 +1,295 @@
+// hangang.decision.v1: one bounded record of an enforced access decision.
+//
+// The event never carries headers, bodies, query strings, raw paths, cookies,
+// credentials, receipts, permits or provider tokens. Subjects and client
+// addresses appear only as keyed pseudonyms; the optional sealed values exist
+// only under the `standard` privacy profile and never leave the local store.
+//
+// Compatibility: unknown enum values decode as *_UNSPECIFIED and are shown as
+// unknown, never as allow. Adding an enum value or a reason code requires a
+// schema minor version, an EN/KO message key and a contract test.
+syntax = "proto3";
+
+package hangang.decision.v1;
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_ENFORCED = 1;
+  KIND_SIMULATION = 2;
+  KIND_SHADOW = 3;
+}
+
+enum Result {
+  RESULT_UNSPECIFIED = 0;
+  RESULT_ALLOW = 1;
+  RESULT_DENY = 2;
+  RESULT_CHALLENGE = 3;
+  RESULT_ERROR = 4;
+  RESULT_UNAVAILABLE = 5;
+}
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_NETWORK = 1;
+  STAGE_IDENTITY = 2;
+  STAGE_AUTHORIZATION = 3;
+  STAGE_ENFORCEMENT = 4;
+}
+
+enum Authority {
+  AUTHORITY_UNSPECIFIED = 0;
+  AUTHORITY_SUMUNJANG = 1;
+  AUTHORITY_HOPAE = 2;
+  AUTHORITY_PUMGYE = 3;
+  AUTHORITY_HANGANG = 4;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_LOCAL = 1;
+  TRANSPORT_HTTP = 2;
+  TRANSPORT_HGD1 = 3;
+  TRANSPORT_HOP1 = 4;
+  TRANSPORT_PPG1 = 5;
+  TRANSPORT_GRPC = 6;
+  TRANSPORT_SNAPSHOT = 7;
+}
+
+enum NetworkVerdict {
+  NETWORK_VERDICT_UNSPECIFIED = 0;
+  NETWORK_VERDICT_ALLOW = 1;
+  NETWORK_VERDICT_DENY = 2;
+  NETWORK_VERDICT_OBSERVE = 3;
+  NETWORK_VERDICT_UNAVAILABLE = 4;
+}
+
+enum GuardMode {
+  GUARD_MODE_UNSPECIFIED = 0;
+  GUARD_MODE_OBSERVE = 1;
+  GUARD_MODE_ENFORCE = 2;
+}
+
+enum IdentityVerdict {
+  IDENTITY_VERDICT_UNSPECIFIED = 0;
+  IDENTITY_VERDICT_AUTHENTICATED = 1;
+  IDENTITY_VERDICT_ANONYMOUS = 2;
+  IDENTITY_VERDICT_CHALLENGE = 3;
+  IDENTITY_VERDICT_DENIED = 4;
+  IDENTITY_VERDICT_UNAVAILABLE = 5;
+}
+
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_HUMAN = 1;
+  PRINCIPAL_KIND_SERVICE = 2;
+  PRINCIPAL_KIND_WORKLOAD = 3;
+}
+
+enum Factor {
+  FACTOR_UNSPECIFIED = 0;
+  FACTOR_PASSWORD = 1;
+  FACTOR_FEDERATED = 2;
+  FACTOR_OTP = 3;
+  FACTOR_WEBAUTHN = 4;
+  FACTOR_CERTIFICATE = 5;
+  FACTOR_BEARER = 6;
+}
+
+// Exact pumgye_core::Decision variants plus the resource lookup outcomes of
+// pumgye_core::ResourceDecision and the transport failure.
+enum AuthorizationDecision {
+  AUTHORIZATION_DECISION_UNSPECIFIED = 0;
+  AUTHORIZATION_DECISION_ALLOW = 1;
+  AUTHORIZATION_DECISION_UNKNOWN_SERVICE = 2;
+  AUTHORIZATION_DECISION_GUEST = 3;
+  AUTHORIZATION_DECISION_NETWORK_GUEST = 4;
+  AUTHORIZATION_DECISION_PERMISSION_DENIED = 5;
+  AUTHORIZATION_DECISION_CLASS_DENIED = 6;
+  AUTHORIZATION_DECISION_ASSURANCE_DENIED = 7;
+  AUTHORIZATION_DECISION_GUARD_DENIED = 8;
+  AUTHORIZATION_DECISION_GUARD_UNAVAILABLE = 9;
+  AUTHORIZATION_DECISION_UNKNOWN_RESOURCE = 10;
+  AUTHORIZATION_DECISION_UNKNOWN_ACTION = 11;
+  AUTHORIZATION_DECISION_UNAVAILABLE = 12;
+  AUTHORIZATION_DECISION_NOT_MAPPED = 13;
+}
+
+enum EnforcementAction {
+  ENFORCEMENT_ACTION_UNSPECIFIED = 0;
+  ENFORCEMENT_ACTION_REFUSED = 1;
+  ENFORCEMENT_ACTION_CHALLENGED = 2;
+  ENFORCEMENT_ACTION_FORWARDED = 3;
+  ENFORCEMENT_ACTION_REDIRECTED = 4;
+}
+
+enum Fence {
+  FENCE_UNSPECIFIED = 0;
+  FENCE_OK = 1;
+  FENCE_STALE_OWNER = 2;
+  FENCE_REVISION_REGRESSED = 3;
+  FENCE_EXPIRED = 4;
+}
+
+enum SampleClass {
+  SAMPLE_CLASS_UNSPECIFIED = 0;
+  SAMPLE_CLASS_DENY = 1;
+  SAMPLE_CLASS_CHALLENGE = 2;
+  SAMPLE_CLASS_ERROR = 3;
+  SAMPLE_CLASS_UNAVAILABLE = 4;
+  SAMPLE_CLASS_ALLOW = 5;
+  SAMPLE_CLASS_AUDIT = 6;
+  SAMPLE_CLASS_TRACE = 7;
+  SAMPLE_CLASS_SIMULATION = 8;
+  SAMPLE_CLASS_SUPPRESSED = 9;
+}
+
+enum PrivacyProfile {
+  PRIVACY_PROFILE_UNSPECIFIED = 0;
+  PRIVACY_PROFILE_STRICT = 1;
+  PRIVACY_PROFILE_STANDARD = 2;
+}
+
+message Emitter {
+  string component = 1;
+  string instance = 2;
+  string build = 3;
+}
+
+message Route {
+  string listener = 1;
+  string host = 2;
+  string route_id = 3;
+  // Configured route template (prefix or pattern); never the request path.
+  string path_template = 4;
+  string method = 5;
+  string service = 6;
+  string resource = 7;
+  string action = 8;
+}
+
+message Outcome {
+  Result result = 1;
+  uint32 status = 2;
+  Stage deciding_stage = 3;
+  // Namespaced stable reason code (sumunjang.*, hopae.*, pumgye.*, hangang.*).
+  string reason = 4;
+}
+
+message NetworkStage {
+  NetworkVerdict verdict = 1;
+  GuardMode mode = 2;
+  repeated string rules = 3;
+  bool rules_truncated = 4;
+  optional uint64 revision = 5;
+  uint32 latency_us = 6;
+  Transport transport = 7;
+  string ip_ref = 8;
+  string prefix_ref = 9;
+  optional uint32 asn = 10;
+  string country = 11;
+  // AEAD(epoch key) of the canonical client address; `standard` profile only.
+  bytes sealed_ip = 12;
+}
+
+message IdentityStage {
+  Authority authority = 1;
+  IdentityVerdict verdict = 2;
+  string subject_ref = 3;
+  PrincipalKind principal = 4;
+  string provider = 5;
+  optional uint32 aal = 6;
+  repeated Factor factors = 7;
+  bool factors_truncated = 8;
+  string session_ref = 9;
+  optional uint64 generation = 10;
+  uint32 latency_us = 11;
+  Transport transport = 12;
+  // AEAD(epoch key) of the opaque Hopae subject ID; `standard` profile only.
+  bytes sealed_subject = 13;
+  // The risk level Hangang sent Hopae in the signed risk context (Hopae
+  // ADR-0023); unspecified when none was sent.
+  RiskLevel risk_level = 14;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_ELEVATED = 2;
+  RISK_LEVEL_HIGH = 3;
+}
+
+message AuthorizationStage {
+  AuthorizationDecision decision = 1;
+  repeated string roles = 2;
+  bool roles_truncated = 3;
+  string information_class = 4;
+  optional uint32 required_aal = 5;
+  optional uint64 revision = 6;
+  string permit_digest = 7;
+  uint32 latency_us = 8;
+  Transport transport = 9;
+}
+
+message EnforcementStage {
+  EnforcementAction action = 1;
+  repeated string obligations = 2;
+  bool obligations_truncated = 3;
+  Fence fence = 4;
+  optional uint64 revision = 5;
+  // 1..5 for 1xx..5xx when forwarded, 0 otherwise.
+  uint32 upstream_status_class = 6;
+}
+
+message StageVerdict {
+  oneof stage {
+    NetworkStage network = 1;
+    IdentityStage identity = 2;
+    AuthorizationStage authorization = 3;
+    EnforcementStage enforcement = 4;
+  }
+}
+
+// Absent = not consulted (never zero).
+message Revisions {
+  optional uint64 hangang = 1;
+  optional uint64 sumunjang = 2;
+  optional uint64 hopae = 3;
+  optional uint64 pumgye = 4;
+  optional uint64 catalog = 5;
+}
+
+message Sampling {
+  SampleClass class = 1;
+  // Parts per million; 1000000 = every event of this class was kept.
+  uint32 rate_ppm = 2;
+}
+
+message Privacy {
+  PrivacyProfile profile = 1;
+  string key_epoch = 2;
+}
+
+// One summary per token-bucket window for denies refused by the bucket.
+message Suppressed {
+  uint64 count = 1;
+  uint64 first_unix_ms = 2;
+  uint64 last_unix_ms = 3;
+  uint32 window_seconds = 4;
+}
+
+message DecisionEvent {
+  string schema = 1;
+  // 128-bit sortable identifier (48-bit milliseconds + 80 random bits).
+  bytes event_id = 2;
+  Kind kind = 3;
+  string request_id = 4;
+  uint64 time_unix_ms = 5;
+  Emitter emitter = 6;
+  Route route = 7;
+  Outcome outcome = 8;
+  repeated StageVerdict stages = 9;
+  Revisions revisions = 10;
+  Sampling sampling = 11;
+  Privacy privacy = 12;
+  Suppressed suppressed = 13;
+}

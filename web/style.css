@@ -38,6 +38,9 @@ button { cursor: pointer; }
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 4px rgba(255,113,133,.1); }
 .connection-pill.is-online .pulse { background: var(--green); box-shadow: 0 0 0 4px rgba(97,214,154,.1); }
 .revision { padding: 4px 8px; color: var(--cyan); border: 1px solid rgba(54,213,229,.24); border-radius: 4px; background: var(--cyan-soft); font: 700 10px var(--mono); letter-spacing: .08em; }
+.assurance-pill { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 11px var(--mono); white-space: nowrap; }
+.assurance-pill.is-strong { color: var(--green); border-color: rgba(97,214,154,.4); }
+.assurance-pill.is-warning { color: var(--amber, #f0b354); border-color: rgba(240,179,84,.5); }
 .signed-in-user { max-width: 180px; overflow: hidden; color: var(--muted); font: 11px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .sidebar { position: sticky; top: 64px; display: flex; flex-direction: column; justify-content: space-between; height: calc(100vh - 64px); padding: 22px 14px 20px; border-right: 1px solid var(--line); background: rgba(10, 19, 28, .78); }
 .sidebar nav { display: grid; gap: 5px; }

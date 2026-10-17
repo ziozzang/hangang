@@ -63,6 +63,246 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
         }
     } else {
         let asset: Option<(&str, &'static [u8])> = match path {
+            "/ui/kit/ui.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/kit/ui.js"),
+            )),
+            "/ui/kit/i18n.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/kit/i18n.js"),
+            )),
+            "/ui/kit/kit.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/kit/kit.css"),
+            )),
+            "/ui/zt/shell.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/shell.js"),
+            )),
+            "/ui/zt/overview.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/overview.js"),
+            )),
+            "/ui/zt/access.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/access.js"),
+            )),
+            "/ui/zt/audit.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/audit.js"),
+            )),
+            "/ui/zt/entities.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/entities.js"),
+            )),
+            "/ui/zt/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/en.json"),
+            )),
+            "/ui/zt/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/ko.json"),
+            )),
+            "/ui/zt/identities/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/index.js"),
+            )),
+            "/ui/zt/identities/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/common.js"),
+            )),
+            "/ui/zt/identities/users.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/users.js"),
+            )),
+            "/ui/zt/identities/user.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/user.js"),
+            )),
+            "/ui/zt/identities/sessions.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/sessions.js"),
+            )),
+            "/ui/zt/identities/groups.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/groups.js"),
+            )),
+            "/ui/zt/identities/providers.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/providers.js"),
+            )),
+            "/ui/zt/identities/authentication.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/authentication.js"),
+            )),
+            "/ui/zt/identities/explain.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/explain.js"),
+            )),
+            "/ui/zt/identities/editor.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/editor.js"),
+            )),
+            "/ui/zt/identities/projections.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/identities/projections.js"),
+            )),
+            "/ui/zt/identities/identities.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/identities/identities.css"),
+            )),
+            "/ui/zt/identities/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/identities/messages/en.json"),
+            )),
+            "/ui/zt/identities/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/identities/messages/ko.json"),
+            )),
+            "/ui/zt/policies/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/index.js"),
+            )),
+            "/ui/zt/policies/model.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/model.js"),
+            )),
+            "/ui/zt/policies/store.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/store.js"),
+            )),
+            "/ui/zt/policies/service.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/service.js"),
+            )),
+            "/ui/zt/policies/simulator.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/simulator.js"),
+            )),
+            "/ui/zt/policies/publish.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/policies/publish.js"),
+            )),
+            "/ui/zt/policies/policies.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/policies/policies.css"),
+            )),
+            "/ui/zt/messages/policies.en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/policies.en.json"),
+            )),
+            "/ui/zt/messages/policies.ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/policies.ko.json"),
+            )),
+            "/ui/zt/messages/pumgye.en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/pumgye.en.json"),
+            )),
+            "/ui/zt/messages/pumgye.ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/messages/pumgye.ko.json"),
+            )),
+            "/ui/zt/workloads/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/index.js"),
+            )),
+            "/ui/zt/workloads/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/common.js"),
+            )),
+            "/ui/zt/workloads/workloads.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/workloads.js"),
+            )),
+            "/ui/zt/workloads/routes.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/routes.js"),
+            )),
+            "/ui/zt/workloads/workloads.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/workloads/workloads.css"),
+            )),
+            "/ui/zt/workloads/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/workloads/messages/en.json"),
+            )),
+            "/ui/zt/workloads/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/workloads/messages/ko.json"),
+            )),
+            "/ui/zt/network/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/index.js"),
+            )),
+            "/ui/zt/network/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/common.js"),
+            )),
+            "/ui/zt/network/trace.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/trace.js"),
+            )),
+            "/ui/zt/network/actions.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/actions.js"),
+            )),
+            "/ui/zt/network/diff.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/diff.js"),
+            )),
+            "/ui/zt/network/overview.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/overview.js"),
+            )),
+            "/ui/zt/network/threats.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/threats.js"),
+            )),
+            "/ui/zt/network/ip.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/ip.js"),
+            )),
+            "/ui/zt/network/blocks.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/blocks.js"),
+            )),
+            "/ui/zt/network/rules.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/rules.js"),
+            )),
+            "/ui/zt/network/policy.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/policy.js"),
+            )),
+            "/ui/zt/network/asn.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/asn.js"),
+            )),
+            "/ui/zt/network/system.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/system.js"),
+            )),
+            "/ui/zt/network/zones.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/zones.js"),
+            )),
+            "/ui/zt/network/asn_workflow.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/network/asn_workflow.js"),
+            )),
+            "/ui/zt/network/network.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/network/network.css"),
+            )),
+            "/ui/zt/network/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/network/messages/en.json"),
+            )),
+            "/ui/zt/network/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/network/messages/ko.json"),
+            )),
             "/ui/lua-editor.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/lua-editor.js"),
@@ -70,10 +310,6 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
             "/ui/lua-editor.css" => Some((
                 "text/css; charset=utf-8",
                 include_bytes!("../web/lua-editor.css"),
-            )),
-            "/ui/pumgye.js" => Some((
-                "text/javascript; charset=utf-8",
-                include_bytes!("../web/pumgye.js"),
             )),
             "/ui/app.js" => Some((
                 "text/javascript; charset=utf-8",
@@ -226,6 +462,66 @@ mod tests {
             "/ui/locales/ko-operations.js",
             "/ui/docker.js",
             "/ui/locales/ko-docker.js",
+            "/ui/kit/ui.js",
+            "/ui/kit/i18n.js",
+            "/ui/kit/kit.css",
+            "/ui/zt/shell.js",
+            "/ui/zt/overview.js",
+            "/ui/zt/access.js",
+            "/ui/zt/audit.js",
+            "/ui/zt/entities.js",
+            "/ui/zt/messages/en.json",
+            "/ui/zt/messages/ko.json",
+            "/ui/zt/identities/index.js",
+            "/ui/zt/identities/common.js",
+            "/ui/zt/identities/users.js",
+            "/ui/zt/identities/user.js",
+            "/ui/zt/identities/sessions.js",
+            "/ui/zt/identities/groups.js",
+            "/ui/zt/identities/providers.js",
+            "/ui/zt/identities/authentication.js",
+            "/ui/zt/identities/explain.js",
+            "/ui/zt/identities/editor.js",
+            "/ui/zt/identities/projections.js",
+            "/ui/zt/identities/identities.css",
+            "/ui/zt/identities/messages/en.json",
+            "/ui/zt/identities/messages/ko.json",
+            "/ui/zt/policies/index.js",
+            "/ui/zt/policies/model.js",
+            "/ui/zt/policies/store.js",
+            "/ui/zt/policies/service.js",
+            "/ui/zt/policies/simulator.js",
+            "/ui/zt/policies/publish.js",
+            "/ui/zt/policies/policies.css",
+            "/ui/zt/messages/policies.en.json",
+            "/ui/zt/messages/policies.ko.json",
+            "/ui/zt/messages/pumgye.en.json",
+            "/ui/zt/messages/pumgye.ko.json",
+            "/ui/zt/network/index.js",
+            "/ui/zt/network/common.js",
+            "/ui/zt/network/trace.js",
+            "/ui/zt/network/actions.js",
+            "/ui/zt/network/diff.js",
+            "/ui/zt/network/overview.js",
+            "/ui/zt/network/threats.js",
+            "/ui/zt/network/ip.js",
+            "/ui/zt/network/blocks.js",
+            "/ui/zt/network/rules.js",
+            "/ui/zt/network/policy.js",
+            "/ui/zt/network/asn.js",
+            "/ui/zt/network/system.js",
+            "/ui/zt/network/zones.js",
+            "/ui/zt/network/asn_workflow.js",
+            "/ui/zt/network/network.css",
+            "/ui/zt/network/messages/en.json",
+            "/ui/zt/network/messages/ko.json",
+            "/ui/zt/workloads/index.js",
+            "/ui/zt/workloads/common.js",
+            "/ui/zt/workloads/workloads.js",
+            "/ui/zt/workloads/routes.js",
+            "/ui/zt/workloads/workloads.css",
+            "/ui/zt/workloads/messages/en.json",
+            "/ui/zt/workloads/messages/ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);

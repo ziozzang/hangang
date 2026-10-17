@@ -303,6 +303,7 @@ impl TcpPool {
                 },
                 reason: None,
                 ttl_ms,
+                evidence: None,
             };
             let mut idle = self
                 .idle
@@ -342,8 +343,15 @@ pub(crate) struct RequestEvidence {
     lifetime: Arc<lifetime::Lifetime>,
     ttl_ms: u64,
     value: pumgye_core::GuardEvidence,
+    /// Sumunjang's network evidence of the same evaluation, when requested
+    /// and returned (`include_evidence`, gRPC only).
+    network: Option<Arc<crate::risk_context::Evidence>>,
 }
 impl RequestEvidence {
+    /// Sumunjang's network evidence of this evaluation (risk context).
+    pub(crate) fn network(&self) -> Option<&crate::risk_context::Evidence> {
+        self.network.as_deref()
+    }
     pub(crate) fn current(
         &self,
         guard: &GuardClient,
@@ -361,6 +369,13 @@ impl RequestEvidence {
                 .map(|cache| cache.revision == Some(self.revision))
                 .unwrap_or(false)
     }
+    /// Policy revision this evidence was issued under (decision events).
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub(crate) fn value(&self) -> pumgye_core::GuardEvidence {
+        self.value
+    }
     pub(crate) fn remaining(&self, guard: &GuardClient, ip: IpAddr) -> Option<Duration> {
         self.bound_to(guard, ip)
             .then(|| self.lifetime.remaining(self.ttl_ms.min(1000)))
@@ -376,6 +391,8 @@ struct Decision {
     mode: Mode,
     reason: Option<String>,
     ttl_ms: u64,
+    #[serde(skip)]
+    evidence: Option<Arc<crate::risk_context::Evidence>>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -403,6 +420,9 @@ pub struct NativeTls {
 pub struct Config {
     pub decision_tcp: Option<pumgye_client::Endpoint>,
     pub decision_grpc: bool,
+    /// Ask the gRPC Network service for its evidence (additive
+    /// `include_evidence`; an older service answers without it).
+    pub include_evidence: bool,
     pub decision_tls: Option<NativeTls>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
@@ -646,6 +666,58 @@ impl GuardClient {
         }
         Ok(guard)
     }
+    /// Decision-event transport label of the admission query.
+    pub(crate) fn decision_transport(&self) -> crate::decision::Transport {
+        if self.transport_mode == TransportMode::Snapshot {
+            crate::decision::Transport::Snapshot
+        } else if self.grpc.is_some() {
+            crate::decision::Transport::Grpc
+        } else if self.tcp.is_some() {
+            crate::decision::Transport::Hgd1
+        } else {
+            crate::decision::Transport::Http
+        }
+    }
+    /// Last policy revision observed from Sumunjang, if any.
+    pub(crate) fn known_revision(&self) -> Option<u64> {
+        if self.transport_mode == TransportMode::Snapshot {
+            return self.policy.load().as_ref().map(|policy| policy.revision);
+        }
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision
+    }
+    /// Network stage of a decision event for one admission result.
+    pub(crate) fn decision_stage(
+        &self,
+        rejected: Option<u16>,
+        evidence: Option<&RequestEvidence>,
+        unavailable: bool,
+        started: Option<std::time::Instant>,
+    ) -> crate::decision::Network {
+        use crate::decision::NetworkVerdict;
+        let (verdict, enforce) = match (rejected, evidence.map(RequestEvidence::value)) {
+            (Some(_), _) if unavailable => (NetworkVerdict::Unavailable, true),
+            (None, _) if unavailable => (NetworkVerdict::Unavailable, false),
+            (Some(_), _) => (NetworkVerdict::Deny, true),
+            (None, Some(pumgye_core::GuardEvidence::Observe)) => (NetworkVerdict::Observe, false),
+            (None, Some(pumgye_core::GuardEvidence::Deny)) => (NetworkVerdict::Deny, false),
+            (None, Some(pumgye_core::GuardEvidence::Unavailable)) => {
+                (NetworkVerdict::Unavailable, false)
+            }
+            (None, _) => (NetworkVerdict::Allow, true),
+        };
+        crate::decision::Network {
+            verdict,
+            enforce,
+            revision: evidence
+                .map(RequestEvidence::revision)
+                .or_else(|| self.known_revision()),
+            latency_us: crate::decision::elapsed_us(started),
+            transport: self.decision_transport(),
+        }
+    }
     /// Native zero-trust admission after trusted-proxy identity resolution.
     pub async fn admit(&self, ip: IpAddr, path: &str) -> bool {
         self.rejection(ip, path).await.is_none()
@@ -727,6 +799,7 @@ impl GuardClient {
                     lifetime: started,
                     ttl_ms,
                     value,
+                    network: decision.evidence.clone(),
                 });
                 (value, proof)
             }
@@ -741,19 +814,20 @@ impl GuardClient {
         &self,
         ip: IpAddr,
         path: &str,
-    ) -> (Option<u16>, Option<RequestEvidence>) {
+    ) -> (Option<u16>, Option<RequestEvidence>, bool) {
         let ip = ip.to_canonical();
         if self.transport_mode == TransportMode::Snapshot {
             if self.denied(ip) {
-                return (Some(403), None);
+                return (Some(403), None, false);
             }
             self.observe_path(ip, path);
-            return (None, None);
+            return (None, None, false);
         }
         if self.cancel.is_cancelled() {
             return (
                 (self.failure_mode == FailureMode::Deny).then_some(503),
                 None,
+                true,
             );
         }
         let kind = self.path_kind(path);
@@ -774,6 +848,7 @@ impl GuardClient {
                         proof.ttl_ms = entry.ttl_ms;
                         proof
                     }),
+                    false,
                 );
             }
         }
@@ -783,6 +858,7 @@ impl GuardClient {
                 return (
                     (self.failure_mode == FailureMode::Deny).then_some(503),
                     None,
+                    true,
                 );
             }
         };
@@ -843,6 +919,7 @@ impl GuardClient {
                     return (
                         (self.failure_mode == FailureMode::Deny).then_some(503),
                         None,
+                        true,
                     );
                 }
                 if cache.revision != Some(decision.revision) {
@@ -856,6 +933,7 @@ impl GuardClient {
                     return (
                         (self.failure_mode == FailureMode::Deny).then_some(503),
                         None,
+                        true,
                     );
                 }
                 let value = if decision.mode == Mode::Enforce {
@@ -870,6 +948,7 @@ impl GuardClient {
                     lifetime: query_started,
                     ttl_ms: decision.ttl_ms,
                     value,
+                    network: decision.evidence.clone(),
                 };
                 let ttl = self.cache_ms.min(decision.ttl_ms);
                 if kind.is_none() && ttl > 0 {
@@ -890,7 +969,7 @@ impl GuardClient {
                     }
                 }
                 let proof = (!denied && decision.ttl_ms > 0).then_some(capture);
-                (denied.then_some(403), proof)
+                (denied.then_some(403), proof, false)
             }
             Err(_) => {
                 let failures = self
@@ -903,6 +982,7 @@ impl GuardClient {
                 (
                     (self.failure_mode == FailureMode::Deny).then_some(503),
                     None,
+                    true,
                 )
             }
         }
@@ -1075,6 +1155,7 @@ mod tests {
         let mut c = Config {
             decision_tcp: None,
             decision_grpc: false,
+            include_evidence: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
@@ -1157,6 +1238,7 @@ mod tests {
         Config {
             decision_tcp: None,
             decision_grpc: false,
+            include_evidence: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
@@ -1763,10 +1845,10 @@ mod tests {
         let clock = Arc::new(Mutex::new(Some(Duration::ZERO)));
         *guard.test_clock.lock().unwrap() = Some(clock.clone());
         let ip = "192.0.2.8".parse().unwrap();
-        let (_, first) = guard.admission(ip, "/").await;
+        let (_, first, _) = guard.admission(ip, "/").await;
         let first = first.unwrap();
         *clock.lock().unwrap() = Some(Duration::from_millis(400));
-        let (_, cached) = guard.admission(ip, "/").await;
+        let (_, cached, _) = guard.admission(ip, "/").await;
         let cached = cached.unwrap();
         assert!(Arc::ptr_eq(&first.lifetime, &cached.lifetime));
         assert_eq!(tcp.requests.lock().unwrap().len(), 1);
@@ -1785,7 +1867,7 @@ mod tests {
         assert!(cached.remaining(&guard, ip).is_none());
         let clock = Arc::new(Mutex::new(Some(Duration::ZERO)));
         *guard.test_clock.lock().unwrap() = Some(clock.clone());
-        let (_, proof) = guard.admission(ip, "/").await;
+        let (_, proof, _) = guard.admission(ip, "/").await;
         let proof = proof.unwrap();
         *clock.lock().unwrap() = None;
         assert!(proof.remaining(&guard, ip).is_none());
@@ -1807,7 +1889,7 @@ mod tests {
             GuardClient::start_with_token(config, "test-token-0123456789".into(), cancel.clone())
                 .unwrap();
         let ip = "192.0.2.8".parse().unwrap();
-        let (_, proof) = guard.admission(ip, "/").await;
+        let (_, proof, _) = guard.admission(ip, "/").await;
         let proof = proof.unwrap();
         assert!(proof.current(&guard, ip).is_some());
         cancel.cancel();
@@ -1854,13 +1936,13 @@ mod tests {
                 assert_eq!(evidence, pumgye_core::GuardEvidence::Unavailable);
                 assert!(capture.is_none());
             } else {
-                let ((rejected, capture), ()) = tokio::join!(guard.admission(ip, "/"), advance);
+                let ((rejected, capture, _), ()) = tokio::join!(guard.admission(ip, "/"), advance);
                 assert_eq!(rejected, Some(503));
                 assert!(capture.is_none());
             }
         }
         tcp.response.lock().unwrap()[16..20].copy_from_slice(&0u32.to_be_bytes());
-        let (rejected, capture) = guard.admission(ip, "/").await;
+        let (rejected, capture, _) = guard.admission(ip, "/").await;
         assert!(rejected.is_none() && capture.is_none());
         let (evidence, capture) = guard.authorization_capture(ip).await;
         assert_eq!(evidence, pumgye_core::GuardEvidence::EnforcedAllow);
@@ -1887,7 +1969,7 @@ mod tests {
         )
         .unwrap();
         let ip = "192.0.2.8".parse().unwrap();
-        let (denied, proof) = guard.admission(ip, "/").await;
+        let (denied, proof, _) = guard.admission(ip, "/").await;
         assert!(denied.is_none());
         let proof = proof.unwrap();
         assert_eq!(

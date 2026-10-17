@@ -1,0 +1,245 @@
+# Zero Trust console sections and the shared UI kit
+
+[Documentation](README.md) · [한국어](ko/ZERO_TRUST_CONSOLE.md)
+
+The management console groups zero-trust work by operator task (ADR 0020 P0):
+Overview, Access, Identities, Policies, Network, Devices & Workloads, Audit and
+System. Component pages (Pumgye, installed Hopae and Sumunjang packages) remain
+under *Component pages* until their task pages ship. All sections are
+administrator-only and read data through the existing management API.
+
+## Sections
+
+| Section | Route | Content |
+| --- | --- | --- |
+| Overview | `#overview` | Authority health (Hangang, Hopae, Sumunjang, Pumgye, decision exporter), decision KPIs and deny-rate trend for 1 h, 24 h or 7 d, top deny reasons, routes and countries, recent administrative changes; refreshes every 30 s while visible |
+| Access | `#access/decisions` | Decision log with server-side filters held in the URL, cursor pagination, time-order toggle, request/user/IP search and a bounded live tail |
+| Access | `#access/requests/{request_id}` | Request detail: stage timeline with the deciding stage, localized reason and remediation, revision vector with *changed since* |
+| Identities | `#identities/…` | Users, user detail, sessions, groups, providers, authentication policies and credential projections through the Hopae package (see below) |
+| Network | `#network/…` | Overview, threat queue, IP detail, blocks & allowlist, rules, policy and ASN pools through the Sumunjang package (see below) |
+| Devices & Workloads | `#workloads/…` | Kubernetes workload principals with Pumgye grants, workload detail with re-grant proposals, protected routes and the device posture state (see below) |
+| Policies | `#policies` | Pumgye service catalog (context, Sumunjang requirement, role, assignment, network and resource counts, highest class), access matrix and advanced JSON |
+| Policies | `#policies/services/{id}` | Service detail tabs: overview, resources and actions, roles, assignments, access simulator and change history |
+| Policies | `#policies/publish` | Review and publish: structured diff, what-if impact, required reason, typed confirmation and conflict resolution |
+| Policies | `#policies/simulate?subject={id}` | Cross-section simulator entry (used by Identities): redirects to the service's simulator tab when `service` is given or only one exists, otherwise picks a service (assigned ones first), keeping the subject |
+| Audit | `#audit` | Unified administrative audit from console accounts, console package operations and Pumgye publications; failed sources are labelled; account changes show a structured before/after diff. Console-account audit retention, policy and export moved to `#account-audit`; earlier `#audit-trail` links redirect |
+| System | `#system` | Components, packages, decision events, exporter and privacy profile; raw JSON only behind *View raw diagnostics* |
+
+Network otherwise shows an entity
+opener and links to the current component pages. When decision events are off,
+every decision view states *Decision events disabled* instead of showing an
+empty list. Actions that need later phases (simulator, reveal) are shown
+disabled with the reason.
+
+## Identities
+
+All Identities pages call the Hopae console package through the host broker
+(`/v1/plugins/hopae/<route>`); package discovery lists each package's declared
+routes, so an operation the installed package does not declare is shown
+disabled with the reason instead of failing.
+
+| Route | Page | Hopae routes |
+| --- | --- | --- |
+| `#identities/users?q=&status=&group=` | Users: server search, group filter, bulk disable (typed count + reason) | `users/query`, `subjects/search`, `subjects/resolve` (`include_groups`), `groups/get`, `users/disable` |
+| `#identities/users/{id}/{tab}` | User detail: Profile & linked identities, Authentication (factor status, access test), Sessions (terminate one/all), Groups, Access (Pumgye grants, simulator link), Activity (Hopae events and Hangang decisions) | `subjects/resolve`, `sessions/query`, `events/query`, `subjects/groups`, `explain/authentication`, `users/enable`, `users/disable`, `users/sessions-terminate`, `sessions/terminate`, `groups/members/*` |
+| `#identities/sessions?user=` | Live sessions with device, bound address, assurance and activity | `sessions/query`, `sessions/terminate` |
+| `#identities/groups`, `#identities/groups/{ref}` | Groups; local groups are edited with `expected_revision` and a reason, LDAP/OIDC groups are read-only with their source | `groups/search`, `groups/get`, `groups/create`, `groups/update`, `groups/delete`, `groups/members/add`, `groups/members/remove` |
+| `#identities/providers` | Provider cards: health, kind, management source, re-authentication, client secret, redirect URI, last error | `status` |
+| `#identities/authentication[/test]` | Service authentication profiles as forms, entity-grouped change list, CAS publish with reason and draft kept across navigation; "test access as a user" | `authentication/profiles`, `authentication/profiles/publish`, `explain/authentication` |
+| `#identities/projections` | Projection plans per service with connector circuit states, plan editor | `authentication/projections`, `authentication/projections/publish`, `status` |
+
+Every write asks for a reason. Hopae's group writes carry it in their body;
+for the other writes the console sends it in the host-only
+`x-hangang-change-reason` header (percent-encoded UTF-8, 1–512 characters),
+which the broker records in its private operation journal (shown in the
+unified audit) and never forwards.
+
+With Hopae console package 0.1.10 (Hopae `ADMIN.md`, "Hangang console
+routes") the pages also use: server-side user filters (search, status,
+provider, multi-factor, group), session filters (user, assurance) and event
+filters (user, kind prefix) instead of bounded scans; `users/get` for linked
+identities (provider subject, e-mail, first and last seen); `users/factors`
+(passkeys with authenticator, synced or device-bound, backup state, AAL 3
+high-assurance keys, last use; authenticator app; recovery codes) and
+`users/factors/reset` (one passkey, the app, recovery codes or all, with a
+reason; Hopae refuses self-targets); `users/bulk-disable` (up to 100 users,
+per-item results); reasons in Hopae's own audit for disable, enable,
+terminate and publications; `authentication/profiles/validate` with findings
+marked on the form fields before review; the portal origin for full redirect
+URIs and the console authority mode badge; AAL 3 in the access test. Packages
+0.1.8 and 0.1.9 keep the previous behaviour (bounded scans, sequential bulk
+disable, factor and linked-identity notes).
+
+## Policies
+
+The Policies section replaces the former embedded Pumgye page; `#pumgye` links
+redirect to `#policies` (`#pumgye/policy` to `#policies/advanced`). It edits the
+policy version 1 document of the independent Pumgye authority (or the `pumgye`
+member of the Hangang configuration when no authority is configured).
+
+- **Draft.** Every edit (services, permissions, roles with permissions, an
+  explicit information-class list, minimum AAL and inheritance, assignments,
+  network rules, resources and actions) changes a draft bound to the base
+  revision. Pumgye v1 grants exactly the listed classes; classes are not a
+  hierarchy, so the role editor shows one checkbox per class and no ceiling. The draft survives
+  navigation, locale changes and page refresh in the same tab.
+- **Roles.** The editor shows effective rights through inheritance and how
+  many subjects hold the role, refuses inheritance cycles and refuses deleting a
+  role that is still used.
+- **Assignments.** Subjects are picked through Hopae `subjects/search` and
+  shown with resolved names; user, Human, workload and Kubernetes API subjects
+  are validated per service context; selected assignments can be revoked in bulk
+  with typed confirmation.
+- **Access simulator.** Runs Pumgye `POST /v1/explain` for the published policy
+  or the draft as a candidate and shows the decision, localized reason,
+  remediation and the ordered evaluation trace. Pumgye validation errors are
+  shown on the offending field.
+- **Review and publish.** Shows the changes grouped by service as sentences
+  (for example "Kim Analyst u_kim: analyst role revoked") with the JSON path
+  secondary and the raw JSON diff on demand; subjects use their Hopae display
+  names in the diff, impact table and examples. Then the
+  compiled-rights diff (`/v1/explain/diff`) and an allow→deny / deny→allow
+  impact over cases synthesized from changed user assignments
+  (`/v1/explain/batch`). Publishing is a compare-and-swap with the Pumgye and
+  Hangang authority revisions and requires a reason (recorded in the Hangang
+  audit log with the actor and resulting revision). A change that turns an
+  allowed case into a denial, or touches a service granting the highest class,
+  requires typing the service name. A 409 opens a three-way view (published
+  since, your draft, conflicting paths) and rebases the draft.
+- **Advanced JSON** is read-only until *Edit JSON*; applied JSON becomes a draft
+  and goes through the same review.
+- A Kubernetes-owned or unreported policy source is shown read-only.
+
+The management API brokers Pumgye simulation for the console:
+`POST /v1/pumgye/explain`, `/v1/pumgye/explain/batch`, `/v1/pumgye/explain/diff`
+and `GET /v1/pumgye/audit/simulations`. They are administrator-only, rate
+limited per console account (burst 20, 2 per second) before Pumgye's own bucket,
+set `on_behalf_of` to `console:<account>` from the session and relay Pumgye's
+structured errors.
+
+## Network
+
+All Network pages call the Sumunjang console package through the host broker
+(`/v1/plugins/guard/<route>`). The former Sumunjang package page is no longer
+in the navigation; `#plugin-guard` links redirect to `#network`.
+
+| Route | Page | Sumunjang routes |
+| --- | --- | --- |
+| `#network` | Overview: mode banner; in observe mode what enforcement would deny among tracked addresses; queue, blocks, allowlist and rule counts; network-stage denial trend and top countries from the Hangang decision log; top ASNs; recent policy changes | `policy/document`, `candidates`, `blocks`, `rules`, `explain/batch`, `audit/query` |
+| `#network/threats?q=&stage=&asn=&eligible=` | Threat queue: score, stage, events, ASN, last seen; bulk approval with typed count and reason | `candidates`, `candidates/approve` |
+| `#network/ip/{ip}` | IP detail: GeoIP/ASN, score and stage, matched rules, covering blocks with expiry, allowlist, explain trace (published and, while observing, if enforced), related decisions; block/unblock/allowlist with reason | `lookup`, `explain`, `blocks`, `policy/document` |
+| `#network/blocks[/allowlist]?kind=` | Blocks (manual, approved, automatic) with expiry countdown; allowlist; additions validate the CIDR and preview impact | `blocks`, `networks/inspect`, `explain/batch`, `policy/document` |
+| `#network/zones[/{id}]` | Network zones (Sumunjang 0.1.7): list with usage against the 64-zone/65,536-prefix bounds, detail with prefixes and tracked members, create/replace/delete as a compare-and-set on the zone revision with a reason, Sumunjang's `/zone/id` and `/zone/prefixes/N` errors on the form, membership impact on tracked addresses; zone labels in the IP trace and threat queue | `zones` (GET/POST), `explain/batch` |
+| `#network/rules[/lua]?rule=` | Rules as a structured form or Lua in the host CodeMirror editor; validate, change list, what-if on tracked addresses, publish with reason | `rules`, `rules/validate`, `rules/lua`, `explain/batch` |
+| `#network/policy` | Mode, automatic blocking, window, threshold, block lifetime and weights; change list, what-if, CAS publish (`expected_revision`) with reason; switching to enforce requires typing the mode | `policy/document`, `explain/batch` |
+| `#network/asn` | ASNs seen in evidence and rules naming them (read-only); tabs for the prefix bundle and block proposals with Sumunjang 0.2.0, otherwise the proposal workflow shown as planned | `candidates`, `rules` |
+| `#network/asn/bundle` | Signed prefix bundle (Sumunjang 0.2.0): version, source, provenance, digest, trusted signature key, scheduled refresh status, previous bundles; manual refresh, upload of a signed bundle file (at most 1 MiB, sent through the broker) and rollback as a compare-and-set on the installed version with typed `v<version>` and a reason; the diff report (added, removed, reassigned prefixes, top ASNs) after each install | `asn/bundle` (GET/PUT), `asn/refresh`, `asn/bundle/rollback` |
+| `#network/asn/proposals[?state=&asn=]` | Block proposals: state filters (open, each state), ASN, scope, approvals n/m, tracked addresses, reason, proposer, expiry | `asn/proposals` |
+| `#network/asn/proposals/new` | Wizard: ASN (prefixes from the offline catalog) → scope (whole ASN, selected prefixes, evidence aggregates) with an impact preview and Sumunjang's located errors → reason and expiry (1–30 days) → draft; Hangang decision-log counts for the ASN are attached right after | `asn/catalog/query`, `asn/preview`, `asn/proposals` (POST), `asn/proposals/{id}` |
+| `#network/asn/proposals/{id}` | Proposal detail: impact (networks, estimated IPv4 addresses and IPv6 /64s, evidence addresses, current-mode and enforce verdict changes with samples, collisions with the allowlist, zones and existing blocks, warnings), Hangang decision-log counts, approval timeline; submit, approve, reject, refresh impact, activate (typed `AS<asn>`) and withdraw per state, each with a reason and the proposal revision; the proposer sees why approval is disabled (two-person rule) | `asn/proposals/{id}` (GET/POST) |
+
+Sumunjang status, GeoIP databases (reload), signed updates (check) and the
+Kubernetes source moved to System; raw diagnostics stay collapsed. Writes
+carry the operator reason in `x-hangang-change-reason` (operation journal);
+policy writes also send it in Sumunjang's `reason`, and a manual block uses
+it as the block reason (128 bytes). Rule replacement has no revision
+precondition in Sumunjang, so the console re-reads the published rules
+right before publishing and refuses when they changed.
+
+With Sumunjang console package 0.1.6 (Sumunjang `docs/CONSOLE_NETWORK_API.md`)
+the pages also use: per-address in-memory score and signal history (minute
+buckets, labelled "since restart" from `retained_since`), per-signal counts and
+country on candidates, block provenance (`source`, `created_by`,
+`created_at`), the rules document with `expected_revision` compare-and-set and
+the stored Lua source, dedicated allowlist routes with expiry and reason
+(expired entries listed greyed), reasons on block removal and approval, and the
+paginated offline ASN catalog. Against 0.1.5 packages the pages fall back to the
+previous behaviour (fresh-read guard for rules, allowlist through the policy
+document) and say what is missing. Remaining follow-up: impact estimates cover tracked addresses only.
+
+With Sumunjang console package 0.2.0 (broker contract v2, route pattern
+`asn/proposals/*`; Sumunjang `docs/ASN_PROPOSALS.md`) the ASN page adds the
+prefix bundle and block proposal pages above. Decision-log context is attached
+to a proposal with the `annotate` action as aggregate counts only (7-day
+window from the console's decision facets filtered by ASN: events, estimated
+requests, outcomes, stages, country count); no addresses or subjects leave
+Hangang. Packages without these routes keep the read-only ASN page.
+
+## Devices & Workloads
+
+| Route | Page | Sources |
+| --- | --- | --- |
+| `#workloads[/workloads]?q=&namespace=&status=` | Workload principals (one per ServiceAccount incarnation): namespace/ServiceAccount, SPIFFE ID, live or retired with the cause, last observed, legacy Pod-bound mappings, Pumgye grants (direct, plus those still on Pod-bound subjects) | Hopae `subjects/lifecycle` with `include_workloads` (or `subjects/workloads/snapshot` when declared), `/v1/pumgye/v2/workloads`, `/v1/pumgye/v2/policy` |
+| `#workloads/w/{principal}` | Identity (principal, SPIFFE ID, wire subject, cluster, namespace, ServiceAccount and UID, first/last observed, retirement and replacement), legacy mappings, grants by match (principal, SPIFFE ID, Pod-bound subject), recent decisions filtered by the wire subject, re-grant proposals with apply (typed count, reason, optional approval reference, compare-and-set on `policy_revision` from `/v2/workloads`, else the v2 document revision) | as above, `/v1/observability/decisions?subject=` |
+| `#workloads/routes?state=` | Kubernetes route protection: protected/unprotected/withheld counts, withheld Ingresses with the localized reason and the controller message, ProtectionPolicy acceptance, snapshot staleness meter and fail-closed state, client address preservation, Sumunjang prerequisite | `/v1/kubernetes/protection` |
+| `#workloads/devices` | Device posture is not configured: no inventory or posture source exists, so nothing is shown or simulated | — |
+
+Hopae console package 0.1.10 declares `subjects/lifecycle` but not
+`subjects/workloads/snapshot`, so the list folds the retained lifecycle feed
+(up to 2,000 events) and says so; the snapshot route is shown as a disabled
+*Hopae manifest gap* with its reason, and is used automatically once a package
+declares it. Each source is optional: a missing Hopae package, Pumgye
+authority or protection report is stated on the page. The report does not
+carry the client address mode, only whether it is preserved; full
+ProtectionPolicy conditions stay on the Kubernetes objects.
+
+The management API brokers the Pumgye model v2 workload operations for the
+console: `GET /v1/pumgye/v2/workloads`, `GET /v1/pumgye/v2/policy` and
+`POST /v1/pumgye/v2/workloads/regrants/apply`. They are administrator-only and
+share the per-account rate limit of the explain broker. An application must
+carry `base_revision`, 1–1,024 proposal IDs and the operator `reason` (unknown
+fields are refused before Pumgye); it is recorded in the Hangang audit log with
+the actor and the resulting revision, and the answer omits the echoed document.
+
+## Shared UI kit
+
+`web/kit/ui.js` (`@hangang/console-ui` kit 1) provides `el`, `dataTable`,
+`entityLink`, `statusBadge`, `freshnessBadge`, `stageTimeline`,
+`structuredDiff`, `confirmDialog` (typed target plus required reason),
+`emptyState`, `errorState`, `loadingState`, `field` and `subjectResolver`.
+Components render untrusted values as text nodes, respect the host CSP, use the
+River theme tokens in light and dark, and become card lists below 720 px.
+
+Console packages receive the kit additively in their mount context as
+`context.ui`, together with the key-based translator `context.t`,
+`context.navigate(hash)` and `context.link({type, id})`. Version 1 packages that
+ignore these fields are unaffected.
+
+## Messages and lint
+
+The sections use key-based catalogs `web/zt/messages/en.json` and `ko.json`
+through `web/kit/i18n.js`; missing keys fall back to English and are recorded.
+`npm run lint:i18n` (also run by `npm test`) fails when:
+
+- the English and Korean key sets differ or a message is empty or untranslated;
+- a used message key or a dynamic key family is missing;
+- a registered decision reason code lacks its message or remediation;
+- a string literal is rendered directly through `textContent`, `innerHTML`,
+  `title`, `placeholder`, `aria-*` or the kit's `text` property.
+
+```sh
+cd web
+npm run lint:i18n
+npx playwright test tests/zero_trust.spec.js
+```
+
+## Limitations
+
+Subject display follows the Hopae subject directory contract (Hopae
+`docs/SUBJECT_DIRECTORY.md`): `subjects/resolve` (at most 100 IDs) and
+`subjects/search` for the subject picker, with `active`, `disabled`, `deleted`
+(tombstone, no personal data) and `unknown` (with its reason) shown distinctly.
+The Hopae console package must list `subjects/resolve`, `subjects/search`,
+`subjects/lifecycle`, `subjects/lifecycle/snapshot` and
+`explain/authentication` as `POST` routes with `"mutation": false`; the broker
+then forwards them to `/v1/<path>` with the signed actor assertion over the
+exact body, does not record them as mutations, and Hopae's delegation verifier
+applies its JSON API rule. Without those routes, or when Hopae is rate limited,
+user pages show the opaque ID. Hopae
+`admin.*` events (`events/query`) and Sumunjang policy-change audit
+(`audit/query`, `sumunjang.audit.v1`) join the unified audit through their
+console packages; a source whose package does not declare the operation is
+shown as not connected, and a failing source is labelled, never shown as no
+activity. The simulator, impact analysis, reveal, saved views
+and CSV export arrive with ADR 0020 P1 and P2. Legacy pages keep their
+English-sentence dictionaries until they are migrated.
