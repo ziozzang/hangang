@@ -242,7 +242,7 @@ fn evidence_of(e: NetworkEvidence, d: &Decision) -> Option<Arc<crate::risk_conte
         || !(0..=5).contains(&e.deciding_stage)
         || !(0..=3).contains(&e.enforce_verdict)
         || e.zone_ids.len() > 8
-        || e.zone_ids.iter().any(|z| z.is_empty() || z.len() > 128)
+        || !e.zone_ids.iter().all(|z| crate::risk_context::zone_ok(z))
         || e.risk_score > 100
         || !(0..=5).contains(&e.risk_stage)
     {
@@ -296,6 +296,39 @@ fn decode(reply: NetworkReply, request_id: u64, floor: u64) -> Result<Decision> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn evidence_keeps_sumunjang_zone_ids_and_refuses_others() {
+        let d = decode(
+            NetworkReply {
+                request_id: 1,
+                revision: 2,
+                verdict: 1,
+                mode: 1,
+                ttl_ms: 1000,
+            },
+            1,
+            0,
+        )
+        .unwrap();
+        let e = |zones: &[&str]| NetworkEvidence {
+            reason_code: "sumunjang.observe.mode".into(),
+            deciding_stage: 1,
+            zone_ids: zones.iter().map(|z| z.to_string()).collect(),
+            risk_score: 30,
+            risk_stage: 3,
+            ..NetworkEvidence::default()
+        };
+        let kept = evidence_of(e(&["Corp:VPN", "legacy.orders.1"]), &d).unwrap();
+        assert_eq!(kept.zones, ["Corp:VPN", "legacy.orders.1"]);
+        assert_eq!(
+            kept.risk,
+            Some((30, crate::risk_context::RiskStage::Suspicious))
+        );
+        assert!(
+            evidence_of(e(&["corp vpn"]), &d).is_none(),
+            "refused, never silently trimmed"
+        );
+    }
     #[test]
     fn defaults_unavailable_conflicts_and_stale_replies_fail_closed() {
         let reply = NetworkReply {

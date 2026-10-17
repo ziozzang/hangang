@@ -175,8 +175,9 @@ hangang ... --guard-decision-grpc ... \
   - `low`: 그 밖의 모든 요청.
 - **헤더.** 계약 그대로 `x-hopae-risk-context: v1.<P>.<T>`입니다.
   - `P`에는 `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn`, `country`가 담깁니다.
-    `zones`(주소를 포함하는 Sumunjang 존 ID, 최대 8개. 계약 문자 집합 `[a-z0-9._-]{1,64}`를
-    벗어난 ID는 뺌)와 `score`(Sumunjang이 위험 단계를 계산했을 때만, 10 단위 0–100)도
+    `zones`(주소를 포함하는 Sumunjang 존 ID, 최대 8개. Sumunjang이 준 그대로
+    `[A-Za-z0-9_.:-]{1,128}`, 대소문자 구분. 다른 ID가 섞인 증거는 거부하므로 존을 빼는 대신
+    헤더를 생략)와 `score`(Sumunjang이 위험 단계를 계산했을 때만, 10 단위 0–100)도
     담깁니다. Sumunjang은 이를 `NetworkEvidence` 필드 10–14로 주며, 이전 Sumunjang은
     보내지 않으므로 클레임에도 없습니다.
   - `T`는 클레임과 이 verify 호출의 `x-original-method`, `x-forwarded-for`,

@@ -18,6 +18,17 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+/// Largest header value (the contract's bound).
+pub const MAX_VALUE: usize = 2048;
+
+/// A Sumunjang (Pumgye) zone id: `[A-Za-z0-9_.:-]{1,128}`, case-sensitive.
+pub fn zone_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+
 /// The verify request header.
 pub const HEADER: &str = "x-hopae-risk-context";
 const DOMAIN: &str = "hopae-risk-context.v1\n";
@@ -206,16 +217,10 @@ impl Settings {
         if e.asn != 0 {
             claims["asn"] = e.asn.into();
         }
-        // Only zone ids of the contract's alphabet (`[a-z0-9._-]{1,64}`), at most 8.
-        let zones: Vec<&str> = e
-            .zones
-            .iter()
-            .map(String::as_str)
-            .filter(|z| token_ok(z))
-            .take(8)
-            .collect();
-        if !zones.is_empty() {
-            claims["zones"] = zones.into();
+        // Every zone, as Sumunjang reported it (the evidence was checked
+        // against the zone id alphabet when it was received).
+        if !e.zones.is_empty() {
+            claims["zones"] = e.zones.iter().take(8).cloned().collect::<Vec<_>>().into();
         }
         if let Some((score, _)) = e.risk {
             claims["score"] = (score.min(100) / 10 * 10).into();
@@ -271,7 +276,7 @@ pub fn header_for(
     let url = one("x-original-url")?;
     let (level, claims) = settings.claims(evidence, now);
     let value = settings.sign_bytes(claims.to_string().as_bytes(), method, ip, url);
-    (value.len() <= 1024)
+    (value.len() <= MAX_VALUE)
         .then(|| hyper::header::HeaderValue::from_str(&value).ok())
         .flatten()
         .map(|v| (level, v))
@@ -428,8 +433,8 @@ mod tests {
         let (_, c) = s.claims(&e, 0);
         assert_eq!(
             c["zones"],
-            serde_json::json!(["corp-vpn", "lab"]),
-            "ids outside the contract alphabet are left out"
+            serde_json::json!(["corp-vpn", "Legacy:Zone", "lab"]),
+            "case-sensitive ids with colons are kept"
         );
         assert_eq!(c["score"], 30);
         e.risk = Some((50, RiskStage::Suspicious));
@@ -447,5 +452,38 @@ mod tests {
         let plain = Settings::new(KEY.to_vec(), Thresholds::default()).unwrap();
         e.risk = Some((100, RiskStage::High));
         assert_eq!(plain.level(&e), Level::Low);
+    }
+
+    /// Hopae's second documented vector (zones with upper case and colons).
+    #[test]
+    fn the_contract_zone_vector_is_reproduced() {
+        let claims = br#"{"iat":1800000000,"level":"low","source":"sumunjang","mode":"observe","reason":"sumunjang.observe.mode","score":20,"country":"KR","zones":["Corp:VPN","legacy.orders.1"],"rev":5}"#;
+        assert_eq!(
+            sign(
+                KEY,
+                claims,
+                "GET",
+                "192.0.2.10".parse().unwrap(),
+                "https://app.example.test/admin/x"
+            ),
+            "v1.eyJpYXQiOjE4MDAwMDAwMDAsImxldmVsIjoibG93Iiwic291cmNlIjoic3VtdW5qYW5nIiwibW9kZSI6Im9ic2VydmUiLCJyZWFzb24iOiJzdW11bmphbmcub2JzZXJ2ZS5tb2RlIiwic2NvcmUiOjIwLCJjb3VudHJ5IjoiS1IiLCJ6b25lcyI6WyJDb3JwOlZQTiIsImxlZ2FjeS5vcmRlcnMuMSJdLCJyZXYiOjV9.MOFgcPWLbPgy37fmi01OJnwX7tm6enJ1T5b2lxlLGWA"
+        );
+        assert!(zone_ok("Corp:VPN") && !zone_ok("corp vpn") && !zone_ok(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn eight_long_zones_fit_the_header() {
+        let s = Settings::new(KEY.to_vec(), Thresholds::default()).unwrap();
+        let mut e = evidence();
+        e.zones = (0..8).map(|i| format!("{i}{}", "Z".repeat(127))).collect();
+        e.risk = Some((100, RiskStage::High));
+        let mut h = hyper::HeaderMap::new();
+        h.insert("x-forwarded-for", "192.0.2.10".parse().unwrap());
+        h.insert(
+            "x-original-url",
+            "https://app.example.test/admin/x".parse().unwrap(),
+        );
+        let (_, v) = header_for(&s, &e, &h, 0).expect("not omitted");
+        assert!(v.len() <= MAX_VALUE);
     }
 }

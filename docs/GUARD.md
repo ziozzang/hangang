@@ -220,8 +220,9 @@ and, on each route whose authorization service is Hopae, `"auth": {...,
   defines it:
   - `P` holds `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn` and
     `country`. It also holds `zones` (the Sumunjang zone ids containing the
-    address, at most 8; ids outside the contract alphabet `[a-z0-9._-]{1,64}`
-    are left out) and `score` (Sumunjang's 0–100 score in tens, only when it
+    address, at most 8, exactly as Sumunjang reports them: `[A-Za-z0-9_.:-]{1,128}`,
+    case-sensitive; evidence with any other id is refused, so the header is
+    omitted rather than a zone dropped) and `score` (Sumunjang's 0–100 score in tens, only when it
     computed a risk stage). Sumunjang reports these as fields 10–14 of
     `NetworkEvidence`; an older Sumunjang omits them, and so do the claims.
   - `T` is an HMAC-SHA256 over the claims and this verify call's
