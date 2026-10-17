@@ -298,6 +298,7 @@ async fn admin_kubernetes_protection_report_is_admin_only_and_follows_the_contro
         policy: None,
         reason: Some("ProtectionRequired"),
         message: Some("no policy".into()),
+        handoff_hosts: Vec::new(),
     });
     manager.metrics.kubernetes_protection.publish(report);
     let response = get(&client, &base, path, Some(TOKEN)).await;

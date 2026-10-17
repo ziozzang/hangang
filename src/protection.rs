@@ -648,6 +648,9 @@ pub struct Resolution {
     pub client_address: std::result::Result<(), String>,
     pub require_protection: bool,
     pub facts: GatewayFacts,
+    /// Hosts of each protected Ingress that get the internal Hopae handoff
+    /// route (`None` for hostless rules).
+    pub handoff: BTreeMap<ObjectKey, Vec<Option<String>>>,
 }
 impl Resolution {
     /// The protection input for route generation.
@@ -724,6 +727,7 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
         client_address: client_address.clone(),
         require_protection: settings.require_protection,
         facts: options.facts,
+        handoff: BTreeMap::new(),
     };
     // Ingress -> applying policy index, or a conflict.
     let mut by_policy: BTreeMap<usize, Vec<ObjectKey>> = BTreeMap::new();
@@ -764,6 +768,13 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
                 })
             }
         };
+        if matches!(decision, Decision::Protected(_))
+            && let Some(object) = (inputs.ingress)(&ingress.0, &ingress.1)
+        {
+            resolution
+                .handoff
+                .insert(ingress.clone(), handoff_hosts(object));
+        }
         resolution.decisions.insert(ingress.clone(), decision);
     }
 
@@ -908,6 +919,55 @@ impl Spec {
     }
 }
 
+/// Hopae's reserved path namespace on protected hosts (gateway contract:
+/// `/_hopae` and everything below it, ASCII case-insensitive). The controller
+/// routes it itself for the sign-in handoff; tenant paths may not claim it.
+pub const HOPAE_RESERVED_PATH: &str = "/_hopae";
+
+/// Whether an Ingress path lies in Hopae's reserved namespace.
+pub fn is_hopae_reserved(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == HOPAE_RESERVED_PATH || lower.starts_with("/_hopae/") || lower.starts_with("/%5fhopae")
+}
+
+fn ingress_paths(ingress: &Value) -> impl Iterator<Item = (Option<String>, &str, &str)> {
+    ingress
+        .pointer("/spec/rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|rule| {
+            let host = rule
+                .get("host")
+                .and_then(Value::as_str)
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned);
+            rule.pointer("/http/paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |path| {
+                    (
+                        host.clone(),
+                        path.get("path").and_then(Value::as_str).unwrap_or(""),
+                        path.get("pathType").and_then(Value::as_str).unwrap_or(""),
+                    )
+                })
+        })
+}
+
+/// Hosts of an Ingress that get the internal Hopae handoff route (`None`:
+/// hostless rules), in rule order without duplicates.
+pub fn handoff_hosts(ingress: &Value) -> Vec<Option<String>> {
+    let mut hosts: Vec<Option<String>> = Vec::new();
+    for (host, _, _) in ingress_paths(ingress) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 /// The first path of an Ingress outside the allowed public paths, if any.
 fn uncovered_public_path(public: &PublicAccess, ingress: &Value) -> Option<String> {
     if public.paths.is_empty() {
@@ -978,6 +1038,17 @@ fn decide<'a>(
             policy: policy.key.clone(),
             reason: bounded(public.reason.trim()),
         };
+    }
+    if let Some(object) = lookup(&ingress.0, &ingress.1)
+        && let Some((_, path, _)) =
+            ingress_paths(object).find(|(_, path, _)| is_hopae_reserved(path))
+    {
+        return withheld(
+            "ReservedPath",
+            format!(
+                "path {path} is in Hopae's reserved {HOPAE_RESERVED_PATH} namespace, which the gateway routes itself on protected hosts for the sign-in handoff"
+            ),
+        );
     }
     let settings = &options.settings;
     let (Some(identity), Some(authorization)) = (&spec.identity, &spec.authorization) else {
@@ -1366,6 +1437,8 @@ pub struct Counts {
     pub withheld: u64,
     pub invalid_policies: u64,
     pub conflicted_policies: u64,
+    /// Internal Hopae handoff routes added for protected hosts.
+    pub handoff_routes: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IngressRow {
@@ -1382,6 +1455,9 @@ pub struct IngressRow {
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Hosts with the internal `/_hopae` handoff route (`*` for hostless).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub handoff_hosts: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PolicyRow {
@@ -1428,6 +1504,16 @@ impl Resolution {
                 report.truncated += 1;
                 continue;
             }
+            let handoff_hosts: Vec<String> = self
+                .handoff
+                .get(key)
+                .into_iter()
+                .flatten()
+                .map(|host| host.clone().unwrap_or_else(|| "*".into()))
+                .collect();
+            if admitted.contains(key) {
+                report.counts.handoff_routes += handoff_hosts.len() as u64;
+            }
             report.ingresses.push(IngressRow {
                 namespace: key.0.clone(),
                 name: key.1.clone(),
@@ -1436,6 +1522,7 @@ impl Resolution {
                 policy: self.attached.get(key).map(|p| p.1.clone()),
                 reason,
                 message,
+                handoff_hosts,
             });
         }
         for (key, finding) in &self.policies {
@@ -1513,6 +1600,11 @@ impl Diagnostics {
                 "kubernetes_ingresses_withheld",
                 "Selected Ingresses withheld because protection is missing, ambiguous or cannot be enforced.",
                 report.counts.withheld,
+            ),
+            (
+                "kubernetes_handoff_routes",
+                "Internal Hopae handoff routes (/_hopae) the controller added for protected hosts.",
+                report.counts.handoff_routes,
             ),
             (
                 "kubernetes_protection_policies_invalid",
@@ -1892,6 +1984,59 @@ mod tests {
     }
 
     #[test]
+    fn protected_hosts_report_their_handoff_route_and_reserved_paths_are_refused() {
+        let options = options();
+        let object = ingress_object(
+            "shop",
+            "orders",
+            &[("/api", "Prefix"), ("/web", "Prefix")],
+            false,
+        );
+        let resolution = run_with(
+            &options,
+            &[("shop", "orders")],
+            &[policy("shop", "orders", &["orders"])],
+            local_lb(),
+            &[object],
+        );
+        assert!(matches!(
+            resolution.decisions[&key("shop", "orders")],
+            Decision::Protected(_)
+        ));
+        let report = resolution.report(&keys(&[("shop", "orders")]));
+        assert_eq!(report.counts.handoff_routes, 1, "one route per host");
+        assert_eq!(
+            report.ingresses[0].handoff_hosts,
+            vec!["auth.example.test".to_owned()]
+        );
+        let diagnostics = Diagnostics::default();
+        diagnostics.publish(report);
+        let mut metrics = String::new();
+        diagnostics.render(&mut metrics);
+        assert!(metrics.contains("hangang_kubernetes_handoff_routes 1"));
+        for reserved in ["/_hopae", "/_HOPAE/login", "/_hopae/", "/%5Fhopae/x"] {
+            let object = ingress_object(
+                "shop",
+                "orders",
+                &[("/api", "Prefix"), (reserved, "Prefix")],
+                false,
+            );
+            let resolution = run_with(
+                &options,
+                &[("shop", "orders")],
+                &[policy("shop", "orders", &["orders"])],
+                None,
+                &[object],
+            );
+            assert!(
+                matches!(&resolution.decisions[&key("shop", "orders")], Decision::Withheld(w) if w.reason == "ReservedPath"),
+                "{reserved}"
+            );
+        }
+        assert!(!is_hopae_reserved("/_hopaex") && !is_hopae_reserved("/app/_hopae"));
+    }
+
+    #[test]
     fn explicit_public_policy_shape_is_validated() {
         let options = options();
         let mut bad = Vec::new();
@@ -2035,7 +2180,8 @@ mod tests {
             keys(&[("blue", "app")]),
             "the Ingress without a decision is withheld"
         );
-        assert_eq!(config.http.len(), 2);
+        // /api, the default backend and the internal handoff route.
+        assert_eq!(config.http.len(), 3);
         for route in &config.http {
             assert_eq!(route.access_mode, AccessMode::Protected);
             assert!(
@@ -2440,7 +2586,8 @@ mod tests {
         intermediate.validate().unwrap();
         intermediate.validate_transition_from(&previous).unwrap();
         next.validate_transition_from(&intermediate).unwrap();
-        assert_eq!(intermediate.http.len(), 2);
+        // v2, the unchanged handoff route and the released /api tombstone.
+        assert_eq!(intermediate.http.len(), 3);
         // An unchanged scope needs no release.
         assert!(release_plan(&previous, &previous).is_none());
     }

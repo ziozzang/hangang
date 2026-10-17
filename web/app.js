@@ -710,6 +710,7 @@ function renderProtection(data) {
   const lines = [
     t('Protected {protected} · explicitly public {public} · unprotected {unprotected} · withheld {withheld}', { protected: count(counts.protected), public: count(counts.public), unprotected: count(counts.unprotected), withheld: count(counts.withheld) }),
     t('Invalid policies {invalid} · conflicted policies {conflicted}', { invalid: count(counts.invalid_policies), conflicted: count(counts.conflicted_policies) }),
+    t('Hopae handoff routes added for protected hosts: {count}', { count: count(counts.handoff_routes) }),
     report.require_protection ? t('Ingresses without a policy are withheld.') : t('Ingresses without a policy are published unprotected.'),
     report.client_address_preserved ? t('Client address preserved') : t('Client address not preserved: {detail}', { detail: String(report.client_address_message || '—').slice(0, 1024) }),
     report.guard_enforcing ? t('Sumunjang admission is fail-closed') : t('Sumunjang admission is not fail-closed'),

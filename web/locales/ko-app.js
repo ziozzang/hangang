@@ -1266,6 +1266,7 @@ export default {
   'Kubernetes route protection is not enabled on this instance.': '이 인스턴스에서는 Kubernetes 경로 보호가 켜져 있지 않습니다.',
   'Protected {protected} · explicitly public {public} · unprotected {unprotected} · withheld {withheld}': '보호 {protected} · 명시적 공개 {public} · 미보호 {unprotected} · 보류 {withheld}',
   'Explicitly public {namespace}/{name} ({policy}): {reason}': '명시적 공개 {namespace}/{name} ({policy}): {reason}',
+  'Hopae handoff routes added for protected hosts: {count}': '보호된 호스트에 추가한 Hopae handoff 경로: {count}',
   'Invalid policies {invalid} · conflicted policies {conflicted}': '무효 정책 {invalid} · 충돌 정책 {conflicted}',
   'Ingresses without a policy are withheld.': '정책이 없는 Ingress는 보류됩니다.',
   'Ingresses without a policy are published unprotected.': '정책이 없는 Ingress는 보호 없이 게시됩니다.',

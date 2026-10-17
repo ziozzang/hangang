@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Add the Hopae sign-in handoff route automatically: every host of a
+  protected Ingress gets one internal `/_hopae` route (case-insensitive,
+  protected like the tenant routes, one per host); tenant paths under
+  `/_hopae` withhold the Ingress (`ReservedPath`). Reported as
+  `handoff_hosts`, `counts.handoff_routes` and
+  `hangang_kubernetes_handoff_routes`.
 - Add explicitly public ProtectionPolicies (`access: Public` with a required
   `public.reason` and optional `public.paths`) for identity portals, provider
   callbacks and health routes, so `require_protection` can stay on. They are

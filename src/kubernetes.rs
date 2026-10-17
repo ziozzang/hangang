@@ -2858,7 +2858,8 @@ mod tests {
         assert_eq!(cached["metadata"]["uid"], "u");
 
         let (snapshot, admission) = cache.snapshot(&options).unwrap();
-        assert_eq!(snapshot.config.http.len(), 1);
+        // The tenant route and the internal Hopae handoff route.
+        assert_eq!(snapshot.config.http.len(), 2);
         assert_eq!(
             snapshot.config.http[0].access_mode,
             crate::config::AccessMode::Protected
