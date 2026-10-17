@@ -7,6 +7,7 @@ const source = {
   app: read('../app.js'), console: read('../console.js'), operations: read('../operations.js'),
   docker: read('../docker.js'), 'zt-policies': read('../zt/policies/store.js') + read('../zt/policies/service.js') + read('../zt/policies/simulator.js') + read('../zt/policies/publish.js'),
   'zt-access': read('../zt/access.js'), 'zt-overview': read('../zt/overview.js'), 'zt-entities': read('../zt/entities.js'),
+  'zt-workloads': read('../zt/workloads/common.js') + read('../zt/workloads/workloads.js'),
 };
 
 // Each management operation needs a feature-specific UI surface and a real caller.
@@ -82,6 +83,9 @@ const coverage = new Map([
   ['POST /v1/pumgye/explain/batch', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/explain/batch', { method: 'POST'"]],
   ['POST /v1/pumgye/explain/diff', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/explain/diff', { method: 'POST'"]],
   ['GET /v1/pumgye/audit/simulations', ['#view-policies', 'zt-policies', "cx.api('/v1/pumgye/audit/simulations"]],
+  ['GET /v1/pumgye/v2/workloads', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/workloads')"]],
+  ['GET /v1/pumgye/v2/policy', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/policy')"]],
+  ['POST /v1/pumgye/v2/workloads/regrants/apply', ['#view-workloads', 'zt-workloads', "cx.api('/v1/pumgye/v2/workloads/regrants/apply', { method: 'POST'"]],
   ['GET /v1/observability/status', ['#view-system', 'zt-entities', "cx.api('/v1/observability/status')"]],
   ['GET /v1/observability/decisions', ['#view-access', 'zt-access', '/v1/observability/decisions?${decisionQuery(']],
   ['GET /v1/observability/decisions/facets', ['#view-overview', 'zt-overview', '/v1/observability/decisions/facets?${window}']],

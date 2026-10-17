@@ -336,8 +336,8 @@ test('network and service entity routes show recent decisions', async ({ page })
   await expect(page.locator('#view-network')).toContainText('KR');
   await expect(page.locator('#view-network tbody tr')).toHaveCount(4);
   expect(calls.filter(c => c.path === '/v1/observability/decisions').at(-1).query).toContain('ip=198.51.100.7');
-  await page.goto('/ui/#workloads');
-  await expect(page.locator('#view-workloads')).toContainText('not configured yet');
+  await page.goto('/ui/#workloads/devices');
+  await expect(page.locator('#view-workloads')).toContainText('Device posture is not configured');
 });
 
 test('#audit is the unified audit; old #audit-trail links redirect and account audit stays reachable', async ({ page }) => {
