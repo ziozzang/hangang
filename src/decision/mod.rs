@@ -489,6 +489,8 @@ pub struct Identity {
     pub subject: Option<Subject>,
     pub latency_us: u32,
     pub transport: Transport,
+    /// The risk level Hangang sent Hopae (Hopae ADR-0023), when it did.
+    pub risk: Option<crate::risk_context::Level>,
 }
 
 /// Exact `pumgye_core::Decision` plus resource lookup and transport outcomes.

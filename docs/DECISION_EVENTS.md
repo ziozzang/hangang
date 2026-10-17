@@ -98,7 +98,7 @@ limit, namespace refusal). Ordinary public traffic produces no event.
 | Stage | Source | Recorded |
 | --- | --- | --- |
 | `network` | Sumunjang admission | verdict (`allow`, `deny`, `observe`, `unavailable`), mode, policy revision, transport, latency; pseudonymous IP and prefix references, country |
-| `identity` | Hopae (`hop1` or HTTP authentication) or Hangang (JWT, Basic, workload certificate) | verdict, principal kind, AAL, factor, pseudonymous subject reference, latency |
+| `identity` | Hopae (`hop1` or HTTP authentication) or Hangang (JWT, Basic, workload certificate) | verdict, principal kind, AAL, factor, pseudonymous subject reference, latency, `risk_level` (`low`, `elevated`, `high`: the level Hangang sent Hopae in the signed risk context, [guard](GUARD.md#hopae-risk-context); `null` when none was sent) |
 | `authorization` | Pumgye remote or compiled policy | exact `pumgye_core::Decision` variant (plus `UnknownResource`, `UnknownAction`, `Unavailable`, `NotMapped`), information class, policy revision, transport, latency |
 | `enforcement` | Hangang | `refused`, `challenged`, `forwarded` or `redirected`, fence, Hangang configuration revision, upstream status class |
 

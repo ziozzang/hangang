@@ -206,6 +206,16 @@ message IdentityStage {
   Transport transport = 12;
   // AEAD(epoch key) of the opaque Hopae subject ID; `standard` profile only.
   bytes sealed_subject = 13;
+  // The risk level Hangang sent Hopae in the signed risk context (Hopae
+  // ADR-0023); unspecified when none was sent.
+  RiskLevel risk_level = 14;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_ELEVATED = 2;
+  RISK_LEVEL_HIGH = 3;
 }
 
 message AuthorizationStage {

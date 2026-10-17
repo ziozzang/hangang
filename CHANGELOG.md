@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Hopae risk context (Hopae ADR-0023): with `--risk-context-key-env` the
+  gRPC guard query asks Sumunjang for its evidence (`include_evidence`),
+  Hangang maps it to `low`/`elevated`/`high` (configurable thresholds) and
+  sends the HMAC-signed `x-hopae-risk-context` on the Hopae verify of routes
+  with `auth.risk_context` (HTTP and HOP1), never upstream; client copies are
+  stripped; `hangang_risk_context_*` metrics and the decision events'
+  identity `risk_level`.
 ## 0.3.6 — 2026-10-15
 
 - Add opt-in native credential projection through Hopae's authenticated mTLS RPC.

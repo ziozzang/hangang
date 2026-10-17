@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
     let configuration = |name: &str, token: &str| Config {
         decision_tcp: Some(args[0].parse().unwrap()),
         decision_grpc: true,
+        include_evidence: false,
         decision_tls: Some(NativeTls {
             server_name: name.into(),
             ca: args[2].clone().into(),

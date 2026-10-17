@@ -21,7 +21,61 @@ pub(super) struct Client {
     sequence: AtomicU64,
     timeout: Duration,
     cancel: CancellationToken,
+    include_evidence: bool,
 }
+
+/// The additive request and reply of the Network service with evidence
+/// (Sumunjang `network.proto` fields 4 and 6). Field numbers and types match
+/// the original messages, so an older service ignores `include_evidence`
+/// and answers the original reply (no evidence).
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct EvidenceRequest {
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub ip: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub minimum_revision: u64,
+    #[prost(bool, tag = "4")]
+    pub include_evidence: bool,
+}
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct EvidenceReply {
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(int32, tag = "3")]
+    pub verdict: i32,
+    #[prost(int32, tag = "4")]
+    pub mode: i32,
+    #[prost(uint32, tag = "5")]
+    pub ttl_ms: u32,
+    #[prost(message, optional, tag = "6")]
+    pub evidence: Option<NetworkEvidence>,
+}
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct NetworkEvidence {
+    #[prost(string, tag = "1")]
+    pub reason_code: String,
+    #[prost(int32, tag = "2")]
+    pub deciding_stage: i32,
+    #[prost(string, repeated, tag = "3")]
+    pub rule_ids: Vec<String>,
+    #[prost(bool, tag = "4")]
+    pub rule_ids_truncated: bool,
+    #[prost(string, tag = "5")]
+    pub block_network: String,
+    #[prost(uint32, tag = "6")]
+    pub asn: u32,
+    #[prost(string, tag = "7")]
+    pub country: String,
+    #[prost(int32, tag = "8")]
+    pub enforce_verdict: i32,
+    #[prost(string, tag = "9")]
+    pub enforce_reason_code: String,
+}
+
 impl Client {
     pub(super) fn new(config: &Config, token: &str, cancel: CancellationToken) -> Result<Self> {
         let tls = config
@@ -56,6 +110,7 @@ impl Client {
             sequence: AtomicU64::new(1),
             timeout,
             cancel,
+            include_evidence: config.include_evidence,
         })
     }
     pub(super) async fn query(&self, ip: IpAddr) -> Result<Decision> {
@@ -70,6 +125,9 @@ impl Client {
                 value.checked_add(1)
             })
             .map_err(|_| anyhow::anyhow!("guard gRPC sequence exhausted"))?;
+        if self.include_evidence {
+            return self.query_with_evidence(ip, request_id).await;
+        }
         let mut request = tonic::Request::new(NetworkRequest {
             request_id,
             minimum_revision: self.revision.load(Ordering::Acquire),
@@ -101,6 +159,93 @@ impl Client {
         }
     }
 }
+impl Client {
+    /// `Check` with `include_evidence`, through the additive messages above.
+    async fn query_with_evidence(&self, ip: IpAddr, request_id: u64) -> Result<Decision> {
+        let mut request = tonic::Request::new(EvidenceRequest {
+            request_id,
+            minimum_revision: self.revision.load(Ordering::Acquire),
+            ip: match ip.to_canonical() {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            },
+            include_evidence: true,
+        });
+        request.set_timeout(self.timeout);
+        request
+            .metadata_mut()
+            .insert("authorization", self.token.clone());
+        let operation = async {
+            let mut grpc = tonic::client::Grpc::new(self.channel.clone())
+                .max_encoding_message_size(2048)
+                .max_decoding_message_size(2048);
+            grpc.ready().await?;
+            let reply: EvidenceReply = grpc
+                .unary(
+                    request,
+                    tonic::codegen::http::uri::PathAndQuery::from_static(
+                        "/hangang.sumunjang.v1.Network/Check",
+                    ),
+                    tonic_prost::ProstCodec::default(),
+                )
+                .await?
+                .into_inner();
+            let evidence = reply.evidence.clone();
+            let mut result = decode(
+                NetworkReply {
+                    request_id: reply.request_id,
+                    revision: reply.revision,
+                    verdict: reply.verdict,
+                    mode: reply.mode,
+                    ttl_ms: reply.ttl_ms,
+                },
+                request_id,
+                self.revision.load(Ordering::Acquire),
+            )?;
+            result.evidence = evidence.and_then(|e| evidence_of(e, &result));
+            self.revision.fetch_max(result.revision, Ordering::AcqRel);
+            ensure!(
+                result.revision >= self.revision.load(Ordering::Acquire),
+                "guard gRPC revision changed"
+            );
+            Ok(result)
+        };
+        tokio::select! { biased;
+            _=self.cancel.cancelled()=>Err(anyhow::anyhow!("guard gRPC cancelled")),
+            result=tokio::time::timeout(self.timeout,operation)=>result.map_err(|_|anyhow::anyhow!("guard gRPC deadline"))?,
+        }
+    }
+}
+
+/// Bounded evidence for the risk context; malformed evidence is dropped
+/// (the verdict still stands, the header is omitted).
+fn evidence_of(e: NetworkEvidence, d: &Decision) -> Option<Arc<crate::risk_context::Evidence>> {
+    let code_ok = |s: &str| {
+        s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    };
+    if !code_ok(&e.reason_code)
+        || !code_ok(&e.enforce_reason_code)
+        || !(e.country.is_empty()
+            || (e.country.len() == 2 && e.country.bytes().all(|b| b.is_ascii_uppercase())))
+        || !(0..=5).contains(&e.deciding_stage)
+        || !(0..=3).contains(&e.enforce_verdict)
+    {
+        return None;
+    }
+    Some(Arc::new(crate::risk_context::Evidence {
+        reason_code: e.reason_code,
+        deciding_stage: e.deciding_stage,
+        asn: e.asn,
+        country: e.country,
+        enforce_verdict: e.enforce_verdict,
+        enforce_reason_code: e.enforce_reason_code,
+        observe: d.mode == Mode::Observe,
+        revision: d.revision,
+    }))
+}
+
 fn decode(reply: NetworkReply, request_id: u64, floor: u64) -> Result<Decision> {
     ensure!(
         reply.request_id == request_id && reply.revision >= floor && reply.ttl_ms <= 5000,
@@ -127,6 +272,7 @@ fn decode(reply: NetworkReply, request_id: u64, floor: u64) -> Result<Decision> 
         mode,
         reason: None,
         ttl_ms: u64::from(reply.ttl_ms),
+        evidence: None,
     })
 }
 #[cfg(test)]

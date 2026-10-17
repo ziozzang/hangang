@@ -92,6 +92,7 @@ fn record(capture: &mut Capture, route: &Arc<hangang::config::HttpRuntime>, deny
             .then(|| decision::Subject::new(b"u_example_subject")),
         latency_us: decision::elapsed_us(started),
         transport: decision::Transport::Hop1,
+        risk: None,
     });
     capture.authorization(
         if deny {

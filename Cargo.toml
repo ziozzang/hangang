@@ -26,6 +26,7 @@ pumgye-core = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c
 pumgye-client = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c203b35d2e37aee9ce95a040d874" }
 pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c203b35d2e37aee9ce95a040d874" }
 prost = "0.14"
+tonic-prost = "0.14.6"
 zeroize = "1"
 hmac = "0.12"
 anyhow = "1"

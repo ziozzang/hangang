@@ -303,6 +303,7 @@ impl TcpPool {
                 },
                 reason: None,
                 ttl_ms,
+                evidence: None,
             };
             let mut idle = self
                 .idle
@@ -342,8 +343,15 @@ pub(crate) struct RequestEvidence {
     lifetime: Arc<lifetime::Lifetime>,
     ttl_ms: u64,
     value: pumgye_core::GuardEvidence,
+    /// Sumunjang's network evidence of the same evaluation, when requested
+    /// and returned (`include_evidence`, gRPC only).
+    network: Option<Arc<crate::risk_context::Evidence>>,
 }
 impl RequestEvidence {
+    /// Sumunjang's network evidence of this evaluation (risk context).
+    pub(crate) fn network(&self) -> Option<&crate::risk_context::Evidence> {
+        self.network.as_deref()
+    }
     pub(crate) fn current(
         &self,
         guard: &GuardClient,
@@ -383,6 +391,8 @@ struct Decision {
     mode: Mode,
     reason: Option<String>,
     ttl_ms: u64,
+    #[serde(skip)]
+    evidence: Option<Arc<crate::risk_context::Evidence>>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -410,6 +420,9 @@ pub struct NativeTls {
 pub struct Config {
     pub decision_tcp: Option<pumgye_client::Endpoint>,
     pub decision_grpc: bool,
+    /// Ask the gRPC Network service for its evidence (additive
+    /// `include_evidence`; an older service answers without it).
+    pub include_evidence: bool,
     pub decision_tls: Option<NativeTls>,
     pub transport_mode: TransportMode,
     pub failure_mode: FailureMode,
@@ -786,6 +799,7 @@ impl GuardClient {
                     lifetime: started,
                     ttl_ms,
                     value,
+                    network: decision.evidence.clone(),
                 });
                 (value, proof)
             }
@@ -934,6 +948,7 @@ impl GuardClient {
                     lifetime: query_started,
                     ttl_ms: decision.ttl_ms,
                     value,
+                    network: decision.evidence.clone(),
                 };
                 let ttl = self.cache_ms.min(decision.ttl_ms);
                 if kind.is_none() && ttl > 0 {
@@ -1140,6 +1155,7 @@ mod tests {
         let mut c = Config {
             decision_tcp: None,
             decision_grpc: false,
+            include_evidence: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,
@@ -1222,6 +1238,7 @@ mod tests {
         Config {
             decision_tcp: None,
             decision_grpc: false,
+            include_evidence: false,
             decision_tls: None,
             transport_mode: TransportMode::Query,
             failure_mode: FailureMode::Deny,

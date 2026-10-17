@@ -141,3 +141,55 @@ failure mode 적용, mandatory fresh authorization은 unavailable 유지). 기�
 legacy socket 쓰기를 network evidence로 검사한다는 의미는 아닙니다.
 Native guard owner가 취소되면 캐시 및 보존된 capture도 철회되며, query admission은
 해당 owner의 캐시를 재사용하거나 새 증거를 만들지 않습니다.
+## 호패 위험 컨텍스트
+
+한강은 요청에 대한 Sumunjang 네트워크 증거를 호패에 전달할 수 있고, 호패의 위험 규칙은 이를
+보고 최근 인증 요소를 요구하거나 요청을 거부합니다(호패 ADR-0023, 호패 `GATEWAY_CONTRACT.md`
+"위험 컨텍스트").
+
+```sh
+hangang ... --guard-decision-grpc ... \
+  --risk-context-key-env HANGANG_RISK_CONTEXT_KEY \
+  --risk-elevated-reason sumunjang.allow.rule --risk-elevated-country RU \
+  --risk-elevated-asn 64666 --risk-unlisted-elevated
+```
+
+그리고 인증 서비스가 호패인 각 라우트에 `"auth": {..., "risk_context": true}`를 둡니다.
+
+- **증거.** `--risk-context-key-env`를 주면 gRPC 질의가 Sumunjang Network 서비스에
+  `include_evidence`를 요청합니다. 증거에는 사유 코드, 결정 단계, ASN, 국가, 집행했다면 내릴
+  판정이 담깁니다. 이 추가 필드를 모르는 Sumunjang은 원래 응답을 돌려줍니다. 증거가 없으면
+  헤더를 생략하고 호패의 `risk.missing`이 적용됩니다. 오래된 Sumunjang, HTTP·HGD1 전송,
+  Sumunjang 장애, TTL이 0인 판정이 이 경우에 해당합니다.
+- **수준.** 계약의 대응표를 따르며 임계값은 설정할 수 있습니다.
+  - `high`: 집행했다면 거부되었을 요청. observe 모드에서만 보이며, 실제로 집행된 거부는 호패
+    전에 거부되기 때문입니다.
+  - `elevated`: 설정한 사유 코드(`--risk-elevated-reason`, 판정 사유나 집행했다면의 사유와
+    대조), 국가(`--risk-elevated-country`), ASN(`--risk-elevated-asn`). 또는
+    `--risk-unlisted-elevated`일 때 정책 기본값으로만 허용된 요청(observe 모드에서는
+    집행했다면의 사유가 `sumunjang.allow.default`인 요청).
+  - `low`: 그 밖의 모든 요청.
+- **헤더.** 계약 그대로 `x-hopae-risk-context: v1.<P>.<T>`입니다.
+  - `P`에는 `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn`, `country`가 담깁니다.
+  - `T`는 클레임과 이 verify 호출의 `x-original-method`, `x-forwarded-for`,
+    `x-original-url`에 대한 HMAC-SHA256입니다.
+  - 키는 `--risk-context-key-env`에서 읽으며 32–4,096바이트이고 호패의
+    `risk.context_key_env`와 같아야 합니다.
+
+  헤더는 라우트의 인증 호출(HTTP forward-auth 또는 HOP1)에만 보내고 업스트림으로는 보내지
+  않습니다. 같은 이름의 클라이언트 헤더는 입구에서 지우며, 이 이름은 전달 헤더나 고정 인증
+  헤더로 설정할 수 없습니다. 단위 테스트 `the_contract_test_vector_is_reproduced`가 호패
+  문서의 테스트 벡터를 바이트 단위로 재현합니다.
+- **키 교체.**
+  1. 호패 `risk.context_key_next_env`에 새 키를 둡니다.
+  2. 한강을 새 키를 가리키는 `--risk-context-key-env`로 재시작합니다.
+  3. 새 키를 호패의 현재 키로 올리고 이전 키를 지웁니다.
+- **관측.**
+  - `hangang_risk_context_sent_total{level}`과 `hangang_risk_context_omitted_total`이 보낸
+    것과 생략한 것을 셉니다.
+  - 결정 이벤트의 identity 단계에 `risk_level`이 기록됩니다
+    ([결정 이벤트](DECISION_EVENTS.md)).
+- **검증.** `tests/risk_context_smoke.py`는 증거를 주는 실제 Sumunjang, 위험 규칙이 있는
+  실제 호패, 한강을 함께 돌립니다. `low`는 허용, `elevated`는 `/admin`에서 단계 상승,
+  `high`는 거부되는지, 클라이언트가 보낸 헤더가 제거되어 업스트림에 닿지 않는지 확인합니다.
+

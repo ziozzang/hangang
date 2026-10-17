@@ -6178,6 +6178,11 @@
               "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             },
             "description": "Cookie names removed (exact, case-sensitive match) from every Cookie field of the upstream request after an allowed authorization. The authorization call still receives the full listed cookie header. Remaining pairs keep their order; the header is removed when none remain."
+          },
+          "risk_context": {
+            "type": "boolean",
+            "default": false,
+            "description": "Send the authorization service (Hopae) the HMAC-signed x-hopae-risk-context built from Sumunjang's evidence for the request (Hopae ADR-0023); needs --risk-context-key-env and the gRPC guard transport. Omitted without evidence; never sent upstream."
           }
         }
       },

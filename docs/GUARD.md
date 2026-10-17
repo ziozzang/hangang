@@ -177,3 +177,66 @@ chain has separate local authority/output/transport fences; this cache change
 does not claim that every legacy socket write is fenced by network evidence.
 Canceling the native guard owner also retires its cached and retained captures;
 query-mode admission cannot reuse the cache or issue fresh proof under that owner.
+## Hopae risk context
+
+Hangang can pass Sumunjang's network evidence for a request to Hopae, so
+Hopae's risk rules can require a fresh factor or deny (Hopae ADR-0023, Hopae
+`GATEWAY_CONTRACT.md` "Risk context").
+
+```sh
+hangang ... --guard-decision-grpc ... \
+  --risk-context-key-env HANGANG_RISK_CONTEXT_KEY \
+  --risk-elevated-reason sumunjang.allow.rule --risk-elevated-country RU \
+  --risk-elevated-asn 64666 --risk-unlisted-elevated
+```
+
+and, on each route whose authorization service is Hopae, `"auth": {...,
+"risk_context": true}`.
+
+- **Evidence.** With `--risk-context-key-env`, the gRPC query asks
+  Sumunjang's Network service for `include_evidence`. The evidence covers
+  the reason code, the deciding stage, the ASN, the country, and what
+  enforcement would decide. A Sumunjang without this additive field answers
+  the original reply. When there is no evidence, the header is omitted and
+  Hopae's `risk.missing` applies. That happens with an older Sumunjang, with
+  the HTTP or HGD1 transports, when Sumunjang is unavailable, or when a
+  decision has a zero TTL.
+- **Level.** The mapping follows the contract table, with configurable
+  thresholds:
+  - `high`: enforcement would deny the request, which is only seen in observe
+    mode, because an enforced denial is refused before Hopae.
+  - `elevated`: a configured reason code (`--risk-elevated-reason`, matched
+    against the decision's or the would-be enforcement's), country
+    (`--risk-elevated-country`) or ASN (`--risk-elevated-asn`), or, with
+    `--risk-unlisted-elevated`, a request allowed only by the policy default
+    (in observe mode: the would-be enforcement's `sumunjang.allow.default`).
+  - `low`: everything else.
+- **Header.** `x-hopae-risk-context: v1.<P>.<T>`, exactly as the contract
+  defines it:
+  - `P` holds `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn` and
+    `country`.
+  - `T` is an HMAC-SHA256 over the claims and this verify call's
+    `x-original-method`, `x-forwarded-for` and `x-original-url`.
+  - The key comes from `--risk-context-key-env` (32 to 4,096 bytes, the same
+    as Hopae's `risk.context_key_env`).
+
+  It is sent only on the route's authorization call, over HTTP forward-auth
+  or HOP1, and never upstream. A client-supplied header of that name is
+  removed at the edge, and the name cannot be configured as a forwarded or
+  static authorization header. The unit test
+  `the_contract_test_vector_is_reproduced` reproduces Hopae's documented test
+  vector byte for byte.
+- **Rotation.**
+  1. Set Hopae's `risk.context_key_next_env` to the new key.
+  2. Restart Hangang with `--risk-context-key-env` naming the new key.
+  3. Make the new key Hopae's current key and remove the old one.
+- **Observability.**
+  - `hangang_risk_context_sent_total{level}` and
+    `hangang_risk_context_omitted_total` count what was sent.
+  - The decision event's identity stage records `risk_level`
+    ([decision events](DECISION_EVENTS.md)).
+- **Validation.** `tests/risk_context_smoke.py` runs a real Sumunjang with
+  evidence, a real Hopae with risk rules and Hangang. It checks that `low` is
+  allowed, `elevated` is stepped up on `/admin`, and `high` is denied, and
+  that client copies are stripped and never reach the upstream.
+
