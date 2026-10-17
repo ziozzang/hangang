@@ -49,7 +49,9 @@ Run each component's `tools/build_console_plugin.py`; hash `manifest.json` and
 pin it. Files must not be group/world writable. Manifests/assets are bounded,
 hash-verified and copied into an immutable startup registry. Edits take effect
 only after a validated reload/restart with a new pin. `--check` validates packages
-without starting the console. Registry configuration and audit storage stay private.
+without starting the console. Registry configuration and audit storage stay private:
+the registry file (`--plugins`, `--admin-plugins`) follows the same file rule as
+the SSO configuration below (private to the process, or a Kubernetes volume file).
 
 Discovery `GET /v1/plugins` exposes names/entry points, never backend origins or
 credentials. `GET /ui/plugins/<id>/<asset>` serves only pinned listed assets.

@@ -21,7 +21,8 @@
 - `hangang-console --upstream-ca` trusts a private CA for an HTTPS upstream
   (re-read when it changes), so the authority's admin listener can stay TLS-only.
 - `hangang-console` accepts Kubernetes ConfigMap/Secret volume files for the SSO
-  configuration (root-owned, `fsGroup` group, 0440/0400, the `..data`
+  and console plugin registry configuration (one shared rule; the registry file
+  must now be private, no longer merely not group/world-writable) (root-owned, `fsGroup` group, 0440/0400, the `..data`
   atomic-writer layout); world-readable files and other symlinks stay refused.
 
 ## 0.3.6 — 2026-10-15

@@ -46,7 +46,8 @@ upstream이 필요합니다. 검증: `tests/console_upstream_tls_smoke.py`.
 각 컴포넌트의 tools/build_console_plugin.py로 패키지를 만들고 manifest.json 해시를
 고정합니다. 파일은 group/world 쓰기를 허용하지 않습니다. 제한된 manifest·assets를
 해시 검증 후 불변 startup registry에 복사합니다. 수정은 새 pin으로 검증된 reload/restart
-후 적용합니다. --check는 콘솔 시작 없이 검사합니다. registry·감사 저장소는 비공개입니다.
+후 적용합니다. --check는 콘솔 시작 없이 검사합니다. registry·감사 저장소는 비공개입니다. registry 파일(`--plugins`, `--admin-plugins`)도 아래 SSO
+설정과 같은 파일 규칙(프로세스 전용 또는 Kubernetes 볼륨 파일)을 따릅니다.
 
 GET /v1/plugins는 이름·entry만 공개하며 backend origin·자격을 공개하지 않습니다.
 GET /ui/plugins/<id>/<asset>는 pin한 목록만 제공합니다. 활성 관리자만 manifest의
