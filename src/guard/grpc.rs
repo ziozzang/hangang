@@ -74,6 +74,16 @@ pub(super) struct NetworkEvidence {
     pub enforce_verdict: i32,
     #[prost(string, tag = "9")]
     pub enforce_reason_code: String,
+    #[prost(string, repeated, tag = "10")]
+    pub zone_ids: Vec<String>,
+    #[prost(bool, tag = "11")]
+    pub zone_ids_truncated: bool,
+    #[prost(uint64, tag = "12")]
+    pub zone_revision: u64,
+    #[prost(uint32, tag = "13")]
+    pub risk_score: u32,
+    #[prost(int32, tag = "14")]
+    pub risk_stage: i32,
 }
 
 impl Client {
@@ -231,9 +241,15 @@ fn evidence_of(e: NetworkEvidence, d: &Decision) -> Option<Arc<crate::risk_conte
             || (e.country.len() == 2 && e.country.bytes().all(|b| b.is_ascii_uppercase())))
         || !(0..=5).contains(&e.deciding_stage)
         || !(0..=3).contains(&e.enforce_verdict)
+        || e.zone_ids.len() > 8
+        || e.zone_ids.iter().any(|z| z.is_empty() || z.len() > 128)
+        || e.risk_score > 100
+        || !(0..=5).contains(&e.risk_stage)
     {
         return None;
     }
+    let risk = crate::risk_context::RiskStage::from_wire(e.risk_stage)
+        .map(|stage| ((e.risk_score / 10 * 10) as u8, stage));
     Some(Arc::new(crate::risk_context::Evidence {
         reason_code: e.reason_code,
         deciding_stage: e.deciding_stage,
@@ -243,6 +259,8 @@ fn evidence_of(e: NetworkEvidence, d: &Decision) -> Option<Arc<crate::risk_conte
         enforce_reason_code: e.enforce_reason_code,
         observe: d.mode == Mode::Observe,
         revision: d.revision,
+        zones: e.zone_ids,
+        risk,
     }))
 }
 

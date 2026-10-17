@@ -11,6 +11,9 @@
   with `auth.risk_context` (HTTP and HOP1), never upstream; client copies are
   stripped; `hangang_risk_context_*` metrics and the decision events'
   identity `risk_level`.
+- The risk context carries Sumunjang's `zones` and `score` (NetworkEvidence
+  fields 10–14) and can map its risk stage (`--risk-elevated-stage`,
+  `--risk-high-stage`).
 ## 0.3.6 — 2026-10-15
 
 - Add opt-in native credential projection through Hopae's authenticated mTLS RPC.

@@ -79,6 +79,13 @@ struct Args {
     /// matched) is `elevated`.
     #[arg(long, requires = "risk_context_key_env")]
     risk_unlisted_elevated: bool,
+    /// A Sumunjang risk stage (`watch`, `suspicious`, `high`, `blocked`) at or
+    /// above which a request is `elevated`.
+    #[arg(long, requires = "risk_context_key_env", value_parser = parse_risk_stage)]
+    risk_elevated_stage: Option<hangang::risk_context::RiskStage>,
+    /// A Sumunjang risk stage at or above which a request is `high`.
+    #[arg(long, requires = "risk_context_key_env", value_parser = parse_risk_stage)]
+    risk_high_stage: Option<hangang::risk_context::RiskStage>,
     /// Exact path generating honeypot evidence; repeat for multiple paths.
     #[arg(long, requires = "guard_url")]
     guard_honeypot_path: Vec<String>,
@@ -1210,6 +1217,8 @@ async fn run(args: Args) -> Result<()> {
                     elevated_countries: args.risk_elevated_country.iter().cloned().collect(),
                     elevated_asns: args.risk_elevated_asn.iter().copied().collect(),
                     unlisted_elevated: args.risk_unlisted_elevated,
+                    elevated_stage: args.risk_elevated_stage,
+                    high_stage: args.risk_high_stage,
                 },
             )
             .map(Arc::new)
@@ -2088,4 +2097,9 @@ impl hangang::kubernetes::ConfigSink for KubernetesSink {
             }
         }
     }
+}
+
+fn parse_risk_stage(s: &str) -> Result<hangang::risk_context::RiskStage, String> {
+    hangang::risk_context::RiskStage::parse(s)
+        .ok_or_else(|| "expected normal, watch, suspicious, high or blocked".into())
 }

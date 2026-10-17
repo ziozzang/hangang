@@ -12,6 +12,11 @@ applies `apps[].risk`. The client address picks the evidence:
   `elevated`, so `/admin` requires a step-up (`401 step_up_required`).
 - 192.0.2.30 is blocked while the policy is observed (enforcement would
   deny): `high`, `403 risk_denied`.
+- 192.0.2.50 matches nothing (`elevated`: `/public` is allowed) until it hits
+  the honeypot path; its Sumunjang risk stage then becomes `suspicious`
+  (`--risk-high-stage suspicious`): `high`, `403 risk_denied` on `/public`.
+- Zones: 192.0.2.10 is in Sumunjang zone `corp-vpn`; Hopae denies `/internal`
+  outside it (`outside_zones`), so the `zones` claim decides.
 
 A client-supplied `x-hopae-risk-context` never reaches Hopae or the upstream,
 and the upstream never sees the header. Run with SUMUNJANG_BIN (guard-server,
@@ -100,7 +105,7 @@ def main():
         try:
             # Sumunjang: observe mode, 192.0.2.10 allowlisted, 192.0.2.30 blocked.
             s_http, s_native, s_grpc = port(), port(), port()
-            (root / 'bootstrap.json').write_text('{"mode":"observe","allow":["192.0.2.10/32"]}')
+            (root / 'bootstrap.json').write_text('{"mode":"observe","allow":["192.0.2.10/32","192.0.2.40/32"]}')
             children.append(subprocess.Popen([str(SUMUNJANG), '--bootstrap-policy', str(root / 'bootstrap.json'), '--listen', f'127.0.0.1:{s_http}',
                                               '--database', str(root / 'policy.sqlite3'), '--decision-listen', f'127.0.0.1:{s_native}',
                                               '--grpc-listen', f'127.0.0.1:{s_grpc}', '--decision-tls-cert', str(root / 'server.pem'),
@@ -109,6 +114,10 @@ def main():
             sumunjang = f'http://127.0.0.1:{s_http}'
             eventually(lambda: call(sumunjang + '/healthz')[0] == 200, 'sumunjang readiness')
             status, _, body = call(sumunjang + '/v1/blocks', 'POST', {'network': '192.0.2.30/32', 'expires_at': int(time.time()) + 600, 'reason': 'manual'}, {'Authorization': 'Bearer ' + admin_token})
+            assert status in (200, 201), (status, body)
+            admin_auth = {'Authorization': 'Bearer ' + admin_token}
+            revision = json.loads(call(sumunjang + '/v1/zones', headers=admin_auth)[2])['revision']
+            status, _, body = call(sumunjang + '/v1/zones', 'POST', {'expected_revision': revision, 'zone': {'id': 'corp-vpn', 'prefixes': ['192.0.2.10/32']}}, admin_auth)
             assert status in (200, 201), (status, body)
 
             # Hopae: the application and its risk rules; a session for a user.
@@ -123,6 +132,7 @@ def main():
                 'apps': [{'app_id': 'app', 'hosts': ['app.example.test'], 'binding': {'ip': 'off', 'ua': 'off'},
                           'risk': {'rules': [
                               {'path_prefix': '/admin', 'when': {'level_at_least': 'elevated'}, 'then': {'step_up': {'aal': 2, 'max_age_secs': 600}}},
+                              {'path_prefix': '/internal', 'when': {'outside_zones': ['corp-vpn']}, 'then': 'deny'},
                               {'when': {'level_at_least': 'high'}, 'then': 'deny'}]}}],
                 'providers': [{'provider_id': 'mock', 'kind': 'oidc', 'client_id': 'c', 'client_secret_env': 'HOPAE_TEST_MOCK_SECRET',
                                'issuer': 'http://127.0.0.1:1', 'allow_private_endpoints': True}],
@@ -153,7 +163,8 @@ def main():
                                               '--guard-decision-server-name', 'sumunjang.example.test', '--guard-decision-ca', str(root / 'ca.pem'),
                                               '--guard-decision-cert', str(root / 'client.pem'), '--guard-decision-key', str(root / 'client.key'),
                                               '--guard-timeout-ms', '1000',
-                                              '--risk-context-key-env', 'RISK_CONTEXT_KEY', '--risk-unlisted-elevated'],
+                                              '--risk-context-key-env', 'RISK_CONTEXT_KEY', '--risk-unlisted-elevated',
+                                              '--risk-high-stage', 'suspicious', '--guard-honeypot-path', '/trap'],
                                              env=env, stdout=log, stderr=log))
             gateway = f'http://127.0.0.1:{public}'
             eventually(lambda: call(f'http://127.0.0.1:{admin}/v1/status', headers={'Authorization': 'Bearer ' + env['HANGANG_ADMIN_TOKEN']})[0] == 200, 'hangang readiness')
@@ -180,10 +191,21 @@ def main():
             # A client-chosen context never replaces Hangang's: still denied.
             status, _, _ = get('/public', '192.0.2.30', {'x-hopae-risk-context': 'v1.eyJsZXZlbCI6ImxvdyJ9.AAAA'})
             assert status == 403
+            # Zones: inside corp-vpn /internal is allowed, outside it is denied.
+            status, _, body = get('/internal/x', '192.0.2.10')
+            assert status == 200, (status, body)
+            status, _, body = get('/internal/x', '192.0.2.40')
+            assert status == 403 and b'risk_denied' in body, (status, body)
+            # Risk stage: 192.0.2.50 is elevated (allowed on /public) until a
+            # honeypot hit makes its stage suspicious, which maps to high.
+            status, _, body = get('/public', '192.0.2.50')
+            assert status == 200, (status, body)
+            get('/trap', '192.0.2.50')
+            eventually(lambda: get('/public', '192.0.2.50')[0] == 403, 'a suspicious stage is high')
             metrics = call(f'http://127.0.0.1:{admin}/metrics', headers={'Authorization': 'Bearer ' + env['HANGANG_ADMIN_TOKEN']})[2].decode()
             for level in ['low', 'elevated', 'high']:
                 assert f'hangang_risk_context_sent_total{{level="{level}"}} 0' not in metrics, metrics
-            print('PASS: Sumunjang evidence becomes a signed risk context on Hopae verify: low allowed, elevated stepped up on /admin, high denied; client copies stripped and never upstream.')
+            print('PASS: Sumunjang evidence becomes a signed risk context on Hopae verify: low allowed, elevated stepped up on /admin, high denied, zones and the risk stage decide; client copies stripped and never upstream.')
         finally:
             for child in reversed(children):
                 if child.poll() is None:

@@ -210,11 +210,20 @@ and, on each route whose authorization service is Hopae, `"auth": {...,
     (`--risk-elevated-country`) or ASN (`--risk-elevated-asn`), or, with
     `--risk-unlisted-elevated`, a request allowed only by the policy default
     (in observe mode: the would-be enforcement's `sumunjang.allow.default`).
+  - With `--risk-high-stage` / `--risk-elevated-stage` (`watch`,
+    `suspicious`, `high`, `blocked`), Sumunjang's risk stage at or above the
+    given stage is `high` / `elevated` (for example `--risk-elevated-stage
+    suspicious --risk-high-stage high`). The stage is used only when Sumunjang
+    computed it.
   - `low`: everything else.
 - **Header.** `x-hopae-risk-context: v1.<P>.<T>`, exactly as the contract
   defines it:
   - `P` holds `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn` and
-    `country`.
+    `country`. It also holds `zones` (the Sumunjang zone ids containing the
+    address, at most 8; ids outside the contract alphabet `[a-z0-9._-]{1,64}`
+    are left out) and `score` (Sumunjang's 0–100 score in tens, only when it
+    computed a risk stage). Sumunjang reports these as fields 10–14 of
+    `NetworkEvidence`; an older Sumunjang omits them, and so do the claims.
   - `T` is an HMAC-SHA256 over the claims and this verify call's
     `x-original-method`, `x-forwarded-for` and `x-original-url`.
   - The key comes from `--risk-context-key-env` (32 to 4,096 bytes, the same
@@ -237,6 +246,8 @@ and, on each route whose authorization service is Hopae, `"auth": {...,
     ([decision events](DECISION_EVENTS.md)).
 - **Validation.** `tests/risk_context_smoke.py` runs a real Sumunjang with
   evidence, a real Hopae with risk rules and Hangang. It checks that `low` is
-  allowed, `elevated` is stepped up on `/admin`, and `high` is denied, and
+  allowed, `elevated` is stepped up on `/admin`, and `high` is denied, that a
+  Hopae `outside_zones` rule follows the `zones` claim and that a honeypot hit
+  (stage `suspicious` with `--risk-high-stage suspicious`) turns into a denial, and
   that client copies are stripped and never reach the upstream.
 

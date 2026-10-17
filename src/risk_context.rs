@@ -41,6 +41,44 @@ pub struct Evidence {
     pub enforce_reason_code: String,
     pub observe: bool,
     pub revision: u64,
+    /// Network zone ids containing the address (at most 8, id order).
+    pub zones: Vec<String>,
+    /// Coarse risk score (0–100 in tens) and stage; `None` when Sumunjang did
+    /// not compute them (stage unspecified).
+    pub risk: Option<(u8, RiskStage)>,
+}
+
+/// Sumunjang's suspicion stage (`RiskStage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RiskStage {
+    Normal = 1,
+    Watch = 2,
+    Suspicious = 3,
+    High = 4,
+    Blocked = 5,
+}
+
+impl RiskStage {
+    pub fn from_wire(v: i32) -> Option<RiskStage> {
+        Some(match v {
+            1 => RiskStage::Normal,
+            2 => RiskStage::Watch,
+            3 => RiskStage::Suspicious,
+            4 => RiskStage::High,
+            5 => RiskStage::Blocked,
+            _ => return None,
+        })
+    }
+    pub fn parse(s: &str) -> Option<RiskStage> {
+        Some(match s {
+            "normal" => RiskStage::Normal,
+            "watch" => RiskStage::Watch,
+            "suspicious" => RiskStage::Suspicious,
+            "high" => RiskStage::High,
+            "blocked" => RiskStage::Blocked,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -73,6 +111,10 @@ pub struct Thresholds {
     /// matched; in observe mode the would-be enforcement's `sumunjang.allow.default`)
     /// is `elevated`.
     pub unlisted_elevated: bool,
+    /// A Sumunjang risk stage at or above this is `elevated`.
+    pub elevated_stage: Option<RiskStage>,
+    /// A Sumunjang risk stage at or above this is `high`.
+    pub high_stage: Option<RiskStage>,
 }
 
 /// The signing key and thresholds.
@@ -125,8 +167,13 @@ impl Settings {
     /// default-only allow when configured, is `elevated`; else `low`.
     pub fn level(&self, e: &Evidence) -> Level {
         let t = &self.thresholds;
-        if e.enforce_verdict == 2 {
+        let stage = e.risk.map(|(_, stage)| stage);
+        let at_least = |t: Option<RiskStage>| t.is_some_and(|t| stage.is_some_and(|s| s >= t));
+        if e.enforce_verdict == 2 || at_least(t.high_stage) {
             return Level::High;
+        }
+        if at_least(t.elevated_stage) {
+            return Level::Elevated;
         }
         if t.elevated_reasons.contains(&e.reason_code)
             || t.elevated_reasons.contains(&e.enforce_reason_code)
@@ -158,6 +205,20 @@ impl Settings {
         });
         if e.asn != 0 {
             claims["asn"] = e.asn.into();
+        }
+        // Only zone ids of the contract's alphabet (`[a-z0-9._-]{1,64}`), at most 8.
+        let zones: Vec<&str> = e
+            .zones
+            .iter()
+            .map(String::as_str)
+            .filter(|z| token_ok(z))
+            .take(8)
+            .collect();
+        if !zones.is_empty() {
+            claims["zones"] = zones.into();
+        }
+        if let Some((score, _)) = e.risk {
+            claims["score"] = (score.min(100) / 10 * 10).into();
         }
         claims["country"] =
             if e.country.len() == 2 && e.country.bytes().all(|b| b.is_ascii_uppercase()) {
@@ -249,6 +310,8 @@ mod tests {
             enforce_reason_code: "sumunjang.allow.rule".into(),
             observe: false,
             revision: 7,
+            zones: vec![],
+            risk: None,
         }
     }
 
@@ -261,6 +324,7 @@ mod tests {
                 elevated_countries: ["RU".to_string()].into(),
                 elevated_asns: [64666].into(),
                 unlisted_elevated: true,
+                ..Thresholds::default()
             },
         )
         .unwrap();
@@ -344,5 +408,44 @@ mod tests {
             (c["country"].as_str(), c["reason"].as_str()),
             (Some("XX"), Some("sumunjang.unknown"))
         );
+    }
+
+    #[test]
+    fn zones_score_and_stage() {
+        let s = Settings::new(
+            KEY.to_vec(),
+            Thresholds {
+                elevated_stage: Some(RiskStage::Suspicious),
+                high_stage: Some(RiskStage::High),
+                ..Thresholds::default()
+            },
+        )
+        .unwrap();
+        let mut e = evidence();
+        e.zones = vec!["corp-vpn".into(), "Legacy:Zone".into(), "lab".into()];
+        e.risk = Some((30, RiskStage::Watch));
+        assert_eq!(s.level(&e), Level::Low);
+        let (_, c) = s.claims(&e, 0);
+        assert_eq!(
+            c["zones"],
+            serde_json::json!(["corp-vpn", "lab"]),
+            "ids outside the contract alphabet are left out"
+        );
+        assert_eq!(c["score"], 30);
+        e.risk = Some((50, RiskStage::Suspicious));
+        assert_eq!(s.level(&e), Level::Elevated);
+        e.risk = Some((100, RiskStage::Blocked));
+        assert_eq!(s.level(&e), Level::High);
+        // No stage computed: no score claim and no stage-based level.
+        e.risk = None;
+        e.zones = (0..12).map(|i| format!("z{i}")).collect();
+        let (level, c) = s.claims(&e, 0);
+        assert_eq!(level, Level::Low);
+        assert!(c.get("score").is_none());
+        assert_eq!(c["zones"].as_array().unwrap().len(), 8);
+        // Without stage thresholds the stage does not change the level.
+        let plain = Settings::new(KEY.to_vec(), Thresholds::default()).unwrap();
+        e.risk = Some((100, RiskStage::High));
+        assert_eq!(plain.level(&e), Level::Low);
     }
 }

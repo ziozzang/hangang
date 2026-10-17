@@ -168,9 +168,17 @@ hangang ... --guard-decision-grpc ... \
     대조), 국가(`--risk-elevated-country`), ASN(`--risk-elevated-asn`). 또는
     `--risk-unlisted-elevated`일 때 정책 기본값으로만 허용된 요청(observe 모드에서는
     집행했다면의 사유가 `sumunjang.allow.default`인 요청).
+  - `--risk-high-stage`·`--risk-elevated-stage`(`watch`, `suspicious`, `high`, `blocked`)를 주면
+    Sumunjang 위험 단계가 그 값 이상일 때 `high`·`elevated`입니다(예:
+    `--risk-elevated-stage suspicious --risk-high-stage high`). 단계는 Sumunjang이 계산했을
+    때만 씁니다.
   - `low`: 그 밖의 모든 요청.
 - **헤더.** 계약 그대로 `x-hopae-risk-context: v1.<P>.<T>`입니다.
   - `P`에는 `iat`, `level`, `source`, `mode`, `reason`, `rev`, `asn`, `country`가 담깁니다.
+    `zones`(주소를 포함하는 Sumunjang 존 ID, 최대 8개. 계약 문자 집합 `[a-z0-9._-]{1,64}`를
+    벗어난 ID는 뺌)와 `score`(Sumunjang이 위험 단계를 계산했을 때만, 10 단위 0–100)도
+    담깁니다. Sumunjang은 이를 `NetworkEvidence` 필드 10–14로 주며, 이전 Sumunjang은
+    보내지 않으므로 클레임에도 없습니다.
   - `T`는 클레임과 이 verify 호출의 `x-original-method`, `x-forwarded-for`,
     `x-original-url`에 대한 HMAC-SHA256입니다.
   - 키는 `--risk-context-key-env`에서 읽으며 32–4,096바이트이고 호패의
@@ -191,5 +199,6 @@ hangang ... --guard-decision-grpc ... \
     ([결정 이벤트](DECISION_EVENTS.md)).
 - **검증.** `tests/risk_context_smoke.py`는 증거를 주는 실제 Sumunjang, 위험 규칙이 있는
   실제 호패, 한강을 함께 돌립니다. `low`는 허용, `elevated`는 `/admin`에서 단계 상승,
-  `high`는 거부되는지, 클라이언트가 보낸 헤더가 제거되어 업스트림에 닿지 않는지 확인합니다.
+  `high`는 거부되는지, 호패 `outside_zones` 규칙이 `zones` 클레임을 따르는지, 허니팟
+  요청(단계 `suspicious`, `--risk-high-stage suspicious`)이 거부로 이어지는지, 클라이언트가 보낸 헤더가 제거되어 업스트림에 닿지 않는지 확인합니다.
 
