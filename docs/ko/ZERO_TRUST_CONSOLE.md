@@ -146,7 +146,7 @@ AAL 3 고보증 키, 최근 사용이 있는 패스키, 인증 앱, 복구 코�
 | 경로 | 페이지 | 원천 |
 | --- | --- | --- |
 | `#workloads[/workloads]?q=&namespace=&status=` | 워크로드 주체(ServiceAccount 생성분마다 하나): 네임스페이스/ServiceAccount, SPIFFE ID, 활성 또는 폐기와 그 원인, 마지막 관측, 기존 Pod 결합 매핑, 품계 권한(직접 권한과 아직 Pod 결합 주체에 있는 권한) | 호패 `subjects/lifecycle`의 `include_workloads`(선언되어 있으면 `subjects/workloads/snapshot`), `/v1/pumgye/v2/workloads`, `/v1/pumgye/v2/policy` |
-| `#workloads/w/{principal}` | 신원(주체, SPIFFE ID, 전송 주체, 클러스터, 네임스페이스, ServiceAccount와 UID, 처음/마지막 관측, 폐기와 대체 주체), 기존 매핑, 일치 기준별 권한(주체, SPIFFE ID, Pod 결합 주체), 전송 주체로 거른 최근 판단, 재부여 제안과 적용(개수 입력, 사유, 선택 승인 참조, v2 리비전 비교 후 교체) | 위와 같음, `/v1/observability/decisions?subject=` |
+| `#workloads/w/{principal}` | 신원(주체, SPIFFE ID, 전송 주체, 클러스터, 네임스페이스, ServiceAccount와 UID, 처음/마지막 관측, 폐기와 대체 주체), 기존 매핑, 일치 기준별 권한(주체, SPIFFE ID, Pod 결합 주체), 전송 주체로 거른 최근 판단, 재부여 제안과 적용(개수 입력, 사유, 선택 승인 참조, `/v2/workloads`의 `policy_revision`, 없으면 v2 문서 리비전으로 비교 후 교체) | 위와 같음, `/v1/observability/decisions?subject=` |
 | `#workloads/routes?state=` | Kubernetes 경로 보호: 보호됨/보호 안 됨/보류됨 개수, 현지화한 사유와 컨트롤러 메시지가 있는 보류 Ingress, ProtectionPolicy 수락 상태, 스냅숏 나이 게이지와 닫힌 실패 상태, 클라이언트 주소 보존, 수문장 전제 조건 | `/v1/kubernetes/protection` |
 | `#workloads/devices` | 장치 상태가 설정되지 않음: 장치 목록이나 상태 원천이 없으므로 아무것도 표시하거나 꾸며내지 않습니다 | — |
 

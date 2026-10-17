@@ -150,7 +150,7 @@ function proposalsPanel(cx, row, data, status) {
       ui.el('span', { class: 'kit-muted' }, t('workloads.regrant.from'), ' ', ui.el('code', { class: 'kit-mono', text: proposal.evidence?.legacy_binding || '—' })))),
     facts(cx, [['workloads.regrant.legacy_subject', mono(cx, proposal.evidence?.legacy_subject)], ['workloads.regrant.new_binding', mono(cx, binding.id)], ['workloads.grant.col.scope', scopeCell(cx, binding.scope)], ['workloads.grant.col.effect', t(binding.effect === 'deny' ? 'workloads.grant.deny' : 'workloads.grant.allow')]]));
   }));
-  const revision = data.pumgyeData.policy?.revision;
+  const revision = data.pumgyeData.revision;
   const apply = ui.el('button', { type: 'button', class: 'button button-primary', text: t('workloads.regrant.apply', { count: selected.size }) });
   const sync = () => { apply.textContent = t('workloads.regrant.apply', { count: selected.size }); apply.disabled = !selected.size || !Number.isFinite(revision); };
   sync();

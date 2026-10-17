@@ -56,7 +56,7 @@ function decision(index) {
     revisions: { hangang: 270 }, sampling: { class: 'allow', rate: 1 }, privacy: { profile: 'standard', key_epoch: '2026-10-17' } };
 }
 
-async function setup(page, { hopae = true, snapshot = false, pumgye = true, protection = PROTECTION, conflict = false } = {}) {
+async function setup(page, { hopae = true, snapshot = false, pumgye = true, protection = PROTECTION, conflict = false, policyRevision } = {}) {
   const calls = [];
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
@@ -73,7 +73,7 @@ async function setup(page, { hopae = true, snapshot = false, pumgye = true, prot
     if (p.startsWith('/v1/plugins/hopae/')) return route.fulfill({ json: {} });
     if (p === '/v1/pumgye/v2/workloads') return pumgye ? route.fulfill({ json: { principals: [
       { ...workload(WK1, S1, 'payments', 'api', SPIFFE1), status: 'active' }, { ...workload(WK2, S2, 'payments', 'worker', SPIFFE2), status: 'retired', cause: 'uid_changed', replacement: WK3 }, { ...workload(WK3, S3, 'payments', 'worker', SPIFFE2), status: 'active' }],
-      legacy_mappings: { [LEGACY]: WK1 }, regrant_proposals: [PROPOSAL] } }) : route.fulfill({ status: 503, json: { title: 'Authority Unavailable', detail: 'independent Pumgye authority is not available' } });
+      legacy_mappings: { [LEGACY]: WK1 }, regrant_proposals: [PROPOSAL], ...(policyRevision === undefined ? {} : { policy_revision: policyRevision }) } }) : route.fulfill({ status: 503, json: { title: 'Authority Unavailable', detail: 'independent Pumgye authority is not available' } });
     if (p === '/v1/pumgye/v2/policy') return pumgye ? route.fulfill({ json: { revision: 41, policy: { version: 2, bindings: BINDINGS } } }) : route.fulfill({ status: 503, json: { detail: 'independent Pumgye authority is not available' } });
     if (p === '/v1/pumgye/v2/workloads/regrants/apply') return conflict ? route.fulfill({ status: 409, json: { error: { code: 'pumgye.error.revision_conflict', message_key: 'pumgye.error.revision_conflict', current_revision: 42 } } }) : route.fulfill({ json: { revision: 42, applied: body.proposals.length, warnings: [], orphaned: [] } });
     if (p === '/v1/kubernetes/protection') return protection ? route.fulfill({ json: protection }) : route.fulfill({ status: 404, json: { title: 'Not Found', detail: 'not found' } });
@@ -176,6 +176,20 @@ test('workload detail: identity, grants by match, legacy mappings, decisions and
   const apply = calls.find(call => call.path === '/v1/pumgye/v2/workloads/regrants/apply');
   expect(apply.body).toEqual({ base_revision: 41, proposals: ['rg_00ff00ff00ff00ff'], reason: 'move orders grant to the ServiceAccount', approval_ref: 'CHG-1001' });
   expect(decodeURIComponent(apply.reason)).toBe('move orders grant to the ServiceAccount');
+});
+
+test('the re-grant base prefers policy_revision from /v2/workloads over the v2 document revision', async ({ page }) => {
+  const calls = await setup(page, { policyRevision: 43 });
+  await page.goto(`/ui/#workloads/w/${encodeURIComponent(WK1)}`);
+  const view = page.locator('#view-workloads');
+  await view.getByRole('button', { name: 'Apply 1 selected' }).click();
+  const dialog = page.locator('dialog.zt-dialog');
+  await expect(dialog).toContainText('still at revision 43');
+  await dialog.getByLabel('Type 1 to confirm').fill('1');
+  await dialog.getByLabel(/Reason/).fill('migrate');
+  await dialog.getByRole('button', { name: 'Apply' }).click();
+  await expect(view.locator('.zt-outcome')).toBeVisible();
+  expect(calls.find(call => call.path === '/v1/pumgye/v2/workloads/regrants/apply').body.base_revision).toBe(43);
 });
 
 test('re-grant conflicts are reported and retired principals explain the replacement', async ({ page }) => {

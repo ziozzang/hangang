@@ -123,11 +123,15 @@ function foldChange(items, change) {
 
 /** Pumgye model v2: principals, legacy mappings, re-grant proposals and bindings. */
 export async function pumgyeWorkloads(cx) {
-  const out = { workloads: null, policy: null, error: null, policyError: null };
+  const out = { workloads: null, policy: null, revision: null, error: null, policyError: null };
   const settle = promise => promise.then(answer => ({ ok: answer.data }), error => { if (error?.status === 401) throw error; return { error }; });
   const [workloads, policy] = await Promise.all([settle(cx.api('/v1/pumgye/v2/workloads')), settle(cx.api('/v1/pumgye/v2/policy'))]);
   if (workloads.error) out.error = workloads.error; else out.workloads = { principals: workloads.ok?.principals || [], legacy: workloads.ok?.legacy_mappings || {}, proposals: workloads.ok?.regrant_proposals || [] };
   if (policy.error) out.policyError = policy.error; else out.policy = { revision: policy.ok?.revision ?? null, bindings: Array.isArray(policy.ok?.policy?.bindings) ? policy.ok.policy.bindings : [] };
+  // Re-grant base: Pumgye's `policy_revision` on /v2/workloads (same answer as
+  // the proposals) when present, else the v2 document revision.
+  const listed = workloads.ok?.policy_revision;
+  out.revision = Number.isSafeInteger(listed) && listed >= 0 ? listed : Number.isSafeInteger(out.policy?.revision) ? out.policy.revision : null;
   return out;
 }
 
