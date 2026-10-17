@@ -203,6 +203,34 @@ pub fn serve<B>(request: &Request<B>) -> Option<Response<Body>> {
                 "application/json",
                 include_bytes!("../web/zt/messages/pumgye.ko.json"),
             )),
+            "/ui/zt/workloads/index.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/index.js"),
+            )),
+            "/ui/zt/workloads/common.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/common.js"),
+            )),
+            "/ui/zt/workloads/workloads.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/workloads.js"),
+            )),
+            "/ui/zt/workloads/routes.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../web/zt/workloads/routes.js"),
+            )),
+            "/ui/zt/workloads/workloads.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../web/zt/workloads/workloads.css"),
+            )),
+            "/ui/zt/workloads/messages/en.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/workloads/messages/en.json"),
+            )),
+            "/ui/zt/workloads/messages/ko.json" => Some((
+                "application/json",
+                include_bytes!("../web/zt/workloads/messages/ko.json"),
+            )),
             "/ui/zt/network/index.js" => Some((
                 "text/javascript; charset=utf-8",
                 include_bytes!("../web/zt/network/index.js"),
@@ -487,6 +515,13 @@ mod tests {
             "/ui/zt/network/network.css",
             "/ui/zt/network/messages/en.json",
             "/ui/zt/network/messages/ko.json",
+            "/ui/zt/workloads/index.js",
+            "/ui/zt/workloads/common.js",
+            "/ui/zt/workloads/workloads.js",
+            "/ui/zt/workloads/routes.js",
+            "/ui/zt/workloads/workloads.css",
+            "/ui/zt/workloads/messages/en.json",
+            "/ui/zt/workloads/messages/ko.json",
         ] {
             let get = serve(&Request::builder().uri(path).body(()).unwrap()).unwrap();
             assert_eq!(get.status(), 200);

@@ -26,7 +26,7 @@ for (const prefix of PREFIXES_FILES) {
   Object.assign(en, a); Object.assign(ko, b);
 }
 // Sections with their own catalog directory (zt/<section>/messages/{en,ko}.json).
-const SECTION_CATALOGS = ['zt/identities/messages', 'zt/network/messages'];
+const SECTION_CATALOGS = ['zt/identities/messages', 'zt/network/messages', 'zt/workloads/messages'];
 for (const dir of SECTION_CATALOGS) {
   const a = JSON.parse(readFileSync(path.join(web, dir, 'en.json'), 'utf8')), b = JSON.parse(readFileSync(path.join(web, dir, 'ko.json'), 'utf8'));
   for (const key of Object.keys(a)) if (Object.hasOwn(en, key)) failures.push(`${key} is defined in more than one catalog`);
@@ -41,7 +41,7 @@ for (const [name, a, b] of [['en', en, ko], ['ko', ko, en]]) {
   }
 }
 // Product and protocol names stay in their original form in Korean.
-const PROPER_NAMES = /^(OpenID Connect|LDAP|OAuth 2\.0|Kubernetes TokenReview|https:\/\/[a-z0-9.\/-]+)$/;
+const PROPER_NAMES = /^(OpenID Connect|LDAP|OAuth 2\.0|Kubernetes TokenReview|SPIFFE ID|ServiceAccount( UID)?|Ingress|ProtectionPolicy|https:\/\/[a-z0-9.\/-]+)$/;
 for (const [key, value] of Object.entries(ko)) {
   if (key.startsWith('pumgye.') || /Kubernetes|Human|AAL/.test(flat(value).join(''))) continue;
   if (flat(value).every(message => /^[\x20-\x7e]*$/.test(message)) && flat(en[key] ?? []).every(message => /[a-z]{4,}/i.test(message)) && !/\{|µs|AAL|ASN|HTTP|AS\{/.test(flat(value).join('')) && !['decision.authority.catalog'].includes(key) && !PROPER_NAMES.test(flat(value).join(''))) {
@@ -49,9 +49,9 @@ for (const [key, value] of Object.entries(ko)) {
   }
 }
 
-const SOURCE_DIRS = ['kit', 'zt', 'zt/identities', 'zt/policies', 'zt/network'];
+const SOURCE_DIRS = ['kit', 'zt', 'zt/identities', 'zt/policies', 'zt/network', 'zt/workloads'];
 const sources = SOURCE_DIRS.flatMap(dir => readdirSync(path.join(web, dir)).filter(file => file.endsWith('.js')).map(file => path.join(dir, file)));
-const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system|identities|policies|network)\.[A-Za-z0-9_.-]+$/;
+const KEY = /^(ui|nav|access|audit|decision|entity|overview|request|section|system|identities|policies|network|workloads)\.[A-Za-z0-9_.-]+$/;
 const PREFIXES = new Set(['decision.stage', 'decision.principal', 'decision.result']);
 const literal = /(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
 const forbidden = [
@@ -101,6 +101,17 @@ const families = {
   'system.drop': ['ring_full_deny', 'ring_full_allow', 'exporter_unavailable', 'no_key', 'invalid'],
 };
 for (const name of ['identities', 'policies', 'network', 'workloads']) families[`section.${name}`] = ['owner', 'planned', 'body'];
+// Devices & Workloads section (zt/workloads): dynamic key families.
+Object.assign(families, {
+  'workloads.page': ['workloads', 'routes', 'devices'],
+  'workloads.status': ['active', 'retired', 'unknown'],
+  'workloads.cause': ['deleted', 'uid_changed'],
+  'workloads.reason': ['ProtectionRequired', 'Invalid', 'Conflicted', 'InvalidIdentityProfile', 'RefNotPermitted', 'GuardUnavailable', 'ClientAddressUnavailable', 'Pending', 'Unsupported', 'TargetNotFound', 'Accepted', 'other'],
+  'workloads.routes.state': ['protected', 'unprotected', 'withheld'],
+  'workloads.grant.match': ['principal', 'spiffe', 'legacy'],
+  'workloads.gap.route': ['subjects_workloads_snapshot', 'subjects_lifecycle'],
+  'workloads.devices.item': ['inventory', 'posture', 'binding'],
+});
 // Identities section (zt/identities): dynamic key families built from Hopae values.
 const identityModule = name => readFileSync(path.join(web, 'zt/identities', name), 'utf8');
 const frozenList = (source, name) => JSON.parse(source.match(new RegExp(`${name} = Object\\.freeze\\((\\[[^\\]]*\\])`))[1].replace(/'/g, '"'));

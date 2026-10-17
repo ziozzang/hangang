@@ -1,0 +1,28 @@
+/* Devices & Workloads section (ADR 0020 §6). Theme tokens only, so light and
+   dark follow [data-theme]; layouts collapse to one column at phone width. */
+.zt-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; align-items: start; }
+.zt-banner-warn { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); background: color-mix(in srgb, var(--amber) 10%, var(--surface)); }
+.zt-banner-danger { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); background: color-mix(in srgb, var(--red) 10%, var(--surface)); font-weight: 600; }
+.zt-workload-sources { display: flex; flex-direction: column; gap: .4rem; }
+.zt-gaps { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; font-size: .85rem; }
+.zt-workload-kpis { margin-block: .25rem; }
+.zt-whatif-tile.is-warn .zt-kpi-value { color: var(--amber); }
+.zt-regrants { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
+.zt-regrant-head { display: flex; align-items: flex-start; gap: .6rem; cursor: pointer; }
+.zt-regrant-head input { margin-top: .25rem; inline-size: 1.05rem; block-size: 1.05rem; }
+.zt-legacy { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .3rem; }
+.zt-legacy code { max-inline-size: 100%; overflow-wrap: anywhere; }
+.zt-staleness-row { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; }
+.zt-staleness { inline-size: min(22rem, 100%); block-size: 1rem; }
+.zt-device-list { margin: 0; padding-inline-start: 1.2rem; display: grid; gap: .3rem; }
+#view-workloads .zt-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); gap: .6rem; align-items: end; }
+#view-workloads .zt-filter-chips { display: flex; flex-wrap: wrap; gap: .35rem; margin: 0 0 .6rem; }
+#view-workloads .zt-filter-chips a { text-decoration: none; color: inherit; }
+#view-workloads .zt-filter-chips a[aria-current="true"] { background: var(--cyan-soft); color: var(--text); outline: 1px solid var(--cyan); }
+@media (max-width: 900px) { .zt-grid-2 { grid-template-columns: minmax(0, 1fr); } }
+#view-workloads .zt-reason-cell { max-inline-size: 100%; min-inline-size: 0; }
+#view-workloads .zt-reason-cell > strong, #view-workloads .zt-backend-message { white-space: normal; overflow-wrap: anywhere; }
+#view-workloads .zt-dl dd { min-inline-size: 0; }
+#view-workloads .zt-dl .kit-badge { white-space: normal; max-inline-size: 100%; }
+#view-workloads .zt-stack > .kit-badge { align-self: flex-start; }
+#view-workloads .kit-cell .zt-stack { max-inline-size: 100%; }
