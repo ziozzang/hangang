@@ -345,7 +345,9 @@ fn ingress_routes(
     if let Some((protection, pumgye_authority)) = protection {
         for route in routes.iter_mut().chain(default.iter_mut()) {
             match protection {
-                RouteProtection::Public => route.access_mode = AccessMode::Public,
+                RouteProtection::Public | RouteProtection::ExplicitPublic(_) => {
+                    route.access_mode = AccessMode::Public
+                }
                 RouteProtection::Protected(compiled) => {
                     compiled.protect(route);
                     authority = pumgye_authority.cloned();

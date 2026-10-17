@@ -81,6 +81,32 @@ spec:
 
 Every generated route of the Ingress (all host/path rules and the default backend) is compiled to `access_mode: protected` with the profile's `auth` and an enforced `resource_policy` whose `pumgye_resource` is the policy's mapping, and the document carries the configured `pumgye_authority`. Each route gets its own `resource_id`, derived from its route ID and scope.
 
+## Explicitly public routes
+
+Some routes must be reachable before anyone is authenticated: an identity portal's sign-in and provider callbacks, `/.well-known` documents, health checks. Turning `require_protection` off for them would publish every unprotected Ingress. Instead, give such an Ingress a policy with `access: Public`:
+
+```yaml
+apiVersion: world.hangang.dev/v1alpha1
+kind: ProtectionPolicy
+metadata:
+  name: auth-portal-public
+spec:
+  access: Public
+  targetRefs:
+    - group: networking.k8s.io
+      kind: Ingress
+      name: auth-portal
+  public:
+    reason: Hopae sign-in portal (login, provider callbacks, health)
+    paths: ["/login/*", "/callback/*", "/healthz"]
+```
+
+- `public.reason` (8–256 characters) is required and reported. A public policy has no `identity`, `authorization` or `network`, and it needs explicit `targetRefs` (never `namespaceDefault`). The CRD's CEL rules and the controller enforce this.
+- `public.paths` bounds what the Ingress may expose: `/exact` (an `Exact` path) or `/prefix/*` (any path under it; a `Prefix` path `/prefix` is covered too). Any other path, or a `defaultBackend`, withholds the Ingress with `PublicPathNotAllowed`. Without `paths` the whole Ingress is public, so prefer listing them.
+- The routes are published as `access_mode: public`. The Ingress is reported as **`public`** (explicitly public, reason `ExplicitlyPublic`, the policy and its reason), counted by `hangang_kubernetes_ingresses_public`, never as `unprotected`.
+- A public and a protected policy targeting the same Ingress conflict like any two policies, and the Ingress is withheld. As for protected policies, a targeting policy takes precedence over the namespace default.
+- Deleting the public policy withholds the Ingress again; it never falls back to unprotected while `require_protection` is on.
+
 ## Fail-closed rules
 
 | Situation | Outcome | Reason |
@@ -95,6 +121,7 @@ Every generated route of the Ingress (all host/path rules and the default backen
 | `enforcement: Required` without client address preservation | Ingress withheld; `ClientAddressPreserved=False` | `ClientAddressUnavailable` |
 | Withdrawn later by hostname ownership, TLS, route validation or budget | Not published | `Pending` |
 | `HTTPRoute` or `Gateway` target | Nothing programmed for that target | `Unsupported` |
+| `access: Public` policy and an Ingress path outside `public.paths` (or a `defaultBackend`) | Ingress withheld | `PublicPathNotAllowed` |
 | Snapshot unconfirmed by the API server beyond `--kubernetes-max-staleness-seconds` (default 5 minutes) | Protected routes answer `503`, `x-hangang-reason: kubernetes-authority-stale`; public routes keep serving | [Bounded staleness](KUBERNETES.md#bounded-staleness) |
 
 A withheld Ingress keeps its hostname ownership (it still claims its hosts), never receives the `--kubernetes-publish-address` status entry, and loses it if it carried one. Withholding never touches other Ingresses.
@@ -103,7 +130,7 @@ A withheld Ingress keeps its hostname ownership (it still claims its hosts), nev
 
 The controller writes `status` with the cached `resourceVersion` as a precondition. Top-level `conditions` carry `Accepted`, `ResolvedRefs`, `Programmed` and, for policies with network enforcement, `ClientAddressPreserved`, each with `observedGeneration`. `status.ancestors` follows the Gateway API policy status convention: one entry per target (for a namespace default, per Ingress it applies to; at most 16, the rest counted in the `Programmed` message) with `controllerName: hangang.dev/gateway-controller` and per-target conditions. Entries written by other controllers are preserved. `lastTransitionTime` changes only when a condition's status changes, so replicas do not fight over timestamps. A write that conflicts or finds the object gone is dropped; the watch event behind it reconciles again. `networking.k8s.io/v1` Ingress has no condition field, so an Ingress reports withholding only by not carrying the published address; the policy status and the diagnostics below give the reason.
 
-`GET /v1/kubernetes/protection` on the administration API (viewer or administrator role; read-only, no secrets) returns this instance's latest report: `require_protection`, client address and Sumunjang state, counts, and one row per selected Ingress (`protected`, `unprotected` or `withheld`, whether the published snapshot serves it, the attached policy, reason and message) and per policy, bounded to 1,000 rows each. `/metrics` adds `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted` and `hangang_kubernetes_client_address_preserved`. Alert on `withheld > 0` during rollouts and on `unprotected > 0` once migration is complete. The report's `freshness` object and the `hangang_kubernetes_snapshot_age_seconds`, `hangang_kubernetes_protected_fail_closed` and `hangang_kubernetes_stale_refusals_total` metrics describe [bounded staleness](KUBERNETES.md#bounded-staleness); alert on `protected_fail_closed == 1`.
+`GET /v1/kubernetes/protection` on the administration API (viewer or administrator role; read-only, no secrets) returns this instance's latest report: `require_protection`, client address and Sumunjang state, counts, and one row per selected Ingress (`protected`, `public`, `unprotected` or `withheld`, whether the published snapshot serves it, the attached policy, reason and message) and per policy, bounded to 1,000 rows each. `/metrics` adds `hangang_kubernetes_ingresses_protected`, `hangang_kubernetes_ingresses_public`, `hangang_kubernetes_ingresses_unprotected`, `hangang_kubernetes_ingresses_withheld`, `hangang_kubernetes_protection_policies_invalid`, `hangang_kubernetes_protection_policies_conflicted` and `hangang_kubernetes_client_address_preserved`. Alert on `withheld > 0` during rollouts and on `unprotected > 0` once migration is complete. The report's `freshness` object and the `hangang_kubernetes_snapshot_age_seconds`, `hangang_kubernetes_protected_fail_closed` and `hangang_kubernetes_stale_refusals_total` metrics describe [bounded staleness](KUBERNETES.md#bounded-staleness); alert on `protected_fail_closed == 1`.
 
 ## Client address preservation
 

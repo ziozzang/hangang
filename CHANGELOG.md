@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Add explicitly public ProtectionPolicies (`access: Public` with a required
+  `public.reason` and optional `public.paths`) for identity portals, provider
+  callbacks and health routes, so `require_protection` can stay on. They are
+  reported as `public` (not `unprotected`), counted by
+  `hangang_kubernetes_ingresses_public` and shown in the console; paths
+  outside the list withhold the Ingress (`PublicPathNotAllowed`), and a
+  public plus a protected policy on one Ingress conflict.
 - Reconcile `ProtectionPolicy` (`world.hangang.dev/v1alpha1`, ADR 0022) with
   `--kubernetes-protection-config`: policies attach to Ingresses by `targetRefs`
   or as a namespace default and compile Hopae authentication, an enforced

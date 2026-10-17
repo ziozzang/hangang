@@ -708,7 +708,7 @@ function renderProtection(data) {
   if (!data.enabled || !isObject(data.report)) return [t('Kubernetes route protection is not enabled on this instance.'), staleness].filter(Boolean).join('\n');
   const report = data.report; const counts = isObject(report.counts) ? report.counts : {};
   const lines = [
-    t('Protected {protected} · unprotected {unprotected} · withheld {withheld}', { protected: count(counts.protected), unprotected: count(counts.unprotected), withheld: count(counts.withheld) }),
+    t('Protected {protected} · explicitly public {public} · unprotected {unprotected} · withheld {withheld}', { protected: count(counts.protected), public: count(counts.public), unprotected: count(counts.unprotected), withheld: count(counts.withheld) }),
     t('Invalid policies {invalid} · conflicted policies {conflicted}', { invalid: count(counts.invalid_policies), conflicted: count(counts.conflicted_policies) }),
     report.require_protection ? t('Ingresses without a policy are withheld.') : t('Ingresses without a policy are published unprotected.'),
     report.client_address_preserved ? t('Client address preserved') : t('Client address not preserved: {detail}', { detail: String(report.client_address_message || '—').slice(0, 1024) }),
@@ -716,6 +716,9 @@ function renderProtection(data) {
   ];
   if (staleness) lines.push(staleness);
   const rows = Array.isArray(report.ingresses) ? report.ingresses : [];
+  for (const row of rows.filter((row) => isObject(row) && row.state === 'public').slice(0, 50)) {
+    lines.push(t('Explicitly public {namespace}/{name} ({policy}): {reason}', { namespace: String(row.namespace), name: String(row.name), policy: String(row.policy || '—'), reason: String(row.message || '—').slice(0, 256) }));
+  }
   for (const row of rows.filter((row) => isObject(row) && row.state === 'withheld').slice(0, 50)) {
     lines.push(t('Withheld {namespace}/{name}: {reason}', { namespace: String(row.namespace), name: String(row.name), reason: String(row.reason || '—') }));
   }

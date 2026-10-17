@@ -2115,12 +2115,15 @@ impl ResourceCache {
                 .collect();
             let service =
                 |namespace: &str, name: &str| self.get(ResourceKind::Service, namespace, name);
+            let ingress =
+                |namespace: &str, name: &str| self.get(ResourceKind::Ingress, namespace, name);
             Arc::new(protection::resolve(
                 settings,
                 protection::Inputs {
                     ingresses: &identities,
                     policies: self.objects(ResourceKind::ProtectionPolicy).collect(),
                     service: &service,
+                    ingress: &ingress,
                 },
             ))
         });

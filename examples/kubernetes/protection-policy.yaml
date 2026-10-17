@@ -66,3 +66,52 @@ spec:
           action: read
   network:
     enforcement: None
+---
+# Explicitly public: an identity portal's sign-in, callback and health paths.
+# Reported as `public` (not `unprotected`); any other path on this Ingress, or
+# a defaultBackend, withholds it (PublicPathNotAllowed).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-portal
+spec:
+  ingressClassName: hangang
+  rules:
+    - host: auth.example.test
+      http:
+        paths:
+          - path: /login
+            pathType: Prefix
+            backend:
+              service:
+                name: hopae
+                port:
+                  name: portal
+          - path: /callback
+            pathType: Prefix
+            backend:
+              service:
+                name: hopae
+                port:
+                  name: portal
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: hopae
+                port:
+                  name: portal
+---
+apiVersion: world.hangang.dev/v1alpha1
+kind: ProtectionPolicy
+metadata:
+  name: auth-portal-public
+spec:
+  access: Public
+  targetRefs:
+    - group: networking.k8s.io
+      kind: Ingress
+      name: auth-portal
+  public:
+    reason: Hopae sign-in portal (login, provider callbacks, health)
+    paths: ["/login/*", "/callback/*", "/healthz"]
