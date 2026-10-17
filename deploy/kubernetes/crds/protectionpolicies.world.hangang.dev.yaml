@@ -67,11 +67,50 @@ spec:
               type: object
             spec:
               type: object
-              required: ["identity", "authorization"]
               x-kubernetes-validations:
                 - rule: "(has(self.namespaceDefault) && self.namespaceDefault) ? (!has(self.targetRefs) || size(self.targetRefs) == 0) : (has(self.targetRefs) && size(self.targetRefs) > 0)"
                   message: "a namespaceDefault policy has no targetRefs; any other policy needs at least one targetRef"
+                - rule: "has(self.access) && self.access == 'Public' ? (has(self.public) && !has(self.identity) && !has(self.authorization) && !has(self.network) && !(has(self.namespaceDefault) && self.namespaceDefault)) : (has(self.identity) && has(self.authorization) && !has(self.public))"
+                  message: "access Public needs public (reason) and explicit targetRefs, and has no identity, authorization or network; a protected policy needs identity and authorization and no public"
               properties:
+                access:
+                  type: string
+                  enum: ["Protected", "Public"]
+                  default: Protected
+                  description: >-
+                    Protected (default): Hopae identity and Pumgye authorization.
+                    Public: an explicitly public scope (an identity portal's
+                    login, callback and health routes), reported as public, not
+                    as unprotected; require_protection stays in force elsewhere.
+                public:
+                  type: object
+                  required: ["reason"]
+                  description: Required with access Public.
+                  properties:
+                    reason:
+                      type: string
+                      minLength: 8
+                      maxLength: 256
+                      description: Why the scope is public; shown in diagnostics.
+                    paths:
+                      type: array
+                      maxItems: 32
+                      x-kubernetes-list-type: set
+                      description: >-
+                        Paths a targeted Ingress may contain: /exact or /prefix/*.
+                        Any other path, or a defaultBackend, withholds the Ingress
+                        (PublicPathNotAllowed). Empty: the whole Ingress is public.
+                      items:
+                        type: string
+                        minLength: 1
+                        maxLength: 256
+                        pattern: "^/[\\x21-\\x7e]*$"
+                        x-kubernetes-validations:
+                          - rule: "self.endsWith('*') ? !self.substring(0, size(self) - 1).contains('*') : !self.contains('*')"
+                            message: "only a trailing * is allowed (/prefix/*)"
+                          - rule: "!self.contains('/../') && !self.endsWith('/..')"
+                            message: "paths may not contain .. segments"
+
                 targetRefs:
                   type: array
                   description: >-

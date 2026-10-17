@@ -219,10 +219,20 @@ struct Spec {
     target_refs: Vec<TargetRef>,
     #[serde(default)]
     namespace_default: bool,
-    identity: Identity,
-    authorization: Authorization,
+    /// `Protected` (default) or `Public`: an explicitly public scope, such as
+    /// an identity portal's login, callback and health routes.
     #[serde(default)]
-    network: Network,
+    access: Access,
+    /// Required with `access: Public`: why the scope is public and which
+    /// paths it may contain.
+    #[serde(default)]
+    public: Option<PublicAccess>,
+    #[serde(default)]
+    identity: Option<Identity>,
+    #[serde(default)]
+    authorization: Option<Authorization>,
+    #[serde(default)]
+    network: Option<Network>,
     #[serde(default)]
     failure_mode: FailureMode,
 }
@@ -320,6 +330,42 @@ enum Enforcement {
     None,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+enum Access {
+    #[default]
+    Protected,
+    Public,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicAccess {
+    /// Human-readable justification, shown in status and diagnostics.
+    reason: String,
+    /// Allowed paths: `/exact` or `/prefix/*`. Every path of a targeted
+    /// Ingress must be covered and it may have no default backend. Empty:
+    /// the whole Ingress is public.
+    #[serde(default)]
+    paths: Vec<String>,
+}
+impl PublicAccess {
+    /// Whether an Ingress path (`pathType` Exact, Prefix or
+    /// ImplementationSpecific) lies inside the allowed paths.
+    fn covers(&self, path: &str, path_type: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|allowed| match allowed.strip_suffix('*') {
+                // `/login/*` covers `/login/...`, and a Kubernetes `Prefix`
+                // `/login`, whose matches are `/login` and `/login/...`.
+                Some(prefix) => {
+                    path.starts_with(prefix)
+                        || (path_type == "Prefix"
+                            && prefix.ends_with('/')
+                            && path == prefix.trim_end_matches('/'))
+                }
+                None => path_type == "Exact" && path == allowed,
+            })
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 enum FailureMode {
     #[default]
     Closed,
@@ -412,11 +458,56 @@ fn validate_spec(spec: &Spec) -> Result<()> {
         target.validate()?;
         ensure!(unique.insert(target), "duplicate targetRef");
     }
+    if spec.access == Access::Public {
+        ensure!(
+            !spec.namespace_default,
+            "an access: Public policy needs explicit targetRefs (no namespaceDefault)"
+        );
+        ensure!(
+            spec.identity.is_none() && spec.authorization.is_none() && spec.network.is_none(),
+            "an access: Public policy has no identity, authorization or network"
+        );
+        let public = spec
+            .public
+            .as_ref()
+            .context("access: Public needs public.reason")?;
+        let reason = public.reason.trim();
+        ensure!(
+            (8..=256).contains(&reason.len()) && !reason.chars().any(char::is_control),
+            "public.reason needs 8..256 printable characters"
+        );
+        ensure!(public.paths.len() <= 32, "at most 32 public.paths");
+        for path in &public.paths {
+            let stem = path.strip_suffix('*').unwrap_or(path);
+            ensure!(
+                path.starts_with('/')
+                    && path.len() <= 256
+                    && !stem.contains('*')
+                    && !path.contains("/../")
+                    && !path.ends_with("/..")
+                    && path.bytes().all(|b| b.is_ascii_graphic()),
+                "invalid public path {path:?}: use /exact or /prefix/*"
+            );
+        }
+        return Ok(());
+    }
     ensure!(
-        dns_label(&spec.identity.profile_ref.name),
+        spec.public.is_none(),
+        "public applies only to access: Public"
+    );
+    let identity = spec
+        .identity
+        .as_ref()
+        .context("identity is required unless access is Public")?;
+    let authorization = spec
+        .authorization
+        .as_ref()
+        .context("authorization is required unless access is Public")?;
+    ensure!(
+        dns_label(&identity.profile_ref.name),
         "invalid identity.profileRef.name"
     );
-    let pumgye = &spec.authorization.pumgye;
+    let pumgye = &authorization.pumgye;
     ensure!(
         id(&pumgye.service_id) && id(&pumgye.resource),
         "invalid authorization.pumgye serviceId or resource"
@@ -474,6 +565,8 @@ impl Compiled {
 pub enum RouteProtection {
     /// Deliberately unprotected (`require_protection: false`, no policy).
     Public,
+    /// Explicitly public by an `access: Public` ProtectionPolicy.
+    ExplicitPublic(ObjectKey),
     Protected(Arc<Compiled>),
 }
 
@@ -514,7 +607,13 @@ pub struct Withheld {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision {
     Protected(Arc<Compiled>),
+    /// No policy and `require_protection: false`.
     Public,
+    /// An `access: Public` policy with its recorded reason.
+    ExplicitPublic {
+        policy: ObjectKey,
+        reason: String,
+    },
     Withheld(Withheld),
 }
 
@@ -562,6 +661,9 @@ impl Resolution {
                         Some((key.clone(), RouteProtection::Protected(compiled.clone())))
                     }
                     Decision::Public => Some((key.clone(), RouteProtection::Public)),
+                    Decision::ExplicitPublic { policy, .. } => {
+                        Some((key.clone(), RouteProtection::ExplicitPublic(policy.clone())))
+                    }
                     Decision::Withheld(_) => None,
                 })
                 .collect(),
@@ -577,6 +679,8 @@ pub struct Inputs<'a> {
     pub policies: Vec<&'a Value>,
     /// Looks up a cached Service by namespace/name.
     pub service: &'a dyn Fn(&str, &str) -> Option<&'a Value>,
+    /// Looks up a cached Ingress by namespace/name (public path checks).
+    pub ingress: &'a dyn Fn(&str, &str) -> Option<&'a Value>,
 }
 
 /// Decide protection for every selected Ingress and record the per-policy
@@ -640,7 +744,7 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
                 resolution
                     .attached
                     .insert(ingress.clone(), parsed[*single].key.clone());
-                decide(&parsed[*single], ingress, options, &client_address)
+                decide(&parsed[*single], ingress, options, &client_address, inputs.ingress)
             }
             several => {
                 let names: Vec<ObjectKey> = several.iter().map(|i| parsed[*i].key.clone()).collect();
@@ -667,10 +771,7 @@ pub fn resolve(options: &Options, inputs: Inputs<'_>) -> Resolution {
         let mut finding = PolicyFinding {
             generation: policy.generation,
             invalid: policy.spec.as_ref().err().cloned(),
-            network_required: policy
-                .spec
-                .as_ref()
-                .is_ok_and(|spec| spec.network.enforcement == Enforcement::Required),
+            network_required: policy.spec.as_ref().is_ok_and(Spec::network_required),
             targets: Vec::new(),
             truncated: 0,
         };
@@ -797,11 +898,52 @@ fn target_finding(
     finding
 }
 
-fn decide(
+impl Spec {
+    fn network_required(&self) -> bool {
+        self.access == Access::Protected
+            && self
+                .network
+                .as_ref()
+                .is_none_or(|network| network.enforcement == Enforcement::Required)
+    }
+}
+
+/// The first path of an Ingress outside the allowed public paths, if any.
+fn uncovered_public_path(public: &PublicAccess, ingress: &Value) -> Option<String> {
+    if public.paths.is_empty() {
+        return None;
+    }
+    if ingress.pointer("/spec/defaultBackend").is_some() {
+        return Some("defaultBackend".into());
+    }
+    for rule in ingress
+        .pointer("/spec/rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for path in rule
+            .pointer("/http/paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let value = path.get("path").and_then(Value::as_str).unwrap_or("");
+            let kind = path.get("pathType").and_then(Value::as_str).unwrap_or("");
+            if !public.covers(value, kind) {
+                return Some(format!("{kind} {value}"));
+            }
+        }
+    }
+    None
+}
+
+fn decide<'a>(
     policy: &Parsed,
     ingress: &ObjectKey,
     options: &Options,
     client_address: &std::result::Result<(), String>,
+    lookup: &dyn Fn(&str, &str) -> Option<&'a Value>,
 ) -> Decision {
     let withheld = |reason: &'static str, message: String| {
         Decision::Withheld(Withheld {
@@ -818,8 +960,33 @@ fn decide(
             );
         }
     };
+    if spec.access == Access::Public {
+        let public = spec.public.as_ref().expect("validated public policy");
+        let Some(object) = lookup(&ingress.0, &ingress.1) else {
+            return withheld("TargetNotFound", "the Ingress is not in the cache".into());
+        };
+        if let Some(path) = uncovered_public_path(public, object) {
+            return withheld(
+                "PublicPathNotAllowed",
+                format!(
+                    "{path} is outside public.paths of ProtectionPolicy {}; an explicitly public Ingress may only contain the listed paths",
+                    policy.key.1
+                ),
+            );
+        }
+        return Decision::ExplicitPublic {
+            policy: policy.key.clone(),
+            reason: bounded(public.reason.trim()),
+        };
+    }
     let settings = &options.settings;
-    let name = &spec.identity.profile_ref.name;
+    let (Some(identity), Some(authorization)) = (&spec.identity, &spec.authorization) else {
+        return withheld(
+            "Invalid",
+            "protected policy without identity or authorization".into(),
+        );
+    };
+    let name = &identity.profile_ref.name;
     let Some(profile) = settings.identity_profiles.get(name) else {
         return withheld(
             "InvalidIdentityProfile",
@@ -835,7 +1002,7 @@ fn decide(
             ),
         );
     }
-    let binding = &spec.authorization.pumgye;
+    let binding = &authorization.pumgye;
     if let Some(services) = &settings.pumgye_services
         && !services
             .get(&binding.service_id)
@@ -855,7 +1022,7 @@ fn decide(
             "no Pumgye authority is configured".into(),
         );
     }
-    if spec.network.enforcement == Enforcement::Required {
+    if spec.network_required() {
         if !(options.facts.guard_configured && options.facts.guard_enforcing) {
             return withheld(
                 "GuardUnavailable",
@@ -1193,6 +1360,8 @@ pub struct Report {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Counts {
     pub protected: u64,
+    /// Explicitly public by an `access: Public` policy.
+    pub public: u64,
     pub unprotected: u64,
     pub withheld: u64,
     pub invalid_policies: u64,
@@ -1202,7 +1371,8 @@ pub struct Counts {
 pub struct IngressRow {
     pub namespace: String,
     pub name: String,
-    /// `protected`, `unprotected` or `withheld`.
+    /// `protected`, `public` (explicitly, by policy), `unprotected` (no
+    /// policy, require_protection off) or `withheld`.
     pub state: &'static str,
     /// Whether the published snapshot serves the Ingress.
     pub published: bool,
@@ -1240,6 +1410,10 @@ impl Resolution {
                 Decision::Public => {
                     report.counts.unprotected += 1;
                     ("unprotected", None, None)
+                }
+                Decision::ExplicitPublic { reason, .. } => {
+                    report.counts.public += 1;
+                    ("public", Some("ExplicitlyPublic"), Some(reason.clone()))
                 }
                 Decision::Withheld(withheld) => {
                     report.counts.withheld += 1;
@@ -1324,6 +1498,11 @@ impl Diagnostics {
                 "kubernetes_ingresses_protected",
                 "Selected Ingresses published with a ProtectionPolicy.",
                 report.counts.protected,
+            ),
+            (
+                "kubernetes_ingresses_public",
+                "Selected Ingresses explicitly public by an access: Public ProtectionPolicy.",
+                report.counts.public,
             ),
             (
                 "kubernetes_ingresses_unprotected",
@@ -1519,21 +1698,230 @@ mod tests {
         policies: &[Value],
         service: Option<Value>,
     ) -> Resolution {
-        let ingresses = keys(ingresses);
+        run_with(options, ingresses, policies, service, &[])
+    }
+    /// Like [`run`]; `objects` are Ingress objects for the public path
+    /// checks (others default to one `Prefix /` path).
+    fn run_with(
+        options: &Options,
+        ingresses: &[(&str, &str)],
+        policies: &[Value],
+        service: Option<Value>,
+        objects: &[Value],
+    ) -> Resolution {
+        let keys_set = keys(ingresses);
         let lookup = move |namespace: &str, name: &str| {
             service
                 .as_ref()
                 .filter(|_| (namespace, name) == ("edge", "hangang"))
                 .map(|s| Box::leak(Box::new(s.clone())) as &Value)
         };
+        let objects: Vec<Value> = objects.to_vec();
+        let ingress = move |namespace: &str, name: &str| {
+            let found = objects.iter().find(|o| {
+                o.pointer("/metadata/namespace").and_then(Value::as_str) == Some(namespace)
+                    && o.pointer("/metadata/name").and_then(Value::as_str) == Some(name)
+            });
+            let value = found.cloned().unwrap_or_else(|| {
+                serde_json::json!({
+                    "metadata":{"namespace":namespace,"name":name},
+                    "spec":{"rules":[{"http":{"paths":[{"path":"/","pathType":"Prefix"}]}}]}
+                })
+            });
+            Some(Box::leak(Box::new(value)) as &Value)
+        };
         resolve(
             options,
             Inputs {
-                ingresses: &ingresses,
+                ingresses: &keys_set,
                 policies: policies.iter().collect(),
                 service: &lookup,
+                ingress: &ingress,
             },
         )
+    }
+    fn public_policy(namespace: &str, name: &str, targets: &[&str], paths: &[&str]) -> Value {
+        let refs: Vec<Value> = targets
+            .iter()
+            .map(|t| serde_json::json!({"group":"networking.k8s.io","kind":"Ingress","name":t}))
+            .collect();
+        serde_json::json!({
+            "apiVersion":"world.hangang.dev/v1alpha1","kind":"ProtectionPolicy",
+            "metadata":{"namespace":namespace,"name":name,"generation":1,"creationTimestamp":"2026-10-01T00:00:00Z","uid":format!("uid-{name}")},
+            "spec":{"targetRefs":refs,"access":"Public","public":{"reason":"identity portal login and callbacks","paths":paths}}
+        })
+    }
+    fn ingress_object(
+        namespace: &str,
+        name: &str,
+        paths: &[(&str, &str)],
+        default_backend: bool,
+    ) -> Value {
+        let paths: Vec<Value> = paths
+            .iter()
+            .map(|(path, kind)| serde_json::json!({"path":path,"pathType":kind}))
+            .collect();
+        let mut value = serde_json::json!({"metadata":{"namespace":namespace,"name":name},"spec":{"rules":[{"host":"auth.example.test","http":{"paths":paths}}]}});
+        if default_backend {
+            value["spec"]["defaultBackend"] =
+                serde_json::json!({"service":{"name":"x","port":{"number":80}}});
+        }
+        value
+    }
+
+    #[test]
+    fn explicit_public_policy_publishes_listed_paths_and_is_reported_distinctly() {
+        let options = options();
+        let portal = ingress_object(
+            "shop",
+            "portal",
+            &[
+                ("/login", "Prefix"),
+                ("/callback/", "Prefix"),
+                ("/healthz", "Exact"),
+            ],
+            false,
+        );
+        let policy = public_policy(
+            "shop",
+            "portal-public",
+            &["portal"],
+            &["/login/*", "/callback/*", "/healthz"],
+        );
+        let resolution = run_with(
+            &options,
+            &[("shop", "portal"), ("shop", "orders")],
+            std::slice::from_ref(&policy),
+            None,
+            &[portal],
+        );
+        assert_eq!(
+            resolution.decisions[&key("shop", "portal")],
+            Decision::ExplicitPublic {
+                policy: key("shop", "portal-public"),
+                reason: "identity portal login and callbacks".into()
+            }
+        );
+        // require_protection still withholds the other Ingress.
+        assert!(
+            matches!(&resolution.decisions[&key("shop", "orders")], Decision::Withheld(w) if w.reason == "ProtectionRequired")
+        );
+        let protections = resolution.protections(&options);
+        assert_eq!(
+            protections.routes[&key("shop", "portal")],
+            RouteProtection::ExplicitPublic(key("shop", "portal-public"))
+        );
+        let report = resolution.report(&keys(&[("shop", "portal")]));
+        assert_eq!(
+            (
+                report.counts.public,
+                report.counts.unprotected,
+                report.counts.withheld
+            ),
+            (1, 0, 1)
+        );
+        let row = report
+            .ingresses
+            .iter()
+            .find(|r| r.name == "portal")
+            .unwrap();
+        assert_eq!(
+            (row.state, row.reason, row.message.as_deref()),
+            (
+                "public",
+                Some("ExplicitlyPublic"),
+                Some("identity portal login and callbacks")
+            )
+        );
+        let diagnostics = Diagnostics::default();
+        diagnostics.publish(report);
+        let mut metrics = String::new();
+        diagnostics.render(&mut metrics);
+        assert!(metrics.contains("hangang_kubernetes_ingresses_public 1"));
+        assert!(metrics.contains("hangang_kubernetes_ingresses_unprotected 0"));
+        let status = resolution
+            .desired_status(&policy, &keys(&[("shop", "portal")]))
+            .unwrap();
+        assert_eq!(status["conditions"][2]["reason"], "Programmed");
+        assert!(
+            status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["type"] != "ClientAddressPreserved")
+        );
+    }
+
+    #[test]
+    fn explicit_public_policy_refuses_paths_outside_its_list_and_conflicts() {
+        let options = options();
+        let public = public_policy("shop", "portal-public", &["portal"], &["/login/*"]);
+        for (paths, default_backend) in [
+            (vec![("/admin", "Prefix")], false),
+            (vec![("/login/x", "Prefix"), ("/", "Prefix")], false),
+            (vec![("/loginx", "ImplementationSpecific")], false),
+            (vec![("/login/x", "Prefix")], true),
+        ] {
+            let object = ingress_object("shop", "portal", &paths, default_backend);
+            let resolution = run_with(
+                &options,
+                &[("shop", "portal")],
+                std::slice::from_ref(&public),
+                None,
+                &[object],
+            );
+            assert!(
+                matches!(&resolution.decisions[&key("shop", "portal")], Decision::Withheld(w) if w.reason == "PublicPathNotAllowed"),
+                "{paths:?} default={default_backend}"
+            );
+        }
+        // A protected policy on the same Ingress conflicts: both are refused.
+        let protected = policy("shop", "portal-protected", &["portal"]);
+        let resolution = run(
+            &options,
+            &[("shop", "portal")],
+            &[
+                public_policy("shop", "portal-public", &["portal"], &[]),
+                protected,
+            ],
+            None,
+        );
+        assert!(
+            matches!(&resolution.decisions[&key("shop", "portal")], Decision::Withheld(w) if w.reason == "Conflicted")
+        );
+    }
+
+    #[test]
+    fn explicit_public_policy_shape_is_validated() {
+        let options = options();
+        let mut bad = Vec::new();
+        let mut no_reason = public_policy("shop", "a", &["portal"], &[]);
+        no_reason["spec"]["public"] = serde_json::json!({"reason":"short"});
+        bad.push(no_reason);
+        let mut missing = public_policy("shop", "b", &["portal"], &[]);
+        missing["spec"].as_object_mut().unwrap().remove("public");
+        bad.push(missing);
+        let mut with_identity = public_policy("shop", "c", &["portal"], &[]);
+        with_identity["spec"]["identity"] = serde_json::json!({"profileRef":{"name":"corp"}});
+        bad.push(with_identity);
+        let mut default = public_policy("shop", "d", &[], &[]);
+        default["spec"]["namespaceDefault"] = true.into();
+        bad.push(default);
+        let mut wildcard = public_policy("shop", "e", &["portal"], &["/a*b"]);
+        wildcard["spec"]["public"]["paths"] = serde_json::json!(["/a*b"]);
+        bad.push(wildcard);
+        bad.push(public_policy("shop", "f", &["portal"], &["relative/*"]));
+        let mut protected_with_public = policy("shop", "g", &["portal"]);
+        protected_with_public["spec"]["public"] = serde_json::json!({"reason":"not allowed here"});
+        bad.push(protected_with_public);
+        for policy in bad {
+            let name = policy["metadata"]["name"].as_str().unwrap().to_owned();
+            let resolution = run(&options, &[("shop", "portal")], &[policy], None);
+            assert!(
+                matches!(&resolution.decisions[&key("shop", "portal")], Decision::Withheld(w) if w.reason == "Invalid"),
+                "policy {name} accepted"
+            );
+        }
     }
     fn key(namespace: &str, name: &str) -> ObjectKey {
         (namespace.to_owned(), name.to_owned())

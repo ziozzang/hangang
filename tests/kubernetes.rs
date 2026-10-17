@@ -108,6 +108,8 @@ enum Mode {
     /// Two Ingresses, one targeted by a ProtectionPolicy. The first policy
     /// watch deletes the policy once its status has been written.
     Protection,
+    /// A protected and an explicitly public (`access: Public`) Ingress.
+    ProtectionPublic,
     /// The ProtectionPolicy CRD is not installed: its list answers 404.
     ProtectionMissing,
 }
@@ -453,6 +455,60 @@ async fn protection_policy_is_compiled_reported_and_fails_closed_when_removed() 
         log.iter()
             .any(|(path, _)| path.ends_with("/ingresses/main/status"))
     );
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task).await??;
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn explicitly_public_ingress_is_published_public_and_withheld_once_its_policy_goes()
+-> Result<()> {
+    let mut harness = harness(Mode::ProtectionPublic, Some("blue")).await?;
+    harness.options.protection = Some(Arc::new(protection_options()));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let controller = Controller::new(harness.options.clone(), Arc::new(ChannelSink(tx)))?;
+    let (cancel, task) = spawn(controller);
+    let first = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
+    assert_eq!(
+        first.config.http.len(),
+        2,
+        "require_protection still applies; both Ingresses have a policy"
+    );
+    let portal = first
+        .config
+        .http
+        .iter()
+        .find(|r| r.host.as_deref() == Some("auth.example.test"))
+        .unwrap();
+    assert_eq!(portal.access_mode, hangang::config::AccessMode::Public);
+    assert!(portal.auth.is_none() && portal.resource_policy.is_none());
+    let api = first
+        .config
+        .http
+        .iter()
+        .find(|r| r.host.as_deref() == Some("api.example.test"))
+        .unwrap();
+    assert_eq!(api.access_mode, hangang::config::AccessMode::Protected);
+    // Without its public policy the portal is withheld, never unprotected.
+    let second = next_snapshot(&mut rx, Duration::from_secs(4)).await?;
+    assert_eq!(second.config.http.len(), 1);
+    assert_eq!(
+        second.config.http[0].host.as_deref(),
+        Some("api.example.test")
+    );
+    let log = harness.state.patch_log.lock().unwrap().clone();
+    let (_, patch) = log
+        .iter()
+        .find(|(path, _)| path.ends_with("/protectionpolicies/portal-public/status"))
+        .expect("public policy status was written");
+    let programmed = patch["status"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "Programmed")
+        .unwrap()
+        .clone();
+    assert_eq!(programmed["status"], "True");
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(2), task).await??;
     harness.stop().await
@@ -1365,7 +1421,9 @@ async fn handle(
         if matches!(state.mode, Mode::Recreated) {
             return Ok(handle_recreated_patch(&patch));
         }
-        if matches!(state.mode, Mode::Protection) && path.contains("/protectionpolicies/") {
+        if matches!(state.mode, Mode::Protection | Mode::ProtectionPublic)
+            && path.contains("/protectionpolicies/")
+        {
             let mut object = protection_policy("8");
             object["status"] = patch["status"].clone();
             return Ok(json(StatusCode::OK, object));
@@ -1421,6 +1479,7 @@ async fn handle(
         Mode::SlowIngressList => handle_stale(&path, &query, &state),
         Mode::LateWatch => handle_late_watch(&path, &query),
         Mode::Protection => handle_protection(&path, &query, &state).await,
+        Mode::ProtectionPublic => handle_protection_public(&path, &query, &state).await,
         Mode::ProtectionMissing => handle_protection_missing(&path, &query),
     };
     Ok(response)
@@ -2139,6 +2198,63 @@ async fn handle_protection(path: &str, query: &str, state: &ApiState) -> Respons
     }
     if path.ends_with("/ingresses") {
         let bare = ingress_in("blue", "bare", "11", "bare.example.test", &["/"], None);
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[
+                ingress_in("blue", "main", "11", "api.example.test", &["/"], None), bare]}),
+        );
+    }
+    response(StatusCode::NOT_FOUND, "not found")
+}
+fn public_policy(rv: &str) -> serde_json::Value {
+    serde_json::json!({"apiVersion":"world.hangang.dev/v1alpha1","kind":"ProtectionPolicy",
+        "metadata":{"name":"portal-public","namespace":"blue","resourceVersion":rv,"uid":"public-uid","generation":1,
+            "creationTimestamp":"2026-01-01T00:00:00Z"},
+        "spec":{"targetRefs":[{"group":"networking.k8s.io","kind":"Ingress","name":"bare"}],
+            "access":"Public","failureMode":"Closed",
+            "public":{"reason":"identity portal sign-in and callbacks","paths":["/login/*"]}}})
+}
+async fn handle_protection_public(
+    path: &str,
+    query: &str,
+    state: &ApiState,
+) -> Response<Full<Bytes>> {
+    let watch = query.contains("watch=true");
+    if path.ends_with("/protectionpolicies") {
+        if !watch {
+            return json(
+                StatusCode::OK,
+                serde_json::json!({"metadata":{"resourceVersion":"7"},"items":[protection_policy("7"), public_policy("7")]}),
+            );
+        }
+        if state.secret_watches.fetch_add(1, Ordering::SeqCst) == 0 {
+            for _ in 0..200 {
+                if state
+                    .patch_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(path, _)| path.contains("/protectionpolicies/portal-public/"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return stream(vec![event("DELETED", public_policy("9"))]);
+        }
+        return response(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if watch {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if path.ends_with("/services") {
+        return json(
+            StatusCode::OK,
+            serde_json::json!({"metadata":{"resourceVersion":"10"},"items":[service()]}),
+        );
+    }
+    if path.ends_with("/ingresses") {
+        let bare = ingress_in("blue", "bare", "11", "auth.example.test", &["/login"], None);
         return json(
             StatusCode::OK,
             serde_json::json!({"metadata":{"resourceVersion":"11"},"items":[

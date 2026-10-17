@@ -88,14 +88,23 @@ class WorldCrdTests(unittest.TestCase):
         rules = [rule['rule'] for _, node in walk(self.schema) for rule in node.get('x-kubernetes-validations', [])]
         self.assertTrue(any('namespaceDefault' in rule for rule in rules))
         self.assertTrue(any('exists_one' in rule for rule in rules))
+        self.assertTrue(any("self.access == 'Public'" in rule for rule in rules))
+        self.assertEqual(self.schema['properties']['spec']['properties']['access']['enum'], ['Protected', 'Public'])
 
     def test_examples_match_the_structural_schema(self):
         objects = [doc for doc in yaml.safe_load_all(EXAMPLE.read_text()) if doc['kind'] == 'ProtectionPolicy']
-        self.assertEqual(len(objects), 2)
+        self.assertEqual(len(objects), 3)
         for policy in objects:
             check(self.schema, policy)
             spec = policy['spec']
             self.assertEqual(bool(spec.get('namespaceDefault')), not spec.get('targetRefs'))
+            # Mirror of the access CEL rule.
+            if spec.get('access') == 'Public':
+                self.assertIn('reason', spec['public'])
+                self.assertFalse({'identity', 'authorization', 'network'} & spec.keys())
+            else:
+                self.assertTrue({'identity', 'authorization'} <= spec.keys())
+                self.assertNotIn('public', spec)
 
     def test_invalid_shapes_are_refused_by_the_schema(self):
         policy = next(doc for doc in yaml.safe_load_all(EXAMPLE.read_text()) if doc['kind'] == 'ProtectionPolicy')
@@ -106,6 +115,10 @@ class WorldCrdTests(unittest.TestCase):
             lambda p: p['spec'].update(unknown=True),
             lambda p: p['spec']['authorization']['pumgye']['actions'].extend(
                 [{'method': 'GET', 'action': 'again'}]),
+            lambda p: p['spec'].update(access='Open'),
+            lambda p: p['spec'].update(public={'paths': ['/x']}),
+            lambda p: p['spec'].update(public={'reason': 'short'}),
+            lambda p: p['spec'].update(public={'reason': 'long enough reason', 'paths': ['relative']}),
         ):
             broken = yaml.safe_load(yaml.safe_dump(policy))
             mutate(broken)
