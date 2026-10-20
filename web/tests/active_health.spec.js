@@ -168,7 +168,7 @@ test('native validation blocks cooldown conflict, overlapping statuses and timeo
 test('advanced JSON checking policy and passive removal survive later native edits', async ({ page }) => {
   const writes = await fixture(page);
   await openEdit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.balance.active_health.initial_state = 'checking';
@@ -191,7 +191,7 @@ test('advanced JSON adds full health policy before unrelated native edit without
   configured.balance.passive_health = null;
   const writes = await fixture(page, configured);
   await openEdit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.balance.active_health = { ...active, initial_state: 'checking', path: '/probe', interval_ms: 5000 };
@@ -213,7 +213,7 @@ test('advanced JSON adds full health policy before unrelated native edit without
 test('advanced JSON removes both health policies before native edit', async ({ page }) => {
   const writes = await fixture(page);
   await openEdit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.balance.active_health = null;

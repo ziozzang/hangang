@@ -56,7 +56,7 @@ for (const result of [409, 422]) test(`list deletion preserves row and exposes s
   const { deletes, remove } = await fixture(page, { result });
   await remove.click(); await page.locator('#confirm-accept').click();
   await expect(page.locator('#global-alert')).toContainText(result === 409 ? 'confirm deletion again' : 'resource scope must first be released');
-  await expect(page.locator('#http-routes [data-route-id="selected"]')).toBeVisible();
+  await expect(page.locator('#http-routes tr[data-route-id="selected"]')).toBeVisible();
   expect(deletes).toHaveLength(1);
 });
 
@@ -71,7 +71,7 @@ test('indeterminate list deletion reloads once and never automatically retries t
   expect(session.listGets).toBe(1);
   await session.remove.click(); await page.locator('#confirm-accept').click();
   await expect(page.locator('#global-alert')).toContainText('Indeterminate Outcome');
-  await expect(page.locator('#http-routes [data-route-id="selected"]')).toBeVisible();
+  await expect(page.locator('#http-routes tr[data-route-id="selected"]')).toBeVisible();
   expect(session.listGets).toBe(2);
   expect(session.deletes).toHaveLength(1);
   await expect(session.remove).toBeEnabled();
@@ -81,7 +81,7 @@ for (const result of [401, 403]) test(`list deletion ${result} clears the admini
   const session = await fixture(page, { result });
   await session.remove.click(); await page.locator('#confirm-accept').click();
   await expect(page.locator('#login-dialog')).toBeVisible();
-  await expect(page.locator('#http-routes [data-route-id="selected"]')).toHaveCount(0);
+  await expect(page.locator('#http-routes tr[data-route-id="selected"]')).toHaveCount(0);
   await expect(page.locator('#http-routes')).toBeEmpty();
   expect(session.deletes).toHaveLength(1);
   expect(session.listGets).toBe(1);

@@ -1324,7 +1324,7 @@ test('route id conflicts and stale revisions are reported without losing the dra
 test('the advanced JSON editor remains authoritative for fields it introduces', async ({ page }) => {
   const calls = await fixtures(page, { '/v1/routes/tcp/db': route => route.fulfill({ json: config.tcp[0], headers: { etag: '"7"' } }) });
   await login(page); await page.getByRole('link', { name: 'TCP routes' }).click(); await page.getByRole('button', { name: 'Edit' }).click();
-  await page.locator('#route-form details.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const editor = page.locator('#route-json');
   const current = JSON.parse(await editor.inputValue());
   await editor.fill(JSON.stringify({ ...current, experimental: { enabled: true } }));

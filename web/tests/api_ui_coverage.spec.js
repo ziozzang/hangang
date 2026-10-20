@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
 const read = (relative) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
 const source = {
   app: read('../app.js'), console: read('../console.js'), operations: read('../operations.js'),
-  docker: read('../docker.js'),
+  docker: read('../docker.js'), pumgye: read('../pumgye.js'),
 };
 
 // Each management operation needs a feature-specific UI surface and a real caller.
@@ -29,6 +29,10 @@ const coverage = new Map([
   ['GET /v1/operations', ['#view-operations', 'operations', '/v1/operations?offset=']],
   ['GET /v1/fleet/observations', ['#fleet-observations-summary', 'operations', "apiCall('/v1/fleet/observations')"]],
   ['GET /v1/fleet/observer-status', ['#observer-identity-fields', 'operations', "apiCall('/v1/fleet/observer-status')"]],
+  ['GET /v1/pumgye/policy', ['#pumgye-document', 'pumgye', "host.api('/v1/pumgye/policy')"]],
+  ['PUT /v1/pumgye/policy', ['#pumgye-publish', 'pumgye', "'/v1/pumgye/policy':'/v1/config',{method:'PUT'"]],
+  ['GET /v1/pumgye/status', ['#pumgye-authority-status', 'pumgye', "host.api('/v1/pumgye/status')"]],
+  ['GET /v1/pumgye/audit', ['#pumgye-audit', 'pumgye', "host.api('/v1/pumgye/audit')"]],
   ['GET /v1/retired-members', ['#retired-rows', 'operations', '/v1/retired-members?offset=']],
   ['GET /v1/status', ['#view-status', 'app', "api('/v1/status'"]],
   ['POST /v1/lifecycle/restart', ['#restart-server', 'app', "api('/v1/lifecycle/restart'"]],
