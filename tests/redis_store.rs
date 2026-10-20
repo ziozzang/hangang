@@ -17,6 +17,7 @@ fn config(revision: u64, id: &str) -> Config {
         cache: None,
         revision,
         http: vec![HttpRoute {
+            error_pages: None,
             listener_ids: Vec::new(),
             access_mode: Default::default(),
             resource_policy: None,
