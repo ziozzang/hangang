@@ -74,6 +74,22 @@ All nodes must use the same Redis endpoint/database, namespace and canonical rul
 
 Reserve the security namespace against eviction and other application writes. Use appropriate persistence/replication for restart retention: loss/eviction of Redis data loses budgets and bans. Operation deadlines are1 second, with64 concurrent commands. An outage fails selected admission closed503, without local fallback; nonselected URLs remain unaffected unless host/global ban scope explicitly requires shared checks. Administrator recovery is independent, but shared lookup/release needs the backend. The UI identifies local versus shared state. Without Redis, each node has its own budget and must not be treated as a fleet-wide ceiling.
 
+### Redis outage behaviour
+
+When the shared backend is stopped, unreachable or slower than its 1-second deadline, hangang does not fall back to local counters. The table shows what a public request receives; the unit test `stopped_backend_fails_every_shared_check_closed_without_local_fallback` in `src/security_redis.rs` checks it.
+
+| Control | Requests the rule selects | Other requests |
+|---|---|---|
+| Rate limit (`path_rate_limits`) | `503` | pass, Redis is not contacted |
+| Failure ban check, scope `url` | `503` | pass |
+| Failure ban check, scope `host` | `503` for every path on the rule's hosts | pass on other hosts |
+| Failure ban check, scope `global` | `503` for every public/workload HTTP request | none (all requests are selected) |
+| Failure observation (response recording) | response replaced by `503` | not recorded |
+| Admin ban list / release | API error `503` | not applicable |
+| No rules configured | pass, Redis is not contacted | pass |
+
+Mitigation: there is no local fallback by design, because a per-node fallback would silently multiply fleet-wide budgets and forget bans. Operate Redis with replication or a supervised restart, keep `global` scope only where a shared outage may block all traffic, and remove `security_redis` from the published settings to return to per-node local state if Redis cannot be restored quickly. URL blocks, IP/country allowlists and admin sockets do not use Redis and keep working.
+
 ## Private security logs
 
 Structured private events include path/allowlist denial, rate rejection, selected failures, ban creation/rejection, backend failure and administrator release. They carry verified client IP and status; newly created bans include the configured path. Raw request URLs, query strings, bodies, passwords and tokens are not logged by this feature. Public responses remain opaque.

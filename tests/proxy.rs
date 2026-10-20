@@ -4288,7 +4288,7 @@ async fn encoded_authentication_paths_cannot_select_public_fallbacks() {
                 ("/%61dmin", 401),
                 ("/ad%6Din", 401),
                 ("//admin", 400),
-                ("/admin;x", 400),
+                ("/admin..", 401),
                 ("/%2561dmin", 400),
                 ("/%2fadmin", 400),
                 ("/admin%5cx", 400),
@@ -8033,4 +8033,80 @@ async fn gateway_error_pages_replace_only_gateway_generated_bodies() {
 
     front_task.abort();
     upstream_task.abort();
+}
+
+#[tokio::test]
+async fn protected_prefix_path_variants_never_reach_a_public_fallback() {
+    // HG-20: spelling variants of a protected prefix must either be denied by
+    // the gateway (400) or be matched to the protected route (401); none may be
+    // served by the public catch-all route or reach the origin unauthenticated.
+    let (backend, seen, backend_task) = upstream("origin").await;
+    let mut secured = route(vec![format!("http://{backend}")]);
+    secured.id = "secured".into();
+    secured.host = Some("secured.test".into());
+    secured.path_prefix = Some("/admin".into());
+    secured.access_mode = hangang::config::AccessMode::Protected;
+    secured.basic_auth = Some(hangang::config::BasicAuth {
+        realm: "restricted".into(),
+        credentials: vec![basic_credential("alice", "secret")],
+        hide_credentials: true,
+        accept_proxy_authorization: false,
+        identity_header: None,
+    });
+    let mut public = route(vec![format!("http://{backend}")]);
+    public.id = "public".into();
+    public.access_mode = hangang::config::AccessMode::Public;
+    let (proxy, policy) = proxy(vec![secured, public]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let variants: &[(&str, u16)] = &[
+        ("/admin", 401),
+        // Trailing dots, case variants and decoded unreserved letters stay on
+        // the protected route (segment-aware, case-insensitive prefix match).
+        ("/admin.", 401),
+        ("/admin/x", 401),
+        ("//admin", 400),
+        ("///admin", 400),
+        ("/admin//x", 400),
+        ("/admin..", 401),
+        ("/admin;x/y", 400),
+        ("/admin/x;y", 400),
+        ("/admin%3bx", 400),
+        // Trailing dots, case variants and decoded unreserved letters stay on
+        // the protected route (segment-aware, case-insensitive prefix match).
+        ("/admin.", 401),
+        ("/admin..", 401),
+        ("/admin/x.", 401),
+        ("/ADMIN", 401),
+        ("/Admin/x", 401),
+        ("/%41dmin", 401),
+        ("/%2561dmin", 400),
+        ("/%252e%252e/admin", 400),
+        ("/x/%252e%252e/admin", 400),
+        ("/x/..%252fadmin", 400),
+        ("/admin/%252e%252e/x", 400),
+        ("/x/%2e%2e/admin", 400),
+        ("/x/../admin", 400),
+        ("/admin/./x", 400),
+        ("/admin%00", 400),
+        ("/admin%5cx", 400),
+    ];
+    let mut failures = vec![];
+    for (path, expected) in variants {
+        let count = seen.lock().unwrap().len();
+        let (status, _) = raw_request(
+            front,
+            &format!("GET {path} HTTP/1.1\r\nHost: secured.test\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        let reached = seen.lock().unwrap().len() != count;
+        if status != *expected || reached {
+            failures.push(format!(
+                "{path}: status {status} (want {expected}), origin reached {reached}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "path variants: {failures:#?}");
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
 }
