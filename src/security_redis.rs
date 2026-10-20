@@ -678,6 +678,82 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn stopped_backend_fails_every_shared_check_closed_without_local_fallback() {
+        // HG-44: a Redis that refuses connections (stopped process) must turn
+        // every selected shared check into 503, never into a silent pass, while
+        // URLs no rule selects keep working without contacting Redis.
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let a =
+            Backend::from_url(settings("stopped-test"), &format!("redis://{address}/")).unwrap();
+        let rates = vec![rate("/login", 1)];
+        let bans = vec![ban()];
+        let ip: IpAddr = "192.0.2.46".parse().unwrap();
+        let other = || {
+            Request::builder()
+                .uri("/images/x")
+                .header("host", "other.test")
+                .body(())
+                .unwrap()
+        };
+        let started = std::time::Instant::now();
+        assert!(a.check_rates(&[], &request("/login"), None).await.is_ok());
+        assert!(
+            a.check_rates(&rates, &request("/images/x"), None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            a.check_rates(&rates, &request("/login"), None)
+                .await
+                .unwrap_err()
+                .status,
+            503
+        );
+        assert!(
+            a.check_bans(&bans, &request("/images/x"), None, ip, Scope::Url)
+                .await
+                .is_ok()
+        );
+        assert!(
+            a.check_bans(&bans, &other(), None, ip, Scope::Host)
+                .await
+                .is_ok()
+        );
+        for (request, scope) in [
+            (request("/login"), Scope::Url),
+            (request("/images/x"), Scope::Host),
+            (other(), Scope::Global),
+        ] {
+            assert_eq!(
+                a.check_bans(&bans, &request, None, ip, scope)
+                    .await
+                    .unwrap_err()
+                    .status,
+                503,
+                "{scope:?}"
+            );
+        }
+        assert!(
+            a.observe(&bans, &request("/images/x"), None, ip)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            a.observe(&bans, &request("/login"), None, ip)
+                .await
+                .err()
+                .unwrap()
+                .status,
+            503
+        );
+        assert_eq!(a.list(&bans, None, 10).await.unwrap_err().status, 503);
+        assert_eq!(a.clear_ip(&bans, ip).await.unwrap_err().status, 503);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    #[tokio::test]
     async fn stalled_backend_fails_closed_with_bounded_deadline_and_unmatched_urls_pass() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = Backend::from_url(
