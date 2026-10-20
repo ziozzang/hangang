@@ -4158,6 +4158,7 @@
             },
             "description": "Alternative case-insensitive Host patterns for a single route sharing its upstreams, policy, balancing and metrics. Matches when any alias matches. Supports the same label-local glob syntax as host; conflicts with host and host_regex. Duplicates are rejected case-insensitively. Omitted from serialized routes when empty. HTTP route priority and configuration order still decide between different routes."
           },
+          "error_pages": {"anyOf": [{"$ref": "#/components/schemas/ErrorPages"}, {"type": "null"}], "default": null, "description": "Route-specific bodies for gateway-generated 403/404/502/503/504 responses; override settings.error_pages status by status. Upstream responses are never rewritten."},
           "acme_http01": {
             "anyOf": [{"$ref": "#/components/schemas/AcmeHttp01"}, {"type": "null"}],
             "default": null,
@@ -6854,7 +6855,24 @@
             "maxLength": 256,
             "pattern": "^/",
             "description": "Unauthenticated readiness probe path on the public listener (overrides --health-path)."
-          }
+          },
+          "error_pages": {"anyOf": [{"$ref": "#/components/schemas/ErrorPages"}, {"type": "null"}], "default": null, "description": "Bodies for gateway-generated 403/404/502/503/504 responses on routes without their own page for that status."}
+        }
+      },
+      "ErrorPages": {
+        "type": "object",
+        "description": "Status code (403, 404, 502, 503 or 504) to the body Hangang sends instead of its plain-text message when it produces that error itself.",
+        "propertyNames": {"enum": ["403", "404", "502", "503", "504"]},
+        "additionalProperties": {"$ref": "#/components/schemas/ErrorPage"}
+      },
+      "ErrorPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content_type"],
+        "properties": {
+          "content_type": {"type": "string", "minLength": 1, "maxLength": 256, "example": "application/json"},
+          "body": {"type": "string", "maxLength": 65536, "description": "Inline body; exactly one of body and body_file."},
+          "body_file": {"type": "string", "pattern": "^[^/]", "description": "Relative file name inside the gateway's --error-pages-dir (HANGANG_ERROR_PAGES_DIR), read (regular file, at most 64 KiB) when the configuration is activated. Absolute paths, '..', and symbolic links leaving the directory are rejected; without --error-pages-dir only inline body is accepted."}
         }
       },
       "HashPasswordRequest": {

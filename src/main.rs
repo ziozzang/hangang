@@ -28,6 +28,10 @@ use tokio_util::sync::CancellationToken;
     after_help = "Source: https://github.com/ziozzang/hangang\nAuthor: Jioh Jung <jung@jioh.net>",
     group(clap::ArgGroup::new("update_source").args(["update_manifest", "update_github"])))]
 struct Args {
+    /// Only directory `body_file` error pages may be read from. Without it,
+    /// `body_file` is rejected and only inline `body` pages are accepted.
+    #[arg(long, env = "HANGANG_ERROR_PAGES_DIR")]
+    error_pages_dir: Option<std::path::PathBuf>,
     /// Opt-in hangang-guard origin (loopback HTTP or remote HTTPS).
     #[arg(long)]
     guard_url: Option<String>,
@@ -360,6 +364,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args = Args::parse();
+    if let Some(directory) = &args.error_pages_dir {
+        hangang::error_pages::set_pages_dir(directory)?;
+    }
     #[cfg(not(target_os = "linux"))]
     anyhow::ensure!(
         !args.supervised && !args.serve_child,
