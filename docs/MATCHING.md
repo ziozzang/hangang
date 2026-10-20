@@ -102,7 +102,7 @@ When Hangang itself answers 403, 404, 502, 503 or 504 (no matching route, backen
 {
   "settings": {
     "error_pages": {
-      "502": {"content_type": "text/html; charset=utf-8", "body_file": "/etc/hangang/pages/502.html"},
+      "502": {"content_type": "text/html; charset=utf-8", "body_file": "502.html"},
       "404": {"content_type": "text/html; charset=utf-8", "body": "<h1>Not found</h1>"}
     }
   },
@@ -113,8 +113,14 @@ When Hangang itself answers 403, 404, 502, 503 or 504 (no matching route, backen
 }
 ```
 
-Each page needs `content_type` and exactly one of `body` (inline) or `body_file` (absolute path on the gateway node). Bodies are limited to 64 KiB. Files are read and checked when the configuration is activated, not per request; a missing or oversized file rejects the configuration, and later edits to the file take effect at the next activation. Errors answered before routing by the management listener, TLS layer or connection admission are not covered.
+Each page needs `content_type` and exactly one of `body` (inline) or `body_file` (a file name relative to the gateway's error pages directory). Bodies are limited to 64 KiB. Files are read and checked when the configuration is activated, not per request; a missing or oversized file rejects the configuration, and later edits to the file take effect at the next activation.
+
+Security: `body_file` is served to anonymous visitors, so it is confined to one directory the operator chooses at startup with `--error-pages-dir` (or `HANGANG_ERROR_PAGES_DIR`). The shared configuration cannot change this directory. Without it, every `body_file` is rejected and only inline `body` works. The path must be relative and may not contain `..` or `.`; absolute paths are rejected when the configuration is loaded. When the file is read, the path is resolved with symbolic links followed and must stay inside the directory, the final component is opened without following links, and the opened file must be a regular file (not a directory, device or pipe) of at most 64 KiB. Keep only public pages in that directory and never point it at a directory holding keys or databases.
+
+Errors answered before routing by the management listener, TLS layer or connection admission are not covered.
 
 ### 한국어 요약
 
-Hangang이 직접 만드는 403·404·502·503·504 응답(맞는 라우트 없음, 백엔드 연결 실패, 정책 거부, 용량 초과, 시간 초과)의 본문을 바꿀 수 있습니다. `settings.error_pages`는 모든 라우트에, 라우트의 `error_pages`는 그 라우트에만 적용되며 상태 코드마다 라우트 쪽이 우선합니다. 업스트림(백엔드)이 보낸 응답은 바꾸지 않습니다. 각 페이지에는 `content_type`과 `body`(직접 쓴 본문) 또는 `body_file`(게이트웨이 노드의 절대 경로) 가운데 하나가 필요하고, 본문은 64 KiB까지입니다. 파일은 설정을 활성화할 때 한 번 읽어 검사하므로, 파일이 없거나 너무 크면 설정이 거부되고 파일을 고친 내용은 다음 활성화 때 반영됩니다.
+Hangang이 직접 만드는 403·404·502·503·504 응답(맞는 라우트 없음, 백엔드 연결 실패, 정책 거부, 용량 초과, 시간 초과)의 본문을 바꿀 수 있습니다. `settings.error_pages`는 모든 라우트에, 라우트의 `error_pages`는 그 라우트에만 적용되며 상태 코드마다 라우트 쪽이 우선합니다. 업스트림(백엔드)이 보낸 응답은 바꾸지 않습니다. 각 페이지에는 `content_type`과 `body`(직접 쓴 본문) 또는 `body_file`(오류 페이지 전용 폴더 안의 상대 파일 이름) 가운데 하나가 필요하고, 본문은 64 KiB까지입니다. 파일은 설정을 활성화할 때 한 번 읽어 검사하므로, 파일이 없거나 너무 크면 설정이 거부되고 파일을 고친 내용은 다음 활성화 때 반영됩니다.
+
+보안 제약: `body_file`의 내용은 인증 없는 방문자에게 그대로 나가므로, 운영자가 게이트웨이를 시작할 때 `--error-pages-dir`(또는 환경 변수 `HANGANG_ERROR_PAGES_DIR`)로 정한 폴더 하나 안의 파일만 읽습니다. 이 폴더는 공유 설정으로 바꿀 수 없습니다. 폴더를 정하지 않으면 `body_file`은 모두 거부되고 직접 쓴 `body`만 쓸 수 있습니다. 경로는 상대 경로여야 하고 `..`나 `.`을 쓸 수 없으며, 절대 경로는 설정을 불러올 때 거부됩니다. 파일을 읽을 때는 심볼릭 링크를 따라간 실제 위치가 그 폴더 안이어야 하고, 마지막 이름은 링크를 따라가지 않고 열며, 연 파일은 64 KiB 이하의 일반 파일이어야 합니다(폴더·장치·파이프 거부). 이 폴더에는 공개해도 되는 페이지만 두고, 키나 데이터베이스가 있는 폴더를 지정하지 마십시오.

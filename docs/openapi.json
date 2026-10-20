@@ -6872,7 +6872,7 @@
         "properties": {
           "content_type": {"type": "string", "minLength": 1, "maxLength": 256, "example": "application/json"},
           "body": {"type": "string", "maxLength": 65536, "description": "Inline body; exactly one of body and body_file."},
-          "body_file": {"type": "string", "pattern": "^/", "description": "Absolute path on the gateway node, read (at most 64 KiB) when the configuration is activated."}
+          "body_file": {"type": "string", "pattern": "^[^/]", "description": "Relative file name inside the gateway's --error-pages-dir (HANGANG_ERROR_PAGES_DIR), read (regular file, at most 64 KiB) when the configuration is activated. Absolute paths, '..', and symbolic links leaving the directory are rejected; without --error-pages-dir only inline body is accepted."}
         }
       },
       "HashPasswordRequest": {
