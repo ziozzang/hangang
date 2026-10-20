@@ -1441,7 +1441,6 @@ async fn frontend(proxy: Proxy) -> (SocketAddr, JoinHandle<()>, Arc<Metrics>) {
 
 fn route(backends: Vec<String>) -> HttpRoute {
     HttpRoute {
-        error_pages: None,
         listener_ids: Vec::new(),
         access_mode: Default::default(),
         resource_policy: None,
@@ -5236,7 +5235,6 @@ async fn request_transform_cannot_overwrite_basic_identity_at_runtime() {
     })
     .unwrap();
     let runtime = hangang::config::HttpRuntime {
-        error_pages: None,
         language_policy: None,
         country_policy: None,
         auth_reserved: Vec::new(),
@@ -7916,121 +7914,4 @@ async fn sacho_security_real_tls_h2_authority_and_forwarding_error_policy_are_un
     task.abort();
     origin_task.abort();
     policy.shutdown().await;
-}
-
-#[tokio::test]
-async fn gateway_error_pages_replace_only_gateway_generated_bodies() {
-    // A live backend whose own 503 must pass through unchanged.
-    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_address = upstream.local_addr().unwrap();
-    let upstream_task = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = upstream.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let service = service_fn(|_request: Request<Incoming>| async {
-                    Ok::<_, std::convert::Infallible>(
-                        Response::builder()
-                            .status(503)
-                            .body(Full::new(Bytes::from_static(b"upstream says no")))
-                            .unwrap(),
-                    )
-                });
-                let _ = http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await;
-            });
-        }
-    });
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_address = dead.local_addr().unwrap();
-    drop(dead);
-
-    let page = |content_type: &str, body: &str| hangang::error_pages::ErrorPage {
-        content_type: content_type.into(),
-        body: Some(body.into()),
-        body_file: None,
-    };
-    let mut api = route(vec![format!("http://{dead_address}")]);
-    api.id = "api".into();
-    api.path_prefix = Some("/api".into());
-    api.error_pages = Some(
-        [(502, page("application/json", r#"{"error":"bad_gateway"}"#))]
-            .into_iter()
-            .collect(),
-    );
-    let mut web = route(vec![format!("http://{dead_address}")]);
-    web.id = "web".into();
-    web.path_prefix = Some("/web".into());
-    let mut live = route(vec![format!("http://{upstream_address}")]);
-    live.id = "live".into();
-    live.path_prefix = Some("/live".into());
-    let settings = hangang::config::Settings {
-        error_pages: Some(
-            [
-                (502, page("text/html; charset=utf-8", "<h1>Down</h1>")),
-                (503, page("text/html; charset=utf-8", "<h1>Busy</h1>")),
-                (404, page("text/html; charset=utf-8", "<h1>Missing</h1>")),
-            ]
-            .into_iter()
-            .collect(),
-        ),
-        ..Default::default()
-    };
-    let active = Arc::new(ArcSwap::from_pointee(
-        Snapshot::new(Config {
-            revision: 1,
-            http: vec![api, web, live],
-            settings,
-            ..Config::default()
-        })
-        .unwrap(),
-    ));
-    let policy = Arc::new(PolicyPool::new(env!("CARGO_BIN_EXE_hangang").into(), 1));
-    let proxy = Proxy::new(active, policy, Arc::new(Metrics::default()));
-    let (front, front_task, _) = frontend(proxy).await;
-
-    let fetch = |path: &'static str| {
-        let uri = format!("http://{front}{path}");
-        async move {
-            let response = client()
-                .request(
-                    Request::builder()
-                        .uri(uri)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .map(|value| value.to_str().unwrap().to_owned());
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            (status, content_type, body)
-        }
-    };
-    // Route page wins over the global page for its status.
-    let (status, content_type, body) = fetch("/api/x").await;
-    assert_eq!(status, 502);
-    assert_eq!(content_type.as_deref(), Some("application/json"));
-    assert_eq!(body, Bytes::from_static(br#"{"error":"bad_gateway"}"#));
-    // A route without its own page uses the global page.
-    let (status, content_type, body) = fetch("/web/x").await;
-    assert_eq!(status, 502);
-    assert_eq!(content_type.as_deref(), Some("text/html; charset=utf-8"));
-    assert_eq!(body, Bytes::from_static(b"<h1>Down</h1>"));
-    // No route matched: the global 404 page.
-    let (status, _, body) = fetch("/elsewhere").await;
-    assert_eq!(status, 404);
-    assert_eq!(body, Bytes::from_static(b"<h1>Missing</h1>"));
-    // An upstream's own error response is never rewritten.
-    let (status, _, body) = fetch("/live/x").await;
-    assert_eq!(status, 503);
-    assert_eq!(body, Bytes::from_static(b"upstream says no"));
-
-    front_task.abort();
-    upstream_task.abort();
 }

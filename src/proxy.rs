@@ -1323,38 +1323,9 @@ impl Proxy {
                 explicit_port: None,
             });
         }
-        let route_pages = crate::error_pages::RouteSlot::default();
-        let mut request = request;
-        request.extensions_mut().insert(route_pages.clone());
         let mut response = self
             .handle_unfinalized(request, peer, snapshot.clone(), context.clone())
             .await?;
-        if response
-            .extensions_mut()
-            .remove::<crate::error_pages::GatewayGenerated>()
-            .is_some()
-        {
-            let status = response.status().as_u16();
-            let page = route_pages
-                .0
-                .get()
-                .and_then(|pages| pages.page(status))
-                .or_else(|| {
-                    snapshot
-                        .settings
-                        .error_pages
-                        .as_ref()
-                        .and_then(|pages| pages.page(status))
-                })
-                .cloned();
-            if let Some((content_type, body)) = page {
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_TYPE, content_type);
-                response.headers_mut().remove(header::CONTENT_LENGTH);
-                *response.body_mut() = full_body(body);
-            }
-        }
         if response
             .extensions_mut()
             .remove::<ResponseSecurityFinalized>()
@@ -2119,11 +2090,6 @@ impl Proxy {
                 "no matching route",
             ));
         };
-        if let Some(pages) = &runtime.error_pages
-            && let Some(slot) = request.extensions().get::<crate::error_pages::RouteSlot>()
-        {
-            let _ = slot.0.set(pages.clone());
-        }
         if let Some(context) = traffic.as_mut() {
             context.route_id = Some(runtime.route.id.clone());
         }
@@ -5107,7 +5073,6 @@ pub fn response(status: u16, text: &str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .extension(crate::error_pages::GatewayGenerated)
         .body(full_body(Bytes::copy_from_slice(text.as_bytes())))
         .expect("static response is valid")
 }
@@ -5818,7 +5783,6 @@ mod tests {
 
     fn route() -> HttpRoute {
         HttpRoute {
-            error_pages: None,
             listener_ids: Vec::new(),
             access_mode: Default::default(),
             resource_policy: None,

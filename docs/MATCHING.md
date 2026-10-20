@@ -93,28 +93,3 @@ The management route editor exposes priority, HTTP glob/regex fields and SNI JSO
 An exact-host or domain-group HTTP route may configure `canonical_domain` to redirect selected GET/HEAD paths to one exact member. The target scheme, host and status are configured; the request Host is never reflected. Segment-boundary include prefixes select paths, exclusions win, and the original path and query are preserved. See [Canonical domain redirects](CANONICAL_DOMAINS.md).
 
 This policy does not make combining existing routes behavior-neutral. A merged route also shares Host-forwarding, upstream, authentication, transforms, limits and every other route setting. In particular, changing `preserve_host` or `upstream_host` can change whether an incoming explicit port reaches the application. Qualify those cases before consolidating routes.
-
-## Gateway error pages
-
-When Hangang itself answers 403, 404, 502, 503 or 504 (no matching route, backend unreachable, policy refusal, capacity, timeout), it normally sends a short plain-text message. `settings.error_pages` replaces that body for every route, and a route's own `error_pages` replaces it for that route, status by status (a route page wins; otherwise the global page; otherwise the plain text). Responses produced by an upstream are never rewritten, and the status code and other headers are kept.
-
-```json
-{
-  "settings": {
-    "error_pages": {
-      "502": {"content_type": "text/html; charset=utf-8", "body_file": "/etc/hangang/pages/502.html"},
-      "404": {"content_type": "text/html; charset=utf-8", "body": "<h1>Not found</h1>"}
-    }
-  },
-  "http": [{
-    "id": "api", "path_prefix": "/api", "backends": ["http://127.0.0.1:8080"],
-    "error_pages": {"502": {"content_type": "application/json", "body": "{\"error\":\"bad_gateway\"}"}}
-  }]
-}
-```
-
-Each page needs `content_type` and exactly one of `body` (inline) or `body_file` (absolute path on the gateway node). Bodies are limited to 64 KiB. Files are read and checked when the configuration is activated, not per request; a missing or oversized file rejects the configuration, and later edits to the file take effect at the next activation. Errors answered before routing by the management listener, TLS layer or connection admission are not covered.
-
-### 한국어 요약
-
-Hangang이 직접 만드는 403·404·502·503·504 응답(맞는 라우트 없음, 백엔드 연결 실패, 정책 거부, 용량 초과, 시간 초과)의 본문을 바꿀 수 있습니다. `settings.error_pages`는 모든 라우트에, 라우트의 `error_pages`는 그 라우트에만 적용되며 상태 코드마다 라우트 쪽이 우선합니다. 업스트림(백엔드)이 보낸 응답은 바꾸지 않습니다. 각 페이지에는 `content_type`과 `body`(직접 쓴 본문) 또는 `body_file`(게이트웨이 노드의 절대 경로) 가운데 하나가 필요하고, 본문은 64 KiB까지입니다. 파일은 설정을 활성화할 때 한 번 읽어 검사하므로, 파일이 없거나 너무 크면 설정이 거부되고 파일을 고친 내용은 다음 활성화 때 반영됩니다.
