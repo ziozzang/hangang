@@ -47,7 +47,7 @@ See [configuration publication](docs/CONFIG_PUBLICATION.md), [upgrade and recove
 
 ## Enterprise controls, integrated
 
-**Our goal is to surpass the operational experience of commercial enterprise gateways by making advanced controls coherent, inspectable, and practical to run.** Hangang brings capabilities commonly expected from enterprise gateways into its MIT-licensed codebase. Today, its clearest advantage is their integration: routing, policy editing, traffic views, and management APIs share one application and configuration model.
+**Our goal is to surpass the operational experience of commercial enterprise gateways by making advanced controls coherent, inspectable, and practical to run.** Hangang brings capabilities commonly expected from enterprise gateways into its AGPL-3.0-only codebase. Today, its clearest advantage is their integration: routing, policy editing, traffic views, and management APIs share one application and configuration model.
 
 | Operational requirement | Implemented in Hangang | Scope to understand |
 | --- | --- | --- |
@@ -176,7 +176,7 @@ make test-web    # Console and browser tests
 make check-docs  # Staged documentation and publication checks
 ```
 
-Some integration targets need Docker or additional dependencies. See [development](docs/DEVELOPMENT.md) and [documentation conventions](docs/DOCUMENTATION.md). Hangang is licensed under [MIT](LICENSE).
+Some integration targets need Docker or additional dependencies. See [development](docs/DEVELOPMENT.md) and [documentation conventions](docs/DOCUMENTATION.md). The source license is described in [License](#license).
 
 Trusted Guard/Hopae menus and native Hopae transport: [console integration](docs/CONSOLE_PLUGINS.md).
 
@@ -237,3 +237,10 @@ replay consumption remain separate work.
 The [candidate release contract](docs/VERSION_0_3_11.md) describes context-aware
 Pumgye policy administration, unchanged native/runtime boundaries and required
 artifact/API-server/adoption gates. This is preparation, not an operating rollout.
+
+## License
+
+The source code is licensed under the GNU Affero General Public License, version 3 only (SPDX: `AGPL-3.0-only`). See [LICENSE](LICENSE). Releases tagged before this change keep the license they were published under.
+
+- **Other license terms:** if you need the source under a different license, email the copyright holder (Jioh Jung) and ask. An approved exception applies only to the person or organisation that requested it.
+- **Official binaries:** official release binaries can be used without restriction, separately from the source license.
