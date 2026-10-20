@@ -26,6 +26,28 @@ To change the Lua editor bundle, run `npm run build:lua-editor` inside `web/`
 and commit the generated assets with the source change. The rest of the console
 is served from checked-in assets embedded by the Rust build.
 
+## Updating the runtime pin
+
+Hangang compiles [hangang-runtime](https://github.com/ziozzang/hangang-runtime)
+in statically and pins it by Git revision in `Cargo.toml`. The runtime README
+requires every consumer to be rebuilt and requalified after an update, so change
+the pin only in its own commit and follow these steps:
+
+1. Read the runtime `CHANGELOG.md` between the old and new revisions and note
+   any behaviour that Hangang relies on.
+2. Replace the `rev = "..."` value of `hangang-runtime` in `Cargo.toml` with the
+   full 40-character commit id.
+3. Update only that package in the lockfile and confirm nothing else moved:
+
+   ```sh
+   cargo update -p hangang-runtime
+   git diff --stat Cargo.lock
+   ```
+
+4. Run `make check` and `make test` (and the full Rust checks listed above).
+5. In the commit message and the Hangang `CHANGELOG.md`, give the old and new
+   revisions and link the runtime `CHANGELOG.md` entries that the update brings in.
+
 ## Documentation
 
 Follow the [documentation conventions](DOCUMENTATION.md) and [terminology](GLOSSARY.md).

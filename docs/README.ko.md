@@ -14,7 +14,7 @@
 - [문서 작성 규칙 · 영문](DOCUMENTATION.md) — 문서 구성 방식
 - [용어집 · 영문](GLOSSARY.md) — 공통 용어
 - [아키텍처 · 영문](ARCHITECTURE.md) — 시스템 구조와 요청 흐름
-- [개발 · 영문](DEVELOPMENT.md) — 개발과 테스트 절차
+- [개발 · 영문](DEVELOPMENT.md) — 개발과 테스트 절차. 런타임 핀 갱신: `Cargo.toml`의 hangang-runtime `rev`를 40자 커밋 id로 교체 → `cargo update -p hangang-runtime`(다른 패키지가 바뀌지 않았는지 `Cargo.lock` 확인) → `make check`·`make test` → 커밋 메시지와 CHANGELOG에 이전·새 리비전과 런타임 CHANGELOG 항목 링크
 - [단일 노드 배포 · 영문](DEPLOYMENT.md) — Docker Compose 배포
 - [OpenAPI 명세](openapi.json) — 관리 API와 설정 스키마
 
