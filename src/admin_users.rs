@@ -24,7 +24,20 @@ use tokio::sync::Semaphore;
 const MAX_USERS: i64 = 256;
 const MAX_SESSIONS: i64 = 4096;
 const MAX_SESSIONS_PER_USER: i64 = 16;
-const SESSION_SECONDS: i64 = 8 * 60 * 60;
+/// Default absolute session lifetime (`--admin-session-seconds`).
+pub const DEFAULT_SESSION_SECONDS: i64 = 8 * 60 * 60;
+/// Default idle session lifetime (`--admin-session-idle-seconds`).
+pub const DEFAULT_SESSION_IDLE_SECONDS: i64 = 30 * 60;
+#[cfg(test)]
+const SESSION_SECONDS: i64 = DEFAULT_SESSION_SECONDS;
+/// Shortest idle window; sessions created with less (broker leases) do not slide.
+const MIN_SLIDING_WINDOW: i64 = 60;
+/// Failed logins per account and client address before delays start.
+const LOGIN_FREE_FAILURES: u32 = 5;
+/// Longest delay imposed between failed login attempts.
+const LOGIN_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Remembered (account, address) pairs; the oldest is forgotten when full.
+const LOGIN_THROTTLE_CAPACITY: usize = 4096;
 const MAX_SAFE_ID: i64 = 9_007_199_254_740_991;
 pub const AUDIT_CAPACITY: i64 = 100_000;
 pub const CONFIG_OPERATION_CAPACITY: i64 = 10_000;
@@ -63,8 +76,99 @@ pub struct User {
 #[derive(Debug)]
 pub struct Login {
     pub token: String,
+    /// Absolute lifetime: the session ends this long after login however
+    /// active it is.
     pub expires_in_seconds: i64,
+    /// The session also ends after this long without a request.
+    pub idle_timeout_seconds: i64,
     pub user: User,
+}
+
+/// A login refused without checking the password because the account and
+/// client address have failed too often recently.
+#[derive(Debug)]
+pub struct LoginThrottled {
+    pub retry_after: Duration,
+}
+impl std::fmt::Display for LoginThrottled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too many failed logins; retry after {} s",
+            self.retry_after.as_secs().max(1)
+        )
+    }
+}
+impl std::error::Error for LoginThrottled {}
+
+struct ThrottleEntry {
+    failures: u32,
+    blocked_until: std::time::Instant,
+    last_failure: std::time::Instant,
+}
+
+/// Per (account, client address) failed-login bookkeeping, held in memory
+/// with a fixed capacity. It slows guessing; it never delays a login whose
+/// key has no recent failures.
+#[derive(Default)]
+struct LoginThrottle {
+    entries: std::collections::HashMap<(String, Option<std::net::IpAddr>), ThrottleEntry>,
+}
+impl LoginThrottle {
+    fn key(username: &str, peer: Option<std::net::IpAddr>) -> (String, Option<std::net::IpAddr>) {
+        (
+            username.to_ascii_lowercase(),
+            peer.map(|ip| ip.to_canonical()),
+        )
+    }
+    fn retry_after(
+        &self,
+        username: &str,
+        peer: Option<std::net::IpAddr>,
+        now: std::time::Instant,
+    ) -> Option<Duration> {
+        let entry = self.entries.get(&Self::key(username, peer))?;
+        (entry.blocked_until > now).then(|| entry.blocked_until - now)
+    }
+    /// Record a failure; returns the delay now imposed, if any.
+    fn failed(
+        &mut self,
+        username: &str,
+        peer: Option<std::net::IpAddr>,
+        now: std::time::Instant,
+    ) -> Option<Duration> {
+        let key = Self::key(username, peer);
+        if !self.entries.contains_key(&key) && self.entries.len() >= LOGIN_THROTTLE_CAPACITY {
+            // Forget expired entries first, then the least recently failed.
+            self.entries.retain(|_, entry| entry.blocked_until > now);
+            if self.entries.len() >= LOGIN_THROTTLE_CAPACITY
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_failure)
+                    .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        let entry = self.entries.entry(key).or_insert(ThrottleEntry {
+            failures: 0,
+            blocked_until: now,
+            last_failure: now,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_failure = now;
+        if entry.failures < LOGIN_FREE_FAILURES {
+            return None;
+        }
+        let exponent = (entry.failures - LOGIN_FREE_FAILURES).min(5);
+        let delay = Duration::from_secs(1u64 << exponent).min(LOGIN_MAX_DELAY);
+        entry.blocked_until = now + delay;
+        Some(delay)
+    }
+    fn succeeded(&mut self, username: &str, peer: Option<std::net::IpAddr>) {
+        self.entries.remove(&Self::key(username, peer));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,6 +625,9 @@ pub struct Store {
     path: PathBuf,
     password_workers: Arc<Semaphore>,
     login_workers: Arc<Semaphore>,
+    session_seconds: i64,
+    session_idle_seconds: i64,
+    login_throttle: Arc<std::sync::Mutex<LoginThrottle>>,
 }
 
 impl Store {
@@ -812,7 +919,27 @@ impl Store {
             path,
             password_workers: Arc::new(Semaphore::new(2)),
             login_workers: Arc::new(Semaphore::new(2)),
+            session_seconds: DEFAULT_SESSION_SECONDS,
+            session_idle_seconds: DEFAULT_SESSION_IDLE_SECONDS,
+            login_throttle: Arc::default(),
         })
+    }
+
+    /// Set the absolute and idle session lifetimes in seconds. A session
+    /// ends at the earlier of `absolute` after login and `idle` after its
+    /// last authenticated request.
+    pub fn with_session_lifetime(mut self, absolute: i64, idle: i64) -> Result<Self> {
+        ensure!(
+            (MIN_SLIDING_WINDOW..=7 * 24 * 60 * 60).contains(&absolute),
+            "admin session lifetime must be 60..604800 seconds"
+        );
+        ensure!(
+            (MIN_SLIDING_WINDOW..=absolute).contains(&idle),
+            "admin session idle lifetime must be 60 seconds up to the absolute lifetime"
+        );
+        self.session_seconds = absolute;
+        self.session_idle_seconds = idle;
+        Ok(self)
     }
 
     pub async fn setup_required(&self) -> Result<bool> {
@@ -858,6 +985,43 @@ impl Store {
     }
 
     pub async fn login(&self, username: String, password: String) -> Result<Option<Login>> {
+        self.login_from(username, password, None).await
+    }
+
+    /// Log in, slowing repeated failures for this account and client
+    /// address. Failures and throttled attempts are logged on the
+    /// `hangang::admin_audit` target without the password.
+    pub async fn login_from(
+        &self,
+        username: String,
+        password: String,
+        peer: Option<std::net::IpAddr>,
+    ) -> Result<Option<Login>> {
+        let throttle = self.login_throttle.clone();
+        let wait = throttle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("login throttle poisoned"))?
+            .retry_after(&username, peer, std::time::Instant::now());
+        if let Some(retry_after) = wait {
+            tracing::warn!(target: "hangang::admin_audit", event = "login_throttled", username = %username, peer = ?peer, retry_after_seconds = retry_after.as_secs().max(1), "administrator login throttled");
+            return Err(LoginThrottled { retry_after }.into());
+        }
+        let outcome = self.login_checked(username.clone(), password).await;
+        let mut throttle = throttle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("login throttle poisoned"))?;
+        match &outcome {
+            Ok(Some(_)) => throttle.succeeded(&username, peer),
+            Ok(None) => {
+                let delay = throttle.failed(&username, peer, std::time::Instant::now());
+                tracing::warn!(target: "hangang::admin_audit", event = "login_failed", username = %username, peer = ?peer, delay_seconds = delay.map_or(0, |d| d.as_secs()), "administrator login failed");
+            }
+            Err(_) => {}
+        }
+        outcome
+    }
+
+    async fn login_checked(&self, username: String, password: String) -> Result<Option<Login>> {
         // Identical Argon2 work for an unknown username. Keep unauthenticated
         // password checks separate from the bounded management pool so a
         // login flood cannot prevent an administrator resetting a password.
@@ -867,6 +1031,7 @@ impl Store {
             .try_acquire_owned()
             .context("password capacity exhausted")?;
         let path = self.path.clone();
+        let (absolute, idle) = (self.session_seconds, self.session_idle_seconds);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut connection = connection(&path)?;
@@ -899,9 +1064,9 @@ impl Store {
                 let removed = transaction.execute("DELETE FROM sessions WHERE token_hash IN (SELECT token_hash FROM sessions WHERE user_id=?1 ORDER BY created_at,token_hash LIMIT 1)",params![user.id])?;
                 if removed == 0 { return Ok(None); }
             }
-            transaction.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![token_hash.as_slice(),user.id,now+SESSION_SECONDS,now])?;
+            transaction.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![token_hash.as_slice(),user.id,now+idle.min(absolute),now])?;
             transaction.commit()?;
-            Ok(Some(Login {token,expires_in_seconds:SESSION_SECONDS,user}))
+            Ok(Some(Login {token,expires_in_seconds:absolute,idle_timeout_seconds:idle,user}))
         }).await?
     }
 
@@ -924,7 +1089,7 @@ impl Store {
             let hash:[u8;32]=Sha256::digest(token.as_bytes()).into();
             tx.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?1,?2,?3,?4)",params![hash.as_slice(),user.id,now+5,now])?;
             tx.commit()?;
-            Ok(Some(Login {token,user,expires_in_seconds:5}))
+            Ok(Some(Login {token,user,expires_in_seconds:5,idle_timeout_seconds:5}))
         }).await?
     }
 
@@ -934,14 +1099,30 @@ impl Store {
         }
         let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let path = self.path.clone();
+        let (absolute, idle) = (self.session_seconds, self.session_idle_seconds);
         tokio::task::spawn_blocking(move || {
             let connection=connection(&path)?;
-            let user=connection.query_row(
-                "SELECT users.id,users.username,users.role,users.enabled FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=?1 AND sessions.expires_at>?2 AND users.enabled=1",
-                params![hash.as_slice(),now()?],
-                |row|Ok(User{id:row.get(0)?,username:row.get(1)?,role:Role::parse(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,enabled:row.get::<_,i64>(3)?==1}),
+            let now=now()?;
+            let found=connection.query_row(
+                "SELECT users.id,users.username,users.role,users.enabled,sessions.expires_at,sessions.created_at FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=?1 AND sessions.expires_at>?2 AND sessions.created_at>?3 AND users.enabled=1",
+                params![hash.as_slice(),now,now.saturating_sub(absolute)],
+                |row|Ok((User{id:row.get(0)?,username:row.get(1)?,role:Role::parse(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,enabled:row.get::<_,i64>(3)?==1},row.get::<_,i64>(4)?,row.get::<_,i64>(5)?)),
             ).optional()?;
-            Ok(user)
+            let Some((user,expires_at,created_at))=found else { return Ok(None) };
+            // Slide the idle deadline, capped by the absolute lifetime. The
+            // stored deadline has one-second resolution, so a busy session
+            // writes at most once per second.
+            let next=now.saturating_add(idle).min(created_at.saturating_add(absolute));
+            // Short broker leases (`sso_lease`, 5 s) never slide: only a
+            // session created with at least the minimum idle window (60 s)
+            // is an interactive login.
+            if next>expires_at && expires_at.saturating_sub(created_at)>=MIN_SLIDING_WINDOW {
+                connection.execute(
+                    "UPDATE sessions SET expires_at=?1 WHERE token_hash=?2 AND expires_at<?1",
+                    params![next,hash.as_slice()],
+                )?;
+            }
+            Ok(Some(user))
         }).await?
     }
 
@@ -5682,5 +5863,222 @@ mod tests {
         assert_eq!(creates[0].actor_kind, AuditActorKind::Account);
         assert_eq!(creates[0].actor_user_id, Some(root.id));
         assert_eq!(creates[0].target_user_id, Some(second.id));
+    }
+    fn session_row(store: &Store, token: &str) -> Option<(i64, i64)> {
+        let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        connection(&store.path)
+            .unwrap()
+            .query_row(
+                "SELECT expires_at,created_at FROM sessions WHERE token_hash=?1",
+                params![hash.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn set_session(store: &Store, token: &str, expires_at: i64, created_at: i64) {
+        let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        connection(&store.path)
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET expires_at=?1,created_at=?2 WHERE token_hash=?3",
+                params![expires_at, created_at, hash.as_slice()],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sessions_have_idle_and_absolute_lifetimes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(directory.path().join("accounts.sqlite3"))
+            .unwrap()
+            .with_session_lifetime(3600, 120)
+            .unwrap();
+        assert!(
+            Store::open(directory.path().join("x.sqlite3"))
+                .unwrap()
+                .with_session_lifetime(3600, 7200)
+                .is_err()
+        );
+        store
+            .bootstrap("root".into(), "strong root password".into())
+            .await
+            .unwrap();
+        let login = store
+            .login("root".into(), "strong root password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(login.expires_in_seconds, 3600);
+        assert_eq!(login.idle_timeout_seconds, 120);
+        let (expires_at, created_at) = session_row(&store, &login.token).unwrap();
+        assert_eq!(
+            expires_at - created_at,
+            120,
+            "first deadline is the idle one"
+        );
+
+        // Use slides the idle deadline forward.
+        let now = now().unwrap();
+        set_session(&store, &login.token, now + 5, now - 100);
+        assert!(store.session(login.token.clone()).await.unwrap().is_some());
+        let (expires_at, _) = session_row(&store, &login.token).unwrap();
+        assert!(expires_at >= now + 120, "idle deadline was not extended");
+
+        // ...but never past the absolute lifetime.
+        set_session(&store, &login.token, now + 5, now - 3590);
+        assert!(store.session(login.token.clone()).await.unwrap().is_some());
+        let (expires_at, created_at) = session_row(&store, &login.token).unwrap();
+        assert_eq!(expires_at, created_at + 3600);
+
+        // A five-second broker lease is never extended by use.
+        let lease = store.sso_lease("root".into()).await.unwrap().unwrap();
+        assert!(store.session(lease.token.clone()).await.unwrap().is_some());
+        let (expires_at, created_at) = session_row(&store, &lease.token).unwrap();
+        assert_eq!(expires_at - created_at, 5);
+
+        // Idle too long: rejected.
+        set_session(&store, &login.token, now - 1, now - 200);
+        assert!(store.session(login.token.clone()).await.unwrap().is_none());
+
+        // Absolute lifetime over even with a fresh idle deadline: rejected.
+        let second = store
+            .login("root".into(), "strong root password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        set_session(&store, &second.token, now + 60, now - 3601);
+        assert!(store.session(second.token.clone()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabling_an_account_revokes_its_sessions_at_once() {
+        let (_directory, store) = store();
+        let root = store
+            .bootstrap("root".into(), "strong root password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let viewer = store
+            .create(
+                MutationAuthority::System,
+                "viewer".into(),
+                "viewer secure password".into(),
+                Role::Viewer,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let login = store
+            .login("viewer".into(), "viewer secure password".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.session(login.token.clone()).await.unwrap().is_some());
+        store
+            .update(
+                MutationAuthority::System,
+                viewer.id,
+                None,
+                Some(false),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(session_row(&store, &login.token).is_none());
+        assert!(store.session(login.token.clone()).await.unwrap().is_none());
+        let _ = root;
+    }
+
+    #[test]
+    fn login_throttle_delays_after_five_failures_and_caps_at_thirty_seconds() {
+        let mut throttle = LoginThrottle::default();
+        let ip = Some("192.0.2.7".parse().unwrap());
+        let start = std::time::Instant::now();
+        for _ in 0..4 {
+            assert_eq!(throttle.failed("Root", ip, start), None);
+        }
+        assert_eq!(throttle.retry_after("root", ip, start), None);
+        assert_eq!(
+            throttle.failed("root", ip, start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            throttle.retry_after("ROOT", ip, start),
+            Some(Duration::from_secs(1))
+        );
+        // Another address and another account are unaffected.
+        assert_eq!(
+            throttle.retry_after("root", Some("192.0.2.8".parse().unwrap()), start),
+            None
+        );
+        assert_eq!(throttle.retry_after("other", ip, start), None);
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            delays.push(throttle.failed("root", ip, start).unwrap().as_secs());
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 30, 30, 30]);
+        // The wait ends.
+        assert_eq!(
+            throttle.retry_after("root", ip, start + Duration::from_secs(31)),
+            None
+        );
+        throttle.succeeded("root", ip);
+        assert!(throttle.entries.is_empty());
+    }
+
+    #[test]
+    fn login_throttle_memory_is_bounded() {
+        let mut throttle = LoginThrottle::default();
+        let now = std::time::Instant::now();
+        for index in 0..(LOGIN_THROTTLE_CAPACITY + 100) {
+            let ip = std::net::IpAddr::from(std::net::Ipv4Addr::from(index as u32));
+            throttle.failed("root", Some(ip), now);
+        }
+        assert!(throttle.entries.len() <= LOGIN_THROTTLE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn throttled_login_is_refused_without_checking_and_success_resets() {
+        let (_directory, store) = store();
+        store
+            .bootstrap("root".into(), "strong root password".into())
+            .await
+            .unwrap();
+        let ip = Some("198.51.100.1".parse().unwrap());
+        for _ in 0..5 {
+            assert!(
+                store
+                    .login_from("root".into(), "wrong password!".into(), ip)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Even the right password waits while throttled.
+        let error = store
+            .login_from("root".into(), "strong root password".into(), ip)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<LoginThrottled>().is_some());
+        // A different address logs in without delay.
+        assert!(
+            store
+                .login_from("root".into(), "strong root password".into(), None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            store
+                .login_from("root".into(), "strong root password".into(), ip)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.login_throttle.lock().unwrap().entries.is_empty());
     }
 }

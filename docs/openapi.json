@@ -1680,6 +1680,11 @@
           },
           "422": {
             "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "description": "Too many recent failed logins for this account from this client address; retry after the Retry-After seconds. The password is not checked.",
+            "headers": { "Retry-After": { "schema": { "type": "integer", "minimum": 1 } } },
+            "content": { "application/problem+json": { "schema": { "$ref": "#/components/schemas/Problem" } } }
           }
         }
       }
@@ -7532,6 +7537,7 @@
         "required": [
           "token",
           "expires_in_seconds",
+          "idle_timeout_seconds",
           "user"
         ],
         "properties": {
@@ -7541,7 +7547,13 @@
           },
           "expires_in_seconds": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 1,
+            "description": "Absolute session lifetime (--admin-session-seconds)."
+          },
+          "idle_timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The session ends after this long without a request (--admin-session-idle-seconds)."
           },
           "user": {
             "$ref": "#/components/schemas/AdminUser"

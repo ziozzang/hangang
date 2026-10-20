@@ -14,6 +14,7 @@ remain exactly as defined in the [OpenAPI specification](openapi.json).
 | Management console | 관리 화면 | The embedded browser interface at `/ui/`. |
 | Management API | 관리 API | The administrator-facing HTTP API; code and flags may use `admin`. |
 | Route | 라우트 | A configured match and forwarding policy for HTTP or TCP traffic. |
+| Forwarded host | 전달 호스트 | The public host name Hangang uses for host-scoped security rules: `X-Forwarded-Host` from a trusted proxy, otherwise `Host`. Trusted proxies must overwrite `X-Forwarded-Host`; see [URL security controls](PATH_BLOCKS.md). |
 | Backend | 백엔드 | A configured destination service or address. |
 | Upstream connection | 업스트림 연결 | The gateway's outbound connection to a backend, including DNS, proxy, and TLS policy. |
 | Member | 멤버 | A named backend entry with identity, health, and lifecycle state. |

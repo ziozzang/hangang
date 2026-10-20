@@ -182,4 +182,82 @@ mod tests {
             .unwrap();
         assert_eq!(check(&rules, &request, Some("app.example:443")), Err(404));
     }
+    /// Pins which host names a host-scoped rule sees. The proxy passes the
+    /// trusted proxy's X-Forwarded-Host (or Host for untrusted peers) as
+    /// `forwarded_host`; a rule applies when the Host header, that value or
+    /// the absolute-URI authority matches. Spoofing one name therefore cannot
+    /// remove a rule that another name still selects, but when a fronting
+    /// proxy rewrites Host and forwards the client's own X-Forwarded-Host,
+    /// the client chooses the only public name the gateway sees.
+    #[test]
+    fn host_scoped_rules_see_host_forwarded_host_and_absolute_authority() {
+        let rules = vec![Rule {
+            path: "/admin".into(),
+            hosts: vec!["admin.example".into()],
+        }];
+        let request = |host: &str, uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .header("host", host)
+                .body(())
+                .unwrap()
+        };
+        // Host matches; a different forwarded name does not lift the block.
+        assert_eq!(
+            check(
+                &rules,
+                &request("admin.example", "/admin"),
+                Some("other.example")
+            ),
+            Err(404)
+        );
+        // Internal Host, public name only in the trusted X-Forwarded-Host.
+        assert_eq!(
+            check(
+                &rules,
+                &request("backend.internal", "/admin"),
+                Some("admin.example")
+            ),
+            Err(404)
+        );
+        // Absolute-form request target authority also participates.
+        assert_eq!(
+            check(
+                &rules,
+                &request("backend.internal", "http://admin.example/admin"),
+                None
+            ),
+            Err(404)
+        );
+        // The documented hazard: a proxy that rewrites Host and passes the
+        // client's forged X-Forwarded-Host leaves no name that matches.
+        assert_eq!(
+            check(
+                &rules,
+                &request("backend.internal", "/admin"),
+                Some("forged.example")
+            ),
+            Ok(())
+        );
+        // Selectors used by allowlists, CSRF and rate limits behave the same.
+        assert!(scope_host_matches(
+            &rules[0],
+            &request("backend.internal", "/admin"),
+            Some("admin.example:443")
+        ));
+        assert!(!scope_host_matches(
+            &rules[0],
+            &request("backend.internal", "/admin"),
+            Some("forged.example")
+        ));
+        // A malformed forwarded value is ignored rather than trusted.
+        assert_eq!(
+            check(
+                &rules,
+                &request("backend.internal", "/admin"),
+                Some("bad host/")
+            ),
+            Ok(())
+        );
+    }
 }
