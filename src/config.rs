@@ -99,6 +99,10 @@ pub struct Settings {
     /// Unauthenticated readiness probe path on the public listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_path: Option<String>,
+    /// Bodies for gateway-generated 403/404/502/503/504 responses on every
+    /// route without its own page for that status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_pages: Option<crate::error_pages::ErrorPages>,
 }
 impl Settings {
     pub fn is_empty(&self) -> bool {
@@ -107,6 +111,9 @@ impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(rules) = &self.request_blocks {
             crate::request_blocks::validate(rules)?;
+        }
+        if let Some(pages) = &self.error_pages {
+            crate::error_pages::validate(pages)?;
         }
         if let Some(rules) = &self.response_security {
             crate::response_security::validate(rules)?;
@@ -202,6 +209,7 @@ pub struct PreparedSettings {
     pub upstream_timeout: Option<std::time::Duration>,
     pub allow_dot_segments: Option<bool>,
     pub health_path: Option<std::sync::Arc<str>>,
+    pub error_pages: Option<std::sync::Arc<crate::error_pages::Prepared>>,
 }
 impl PreparedSettings {
     fn prepare(settings: &Settings) -> anyhow::Result<Self> {
@@ -254,6 +262,10 @@ impl PreparedSettings {
                 .map(std::time::Duration::from_millis),
             allow_dot_segments: settings.allow_dot_segments,
             health_path: settings.health_path.as_deref().map(std::sync::Arc::from),
+            error_pages: match &settings.error_pages {
+                Some(pages) => crate::error_pages::prepare(pages)?,
+                None => None,
+            },
         })
     }
 }
@@ -297,6 +309,10 @@ fn is_legacy_access_mode(mode: &AccessMode) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct HttpRoute {
     pub id: String,
+    /// Route-specific bodies for gateway-generated errors; override
+    /// `settings.error_pages` status by status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_pages: Option<crate::error_pages::ErrorPages>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme_http01: Option<crate::acme_http01::Config>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -909,6 +925,12 @@ impl Config {
         }
         if let Some(policy) = &self.pumgye {
             policy.compile()?;
+        }
+        for route in &self.http {
+            if let Some(pages) = &route.error_pages {
+                crate::error_pages::validate(pages)
+                    .with_context(|| format!("route {} error_pages", route.id))?;
+            }
         }
         for route in &self.http {
             if let Some(gate) = route
@@ -2207,6 +2229,7 @@ pub struct PreparedHostRegexes {
 }
 pub struct HttpRuntime {
     pub host_regex: Option<regex::Regex>,
+    pub error_pages: Option<std::sync::Arc<crate::error_pages::Prepared>>,
     pub admission: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub route: HttpRoute,
     /// Shared with the previous snapshot when the route's backends and
@@ -2560,6 +2583,14 @@ impl Snapshot {
             trust: upstream_trust,
         } = config.prepare_upstream_tls_with_trust()?;
         let mut regexes = config.prepare_host_regexes()?;
+        let mut route_error_pages = std::collections::HashMap::new();
+        for route in &config.http {
+            if let Some(pages) = &route.error_pages
+                && let Some(prepared) = crate::error_pages::prepare(pages)?
+            {
+                route_error_pages.insert(route.id.clone(), prepared);
+            }
+        }
         let admissions: std::collections::HashMap<_, _> = config
             .http
             .iter()
@@ -2759,6 +2790,7 @@ impl Snapshot {
                     .collect();
                 std::sync::Arc::new(HttpRuntime {
                     host_regex: regexes.http.remove(&route.id),
+                    error_pages: route_error_pages.remove(&route.id),
                     jwt_auth,
                     workload_auth,
                     auth_reserved,
