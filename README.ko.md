@@ -46,7 +46,7 @@ macOS Intel이나 Apple Silicon에서 개발·시연하고, 동일한 설정 모
 
 ## 통합된 엔터프라이즈 제어 기능
 
-**고급 제어 기능을 일관되고, 살펴보기 쉽고, 실제로 운영하기 편하게 만들어 상용 엔터프라이즈 게이트웨이보다 나은 운영 경험을 제공하는 것이 목표입니다.** Hangang은 엔터프라이즈 게이트웨이에서 흔히 기대하는 기능을 MIT 라이선스 코드베이스에 담았습니다. 현재 가장 뚜렷한 강점은 통합입니다. 라우팅, 정책 편집, 트래픽 화면, 관리 API가 하나의 애플리케이션과 설정 모델을 공유합니다.
+**고급 제어 기능을 일관되고, 살펴보기 쉽고, 실제로 운영하기 편하게 만들어 상용 엔터프라이즈 게이트웨이보다 나은 운영 경험을 제공하는 것이 목표입니다.** Hangang은 엔터프라이즈 게이트웨이에서 흔히 기대하는 기능을 AGPL-3.0-only 라이선스 코드베이스에 담았습니다. 현재 가장 뚜렷한 강점은 통합입니다. 라우팅, 정책 편집, 트래픽 화면, 관리 API가 하나의 애플리케이션과 설정 모델을 공유합니다.
 
 | 운영 요구 사항 | Hangang의 구현 | 이해해야 할 범위 |
 | --- | --- | --- |
@@ -171,7 +171,7 @@ make test-web    # Console and browser tests
 make check-docs  # Staged documentation and publication checks
 ```
 
-일부 통합 테스트 대상에는 Docker 또는 추가 의존성이 필요합니다. [개발](docs/DEVELOPMENT.md)과 [문서 작성 규칙](docs/DOCUMENTATION.md)을 참조하세요. Hangang의 라이선스는 [MIT](LICENSE)입니다.
+일부 통합 테스트 대상에는 Docker 또는 추가 의존성이 필요합니다. [개발](docs/DEVELOPMENT.md)과 [문서 작성 규칙](docs/DOCUMENTATION.md)을 참조하세요. 소스 라이선스는 [라이선스](#라이선스) 절에 있습니다.
 
 Guard/Hopae 메뉴 및 네이티브 전송: [콘솔 통합](docs/ko/CONSOLE_PLUGINS.md).
 
@@ -222,3 +222,10 @@ flowchart LR
 
 [후보 릴리스 계약](docs/ko/VERSION_0_3_11.md)에 Pumgye 문맥 인식 관리와 기존 native/runtime
 경계, artifact/API-server/적용 gate를 기록했습니다. 운영 적용을 뜻하지 않습니다.
+
+## 라이선스
+
+소스 코드는 GNU Affero 일반 공중 사용 허가서 3판(버전 3만, SPDX: `AGPL-3.0-only`)을 따릅니다. 전문은 [LICENSE](LICENSE)에 있습니다. 이 변경 전에 이미 나간 릴리스 태그는 그때의 라이선스를 그대로 유지합니다.
+
+- **다른 라이선스가 필요할 때:** 저작권자(Jioh Jung)에게 메일로 요청해 승인받을 수 있습니다. 승인된 예외는 요청한 사람·조직에게만 적용됩니다.
+- **공식 바이너리:** 공식 릴리스 바이너리는 소스 라이선스와 별개로 사용 제한이 없습니다.
