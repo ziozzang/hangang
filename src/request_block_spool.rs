@@ -400,6 +400,7 @@ pub(crate) async fn collect(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     fn setup() -> (tempfile::TempDir, Arc<Directory>, Config) {
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -598,6 +599,160 @@ mod tests {
         );
         assert_eq!(pool.slots.available_permits(), 2);
         assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+    /// Child half of `killed_process_leaves_no_spool_file_or_quota_behind`.
+    /// It stages one MiB, reports readiness and then waits to be killed.
+    #[tokio::test]
+    #[ignore = "helper process started by the crash test"]
+    async fn spool_crash_child() {
+        let Ok(path) = std::env::var("HANGANG_SPOOL_CRASH_DIR") else {
+            return;
+        };
+        let directory = Directory::open(&path).unwrap();
+        let config = Config {
+            directory: path,
+            max_body_bytes: 32 * 1024 * 1024,
+            timeout_ms: 60000,
+            idle_timeout_ms: 60000,
+            max_field_bytes: 65536,
+        };
+        let pool = Arc::new(Pool::with_limits(1, 32 * 1024 * 1024));
+        let mut chunk = b"--owned\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.bin\"\r\n\r\n".to_vec();
+        chunk.resize(1024 * 1024, b'x');
+        let stream = futures_util::stream::iter([Ok::<_, crate::proxy::BodyError>(Frame::data(
+            Bytes::from(chunk),
+        ))])
+        .chain(futures_util::stream::pending());
+        let body = http_body_util::StreamBody::new(stream).boxed_unsync();
+        let staging = {
+            let pool = pool.clone();
+            tokio::spawn(
+                async move { collect(body, "owned", &config, directory, pool, None).await },
+            )
+        };
+        while pool.used.load(Ordering::Acquire) < 1024 * 1024 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Give the blocking write a moment to land on disk before reporting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        println!("SPOOL-READY");
+        let _ = staging.await;
+    }
+    #[test]
+    fn killed_process_leaves_no_spool_file_or_quota_behind() {
+        // HG-17: spool files are anonymous (O_TMPFILE, never linked), so a
+        // SIGKILL cannot leave a pathname for start-up cleanup to collect; the
+        // kernel frees the blocks when the last descriptor closes.
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "request_block_spool::tests::spool_crash_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HANGANG_SPOOL_CRASH_DIR", dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let ready = std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.contains("SPOOL-READY"));
+        assert!(ready, "child never staged a spool file");
+        // While staging, the child holds an unlinked file inside the directory.
+        let held = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .unwrap()
+            .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+            .filter(|target| target.starts_with(dir.path()))
+            .count();
+        assert!(held >= 1, "child holds no spool descriptor");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "killed process left a spool pathname"
+        );
+        // A fresh process can stage again in the same directory immediately.
+        assert!(
+            Directory::open(dir.path().to_str().unwrap())
+                .unwrap()
+                .anonymous()
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn concurrent_uploads_never_exceed_the_shared_quota() {
+        // HG-17: N overlapping uploads whose sum exceeds the pool quota must
+        // never hold more than the quota at once, and every byte is returned.
+        let (_dir, directory, config) = setup();
+        const UPLOADS: usize = 8;
+        const QUOTA: u64 = 3 * 64 * 1024;
+        let pool = Arc::new(Pool::with_limits(UPLOADS, QUOTA));
+        let peak = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let (pool, peak, done) = (pool.clone(), peak.clone(), done.clone());
+            tokio::spawn(async move {
+                while !done.load(Ordering::Acquire) {
+                    peak.fetch_max(pool.used.load(Ordering::Acquire), Ordering::AcqRel);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let config = Config {
+            idle_timeout_ms: 2000,
+            ..config
+        };
+        let mut tasks = vec![];
+        for _ in 0..UPLOADS {
+            let mut chunks = vec![Bytes::from_static(
+                b"--owned\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.bin\"\r\n\r\n",
+            )];
+            chunks.extend((0..8).map(|_| Bytes::from(vec![b'x'; 8 * 1024])));
+            chunks.push(Bytes::from_static(b"\r\n--owned--\r\n"));
+            let stream = futures_util::stream::iter(chunks).then(|chunk| async move {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                Ok::<_, crate::proxy::BodyError>(Frame::data(chunk))
+            });
+            let body = http_body_util::StreamBody::new(stream).boxed_unsync();
+            let (directory, pool, config) = (directory.clone(), pool.clone(), config.clone());
+            tasks.push(tokio::spawn(async move {
+                collect(body, "owned", &config, directory, pool, None).await
+            }));
+        }
+        let mut staged = vec![];
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok((upload, _)) => staged.push(upload),
+                Err(status) => {
+                    assert_eq!(status, 503);
+                    rejected += 1;
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+        sampler.await.unwrap();
+        let held: u64 = staged.iter().map(|upload| upload.size).sum();
+        assert!(peak.load(Ordering::Acquire) <= QUOTA, "peak over quota");
+        assert!(held <= QUOTA);
+        assert_eq!(pool.used.load(Ordering::Acquire), held);
+        assert!(
+            !staged.is_empty() && rejected > 0,
+            "quota was not contended"
+        );
+        drop(staged);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+        assert_eq!(pool.slots.available_permits(), UPLOADS);
     }
 }
 
