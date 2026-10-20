@@ -24,7 +24,20 @@ Configuration prepares TLS material and binds every newly required socket before
 
 Changes or withdrawal of a named listener's definition retire its connection generation. Old HTTP keepalives cannot submit requests with stale trust; SSE/WebSocket/HTTP IO observes generation retirement on a250ms check timer and closes (subject to runtime scheduling). Re-enabling an identical definition creates a fresh generation and cannot revive old connections. This is policy revocation, not a promise to finish every long-lived stream. Unchanged listeners and ordinary route/configuration updates preserve established connections, subject to existing route authentication and idle policies.
 
-Certificate file rotation within an unchanged listener replaces its TLS resolver for subsequent handshakes. Invalid, partial or oversized replacements retain the last verified set; reload errors are logged without printing PEM content. Rotation does not itself revoke already established TLS sessions. Public TLS handshake admission is separately bounded to64 handshakes and does not consume the dedicated workload-mTLS handshake budget.
+Certificate file rotation within an unchanged listener replaces its TLS resolver for subsequent handshakes. Invalid, partial or oversized replacements retain the last verified set; reload errors are logged without printing PEM content. Rotation does not itself revoke already established TLS sessions. Public TLS handshake admission is shared by the CLI listener and every named HTTPS listener, and does not consume the dedicated workload-mTLS handshake budget.
+
+### TLS handshake admission
+
+| Flag | Default | Range | Meaning |
+|---|---|---|---|
+| `--tls-handshake-limit` | 256 | 1–65536 | Concurrent public TLS handshakes across all public listeners. A connection arriving while the budget is full is closed at once. |
+| `--tls-handshake-timeout-ms` | 5000 | 100–60000 | Time a public handshake may take. A client that has not finished by then is closed and its slot is released. |
+
+Both refusals are counted in `hangang_tls_handshake_rejections_total` (and in `rejected_connections_total`); `GET /v1/status` reports the same value as `metrics.tls_handshake_rejections_total`. A steadily rising value means slow or idle clients are holding handshake slots: raise the limit, shorten the deadline, or block the sources upstream. Earlier releases fixed the budget at 64 and the deadline at 10 s (named listeners) or 5 s (CLI listener).
+
+#### 한국어 요약
+
+공개 TLS 핸드셰이크(암호화 연결을 맺는 첫 단계)는 CLI 리스너와 이름 있는 HTTPS 리스너가 한 예산을 같이 씁니다. `--tls-handshake-limit`(기본 256, 1–65536)은 동시에 진행할 수 있는 핸드셰이크 수이고, 예산이 차 있을 때 들어온 연결은 바로 닫습니다. `--tls-handshake-timeout-ms`(기본 5000, 100–60000)는 핸드셰이크 제한 시간이며, 그 안에 끝내지 못한 연결은 닫고 자리를 돌려줍니다. 두 경우 모두 `hangang_tls_handshake_rejections_total`(그리고 `rejected_connections_total`)에 셉니다. 이전 판은 64개·10초(이름 있는 리스너) 또는 5초(CLI 리스너)로 고정이었습니다.
 
 Supervisor export/import carries a separate named-public descriptor role, validates it against the frozen configuration and retains listener sockets through generation handoff. Existing private-UDS administrator deployments still cannot use the in-process supervisor; that earlier restriction is unchanged.
 

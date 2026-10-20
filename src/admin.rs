@@ -376,7 +376,16 @@ impl Manager {
             return self.reconcile_store_locked(store.as_ref()).await;
         }
         let path = self.state_path.clone();
-        let mut config = tokio::task::spawn_blocking(move || store::load(&path)).await??;
+        let mut config = match tokio::task::spawn_blocking(move || store::load(&path)).await? {
+            Ok(config) => config,
+            Err(error) => {
+                // An edited file that does not load is a refused document.
+                self.metrics
+                    .config_apply_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
         let current = self.active.load_full();
         config.revision = current.config.revision;
         // The file omits the floor the active document carries; normalise
@@ -543,6 +552,9 @@ impl Manager {
         let (next, prepared) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.metrics
+                    .config_apply_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 // Fail closed: this instance cannot serve the authoritative
                 // revision, and the writer's instance cannot know that.
                 self.store_failure(
@@ -607,7 +619,41 @@ impl Manager {
         }
     }
 
+    /// Every activation attempt funnels through here so a refused or failed
+    /// document is visible as `hangang_config_apply_failures_total`.
     async fn apply_locked(
+        &self,
+        config: Config,
+        expected: u64,
+        persist: bool,
+        passive: bool,
+        tls: Option<Arc<rustls::ServerConfig>>,
+        authority: Option<ConfigAuthority>,
+    ) -> anyhow::Result<Config> {
+        let outcome = self
+            .apply_locked_inner(config, expected, persist, passive, tls, authority)
+            .await;
+        if outcome.is_err() {
+            self.metrics
+                .config_apply_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Configuration state gauges appended to `/metrics`: the active
+    /// revision and whether this instance advertises readiness.
+    pub fn render_state_metrics(&self, out: &mut String) {
+        use std::fmt::Write;
+        let revision = self.active.load().config.revision;
+        let ready = u8::from(self.ready.load(Ordering::Acquire));
+        let _ = write!(
+            out,
+            "# HELP hangang_config_revision Revision of the active configuration document.\n# TYPE hangang_config_revision gauge\nhangang_config_revision {revision}\n# HELP hangang_ready 1 when this instance advertises readiness (/healthz 200), else 0.\n# TYPE hangang_ready gauge\nhangang_ready {ready}\n"
+        );
+    }
+
+    async fn apply_locked_inner(
         &self,
         mut config: Config,
         expected: u64,
@@ -1102,6 +1148,8 @@ impl Admin {
                 "policy_capacity_rejections_total": metrics.policy_capacity_rejections.load(Ordering::Relaxed),
                 "body_transform_errors_total": metrics.body_transform_errors.load(Ordering::Relaxed),
                 "config_updates_total": metrics.config_updates.load(Ordering::Relaxed),
+                "config_apply_failures_total": metrics.config_apply_failures.load(Ordering::Relaxed),
+                "tls_handshake_rejections_total": metrics.tls_handshake_rejections.load(Ordering::Relaxed),
             },
             "acme": self.acme_status.as_ref().map(|status| status.read().expect("status lock").clone()).unwrap_or_default(),
             "state": { "draining": self.manager.stopping.load(Ordering::Acquire), "supervised": self.lifecycle.is_some(), "ready": self.manager.ready.load(Ordering::Acquire), "configuration_source": if self.manager.externally_managed {"kubernetes"} else if self.manager.config_store.is_some() {"shared"} else {"file"} },
@@ -1740,18 +1788,8 @@ impl Admin {
             }
             let state = if let Some(path) = &self.update_status_path {
                 let path = path.clone();
-                match tokio::task::spawn_blocking(
-                    move || -> anyhow::Result<crate::supervisor::UpdateStatus> {
-                        use std::io::Read;
-                        let mut bytes = Vec::new();
-                        std::fs::File::open(path)?
-                            .take(65537)
-                            .read_to_end(&mut bytes)?;
-                        anyhow::ensure!(bytes.len() <= 65536, "update status too large");
-                        Ok(serde_json::from_slice(&bytes)?)
-                    },
-                )
-                .await
+                match tokio::task::spawn_blocking(move || crate::supervisor::load_status(&path))
+                    .await
                 {
                     Ok(Ok(state)) => state,
                     _ => {
@@ -2801,6 +2839,13 @@ impl Admin {
         }
         if path == "/metrics" && req.method() == hyper::Method::GET {
             let mut output = self.manager.metrics.render();
+            self.manager.render_state_metrics(&mut output);
+            if let Some(path) = self.update_status_path.clone()
+                && let Ok(Ok(status)) =
+                    tokio::task::spawn_blocking(move || crate::supervisor::load_status(&path)).await
+            {
+                status.render_metrics(&mut output);
+            }
             for (metric, kind) in [
                 ("sessions", "gauge"),
                 ("datagrams_received_total", "counter"),
@@ -4909,5 +4954,72 @@ mod tests {
         manager.resume_updates();
         assert!(!manager.stopping.load(Ordering::Acquire));
         assert!(manager.ready.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn refused_reload_counts_an_apply_failure_and_exports_state_gauges() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let route = |id: &str, port: u16| crate::config::TcpRoute {
+            country_policy: None,
+            enabled: true,
+            upstream: Default::default(),
+            health: None,
+            inbound_tls: None,
+            priority: 0,
+            sni: None,
+            max_connections: None,
+            id: id.into(),
+            listen: format!("127.0.0.1:{port}").parse().unwrap(),
+            backends: vec!["127.0.0.1:9".into()],
+            deny_cidrs: Vec::new(),
+        };
+        // Two routes with one id: loads from disk but fails validation.
+        let refused = Config {
+            tcp: vec![route("same", 39011), route("same", 39012)],
+            ..Config::default()
+        };
+        store::save(state_path.clone(), refused).await.unwrap();
+        let active = Arc::new(ArcSwap::from_pointee(
+            Snapshot::new(Config {
+                revision: 7,
+                ..Config::default()
+            })
+            .unwrap(),
+        ));
+        let metrics = Arc::new(Metrics::default());
+        let manager = Arc::new(Manager {
+            active: active.clone(),
+            tcp: Arc::new(TcpManager::new(active, metrics.clone(), 1)),
+            policy: Arc::new(PolicyPool::new(std::env::current_exe().unwrap(), 1)),
+            metrics: metrics.clone(),
+            state_path,
+            config_store: None,
+            writes: Mutex::new(()),
+            transactions: Arc::new(tokio::sync::Semaphore::new(32)),
+            externally_managed: false,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            withdrawing: std::sync::atomic::AtomicBool::new(false),
+            authority_epoch: std::sync::Mutex::new(None),
+            store_health: Default::default(),
+        });
+
+        let mut before = metrics.render();
+        manager.render_state_metrics(&mut before);
+        assert!(before.contains("hangang_config_apply_failures_total 0\n"));
+        assert!(before.contains("hangang_config_revision 7\n"));
+        assert!(before.contains("hangang_ready 1\n"));
+
+        assert!(manager.reload_file().await.is_err());
+        assert_eq!(metrics.config_apply_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.config_updates.load(Ordering::Relaxed), 0);
+
+        manager.ready.store(false, Ordering::Release);
+        let mut after = metrics.render();
+        manager.render_state_metrics(&mut after);
+        assert!(after.contains("hangang_config_apply_failures_total 1\n"));
+        assert!(after.contains("# TYPE hangang_config_revision gauge\n"));
+        assert!(after.contains("hangang_config_revision 7\n"));
+        assert!(after.contains("hangang_ready 0\n"));
     }
 }

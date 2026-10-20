@@ -189,6 +189,14 @@ struct Args {
     allow_unsandboxed_lua: bool,
     #[arg(long, default_value_t = 4096)]
     max_connections: usize,
+    /// Concurrent public TLS handshakes shared by every public listener;
+    /// excess connections are closed at once and counted in
+    /// hangang_tls_handshake_rejections_total.
+    #[arg(long, default_value_t = hangang::public_http::DEFAULT_TLS_HANDSHAKE_LIMIT)]
+    tls_handshake_limit: usize,
+    /// Time a public TLS handshake may take before the connection is closed.
+    #[arg(long, default_value_t = hangang::public_http::DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS)]
+    tls_handshake_timeout_ms: u64,
     #[arg(long, default_value_t = 4096)]
     max_requests: usize,
     /// Maximum buffered JSON inspections; each raw body is bounded to 1 MiB.
@@ -421,6 +429,18 @@ fn main() -> Result<()> {
         (1..=1_000_000).contains(&args.max_connections),
         "max-connections must be 1..1000000"
     );
+    anyhow::ensure!(
+        (1..=65_536).contains(&args.tls_handshake_limit),
+        "tls-handshake-limit must be 1..65536"
+    );
+    anyhow::ensure!(
+        (100..=60_000).contains(&args.tls_handshake_timeout_ms),
+        "tls-handshake-timeout-ms must be 100..60000"
+    );
+    hangang::public_http::configure_handshake_admission(
+        args.tls_handshake_limit,
+        Duration::from_millis(args.tls_handshake_timeout_ms),
+    )?;
     anyhow::ensure!(
         (1..=1_000_000).contains(&args.max_requests),
         "max-requests must be 1..1000000"
@@ -1702,12 +1722,13 @@ async fn serve(
                         // Public handshake exhaustion must not deny the
                         // separately admitted administration listener.
                         let handshake_permit=if matches!(&handler,Handler::Proxy(_)) {
-                            match hangang::public_http::public_handshake_admission().try_acquire_owned() {Ok(permit)=>Some(permit),Err(_)=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return;}}
+                            match hangang::public_http::public_handshake_admission().try_acquire_owned() {Ok(permit)=>Some(permit),Err(_)=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);metrics.tls_handshake_rejections.fetch_add(1,Ordering::Relaxed);return;}}
                         } else {None};
                         let acceptor=tokio_rustls::TlsAcceptor::from(config);
-                        let accepted=tokio::select!{_=cancel.cancelled()=>return,result=tokio::time::timeout(Duration::from_secs(5),acceptor.accept(stream))=>result};
+                        let accepted=tokio::select!{_=cancel.cancelled()=>return,result=tokio::time::timeout(hangang::public_http::public_handshake_timeout(),acceptor.accept(stream))=>result};
+                        let public=handshake_permit.is_some();
                         drop(handshake_permit);
-                        match accepted {Ok(Ok(stream))=>Box::new(stream),_=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return}}
+                        match accepted {Ok(Ok(stream))=>Box::new(stream),Err(_) if public=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);metrics.tls_handshake_rejections.fetch_add(1,Ordering::Relaxed);return}_=>{metrics.rejected_connections.fetch_add(1,Ordering::Relaxed);return}}
                     } else {Box::new(stream)};
                     let (io, idle_watch)=hangang::idle::IdleIo::new(io,idle_timeout);
                     let service=service_fn(move |mut request:hyper::Request<hyper::body::Incoming>| {
