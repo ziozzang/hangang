@@ -173,6 +173,13 @@ struct Args {
     /// Operator-installed console plugin registry (pinned packages and backend credential references).
     #[arg(long)]
     admin_plugins: Option<PathBuf>,
+    /// Absolute lifetime of an administrator console session (60..604800).
+    #[arg(long, default_value_t = hangang::admin_users::DEFAULT_SESSION_SECONDS)]
+    admin_session_seconds: i64,
+    /// An administrator session ends after this many seconds without a
+    /// request (60 up to --admin-session-seconds).
+    #[arg(long, default_value_t = hangang::admin_users::DEFAULT_SESSION_IDLE_SECONDS)]
+    admin_session_idle_seconds: i64,
     /// Opt-in inspect-only Unix socket access.
     #[arg(long)]
     docker_socket: Option<PathBuf>,
@@ -1284,7 +1291,10 @@ async fn run(args: Args) -> Result<()> {
         );
         directory.join("users.sqlite3")
     };
-    let users = Arc::new(hangang::admin_users::Store::open(users_db_path)?);
+    let users = Arc::new(
+        hangang::admin_users::Store::open(users_db_path)?
+            .with_session_lifetime(args.admin_session_seconds, args.admin_session_idle_seconds)?,
+    );
     let admin = Admin {
         plugins: admin_plugins,
         fleet_collector: fleet_collector.clone(),
@@ -1734,7 +1744,7 @@ async fn serve(
                     let service=service_fn(move |mut request:hyper::Request<hyper::body::Incoming>| {
                         request.extensions_mut().insert(lease.clone());
                         if let Ok(context)=hangang::admin_plugins::client_context(&request,peer.ip()){request.extensions_mut().insert(context);}
-                        request.extensions_mut().insert(hangang::tls::TransportInfo{tls:transport_tls,local_port});
+                                                request.extensions_mut().insert(hangang::tls::TransportInfo{tls:transport_tls,local_port});if matches!(&handler,Handler::Admin(_)){request.extensions_mut().insert(hangang::admin::AdminPeer(peer.ip()));}
                         let handler=handler.clone();
                         let future:std::pin::Pin<Box<dyn std::future::Future<Output=Result<hyper::Response<hangang::proxy::Body>,std::convert::Infallible>>+Send>>=Box::pin(async move {match handler {Handler::Proxy(p)=>p.handle(request,peer).await,Handler::Admin(a)=>a.handle(request).await,Handler::Acme(store)=>{use http_body_util::BodyExt; let response=store.response(&request).await.unwrap_or_else(||hyper::Response::builder().status(404).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap()); Ok(response.map(|b|b.map_err(|never|match never {}).boxed_unsync()))}}});
                         future

@@ -3502,6 +3502,7 @@ impl Admin {
                 Err(error) => account_problem(error),
             };
         }
+        let peer = req.extensions().get::<AdminPeer>().map(|peer| peer.0);
         let payload: Credentials = match read_json(req, 4096).await {
             Ok(body) => body,
             Err(response) => return response,
@@ -3513,13 +3514,35 @@ impl Admin {
         {
             return problem(401, "Unauthorized", "invalid credentials");
         }
-        match self.users.login(payload.username, payload.password).await {
+        match self
+            .users
+            .login_from(payload.username, payload.password, peer)
+            .await
+        {
             Ok(Some(login)) => auth_json(
                 200,
-                &serde_json::json!({"token":login.token,"expires_in_seconds":login.expires_in_seconds,"user":login.user}),
+                &serde_json::json!({"token":login.token,"expires_in_seconds":login.expires_in_seconds,"idle_timeout_seconds":login.idle_timeout_seconds,"user":login.user}),
             ),
             Ok(None) => problem(401, "Unauthorized", "invalid credentials"),
-            Err(error) => account_problem(error),
+            Err(error) => {
+                if let Some(throttled) = error.downcast_ref::<crate::admin_users::LoginThrottled>()
+                {
+                    let mut response = problem(
+                        429,
+                        "Too Many Requests",
+                        "too many failed logins; retry later",
+                    );
+                    if let Ok(value) = hyper::header::HeaderValue::from_str(
+                        &throttled.retry_after.as_secs().max(1).to_string(),
+                    ) {
+                        response
+                            .headers_mut()
+                            .insert(hyper::header::RETRY_AFTER, value);
+                    }
+                    return response;
+                }
+                account_problem(error)
+            }
         }
     }
 
@@ -4494,6 +4517,12 @@ fn public_asset(req: &Request<Incoming>) -> Option<Response<Body>> {
 
 /// Wait until the instance has proven readiness against its configuration
 /// authority (controller or shared store), or `deadline` elapses.
+/// Socket address of the client on the administration listener, inserted
+/// by the listener so login throttling can key on the real connection peer
+/// (never on a forwarded header).
+#[derive(Clone, Copy, Debug)]
+pub struct AdminPeer(pub std::net::IpAddr);
+
 pub async fn await_readiness(ready: &std::sync::atomic::AtomicBool, deadline: Duration) -> bool {
     tokio::time::timeout(deadline, async {
         while !ready.load(Ordering::Acquire) {
