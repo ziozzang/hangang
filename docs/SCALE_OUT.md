@@ -60,6 +60,12 @@ poll (strict mode). After withdrawal, readiness returns on the first confirming 
 `store.epoch`, `store.grace_seconds`, plus `instance.id` (random per process) and
 `instance.config_digest` so that instances behind one address can be told apart.
 
+`GET /metrics` exports the same state for Prometheus: `hangang_config_revision` (gauge, revision of
+the active document), `hangang_ready` (gauge, 1 while `/healthz` answers 200, else 0) and
+`hangang_config_apply_failures_total` (counter, documents refused or not activated: validation,
+preparation, persistence or authority failures). During a fleet rollout, every instance should report
+the new revision and `hangang_ready 1`; a rising failure counter marks the instances that refused it.
+
 ## Operational rules
 
 - **Provision host-local material before writing the configuration.** Certificate paths, upstream CA

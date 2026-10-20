@@ -22,7 +22,43 @@ pub struct UpdateStatus {
     pub current_version: String,
     pub last_check_unix: u64,
     pub detail: Option<String>,
+    /// Automatic rollbacks since this status file was created: an update was
+    /// activated on disk, the new generation failed to take over, and the
+    /// previous executable was restored.
+    #[serde(default)]
+    pub rollbacks_total: u64,
+    /// Fixed-vocabulary reason for the most recent rollback (no URLs or
+    /// paths; details stay in protected logs).
+    #[serde(default)]
+    pub last_rollback_reason: Option<String>,
+    /// Unix time of the most recent rollback; 0 when none happened.
+    #[serde(default)]
+    pub last_rollback_unix: u64,
 }
+
+/// Every phase the updater reports, in `hangang_update_phase` order.
+pub const UPDATE_PHASES: [&str; 6] = [
+    "idle",
+    "checking",
+    "active",
+    "up_to_date",
+    "rejected",
+    "rolled_back",
+];
+
+/// Reason recorded when the candidate generation fails to take over.
+pub const ROLLBACK_REASON_HANDOFF: &str =
+    "candidate generation failed to take over; previous executable restored";
+
+/// Marks an update error after which the previous executable was restored.
+#[derive(Debug)]
+pub struct RolledBack;
+impl std::fmt::Display for RolledBack {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("update rolled back")
+    }
+}
+
 impl UpdateStatus {
     pub fn initial(enabled: bool) -> Self {
         Self {
@@ -31,8 +67,49 @@ impl UpdateStatus {
             current_version: env!("CARGO_PKG_VERSION").into(),
             last_check_unix: 0,
             detail: None,
+            rollbacks_total: 0,
+            last_rollback_reason: None,
+            last_rollback_unix: 0,
         }
     }
+
+    /// Record an automatic rollback.
+    pub fn record_rollback(&mut self, reason: &str, now_unix: u64) {
+        self.phase = "rolled_back".into();
+        self.detail = Some(reason.into());
+        self.rollbacks_total = self.rollbacks_total.saturating_add(1);
+        self.last_rollback_reason = Some(reason.into());
+        self.last_rollback_unix = now_unix;
+    }
+
+    /// Prometheus lines: `hangang_update_rollbacks_total`, the last rollback
+    /// time and `hangang_update_phase{phase=...}` (1 for the current phase).
+    pub fn render_metrics(&self, out: &mut String) {
+        use std::fmt::Write;
+        let _ = write!(
+            out,
+            "# HELP hangang_update_rollbacks_total Automatic update rollbacks.\n# TYPE hangang_update_rollbacks_total counter\nhangang_update_rollbacks_total {}\n# HELP hangang_update_last_rollback_unix Unix time of the last automatic rollback (0 = none).\n# TYPE hangang_update_last_rollback_unix gauge\nhangang_update_last_rollback_unix {}\n# HELP hangang_update_phase Current updater phase (1 for the active phase).\n# TYPE hangang_update_phase gauge\n",
+            self.rollbacks_total, self.last_rollback_unix
+        );
+        for phase in UPDATE_PHASES {
+            let _ = writeln!(
+                out,
+                "hangang_update_phase{{phase=\"{phase}\"}} {}",
+                u8::from(self.phase == phase)
+            );
+        }
+    }
+}
+
+/// Read a supervisor status file written by `persist_status`.
+pub fn load_status(path: &std::path::Path) -> Result<UpdateStatus> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "update status too large");
+    Ok(serde_json::from_slice(&bytes)?)
 }
 fn persist_status(path: &std::path::Path, status: &UpdateStatus) -> Result<()> {
     use std::io::Write;
@@ -237,6 +314,14 @@ pub async fn run(
                 Err(error) if error.downcast_ref::<crate::update::UpToDate>().is_some() => {
                     update_status.phase = "up_to_date".into();
                 }
+                Err(error) if error.downcast_ref::<RolledBack>().is_some() => {
+                    let _ = active.channel.send_control(Control::Resume);
+                    tracing::warn!(%error,"signed update rolled back; keeping active generation");
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs());
+                    update_status.record_rollback(ROLLBACK_REASON_HANDOFF, now);
+                }
                 Err(error) => {
                     let _ = active.channel.send_control(Control::Resume);
                     tracing::warn!(%error,"signed update rejected; keeping active generation");
@@ -427,7 +512,7 @@ async fn activate_and_replace(
         }
         Err(error) => {
             UpdateManager::rollback(activated).context("restore failed update")?;
-            Err(error)
+            Err(error.context(RolledBack))
         }
     }
 }
@@ -451,4 +536,45 @@ async fn bounded_preflight(executable: &std::path::Path, arguments: &[OsString])
     .await
     .context("candidate preflight timeout")??;
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_is_recorded_and_exported() {
+        let mut status = UpdateStatus::initial(true);
+        status.record_rollback(ROLLBACK_REASON_HANDOFF, 1_700_000_000);
+        status.record_rollback(ROLLBACK_REASON_HANDOFF, 1_700_000_060);
+        assert_eq!(status.phase, "rolled_back");
+        assert_eq!(status.rollbacks_total, 2);
+        assert_eq!(status.last_rollback_unix, 1_700_000_060);
+        assert_eq!(
+            status.last_rollback_reason.as_deref(),
+            Some(ROLLBACK_REASON_HANDOFF)
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update-status.json");
+        persist_status(&path, &status).unwrap();
+        let loaded = load_status(&path).unwrap();
+        assert_eq!(loaded.rollbacks_total, 2);
+
+        let mut out = String::new();
+        loaded.render_metrics(&mut out);
+        assert!(out.contains("hangang_update_rollbacks_total 2\n"));
+        assert!(out.contains("hangang_update_last_rollback_unix 1700000060\n"));
+        assert!(out.contains("hangang_update_phase{phase=\"rolled_back\"} 1\n"));
+        assert!(out.contains("hangang_update_phase{phase=\"idle\"} 0\n"));
+    }
+
+    #[test]
+    fn status_written_by_an_older_release_still_loads() {
+        let old = br#"{"enabled":true,"phase":"active","current_version":"0.1.0","last_check_unix":5,"detail":null}"#;
+        let status: UpdateStatus = serde_json::from_slice(old).unwrap();
+        assert_eq!(status.rollbacks_total, 0);
+        assert_eq!(status.last_rollback_reason, None);
+        assert_eq!(status.last_rollback_unix, 0);
+    }
 }

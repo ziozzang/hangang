@@ -27,6 +27,12 @@ pub struct Metrics {
     pub policy_capacity_rejections: AtomicU64,
     pub body_transform_errors: AtomicU64,
     pub config_updates: AtomicU64,
+    /// Configuration documents that were refused or could not be activated
+    /// (validation, preparation, persistence or authority failures).
+    pub config_apply_failures: AtomicU64,
+    /// Public TLS handshakes refused because the shared handshake budget was
+    /// full, or closed because they missed the handshake deadline.
+    pub tls_handshake_rejections: AtomicU64,
 }
 impl Metrics {
     pub fn render(&self) -> String {
@@ -110,6 +116,16 @@ impl Metrics {
                 &self.body_transform_errors,
             ),
             ("config_updates_total", "counter", &self.config_updates),
+            (
+                "config_apply_failures_total",
+                "counter",
+                &self.config_apply_failures,
+            ),
+            (
+                "tls_handshake_rejections_total",
+                "counter",
+                &self.tls_handshake_rejections,
+            ),
         ] {
             out.push_str(&format!("# HELP hangang_{name} Hangang {name}.\n# TYPE hangang_{name} {kind}\nhangang_{name} {}\n", value.load(Ordering::Relaxed)));
         }

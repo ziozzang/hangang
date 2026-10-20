@@ -30,6 +30,8 @@ grace window는 짧은 store 장애가 한 번에 전체 fleet을 철회하는 �
 
 `GET /v1/status`는 `store.ready`, `store.reason`, `store.last_confirmed_seconds_ago`, `store.epoch`, `store.grace_seconds`와 process마다 random인 `instance.id`, 한 주소 뒤 인스턴스를 구분하는 `instance.config_digest`를 보고합니다.
 
+`GET /metrics`는 같은 상태를 Prometheus용으로 내보냅니다. `hangang_config_revision`(gauge, 활성 document의 revision), `hangang_ready`(gauge, `/healthz`가 200이면 1, 아니면 0), `hangang_config_apply_failures_total`(counter, 검증·준비·저장·authority 실패로 거부되거나 활성화되지 못한 document 수)입니다. fleet rollout 중에는 모든 인스턴스가 새 revision과 `hangang_ready 1`을 보고해야 하며, 실패 카운터가 늘어난 인스턴스가 그 revision을 거부한 곳입니다.
+
 ## 운영 규칙
 
 - **설정 write 전에 호스트 로컬 자료를 배포합니다.** 공유 document의 certificate path, upstream CA file, Lua script, Docker service reference는 모든 인스턴스에서 해석됩니다. write host에만 있는 file을 참조하면 그 host에서는 성공하지만 다른 인스턴스는 unready가 됩니다. 먼저 동일한 byte의 file을 배포하고(status에 digest가 노출됨) write하십시오. file 교체에 의한 certificate rotation도 host별입니다.

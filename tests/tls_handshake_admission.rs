@@ -82,6 +82,8 @@ async fn cli_and_named_tls_share_capacity_without_starving_admin_tls() {
                 "1",
                 "--max-connections",
                 "128",
+                "--tls-handshake-limit",
+                "64",
             ])
             .arg("--tls-cert")
             .arg(&cert)
@@ -157,6 +159,13 @@ async fn cli_and_named_tls_share_capacity_without_starving_admin_tls() {
             .unwrap()
             >= 2
     );
+    assert!(
+        saturated["metrics"]["tls_handshake_rejections_total"]
+            .as_u64()
+            .unwrap()
+            >= 2,
+        "capacity rejections must be reported separately"
+    );
 
     drop(stalled);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -182,4 +191,105 @@ async fn cli_and_named_tls_share_capacity_without_starving_admin_tls() {
             "public TLS capacity did not recover"
         );
     }
+}
+
+#[tokio::test]
+async fn handshake_deadline_is_configurable_and_counted() {
+    let directory = tempfile::tempdir().unwrap();
+    let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = directory.path().join("server.pem");
+    let key = directory.path().join("server.key");
+    std::fs::write(&cert, pair.cert.pem()).unwrap();
+    std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+    let [public, _, admin] = ports();
+    let config = directory.path().join("config.json");
+    std::fs::write(&config, br#"{"revision":0,"http":[],"tcp":[]}"#).unwrap();
+    let mut child = Child(
+        std::process::Command::new(env!("CARGO_BIN_EXE_hangang"))
+            .arg("--config")
+            .arg(&config)
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{public}"),
+                "--admin",
+                &format!("127.0.0.1:{admin}"),
+                "--threads",
+                "2",
+                "--lua-workers",
+                "1",
+                "--tls-handshake-limit",
+                "4",
+                "--tls-handshake-timeout-ms",
+                "300",
+            ])
+            .arg("--tls-cert")
+            .arg(&cert)
+            .arg("--tls-key")
+            .arg(&key)
+            .arg("--admin-tls-cert")
+            .arg(&cert)
+            .arg("--admin-tls-key")
+            .arg(&key)
+            .env("HANGANG_ADMIN_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(1))
+        .add_root_certificate(reqwest::Certificate::from_pem(pair.cert.pem().as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "server exited before readiness"
+            );
+            if status(&client, admin).await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // A client that never sends a ClientHello is closed at the configured
+    // deadline (300 ms), well before the 5 s default.
+    let mut stalled = TcpStream::connect(("127.0.0.1", public)).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(3), stalled.read(&mut byte))
+        .await
+        .expect("a stalled handshake outlived the configured deadline");
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "unexpected stalled-handshake result: {read:?}"
+    );
+    let snapshot = status(&client, admin).await.unwrap();
+    assert_eq!(snapshot["metrics"]["tls_handshake_rejections_total"], 1);
+
+    let metrics = client
+        .get(format!("https://localhost:{admin}/metrics"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("hangang_tls_handshake_rejections_total 1\n"));
+
+    // A complete handshake still succeeds afterwards.
+    let response = client
+        .get(format!("https://localhost:{public}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
 }

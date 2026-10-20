@@ -157,6 +157,10 @@ artifact 응답은 대상 디렉터리의 임시 파일로 스트리밍됩니다
 
 `GET /v1/update/status`는 업데이트 활성화 여부, 현재 phase와 version, 마지막 확인 시간을 보고합니다. `POST /v1/update/check`는 즉시 확인을 대기열에 넣습니다. 둘 다 admin bearer token이 필요합니다. 이미 실행 중인 버전의 서명 매니페스트는 `up_to_date`를 만들고 다운그레이드는 계속 강한 거부입니다.
 
+phase는 `idle`, `checking`, `active`, `up_to_date`, `rejected`(실행 파일을 바꾸기 전에 거부), `rolled_back`(실행 파일을 바꿨지만 새 세대가 넘겨받지 못해 이전 실행 파일로 되돌림)입니다. 상태에는 `rollbacks_total`(자동 롤백 횟수), `last_rollback_reason`(고정된 문장; 릴리스 URL이 들어갈 수 있는 자세한 오류는 보호된 로그에만 남김), `last_rollback_unix`(마지막 롤백 시각, 없으면 0)도 들어갑니다. 이전 판이 쓴 상태 파일은 이 값들이 0인 채로 읽힙니다.
+
+업데이트가 켜져 있으면 `GET /metrics`도 같은 상태를 내보냅니다. `hangang_update_rollbacks_total`(counter), `hangang_update_last_rollback_unix`(gauge), `hangang_update_phase{phase="..."}`(gauge, 현재 phase만 1, 나머지는 0)입니다. 롤백 카운터가 늘면 경보를 거십시오.
+
 ## 수명 주기 동작 검증
 
 저장소 루트에서 바이너리를 빌드하고 관련 자동 검사를 실행합니다.

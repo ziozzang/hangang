@@ -972,7 +972,9 @@
                     "workload_route_terminations_total": 0,
                     "policy_capacity_rejections_total": 0,
                     "body_transform_errors_total": 0,
-                    "config_updates_total": 12
+                    "config_updates_total": 12,
+                    "config_apply_failures_total": 0,
+                    "tls_handshake_rejections_total": 0
                   },
                   "state": {
                     "draining": false,
@@ -1054,7 +1056,10 @@
                   "phase": "idle",
                   "current_version": "0.2.1",
                   "last_check_unix": 1788796800,
-                  "detail": null
+                  "detail": null,
+                  "rollbacks_total": 0,
+                  "last_rollback_reason": null,
+                  "last_rollback_unix": 0
                 }
               }
             }
@@ -5433,7 +5438,9 @@
           "workload_auth_rejections_total",
           "workload_route_terminations_total",
           "body_transform_errors_total",
-          "config_updates_total"
+          "config_updates_total",
+          "config_apply_failures_total",
+          "tls_handshake_rejections_total"
         ],
         "properties": {
           "requests_total": {
@@ -5492,6 +5499,8 @@
             "type": "integer",
             "minimum": 0
           },
+          "config_apply_failures_total": { "type": "integer", "minimum": 0, "description": "Configuration documents refused or not activated (validation, preparation, persistence or authority failure). Also exported as hangang_config_apply_failures_total." },
+          "tls_handshake_rejections_total": { "type": "integer", "minimum": 0, "description": "Public TLS handshakes refused because the shared --tls-handshake-limit budget was full, or closed after --tls-handshake-timeout-ms. Also counted in rejected_connections_total." },
           "body_transform_errors_total": {
             "type": "integer",
             "minimum": 0,
@@ -5560,7 +5569,10 @@
           "phase",
           "current_version",
           "last_check_unix",
-          "detail"
+          "detail",
+          "rollbacks_total",
+          "last_rollback_reason",
+          "last_rollback_unix"
         ],
         "properties": {
           "enabled": {
@@ -5568,6 +5580,7 @@
           },
           "phase": {
             "type": "string",
+            "enum": ["idle", "checking", "active", "up_to_date", "rejected", "rolled_back"],
             "example": "idle"
           },
           "current_version": {
@@ -5583,7 +5596,10 @@
               "string",
               "null"
             ]
-          }
+          },
+          "rollbacks_total": { "type": "integer", "minimum": 0, "description": "Automatic rollbacks: the new generation failed to take over and the previous executable was restored. Also exported as hangang_update_rollbacks_total." },
+          "last_rollback_reason": { "type": ["string", "null"], "description": "Fixed-vocabulary reason for the latest rollback; detailed errors stay in protected logs." },
+          "last_rollback_unix": { "type": "integer", "minimum": 0, "description": "Unix time of the latest rollback; 0 when none happened." }
         }
       },
       "DockerResolveRequest": {

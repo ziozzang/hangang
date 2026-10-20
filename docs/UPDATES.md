@@ -284,6 +284,19 @@ and version, and the last check time. `POST /v1/update/check` queues an immediat
 check. Both require the admin bearer token. A signed manifest for the already
 running version produces `up_to_date`; a downgrade remains a hard rejection.
 
+Phases are `idle`, `checking`, `active`, `up_to_date`, `rejected` (refused before
+the executable was replaced) and `rolled_back` (the executable was replaced, the
+new generation failed to take over, and the previous executable was restored).
+The status also carries `rollbacks_total`, `last_rollback_reason` (a fixed
+sentence; detailed errors, which can contain release URLs, stay in protected
+logs) and `last_rollback_unix` (0 when none happened). Status files written by
+earlier releases load with these fields at zero.
+
+`GET /metrics` exports the same state when updating is enabled:
+`hangang_update_rollbacks_total` (counter), `hangang_update_last_rollback_unix`
+(gauge) and `hangang_update_phase{phase="..."}` (gauge, 1 for the current phase
+and 0 for the others). Alert on an increase of the rollback counter.
+
 ## Verify lifecycle behavior
 
 From the repository root, build the binary and run the relevant automated checks:

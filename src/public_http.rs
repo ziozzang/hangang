@@ -195,15 +195,28 @@ pub async fn serve(
     let tls = tls_slot.is_some();
     if let Some(slot) = tls_slot {
         let Ok(handshake_permit) = public_handshake_admission().try_acquire_owned() else {
+            metrics
+                .tls_handshake_rejections
+                .fetch_add(1, Ordering::Relaxed);
             reject();
             return;
         };
         let acceptor = tokio_rustls::TlsAcceptor::from(slot.load_full());
         let accepted = tokio::select! { biased; _ = cancel.cancelled() => return,
-        result = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)) => result };
-        let Ok(Ok(stream)) = accepted else {
-            reject();
-            return;
+        result = tokio::time::timeout(public_handshake_timeout(), acceptor.accept(stream)) => result };
+        let stream = match accepted {
+            Ok(Ok(stream)) => stream,
+            Err(_) => {
+                metrics
+                    .tls_handshake_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                reject();
+                return;
+            }
+            Ok(Err(_)) => {
+                reject();
+                return;
+            }
         };
         drop(handshake_permit);
         if !evidence.current(&active.load()) {
@@ -242,10 +255,41 @@ pub async fn serve(
     }
 }
 
+/// Default for `--tls-handshake-limit`.
+pub const DEFAULT_TLS_HANDSHAKE_LIMIT: usize = 256;
+/// Default for `--tls-handshake-timeout-ms`.
+pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS: u64 = 5000;
+
+static HANDSHAKE_SETTINGS: std::sync::OnceLock<(usize, Duration)> = std::sync::OnceLock::new();
+
+fn handshake_settings() -> (usize, Duration) {
+    *HANDSHAKE_SETTINGS.get_or_init(|| {
+        (
+            DEFAULT_TLS_HANDSHAKE_LIMIT,
+            Duration::from_millis(DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS),
+        )
+    })
+}
+
+/// Fix the public TLS handshake capacity and deadline. Must run once,
+/// before any public listener accepts a connection.
+pub fn configure_handshake_admission(limit: usize, timeout: Duration) -> anyhow::Result<()> {
+    anyhow::ensure!(limit > 0, "TLS handshake limit must be positive");
+    anyhow::ensure!(!timeout.is_zero(), "TLS handshake timeout must be positive");
+    HANDSHAKE_SETTINGS
+        .set((limit, timeout))
+        .map_err(|_| anyhow::anyhow!("TLS handshake admission is already configured"))
+}
+
+/// Deadline for one public TLS handshake.
+pub fn public_handshake_timeout() -> Duration {
+    handshake_settings().1
+}
+
 /// Shared TLS handshake capacity for named and command-line public listeners.
 pub fn public_handshake_admission() -> Arc<tokio::sync::Semaphore> {
     static ADMISSION: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(handshake_settings().0)));
     ADMISSION.clone()
 }
 
