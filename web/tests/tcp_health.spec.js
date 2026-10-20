@@ -102,7 +102,7 @@ test('healthy default omits initial_state and an existing TCP policy can be disa
 test('advanced JSON TCP health add and remove survive unrelated native input', async ({ page }) => {
   const writes = await fixture(page);
   await edit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.health = checking;
@@ -115,7 +115,7 @@ test('advanced JSON TCP health add and remove survive unrelated native input', a
   expect(writes[0].health).toEqual(checking);
 
   await edit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const removed = JSON.parse(await json.inputValue());
   removed.health = null;
   await json.fill(JSON.stringify(removed, null, 2));

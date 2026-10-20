@@ -126,7 +126,7 @@ test('protected route accepts workload principal and exact SPIFFE subject via na
 test('advanced workload JSON and principal survive unrelated native edits', async ({ page }) => {
   const { routeWrites } = await fixture(page);
   await routeEditor(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue());
   draft.access_mode = 'protected';

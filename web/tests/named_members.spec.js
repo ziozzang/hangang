@@ -45,7 +45,7 @@ async function save(page) {
 }
 
 async function openAdvanced(page) {
-  const details = page.locator('.advanced-editor');
+  const details = page.locator('#route-dialog .advanced-editor:has(> #route-json)');
   if (!(await details.evaluate((element) => element.open))) await details.locator('summary').click();
 }
 

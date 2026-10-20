@@ -68,7 +68,7 @@ test('native inbound mTLS fields save file paths and exact SPIFFE identities', a
 test('advanced JSON mTLS add and removal survive unrelated native edits', async ({ page }) => {
   const writes = await fixture(page);
   await edit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const added = JSON.parse(await json.inputValue());
   added.inbound_tls = structuredClone(inboundTls);
@@ -81,7 +81,7 @@ test('advanced JSON mTLS add and removal survive unrelated native edits', async 
   expect(writes[0].inbound_tls).toEqual(added.inbound_tls);
 
   await edit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const removed = JSON.parse(await json.inputValue()); removed.inbound_tls = null;
   await json.fill(JSON.stringify(removed));
   await expect(page.locator('#route-field-inbound_tls_enabled')).not.toBeChecked();
@@ -109,7 +109,7 @@ test('SNI passthrough and inbound mTLS cannot be saved together', async ({ page 
 test('malformed advanced inbound TLS cannot be silently normalized', async ({ page }) => {
   const writes = await fixture(page);
   await edit(page);
-  await page.locator('#route-dialog .advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const json = page.locator('#route-json');
   const draft = JSON.parse(await json.inputValue()); draft.inbound_tls = { cert_file: inboundTls.cert_file };
   await json.fill(JSON.stringify(draft));

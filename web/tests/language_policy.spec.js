@@ -79,7 +79,7 @@ test('English controls configure, disable and remove a language policy through r
 test('Korean controls and advanced JSON round-trip with an unrelated native edit', async ({ page }) => {
   const { writes } = await fixture(page, baseRoute, 'ko');
   await edit(page);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const draft = { ...baseRoute, language_policy: { mode: 'any', allow: ['ko', '*'], deny: ['fr-CA'], on_missing: 'allow', enforce: false } };
   await page.locator('#route-json').fill(JSON.stringify(draft));
   await expect(page.locator('#route-field-language_policy_action')).toHaveValue('configured');
@@ -102,7 +102,7 @@ test('invalid native and advanced policies do not produce writes or erase the dr
   await expect(page.locator('#route-message')).toContainText('basic tags');
   await page.locator('#save-route').click();
   expect(writes).toHaveLength(0);
-  await page.locator('.advanced-editor summary').click();
+  await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const malformed = { ...baseRoute, language_policy: { mode: 'any', allow: ['ko', 'KO'], deny: [], on_missing: 'deny' } };
   await page.locator('#route-json').fill(JSON.stringify(malformed));
   await page.locator('#route-field-priority').fill('2');
@@ -115,7 +115,7 @@ test('invalid native and advanced policies do not produce writes or erase the dr
 
 test('advanced null language lists are not silently converted during native edits', async ({ page }) => {
   const { writes } = await fixture(page);
-  await edit(page); await page.locator('.advanced-editor summary').click();
+  await edit(page); await page.locator('#route-dialog .advanced-editor:has(> #route-json) > summary').click();
   const malformed = { ...baseRoute, language_policy: { mode: 'any', allow: null, deny: ['fr'], on_missing: 'deny' } };
   await page.locator('#route-json').fill(JSON.stringify(malformed));
   await page.locator('#route-field-priority').fill('2');
