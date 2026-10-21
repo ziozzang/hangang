@@ -464,15 +464,27 @@ impl Observation {
 // times. Before a new client is stored, clients idle longer than the state
 // lifetime are dropped, then the least recently used beyond the capacity, so
 // the hash never holds more than `max_clients` clients even with many gateways.
+// Last-use scores are microseconds raised to one above the newest score, so
+// they strictly increase per rule: requests in the same instant, or after the
+// Redis clock steps back, keep their order and a client used (or rejected) a
+// moment ago is never dropped before older clients.
 const RATE: &str = r#"
 local t=redis.call('TIME'); local now=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000)
+local now_us=tonumber(t[1])*1000000+tonumber(t[2])
 local client=ARGV[1]
 local pending={}
 local k=1
--- A rejected client still counts as recently used, as in local mode; XX never adds one.
+local function touch(order,flag)
+ local stamp=now_us; local top=redis.call('ZRANGE',order,-1,-1,'WITHSCORES')
+ if top[2] and tonumber(top[2])>=stamp then stamp=tonumber(top[2])+1 end
+ if flag then redis.call('ZADD',order,flag,string.format('%.0f',stamp),client)
+ else redis.call('ZADD',order,string.format('%.0f',stamp),client) end
+end
+-- A rejected client still counts as recently used, as in local mode; XX never
+-- adds one, and its stored state is left exactly as it was.
 local function reject(order)
- for _,p in ipairs(pending) do if p.order then redis.call('ZADD',p.order,'XX',now,client) end end
- if order then redis.call('ZADD',order,'XX',now,client) end
+ for _,p in ipairs(pending) do if p.order then touch(p.order,'XX') end end
+ if order then touch(order,'XX') end
  return 0
 end
 for i=2,#ARGV,2 do
@@ -499,14 +511,14 @@ for _,p in ipairs(pending) do
  if p.order then
   if not redis.call('ZSCORE',p.order,client) then
    if redis.call('ZCARD',p.order)==0 then redis.call('DEL',p.key) end
-   local drop=redis.call('ZRANGEBYSCORE',p.order,'-inf',now-p.ttl,'LIMIT',0,64)
+   local drop=redis.call('ZRANGEBYSCORE',p.order,'-inf',string.format('%.0f',now_us-p.ttl*1000),'LIMIT',0,64)
    local excess=redis.call('ZCARD',p.order)-#drop-p.cap+1
    if excess>0 then
     for _,member in ipairs(redis.call('ZRANGE',p.order,#drop,#drop+math.min(excess,1024)-1)) do drop[#drop+1]=member end
    end
    for _,member in ipairs(drop) do redis.call('HDEL',p.key,member); redis.call('ZREM',p.order,member) end
   end
-  redis.call('HSET',p.key,client,cjson.encode(p.state)); redis.call('ZADD',p.order,now,client)
+  redis.call('HSET',p.key,client,cjson.encode(p.state)); touch(p.order,false)
   redis.call('PEXPIRE',p.key,p.ttl); redis.call('PEXPIRE',p.order,p.ttl)
  else
   redis.call('SET',p.key,cjson.encode(p.state),'PX',p.ttl)
@@ -1089,6 +1101,151 @@ mod tests {
             );
         }
         assert_eq!(stored_clients(&a, &rule).await, (3, 3));
+    }
+    async fn is_stored(backend: &Backend, rule: &RateRule, ip: IpAddr) -> bool {
+        let stored: i64 = backend
+            .invoke(
+                "return (redis.call('HEXISTS',KEYS[1],ARGV[1])==1 and redis.call('ZSCORE',KEYS[2],ARGV[1])) and 1 or 0",
+                backend.rate_keys(rule),
+                vec![ip.to_string()],
+            )
+            .await
+            .unwrap();
+        stored == 1
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_redis_same_instant_never_drops_the_client_just_rejected() {
+        // Review repro: A, B and C fill a three-client rule, A is rejected,
+        // then D arrives — all inside one script, so one Redis clock reading.
+        // Equal millisecond scores used to drop A by address order and hand
+        // it a fresh daily budget; B is the least recently used and must go.
+        let name = format!("test-per-client-same-instant-{}", std::process::id());
+        let a = backend(&name);
+        let rule = per_client_daily(3);
+        let keys = a.rate_keys(&rule);
+        a.invoke::<i64>(
+            "return redis.call('DEL',KEYS[1],KEYS[2])",
+            keys.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let script = format!(
+            "local function rate(KEYS,ARGV)\n{RATE}\nend\nlocal results={{}}\n\
+             for i=3,#ARGV do results[#results+1]=rate(KEYS,{{ARGV[i],ARGV[1],ARGV[2]}}) end\n\
+             return results"
+        );
+        let order = [1, 2, 3, 1, 4, 1];
+        let mut args = vec![serde_json::to_string(&rule).unwrap(), "3".into()];
+        args.extend(order.iter().map(|n| client(*n).to_string()));
+        let results: Vec<i64> = a.invoke(&script, keys, args).await.unwrap();
+        assert_eq!(results, [1, 1, 1, 0, 1, 0]);
+        assert!(is_stored(&a, &rule, client(1)).await, "rejected A is kept");
+        assert!(!is_stored(&a, &rule, client(2)).await, "B was least recent");
+        assert_eq!(stored_clients(&a, &rule).await, (3, 3));
+        let again = a
+            .check_rates(
+                std::slice::from_ref(&rule),
+                &request("/login"),
+                None,
+                client(1),
+            )
+            .await;
+        assert_eq!(again.unwrap_err().status, 429, "A keeps its spent budget");
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_redis_order_survives_a_clock_step_back() {
+        // Scores far ahead of the Redis clock stand in for a clock that
+        // stepped back; new uses must still rank above them.
+        let name = format!("test-per-client-clock-{}", std::process::id());
+        let a = backend(&name);
+        let rule = per_client_daily(3);
+        let rules = std::slice::from_ref(&rule);
+        let keys = a.rate_keys(&rule);
+        a.invoke::<i64>(
+            "return redis.call('DEL',KEYS[1],KEYS[2])",
+            keys.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        for n in 1..=3 {
+            assert!(
+                a.check_rates(rules, &request("/login"), None, client(n))
+                    .await
+                    .is_ok()
+            );
+        }
+        let ahead = (1..=3)
+            .map(|n| format!("900000000000000{n}"))
+            .chain((1..=3).map(|n| client(n).to_string()));
+        a.invoke::<i64>(
+            "for i=1,3 do redis.call('ZADD',KEYS[2],'XX',ARGV[i],ARGV[i+3]) end return 1",
+            keys,
+            ahead.collect(),
+        )
+        .await
+        .unwrap();
+        let rejected = a
+            .check_rates(rules, &request("/login"), None, client(1))
+            .await;
+        assert_eq!(rejected.unwrap_err().status, 429);
+        assert!(
+            a.check_rates(rules, &request("/login"), None, client(4))
+                .await
+                .is_ok()
+        );
+        assert!(is_stored(&a, &rule, client(1)).await, "rejected A is kept");
+        assert!(!is_stored(&a, &rule, client(2)).await, "B was least recent");
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_redis_rejected_client_stays_rejected_across_gateways() {
+        // Two gateways alternate: one keeps rejecting A, the other brings a
+        // new address each time. Many of these land in the same millisecond;
+        // A is always the most recent but one, so it must never be dropped.
+        let name = format!("test-per-client-gateways-{}", std::process::id());
+        let gateways = [backend(&name), backend(&name)];
+        let rule = per_client_daily(3);
+        let rules = std::slice::from_ref(&rule);
+        gateways[0]
+            .invoke::<i64>(
+                "return redis.call('DEL',KEYS[1],KEYS[2])",
+                gateways[0].rate_keys(&rule),
+                vec![],
+            )
+            .await
+            .unwrap();
+        for n in 1..=3 {
+            assert!(
+                gateways[0]
+                    .check_rates(rules, &request("/login"), None, client(n))
+                    .await
+                    .is_ok()
+            );
+        }
+        for round in 0..400_u32 {
+            let (rejecting, adding) = (
+                &gateways[(round % 2) as usize],
+                &gateways[(1 - round % 2) as usize],
+            );
+            let rejected = rejecting
+                .check_rates(rules, &request("/login"), None, client(1))
+                .await;
+            assert_eq!(
+                rejected.unwrap_err().status,
+                429,
+                "round {round}: A got a new budget"
+            );
+            let fresh = adding
+                .check_rates(rules, &request("/login"), None, client(10_000 + round))
+                .await;
+            assert!(fresh.is_ok(), "round {round}: new client has a budget");
+        }
+        assert!(is_stored(&gateways[1], &rule, client(1)).await);
+        assert_eq!(stored_clients(&gateways[1], &rule).await, (3, 3));
     }
     #[tokio::test]
     #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
