@@ -1,0 +1,58 @@
+# Supply-chain policy checked by `cargo deny check` in CI
+# (.github/workflows/binaries.yml, job `supply-chain`).
+# cargo-audit in the same job ignores exactly the RUSTSEC IDs listed here.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Known advisories present when this policy was introduced (issue #4). Each
+# entry must name the crate and the follow-up. Remove an entry as soon as the
+# lockfile no longer contains the affected version.
+ignore = [
+    # rsa 0.9: Marvin timing attack, no fixed release exists yet.
+    { id = "RUSTSEC-2023-0071", reason = "rsa: no patched release; tracked in jikji/hangang#4" },
+    # rustls-pemfile 2.2: unmaintained; replace with rustls-pki-types PEM parsing.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration tracked in jikji/hangang#4" },
+]
+
+[licenses]
+version = 2
+# Hangang itself is AGPL-3.0-only; every dependency license below is
+# compatible with distributing it under that license.
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported but do not fail the build.
+multiple-versions = "warn"
+# Internal path crates and rev-pinned git crates have no version requirement.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Sibling projects pinned by exact git revision in Cargo.toml.
+allow-git = [
+    "https://github.com/ziozzang/hangang-runtime",
+    "https://github.com/ziozzang/hopae",
+    "https://github.com/ziozzang/pumgye",
+    "https://github.com/ziozzang/sumunjang",
+]

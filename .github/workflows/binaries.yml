@@ -6,6 +6,8 @@ on:
     branches: [main]
     tags: ['v*']
     paths:
+      - 'deny.toml'
+      - 'Makefile'
       - 'src/**'
       - 'tests/**'
       - 'Cargo.*'
@@ -14,6 +16,8 @@ on:
       - '.github/workflows/binaries.yml'
   pull_request:
     paths:
+      - 'deny.toml'
+      - 'Makefile'
       - 'src/**'
       - 'tests/**'
       - 'Cargo.*'
@@ -29,6 +33,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  full-check:
+    # The native matrix below runs only a few test targets per platform. This
+    # one Linux job runs formatting, clippy on every target and the complete
+    # Rust test suite so integration tests under tests/ catch regressions.
+    name: fmt, clippy and full test suite (x86_64 Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install protoc
+        # build.rs of hangang-route-grpc and the pinned hopae/sumunjang/pumgye
+        # gRPC crates call an external protoc; runner images do not ship one.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Use physical temporary paths
+        run: python3 -c 'import os,tempfile; print("TMPDIR=" + os.path.realpath(tempfile.gettempdir()))' >> "$GITHUB_ENV"
+      - name: Formatting and clippy on all targets
+        run: make check
+      - name: Complete Rust test suite
+        # Tests that need Docker or other external services stay #[ignore].
+        run: cargo test --locked
+
+  supply-chain:
+    # Licenses, RustSEC advisories, dependency sources and duplicates. The
+    # accepted advisory list lives in deny.toml; cargo-audit reads the same IDs.
+    name: dependency licenses and advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.18.9,cargo-audit@0.22.2
+      - name: cargo deny
+        run: cargo deny --locked check advisories bans licenses sources
+      - name: cargo audit
+        shell: bash
+        run: |
+          ignores=()
+          for id in $(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' deny.toml | sort -u); do
+            ignores+=(--ignore "$id")
+          done
+          cargo audit --deny warnings "${ignores[@]}"
+
   native:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -67,9 +131,16 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
           rustup target add '${{ matrix.target }}'
-      - name: Install musl build tools
-        if: contains(matrix.target, '-musl')
-        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+      - name: Install protoc and musl build tools (Linux)
+        # gRPC build scripts call an external protoc; runner images do not ship one.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          if [ '${{ contains(matrix.target, '-musl') }}' = true ]; then sudo apt-get install -y musl-tools; fi
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: Use physical temporary paths
         shell: bash
         run: python3 -c 'import os,tempfile; print("TMPDIR=" + os.path.realpath(tempfile.gettempdir()))' >> "$GITHUB_ENV"
