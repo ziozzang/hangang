@@ -1,0 +1,71 @@
+# Supply-chain policy checked by `cargo deny check` in CI
+# (.github/workflows/binaries.yml, job `supply-chain`).
+# cargo-audit in the same job ignores exactly the RUSTSEC IDs listed here.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Known advisories present when this policy was introduced (issue #4). Each
+# entry must name the crate and the follow-up. Remove an entry as soon as the
+# lockfile no longer contains the affected version.
+ignore = [
+    # rsa 0.9: Marvin timing attack, no fixed release exists yet.
+    { id = "RUSTSEC-2023-0071", reason = "rsa: no patched release; tracked in jikji/hangang#4" },
+    # rustls-pemfile 2.2: unmaintained; replace with rustls-pki-types PEM parsing.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration tracked in jikji/hangang#4" },
+    # Fixed by a semver-compatible lockfile update (separate PR). quinn-proto and
+    # webpki-root-certs are reported only by cargo-audit, which scans every
+    # lockfile entry; cargo-deny skips them as unused on this graph.
+    { id = "RUSTSEC-2026-0338", reason = "quinn-proto < 0.11.18; lockfile update PR" },
+    { id = "RUSTSEC-2026-0340", reason = "quinn-proto < 0.11.18; lockfile update PR" },
+    { id = "RUSTSEC-2026-0343", reason = "quinn-proto < 0.11.18; lockfile update PR" },
+    { id = "RUSTSEC-2026-0346", reason = "rustls < 0.23.46; lockfile update PR" },
+    { id = "RUSTSEC-2026-0347", reason = "rustls < 0.23.46; lockfile update PR" },
+    { id = "RUSTSEC-2026-0348", reason = "rustls < 0.23.46; lockfile update PR" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls < 0.23.46; lockfile update PR" },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots < 1.0.10; lockfile update PR" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki < 0.103.16; lockfile update PR" },
+    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs < 1.0.10; lockfile update PR" },
+]
+
+[licenses]
+version = 2
+# Hangang itself is AGPL-3.0-only; every dependency license below is
+# compatible with distributing it under that license.
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are reported but do not fail the build.
+multiple-versions = "warn"
+# Internal path crates and rev-pinned git crates have no version requirement.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Sibling projects pinned by exact git revision in Cargo.toml.
+allow-git = [
+    "https://github.com/ziozzang/hangang-runtime",
+    "https://github.com/ziozzang/hopae",
+    "https://github.com/ziozzang/pumgye",
+    "https://github.com/ziozzang/sumunjang",
+]
