@@ -249,6 +249,8 @@ export default {
   'SOCKS5 username variable': 'SOCKS5 사용자 환경 변수', 'Set response headers': '응답 헤더 설정',
   'Skip TLS certificate verification': 'TLS 인증서 검증 건너뛰기', 'TLS CA file': 'TLS CA 파일',
   'TLS maximum fragment size': 'TLS 최대 조각 크기', 'TLS server name': 'TLS 서버 이름',
+  'per_client must be true or false.': 'per_client는 true 또는 false여야 합니다.',
+  'max_clients requires per_client.': 'max_clients는 per_client와 함께만 쓸 수 있습니다.',
   'Upstream DNS servers': '업스트림 DNS 서버', 'Upstream Host override': '업스트림 Host 재정의',
   'Upstream timeout (ms)': '업스트림 시간 제한(ms)',
   'Upstream body idle (ms)': '업스트림 본문 대기 한도(ms)',

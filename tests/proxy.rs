@@ -741,6 +741,8 @@ async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
         tps: Some(1),
         burst: 1,
         limits: vec![],
+        per_client: false,
+        max_clients: None,
     }]);
     active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
     assert_eq!(
@@ -925,6 +927,8 @@ async fn path_blocks_and_url_budget_precede_origins_and_survive_unrelated_reload
             tps: Some(1),
             burst: 1,
             limits: vec![],
+            per_client: false,
+            max_clients: None,
         }]),
         ..Default::default()
     };
@@ -3334,6 +3338,60 @@ async fn frontend_with_peer_transport_port(
         }
     });
     (address, task)
+}
+
+#[tokio::test]
+async fn per_client_rate_limit_uses_the_trusted_proxy_client_address() {
+    use ipnet::IpNet;
+
+    let (backend, _seen, backend_task) = upstream("b").await;
+    let settings = hangang::config::Settings {
+        path_rate_limits: Some(vec![hangang::path_rate_limits::Rule {
+            path: "/login".into(),
+            include_subpaths: false,
+            hosts: vec![],
+            tps: None,
+            burst: 1,
+            limits: vec![hangang::path_rate_limits::Window {
+                requests: 1,
+                window_seconds: 60,
+            }],
+            per_client: true,
+            max_clients: None,
+        }]),
+        ..Default::default()
+    };
+    let ((proxy, policy), _active) =
+        proxy_with_settings(vec![route(vec![format!("http://{backend}")])], settings);
+    let proxy = proxy.with_trusted_proxies(vec!["127.0.0.0/8".parse::<IpNet>().unwrap()]);
+    let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let (front, front_task) = frontend_with_peer(proxy, peer).await;
+    let client = client();
+    let status = |forwarded_for: &'static str| {
+        let request = client.request(
+            Request::builder()
+                .uri(format!("http://{front}/login"))
+                .header("x-forwarded-for", forwarded_for)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        );
+        async move {
+            let response = request.await.unwrap();
+            let status = response.status().as_u16();
+            response.into_body().collect().await.unwrap();
+            status
+        }
+    };
+    assert_eq!(status("203.0.113.1").await, 200);
+    assert_eq!(status("203.0.113.1").await, 429, "same client is limited");
+    // Every client behind the shared proxy keeps its own budget.
+    assert_eq!(status("203.0.113.2").await, 200);
+    assert_eq!(status("203.0.113.3").await, 200);
+    assert_eq!(status("203.0.113.2").await, 429);
+
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
 }
 
 #[tokio::test]
