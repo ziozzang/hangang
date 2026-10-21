@@ -51,7 +51,7 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn client_capacity(&self) -> usize {
+    pub(crate) fn client_capacity(&self) -> usize {
         self.max_clients.unwrap_or(DEFAULT_MAX_CLIENTS) as usize
     }
 }

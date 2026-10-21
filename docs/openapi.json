@@ -6692,7 +6692,7 @@
                   "minimum": 1,
                   "maximum": 1048576,
                   "default": 65536,
-                  "description": "Only with per_client. Local mode keeps at most this many client budgets for the rule and drops the least recently used one first. The sum over all per_client rules may not exceed 1048576. Redis mode keeps one expiring key per client instead."
+                  "description": "Only with per_client. Local mode keeps at most this many client budgets for the rule and drops the least recently used one first. The sum over all per_client rules may not exceed 1048576. Redis mode applies the same bound fleet-wide with one hash and one last-use sorted set per rule."
                 }
               }
             },

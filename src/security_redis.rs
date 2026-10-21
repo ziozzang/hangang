@@ -154,14 +154,16 @@ impl Backend {
             .map_err(unavailable)?
             .map_err(unavailable)
     }
-    /// Shared rules keep their established key. A per-client rule adds the
-    /// canonical client IP; every key still carries the namespace hash tag.
-    fn rate_key(&self, rule: &RateRule, client: IpAddr) -> String {
+    /// Shared rules keep their established single key. A per-client rule
+    /// keeps every client's state in one hash (field = canonical client IP)
+    /// plus a sorted set of last-use times, so the script can hold the rule
+    /// to `max_clients` clients. Every key carries the namespace hash tag.
+    fn rate_keys(&self, rule: &RateRule) -> Vec<String> {
         let key = format!("{}:rate:{}", self.prefix, digest(rule));
         if rule.per_client {
-            format!("{key}:client:{}", client.to_canonical())
+            vec![format!("{key}:clients"), format!("{key}:order")]
         } else {
-            key
+            vec![key]
         }
     }
     fn ban_keys(&self, rule: &BanRule) -> [String; 2] {
@@ -176,7 +178,7 @@ impl Backend {
         client: IpAddr,
     ) -> Result<(), Error> {
         let mut keys = vec![];
-        let mut args = vec![];
+        let mut args = vec![client.to_canonical().to_string()];
         for rule in rules {
             if selected(
                 &rule.path,
@@ -185,8 +187,14 @@ impl Backend {
                 request,
                 host,
             )? {
-                keys.push(self.rate_key(rule, client));
+                keys.extend(self.rate_keys(rule));
                 args.push(serde_json::to_string(rule).map_err(unavailable)?);
+                let capacity = if rule.per_client {
+                    rule.client_capacity()
+                } else {
+                    0
+                };
+                args.push(capacity.to_string());
             }
         }
         if keys.is_empty() {
@@ -450,27 +458,60 @@ impl Observation {
         Ok(events)
     }
 }
+// ARGV[1] is the canonical client IP, then a rule and its client capacity per
+// selected rule (0 = one budget shared by every client, one key). A per-client
+// rule uses two keys: a hash of client states and a sorted set of last-use
+// times. Before a new client is stored, clients idle longer than the state
+// lifetime are dropped, then the least recently used beyond the capacity, so
+// the hash never holds more than `max_clients` clients even with many gateways.
 const RATE: &str = r#"
 local t=redis.call('TIME'); local now=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000)
+local client=ARGV[1]
 local pending={}
-for i,key in ipairs(KEYS) do
- local rule=cjson.decode(ARGV[i]); local old=redis.call('GET',key); local state=old and cjson.decode(old) or {updated=now,credit=rule.burst,windows={}}
+local k=1
+-- A rejected client still counts as recently used, as in local mode; XX never adds one.
+local function reject(order)
+ for _,p in ipairs(pending) do if p.order then redis.call('ZADD',p.order,'XX',now,client) end end
+ if order then redis.call('ZADD',order,'XX',now,client) end
+ return 0
+end
+for i=2,#ARGV,2 do
+ local rule=cjson.decode(ARGV[i]); local cap=tonumber(ARGV[i+1])
+ local key=KEYS[k]; local order=false; local old; k=k+1
+ if cap>0 then order=KEYS[k]; k=k+1; old=redis.call('HGET',key,client) else old=redis.call('GET',key) end
+ local state=old and cjson.decode(old) or {updated=now,credit=rule.burst,windows={}}
  local maxage=1000
  if rule.tps then
   state.credit=math.min(rule.burst,state.credit+math.max(0,now-state.updated)*rule.tps/1000)
-  if state.credit<1 then return 0 end
+  if state.credit<1 then return reject(order) end
   state.credit=state.credit-1; maxage=math.max(maxage,math.ceil(rule.burst/rule.tps*1000))
  end
  state.updated=math.max(now,state.updated)
  for j,w in ipairs(rule.limits or {}) do
   local bucket=math.floor(now/(w.window_seconds*1000)); local previous=state.windows[j]
   local count=(previous and previous.bucket==bucket) and previous.count or 0
-  if count>=w.requests then return 0 end
+  if count>=w.requests then return reject(order) end
   state.windows[j]={bucket=bucket,count=count+1}; maxage=math.max(maxage,w.window_seconds*1000)
  end
- pending[i]={state=state,ttl=maxage+1000}
+ pending[#pending+1]={key=key,order=order,cap=cap,state=state,ttl=maxage+1000}
 end
-for i,key in ipairs(KEYS) do redis.call('SET',key,cjson.encode(pending[i].state),'PX',pending[i].ttl) end
+for _,p in ipairs(pending) do
+ if p.order then
+  if not redis.call('ZSCORE',p.order,client) then
+   if redis.call('ZCARD',p.order)==0 then redis.call('DEL',p.key) end
+   local drop=redis.call('ZRANGEBYSCORE',p.order,'-inf',now-p.ttl,'LIMIT',0,64)
+   local excess=redis.call('ZCARD',p.order)-#drop-p.cap+1
+   if excess>0 then
+    for _,member in ipairs(redis.call('ZRANGE',p.order,#drop,#drop+math.min(excess,1024)-1)) do drop[#drop+1]=member end
+   end
+   for _,member in ipairs(drop) do redis.call('HDEL',p.key,member); redis.call('ZREM',p.order,member) end
+  end
+  redis.call('HSET',p.key,client,cjson.encode(p.state)); redis.call('ZADD',p.order,now,client)
+  redis.call('PEXPIRE',p.key,p.ttl); redis.call('PEXPIRE',p.order,p.ttl)
+ else
+  redis.call('SET',p.key,cjson.encode(p.state),'PX',p.ttl)
+ end
+end
 return 1
 "#;
 const CLEAR: &str = r#"
@@ -589,7 +630,7 @@ mod tests {
             .unwrap()
     }
     #[tokio::test]
-    async fn per_client_rate_keys_add_the_canonical_client_and_keep_shared_keys() {
+    async fn per_client_rate_keys_are_a_bounded_hash_and_order_and_keep_shared_keys() {
         let backend = Backend::from_url(
             Settings {
                 allow_insecure_remote: true,
@@ -601,16 +642,17 @@ mod tests {
         let shared = rate("/login", 2);
         let mut per_client = shared.clone();
         per_client.per_client = true;
-        let shared_key = backend.rate_key(&shared, CLIENT);
-        assert_eq!(
-            shared_key,
-            backend.rate_key(&shared, "198.51.100.9".parse().unwrap())
-        );
-        assert!(!shared_key.contains("client"));
-        let mapped: IpAddr = "::ffff:192.0.2.50".parse().unwrap();
-        let key = backend.rate_key(&per_client, mapped);
-        assert!(key.ends_with(":client:192.0.2.50"), "{key}");
-        assert!(key.starts_with(&backend.prefix));
+        let shared_keys = backend.rate_keys(&shared);
+        assert_eq!(shared_keys.len(), 1);
+        assert!(!shared_keys[0].contains("client"));
+        let keys = backend.rate_keys(&per_client);
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].ends_with(":clients") && keys[1].ends_with(":order"));
+        assert!(keys.iter().all(|key| key.starts_with(&backend.prefix)));
+        // A different capacity is a different rule with its own keys.
+        let mut other = per_client.clone();
+        other.max_clients = Some(3);
+        assert_ne!(backend.rate_keys(&other), keys);
     }
     #[test]
     fn settings_never_accept_inline_credentials_or_unrelated_environment() {
@@ -977,6 +1019,110 @@ mod tests {
                 .status,
             429
         );
+    }
+    fn per_client_daily(max_clients: u32) -> RateRule {
+        RateRule {
+            limits: vec![Window {
+                requests: 1,
+                window_seconds: 86400,
+            }],
+            per_client: true,
+            max_clients: Some(max_clients),
+            ..rate("/login", 1)
+        }
+    }
+    async fn stored_clients(backend: &Backend, rule: &RateRule) -> (i64, i64) {
+        let counts: Vec<i64> = backend
+            .invoke(
+                "return {redis.call('HLEN',KEYS[1]),redis.call('ZCARD',KEYS[2])}",
+                backend.rate_keys(rule),
+                vec![],
+            )
+            .await
+            .unwrap();
+        (counts[0], counts[1])
+    }
+    fn client(n: u32) -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::from(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000_u128 + u128::from(n),
+        ))
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_redis_state_is_bounded_and_evicts_least_recently_used() {
+        let name = format!("test-per-client-lru-{}", std::process::id());
+        let a = backend(&name);
+        let rule = per_client_daily(3);
+        let rules = std::slice::from_ref(&rule);
+        let login = || request("/login");
+        for n in 1..=3 {
+            assert!(
+                a.check_rates(rules, &login(), None, client(n))
+                    .await
+                    .is_ok()
+            );
+        }
+        // A rejected client still counts as recently used, so client 2 is now
+        // the least recently used and makes room for client 4.
+        let rejected = a.check_rates(rules, &login(), None, client(1)).await;
+        assert_eq!(rejected.unwrap_err().status, 429);
+        assert!(
+            a.check_rates(rules, &login(), None, client(4))
+                .await
+                .is_ok()
+        );
+        assert_eq!(stored_clients(&a, &rule).await, (3, 3));
+        let kept = a.check_rates(rules, &login(), None, client(1)).await;
+        assert_eq!(kept.unwrap_err().status, 429, "client 1 kept its state");
+        assert!(
+            a.check_rates(rules, &login(), None, client(2))
+                .await
+                .is_ok(),
+            "evicted client 2 starts again with a full budget"
+        );
+        // A flood of fresh addresses never stores more than max_clients.
+        for n in 100..400 {
+            assert!(
+                a.check_rates(rules, &login(), None, client(n))
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(stored_clients(&a, &rule).await, (3, 3));
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_redis_bound_holds_across_concurrent_gateways() {
+        let name = format!("test-per-client-fleet-{}", std::process::id());
+        let a = backend(&name);
+        let b = backend(&name);
+        let rule = per_client_daily(16);
+        let mut tasks = vec![];
+        for task in 0..32_u32 {
+            let backend = if task % 2 == 0 { a.clone() } else { b.clone() };
+            let rules = vec![rule.clone()];
+            tasks.push(tokio::spawn(async move {
+                let mut admitted = 0;
+                for n in 0..16 {
+                    let ip = client(1000 + task * 16 + n);
+                    if backend
+                        .check_rates(&rules, &request("/login"), None, ip)
+                        .await
+                        .is_ok()
+                    {
+                        admitted += 1;
+                    }
+                }
+                admitted
+            }));
+        }
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += task.await.unwrap();
+        }
+        assert_eq!(admitted, 512, "every new client starts with a budget");
+        assert_eq!(stored_clients(&a, &rule).await, (16, 16));
+        assert_eq!(stored_clients(&b, &rule).await, (16, 16));
     }
     #[tokio::test]
     #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
