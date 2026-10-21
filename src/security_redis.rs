@@ -154,8 +154,15 @@ impl Backend {
             .map_err(unavailable)?
             .map_err(unavailable)
     }
-    fn rate_key(&self, rule: &RateRule) -> String {
-        format!("{}:rate:{}", self.prefix, digest(rule))
+    /// Shared rules keep their established key. A per-client rule adds the
+    /// canonical client IP; every key still carries the namespace hash tag.
+    fn rate_key(&self, rule: &RateRule, client: IpAddr) -> String {
+        let key = format!("{}:rate:{}", self.prefix, digest(rule));
+        if rule.per_client {
+            format!("{key}:client:{}", client.to_canonical())
+        } else {
+            key
+        }
     }
     fn ban_keys(&self, rule: &BanRule) -> [String; 2] {
         let base = format!("{}:ban:{}", self.prefix, digest(rule));
@@ -166,6 +173,7 @@ impl Backend {
         rules: &[RateRule],
         request: &Request<()>,
         host: Option<&str>,
+        client: IpAddr,
     ) -> Result<(), Error> {
         let mut keys = vec![];
         let mut args = vec![];
@@ -177,7 +185,7 @@ impl Backend {
                 request,
                 host,
             )? {
-                keys.push(self.rate_key(rule));
+                keys.push(self.rate_key(rule, client));
                 args.push(serde_json::to_string(rule).map_err(unavailable)?);
             }
         }
@@ -523,6 +531,7 @@ return redis.error_reply('invalid security operation')
 mod tests {
     use super::*;
     use crate::path_rate_limits::Window;
+    const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 50));
     fn settings(namespace: &str) -> Settings {
         Settings {
             url_env: "HANGANG_SECURITY_REDIS_TEST_URL".into(),
@@ -557,6 +566,8 @@ mod tests {
                     window_seconds: 86400,
                 },
             ],
+            per_client: false,
+            max_clients: None,
         }
     }
     fn ban() -> BanRule {
@@ -576,6 +587,30 @@ mod tests {
             .header("host", "example.test")
             .body(())
             .unwrap()
+    }
+    #[tokio::test]
+    async fn per_client_rate_keys_add_the_canonical_client_and_keep_shared_keys() {
+        let backend = Backend::from_url(
+            Settings {
+                allow_insecure_remote: true,
+                ..settings("key-test")
+            },
+            "redis://127.0.0.1:1/",
+        )
+        .unwrap();
+        let shared = rate("/login", 2);
+        let mut per_client = shared.clone();
+        per_client.per_client = true;
+        let shared_key = backend.rate_key(&shared, CLIENT);
+        assert_eq!(
+            shared_key,
+            backend.rate_key(&shared, "198.51.100.9".parse().unwrap())
+        );
+        assert!(!shared_key.contains("client"));
+        let mapped: IpAddr = "::ffff:192.0.2.50".parse().unwrap();
+        let key = backend.rate_key(&per_client, mapped);
+        assert!(key.ends_with(":client:192.0.2.50"), "{key}");
+        assert!(key.starts_with(&backend.prefix));
     }
     #[test]
     fn settings_never_accept_inline_credentials_or_unrelated_environment() {
@@ -699,14 +734,18 @@ mod tests {
                 .unwrap()
         };
         let started = std::time::Instant::now();
-        assert!(a.check_rates(&[], &request("/login"), None).await.is_ok());
         assert!(
-            a.check_rates(&rates, &request("/images/x"), None)
+            a.check_rates(&[], &request("/login"), None, CLIENT)
+                .await
+                .is_ok()
+        );
+        assert!(
+            a.check_rates(&rates, &request("/images/x"), None, CLIENT)
                 .await
                 .is_ok()
         );
         assert_eq!(
-            a.check_rates(&rates, &request("/login"), None)
+            a.check_rates(&rates, &request("/login"), None, CLIENT)
                 .await
                 .unwrap_err()
                 .status,
@@ -763,13 +802,13 @@ mod tests {
         .unwrap();
         let rules = vec![rate("/login", 1)];
         assert!(
-            a.check_rates(&rules, &request("/images/x"), None)
+            a.check_rates(&rules, &request("/images/x"), None, CLIENT)
                 .await
                 .is_ok()
         );
         let started = std::time::Instant::now();
         assert_eq!(
-            a.check_rates(&rules, &request("/login"), None)
+            a.check_rates(&rules, &request("/login"), None, CLIENT)
                 .await
                 .unwrap_err()
                 .status,
@@ -789,7 +828,9 @@ mod tests {
             let backend = if n % 2 == 0 { a.clone() } else { b.clone() };
             let rules = rules.clone();
             tasks.push(tokio::spawn(async move {
-                backend.check_rates(&rules, &request("/login"), None).await
+                backend
+                    .check_rates(&rules, &request("/login"), None, CLIENT)
+                    .await
             }));
         }
         let mut accepted = 0;
@@ -801,7 +842,7 @@ mod tests {
         }
         assert_eq!(accepted, 7);
         assert!(
-            a.check_rates(&rules, &request("/images/a.png"), None)
+            a.check_rates(&rules, &request("/images/a.png"), None, CLIENT)
                 .await
                 .is_ok()
         );
@@ -809,22 +850,30 @@ mod tests {
         let a = backend(&name);
         let rules = vec![rate("/login", 3), rate("/login", 1)];
         assert!(
-            a.check_rates(&rules, &request("/login"), None)
+            a.check_rates(&rules, &request("/login"), None, CLIENT)
                 .await
                 .is_ok()
         );
         assert_eq!(
-            a.check_rates(&rules, &request("/login"), None)
+            a.check_rates(&rules, &request("/login"), None, CLIENT)
                 .await
                 .unwrap_err()
                 .status,
             429
         );
         let only = vec![rules[0].clone()];
-        assert!(a.check_rates(&only, &request("/login"), None).await.is_ok());
-        assert!(a.check_rates(&only, &request("/login"), None).await.is_ok());
+        assert!(
+            a.check_rates(&only, &request("/login"), None, CLIENT)
+                .await
+                .is_ok()
+        );
+        assert!(
+            a.check_rates(&only, &request("/login"), None, CLIENT)
+                .await
+                .is_ok()
+        );
         assert_eq!(
-            a.check_rates(&only, &request("/login"), None)
+            a.check_rates(&only, &request("/login"), None, CLIENT)
                 .await
                 .unwrap_err()
                 .status,
@@ -839,15 +888,25 @@ mod tests {
         let mut rule = rate("/login", 100);
         rule.limits[1].requests = 1;
         assert!(
-            a.check_rates(std::slice::from_ref(&rule), &request("/login"), None)
-                .await
-                .is_ok()
+            a.check_rates(
+                std::slice::from_ref(&rule),
+                &request("/login"),
+                None,
+                CLIENT
+            )
+            .await
+            .is_ok()
         );
         assert_eq!(
-            a.check_rates(std::slice::from_ref(&rule), &request("/login"), None)
-                .await
-                .unwrap_err()
-                .status,
+            a.check_rates(
+                std::slice::from_ref(&rule),
+                &request("/login"),
+                None,
+                CLIENT
+            )
+            .await
+            .unwrap_err()
+            .status,
             429
         );
         let name = format!("test-tps-{}", std::process::id());
@@ -857,13 +916,62 @@ mod tests {
         rule.burst = 2;
         for _ in 0..2 {
             assert!(
-                a.check_rates(std::slice::from_ref(&rule), &request("/login"), None)
+                a.check_rates(
+                    std::slice::from_ref(&rule),
+                    &request("/login"),
+                    None,
+                    CLIENT
+                )
+                .await
+                .is_ok()
+            );
+        }
+        assert_eq!(
+            a.check_rates(
+                std::slice::from_ref(&rule),
+                &request("/login"),
+                None,
+                CLIENT
+            )
+            .await
+            .unwrap_err()
+            .status,
+            429
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated HANGANG_SECURITY_REDIS_TEST_URL"]
+    async fn per_client_rules_keep_separate_shared_budgets() {
+        let name = format!("test-per-client-{}", std::process::id());
+        let a = backend(&name);
+        let b = backend(&name);
+        let mut rule = rate("/login", 2);
+        rule.per_client = true;
+        let rules = std::slice::from_ref(&rule);
+        let other: IpAddr = "198.51.100.9".parse().unwrap();
+        for node in [&a, &b] {
+            assert!(
+                node.check_rates(rules, &request("/login"), None, CLIENT)
                     .await
                     .is_ok()
             );
         }
+        // Both nodes charged the same client budget.
         assert_eq!(
-            a.check_rates(std::slice::from_ref(&rule), &request("/login"), None)
+            a.check_rates(rules, &request("/login"), None, CLIENT)
+                .await
+                .unwrap_err()
+                .status,
+            429
+        );
+        assert!(
+            b.check_rates(rules, &request("/login"), None, other)
+                .await
+                .is_ok()
+        );
+        let mapped: IpAddr = "::ffff:192.0.2.50".parse().unwrap();
+        assert_eq!(
+            b.check_rates(rules, &request("/login"), None, mapped)
                 .await
                 .unwrap_err()
                 .status,

@@ -4715,7 +4715,7 @@ function urlDefenseRulesFromJson(raw, kind) {
   const bytes = value => new TextEncoder().encode(value).length;
   const fail = (index, detail) => { throw new Error(t('URL defense rule {index}: {detail}', { index: index + 1, detail: t(detail) })); };
   const known = kind === 'path_blocks' ? ['path', 'hosts'] : kind === 'path_rate_limits'
-    ? ['path', 'hosts', 'include_subpaths', 'tps', 'burst', 'limits']
+    ? ['path', 'hosts', 'include_subpaths', 'tps', 'burst', 'limits', 'per_client', 'max_clients']
     : kind === 'path_allowlists' ? ['path', 'hosts', 'include_subpaths', 'allow_cidrs', 'allow_countries']
     : kind === 'path_csrf' ? ['path', 'hosts', 'include_subpaths', 'allow_origins', 'allow_same_origin', 'allow_missing_origin', 'methods']
     : ['path', 'hosts', 'include_subpaths', 'failures', 'window_seconds', 'ban_seconds', 'statuses'];
@@ -4751,6 +4751,12 @@ function urlDefenseRulesFromJson(raw, kind) {
         fail(index, 'limits allows at most 8 windows with requests 1–1,000,000 and window_seconds 1–86,400.');
       if ((rule.tps === undefined || rule.tps === null) && limits.length === 0) fail(index, 'Configure TPS or at least one request window.');
       signature.limits = limits.map(limit => ({ requests: limit.requests, window_seconds: limit.window_seconds }));
+      if (rule.per_client !== undefined && typeof rule.per_client !== 'boolean') fail(index, 'per_client must be true or false.');
+      signature.per_client = rule.per_client ?? false;
+      if (rule.max_clients !== undefined && rule.max_clients !== null) {
+        if (!signature.per_client) fail(index, 'max_clients requires per_client.');
+        signature.max_clients = integer('max_clients', 1048576);
+      }
     }
     if (kind === 'path_csrf') {
       const origins = rule.allow_origins === undefined ? [] : rule.allow_origins;

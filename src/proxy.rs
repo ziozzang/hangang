@@ -2042,6 +2042,7 @@ impl Proxy {
                     edge.forwarded_host
                         .as_ref()
                         .and_then(|host| host.to_str().ok()),
+                    edge.client_ip,
                 )
                 .await
                 .map_err(|error| error.status())
@@ -2052,6 +2053,7 @@ impl Proxy {
                 edge.forwarded_host
                     .as_ref()
                     .and_then(|host| host.to_str().ok()),
+                edge.client_ip,
             )
         };
         if let Err(status) = rate_result {

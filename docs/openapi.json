@@ -6681,10 +6681,22 @@
                       }
                     }
                   }
+                },
+                "per_client": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Keep a separate budget for each effective client IP (after trusted-proxy resolution, IPv4-mapped IPv6 canonicalized) instead of one budget shared by all clients."
+                },
+                "max_clients": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1048576,
+                  "default": 65536,
+                  "description": "Only with per_client. Local mode keeps at most this many client budgets for the rule and drops the least recently used one first. The sum over all per_client rules may not exceed 1048576. Redis mode keeps one expiring key per client instead."
                 }
               }
             },
-            "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
+            "description": "Exact normalized URLs (one optional trailing slash alias) only by default. Optional TPS token bucket and simultaneous minute/hour/day fixed windows. Shared across clients and methods unless per_client is set. Redis mode atomically checks all selected rules/windows before charging using server time; local mode each rule is synchronized and unchanged rules retain budgets across reload. Reject429/Retry-After1/no-store before auth/cache/origin. Dedicated health/admin are independent unless explicit IP-ban scope expands."
           },
           "request_blocks": { "type": ["array", "null"], "maxItems": 128, "items": { "$ref": "#/components/schemas/RequestBlockRule" }, "description": "Scoped parameter deny profiles. Conditions AND, matching rules OR, before origins/auth/cache/Lua. At most 32KiB aggregate policy text. Protected query/form/multipart/JSON names reject ambiguous aliases/duplicates. Selected bodies are fully bounded and inspected; no automatic authentication or cookie exemption." },
           "response_security": { "type": ["array", "null"], "maxItems": 128, "items": { "$ref": "#/components/schemas/ResponseSecurityRule" }, "description": "Explicit domain-scoped final response profiles, including redirects and denials. Maximum 32 KiB aggregate host/header text; matching rules apply in order with later headers overriding earlier values; redirect upgrading is enabled if any matching rule enables it. Empty means no changes. HSTS applies only to verified HTTPS." },
