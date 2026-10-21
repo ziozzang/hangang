@@ -1466,6 +1466,7 @@ fn route(backends: Vec<String>) -> HttpRoute {
         strip_request_cookies: Vec::new(),
         max_requests: None,
         upstream_timeout_ms: None,
+        upstream_body_idle_ms: None,
         retries: 0,
         require_tls: false,
         https_redirect_code: None,
@@ -3572,6 +3573,119 @@ async fn dot_segment_paths_are_rejected_before_routing_unless_allowed() {
         backend_task.abort();
         policy.shutdown().await;
     }
+}
+
+/// An origin that sends response headers and a first chunk, then never sends
+/// the rest while keeping the socket open.
+async fn stalling_origin() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nhello")
+                    .await;
+                // Hold the connection open without sending the remaining body.
+                let _ = stream.read(&mut buffer).await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            });
+        }
+    });
+    (address, task)
+}
+
+#[tokio::test]
+async fn stalled_upstream_body_is_ended_and_releases_admission() {
+    let (origin, origin_task) = stalling_origin().await;
+    let mut stalled = route(vec![format!("http://{origin}")]);
+    stalled.max_requests = Some(1);
+    stalled.upstream_body_idle_ms = Some(300);
+    let (proxy, policy) = proxy(vec![stalled]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let client = client();
+    let get = || {
+        client.request(
+            Request::builder()
+                .uri(format!("http://{front}/"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+    };
+
+    let first = get().await.unwrap();
+    assert_eq!(first.status(), 200);
+    // While the body is stalled the request still holds the route's only slot.
+    let second = get().await.unwrap();
+    assert_eq!(second.status(), 503);
+    second.into_body().collect().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let body = tokio::time::timeout(Duration::from_secs(5), first.into_body().collect())
+        .await
+        .expect("stalled body must end instead of hanging");
+    assert!(body.is_err(), "a truncated body must surface as an error");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+
+    // The slot is free again once the stalled stream ended.
+    let third = get().await.unwrap();
+    assert_eq!(third.status(), 200);
+    drop(third);
+
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
+async fn upstream_body_idle_does_not_cut_a_slow_downstream_reader() {
+    const SIZE: usize = 4 * 1024 * 1024;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|_: Request<Incoming>| async {
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(vec![7u8; SIZE]))))
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let mut large = route(vec![format!("http://{origin}")]);
+    large.upstream_body_idle_ms = Some(200);
+    let (proxy, policy) = proxy(vec![large]);
+    let (front, front_task, _) = frontend(proxy).await;
+    let response = client()
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // The reader pauses far longer than the idle budget; the origin itself
+    // is never idle, so the full body still arrives.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), SIZE);
+
+    front_task.abort();
+    origin_task.abort();
+    policy.shutdown().await;
 }
 
 #[tokio::test]

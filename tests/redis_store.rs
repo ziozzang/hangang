@@ -34,6 +34,7 @@ fn config(revision: u64, id: &str) -> Config {
             id: id.into(),
             max_requests: None,
             upstream_timeout_ms: None,
+            upstream_body_idle_ms: None,
             retries: 0,
             require_tls: false,
             https_redirect_code: None,
