@@ -89,7 +89,7 @@ Hangang은 메모리 저장량을 제한하고 선택적으로 SQLite에 영속�
 
 완전한 `200 OK`만 저장합니다. `s-maxage`가 `max-age`보다 우선하고 route maximum으로 제한됩니다. 둘 다 없으면 `Date` 기준 `Expires`, 그 다음 route 기본값을 사용합니다. upstream `Age`, `Date`의 apparent age, response header 수신 시간을 계산합니다. entry는 저장 시각과 남은 수명의 합에서 만료되고 hit은 framing을 필요에 따라 바꾸며 누적 `Age`를 설정합니다.
 
-응답 캐시는 보수적으로 동작합니다. `Set-Cookie`, `Content-Range`, trailers, SSE, 중복·잘못된 Content-Type, 잘못된 또는 wildcard `Vary`, 잘못된·중복 freshness metadata, `no-store`·`private`·`no-cache`가 있으면 우회합니다. 의미가 공유 저장소에 영향을 줄 수 있는 알 수 없는 Cache-Control 확장도 우회합니다. native buffered response transform은 변환 후 캐시할 수 있지만 Lua와 streaming response transform은 대상에서 제외됩니다.
+응답 캐시는 보수적으로 동작합니다. `Set-Cookie`, `Content-Range`, trailers, SSE, 중복·잘못된 Content-Type, 잘못된 또는 wildcard `Vary`, 키에서 제외하는 `traceparent`·`tracestate`를 지정한 `Vary`, 잘못된·중복 freshness metadata, `no-store`·`private`·`no-cache`가 있으면 우회합니다. 의미가 공유 저장소에 영향을 줄 수 있는 알 수 없는 Cache-Control 확장도 우회합니다. native buffered response transform은 변환 후 캐시할 수 있지만 Lua와 streaming response transform은 대상에서 제외됩니다.
 
 외부 authorization, route Lua, JSON request matching, request transformation을 쓰는 라우트는 대상이 아닙니다. 요청은 빈 본문의 GET이어야 합니다. Cache-Control 또는 Pragma 지시는 일반 캐시를 우회하며 `only-if-cached`는 origin 요청 없이 `504`를 받습니다. Authorization, Proxy-Authorization, Cookie, Range, Content-Range, Upgrade, 모든 `If-*` 헤더도 우회합니다.
 
