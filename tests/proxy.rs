@@ -2532,6 +2532,123 @@ async fn external_authorization_is_bounded_fail_closed_and_replaces_spoofed_iden
 }
 
 #[tokio::test]
+async fn trace_context_and_request_ids_follow_proxy_trust_into_upstream_and_history() {
+    use ipnet::IpNet;
+    const TRACE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    let (backend, seen, backend_task) = upstream("hello").await;
+    let mut named = route(vec![]);
+    named.backends = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": "blue",
+            "address": format!("http://{backend}"),
+        }))
+        .unwrap(),
+    ];
+    let (gateway, policy) = proxy(vec![named]);
+    let history = Arc::new(TrafficHistory::default());
+    let gateway = gateway
+        .with_trusted_proxies(vec!["127.0.0.0/8".parse::<IpNet>().unwrap()])
+        .with_traffic_history(history.clone());
+    let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let (front, front_task) = frontend_with_peer(gateway, peer).await;
+    let client = client();
+    let send = |headers: Vec<(&'static str, &'static str)>| {
+        let mut request = Request::builder().uri(format!("http://{front}/"));
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let request = client.request(request.body(Full::new(Bytes::new())).unwrap());
+        async move {
+            let response = request.await.unwrap();
+            assert_eq!(response.status(), 200);
+            response.into_body().collect().await.unwrap();
+        }
+    };
+    let upstream_traceparent = |index: usize| {
+        seen.lock().unwrap()[index]
+            .headers
+            .get("traceparent")
+            .map(|value| value.to_str().unwrap().to_owned())
+    };
+
+    // Trusted proxy: valid context and request ID are kept.
+    send(vec![
+        ("traceparent", TRACE),
+        ("tracestate", "vendor=opaque"),
+        ("x-request-id", "edge-7f3a"),
+    ])
+    .await;
+    assert_eq!(upstream_traceparent(0).as_deref(), Some(TRACE));
+    // Trusted proxy, malformed context: replaced with a fresh one.
+    send(vec![
+        ("traceparent", "00-bogus"),
+        ("tracestate", "vendor=stale"),
+    ])
+    .await;
+    let regenerated = upstream_traceparent(1).unwrap();
+    assert_ne!(regenerated, TRACE);
+    assert!(hangang::trace_context::trace_id(&regenerated).is_some());
+    assert!(!seen.lock().unwrap()[1].headers.contains_key("tracestate"));
+
+    let batch = history.snapshot_since(None, 128);
+    let mut records = batch.records.clone();
+    records.sort_by_key(|record| record.id);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].request_id.as_deref(), Some("edge-7f3a"));
+    assert_eq!(
+        records[0].trace_id.as_deref(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+    assert_eq!(records[0].backend_index, Some(0));
+    assert_eq!(records[0].backend_id.as_deref(), Some("blue"));
+    assert_eq!(records[0].response_bytes, Some(5));
+    // The recorded trace ID is the one the upstream actually received.
+    assert_eq!(
+        records[1].trace_id.as_deref(),
+        hangang::trace_context::trace_id(&regenerated)
+    );
+    let generated = records[1].request_id.as_deref().unwrap();
+    assert_eq!(generated.len(), 32);
+    assert!(generated.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    front_task.abort();
+    policy.shutdown().await;
+
+    // Untrusted peer: client-supplied context and request ID are not trusted.
+    let (untrusted, policy) = proxy(vec![route(vec![format!("http://{backend}")])]);
+    let history = Arc::new(TrafficHistory::default());
+    let (front, front_task) =
+        frontend_with_peer(untrusted.with_traffic_history(history.clone()), peer).await;
+    let response = client
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/"))
+                .header("traceparent", TRACE)
+                .header("x-request-id", "client-chosen")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+    let replaced = upstream_traceparent(2).unwrap();
+    assert_ne!(replaced, TRACE);
+    let record = history.snapshot_since(None, 128).records[0].clone();
+    assert_ne!(record.request_id.as_deref(), Some("client-chosen"));
+    assert_eq!(
+        record.trace_id.as_deref(),
+        hangang::trace_context::trace_id(&replaced)
+    );
+    assert_eq!(record.backend_index, Some(0));
+    assert_eq!(record.backend_id, None);
+
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn authorization_service_receives_edge_resolved_forward_auth_context() {
     // The auth service records the request context it received.
     let seen_context = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
@@ -2599,6 +2716,11 @@ async fn authorization_service_receives_edge_resolved_forward_auth_context() {
                 .header("x-forwarded-host", "public.example")
                 .header("x-forwarded-port", "8443")
                 .header("x-original-url", "http://evil.example/")
+                .header(
+                    "traceparent",
+                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                )
+                .header("tracestate", "vendor=opaque")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
@@ -2632,6 +2754,12 @@ async fn authorization_service_receives_edge_resolved_forward_auth_context() {
         one("x-original-url"),
         "https://public.example:8443/private/item?x=1"
     );
+    // The trusted proxy's trace context joins the authorization call.
+    assert_eq!(
+        one("traceparent"),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    );
+    assert_eq!(one("tracestate"), "vendor=opaque");
     // A Host that is not an authority would let the client choose the URL
     // structure the authorization service judges: rejected before auth.
     for (name, value) in [
