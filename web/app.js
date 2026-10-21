@@ -2235,6 +2235,7 @@ function httpSections(route) {
       field('Upstream Host override', 'upstream_host', route.upstream_host || '', { placeholder: 'foo.bar', help: 'HTTP Host / HTTP/2 authority sent upstream; TLS SNI is configured under Upstream connection.' }),
       field('Concurrent request limit', 'max_requests', route.max_requests ?? '', { type: 'number', min: 1, max: 1000000, help: 'Optional, 1–1,000,000. Blank uses only the global limit.' }),
       field('Upstream timeout (ms)', 'upstream_timeout_ms', route.upstream_timeout_ms ?? '', { type: 'number', min: 1, max: 86400000, help: 'Time budget for the upstream to return response headers (upload plus first byte), 1–86,400,000 ms. Blank uses --upstream-timeout-seconds.' }),
+      field('Upstream body idle (ms)', 'upstream_body_idle_ms', route.upstream_body_idle_ms ?? '', { type: 'number', min: 0, max: 86400000, help: 'Longest wait for the next response body chunk after headers, 0–86,400,000 ms; 0 disables. Blank uses 60,000 ms and exempts event streams and gRPC.' }),
       field('Retries', 'retries', route.retries ?? 0, { type: 'number', min: 0, max: 16, help: 'Extra attempts on a freshly selected backend after a pre-response connection error, 0–16. Only safely replayable requests (bodyless GET/HEAD/OPTIONS/DELETE without transform or upgrade) are retried.' }),
       span2(field('Preserve incoming Host', 'preserve_host', Boolean(route.preserve_host), { checkbox: true, help: 'Forward the client Host header unchanged; conflicts with an explicit upstream Host.' })),
       dockerButton(),
@@ -2813,6 +2814,8 @@ function routeFromForm() {
     if (route.preserve_host && route.upstream_host) throw new Error(t('Preserve incoming Host conflicts with an explicit upstream Host'));
     route.max_requests = integer('max_requests', 'Concurrent request limit', { min: 1, max: 1000000, optional: true });
     route.upstream_timeout_ms = integer('upstream_timeout_ms', 'Upstream timeout', { min: 1, max: 86400000, optional: true });
+    route.upstream_body_idle_ms = integer('upstream_body_idle_ms', 'Upstream body idle', { min: 0, max: 86400000, optional: true });
+    if (route.upstream_body_idle_ms === null) delete route.upstream_body_idle_ms;
     route.retries = integer('retries', 'Retries', { min: 0, max: 16, optional: true, fallback: 0 });
     route.lua = raw('lua') || null;
 

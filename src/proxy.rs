@@ -691,6 +691,117 @@ impl hyper::body::Body for AuthResponseBody {
     }
 }
 
+/// Default wait for the next upstream response body frame once headers arrived.
+const DEFAULT_UPSTREAM_BODY_IDLE: Duration = Duration::from_secs(60);
+
+/// Ends an upstream response body that stops producing frames. Only time spent
+/// waiting on the upstream counts: the clock starts at the first pending poll
+/// after a frame, so a slow downstream reader never trips it. Ending the body
+/// drops it, which releases the request permit and backend/route leases.
+struct UpstreamBodyIdle {
+    body: Body,
+    idle: Duration,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+    armed: bool,
+    route_id: String,
+    backend: Option<crate::balance::BackendLease>,
+    terminated: bool,
+}
+
+impl UpstreamBodyIdle {
+    fn new(
+        body: Body,
+        idle: Duration,
+        route_id: String,
+        backend: Option<crate::balance::BackendLease>,
+    ) -> Self {
+        Self {
+            body,
+            idle,
+            timer: Box::pin(tokio::time::sleep(idle)),
+            armed: false,
+            route_id,
+            backend,
+            terminated: false,
+        }
+    }
+}
+
+impl hyper::body::Body for UpstreamBodyIdle {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BodyError>>> {
+        if self.terminated {
+            return std::task::Poll::Ready(None);
+        }
+        if let std::task::Poll::Ready(frame) = std::pin::Pin::new(&mut self.body).poll_frame(cx) {
+            self.armed = false;
+            return std::task::Poll::Ready(frame);
+        }
+        if !self.armed {
+            self.armed = true;
+            let deadline = tokio::time::Instant::now() + self.idle;
+            self.timer.as_mut().reset(deadline);
+        }
+        if self.timer.as_mut().poll(cx).is_ready() {
+            self.terminated = true;
+            if let Some(backend) = &self.backend {
+                backend.record_timeout();
+            }
+            tracing::warn!(
+                target: "hangang::proxy",
+                route = %self.route_id,
+                idle_ms = self.idle.as_millis().min(u64::MAX as u128) as u64,
+                "upstream response body idle timeout; stream ended"
+            );
+            return std::task::Poll::Ready(Some(Err(BodyError::from_error(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream response body idle timeout",
+            )))));
+        }
+        std::task::Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminated || self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// Body idle budget for one upstream response; `None` means unlimited.
+/// Long-lived event and gRPC streams are exempt unless the route opts in.
+fn upstream_body_idle(configured: Option<u64>, headers: &HeaderMap) -> Option<Duration> {
+    match configured {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => {
+            let streaming = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    let media = value
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase();
+                    media == "text/event-stream"
+                        || media == "application/grpc"
+                        || media.starts_with("application/grpc+")
+                })
+                .unwrap_or(false);
+            (!streaming).then_some(DEFAULT_UPSTREAM_BODY_IDLE)
+        }
+    }
+}
+
 impl Proxy {
     pub fn new(
         active: Arc<ArcSwap<Snapshot>>,
@@ -3882,8 +3993,19 @@ impl Proxy {
             });
         }
 
+        let body_idle = upstream_body_idle(runtime.route.upstream_body_idle_ms, upstream.headers());
         let (parts, body) = upstream.into_parts();
-        let mut response = Response::from_parts(parts, boxed_incoming(body));
+        let body = match body_idle {
+            Some(idle) if !body.is_end_stream() => UpstreamBodyIdle::new(
+                boxed_incoming(body),
+                idle,
+                runtime.route.id.clone(),
+                backend_lease.clone(),
+            )
+            .boxed_unsync(),
+            _ => boxed_incoming(body),
+        };
+        let mut response = Response::from_parts(parts, body);
         if let Some(config) = &runtime.response_transform {
             if config.when_prefix.is_some()
                 && (origin_transform_partial
@@ -5870,6 +5992,7 @@ mod tests {
             strip_request_cookies: Vec::new(),
             max_requests: None,
             upstream_timeout_ms: None,
+            upstream_body_idle_ms: None,
             retries: 0,
             require_tls: false,
             https_redirect_code: None,
@@ -6185,6 +6308,41 @@ mod tests {
         for name in ["proxy-connection", "x-real-ip"] {
             assert!(sensitive_mutation(&HeaderName::from_static(name)));
         }
+    }
+
+    #[test]
+    fn upstream_body_idle_defaults_exempt_event_streams_and_grpc() {
+        let headers = |content_type: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            headers
+        };
+        assert_eq!(
+            upstream_body_idle(None, &HeaderMap::new()),
+            Some(DEFAULT_UPSTREAM_BODY_IDLE)
+        );
+        assert_eq!(
+            upstream_body_idle(None, &headers("application/json")),
+            Some(DEFAULT_UPSTREAM_BODY_IDLE)
+        );
+        for streaming in [
+            "text/event-stream",
+            "Text/Event-Stream; charset=utf-8",
+            "application/grpc",
+            "application/grpc+proto",
+        ] {
+            assert_eq!(
+                upstream_body_idle(None, &headers(streaming)),
+                None,
+                "{streaming}"
+            );
+        }
+        // An explicit route value applies to every response; 0 disables.
+        assert_eq!(
+            upstream_body_idle(Some(1500), &headers("text/event-stream")),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(upstream_body_idle(Some(0), &HeaderMap::new()), None);
     }
 
     #[test]

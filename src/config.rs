@@ -348,10 +348,16 @@ pub struct HttpRoute {
     /// headers (this covers sending the request body plus the upstream's
     /// time-to-first-byte). Overrides the global default for this route; raise
     /// it for large uploads or slow-first-byte upstreams such as LLM
-    /// completions. Response body streaming afterwards is bounded by the
-    /// transport idle timeout, not this value.
+    /// completions. Response body streaming afterwards is bounded by
+    /// `upstream_body_idle_ms`, not this value.
     #[serde(default)]
     pub upstream_timeout_ms: Option<u64>,
+    /// Longest wait, in milliseconds, for the next upstream response body
+    /// frame after response headers. Unset uses 60,000 for ordinary responses
+    /// and exempts server-sent events and gRPC streams; an explicit value
+    /// applies to every non-upgraded response. 0 disables the limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_body_idle_ms: Option<u64>,
     /// Additional attempts to a freshly selected backend when a connection-level
     /// error occurs BEFORE any response byte, for safely replayable requests
     /// only (bodyless GET/HEAD/OPTIONS/DELETE without a body transform or
@@ -1074,6 +1080,12 @@ impl Config {
             ensure!(
                 (1..=86_400_000).contains(&timeout),
                 "upstream_timeout_ms must be 1..86400000 (24h)"
+            );
+        }
+        for idle in self.http.iter().filter_map(|r| r.upstream_body_idle_ms) {
+            ensure!(
+                idle <= 86_400_000,
+                "upstream_body_idle_ms must be 0..86400000 (24h)"
             );
         }
         for retries in self.http.iter().map(|r| r.retries) {

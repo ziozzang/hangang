@@ -4288,7 +4288,17 @@
             "minimum": 1,
             "maximum": 86400000,
             "default": null,
-            "description": "Optional per-route time budget in milliseconds for the upstream to return response headers (covers request-body upload plus time-to-first-byte). Overrides the global --upstream-timeout-seconds default. Response body streaming afterwards is bounded by the transport idle timeout."
+            "description": "Optional per-route time budget in milliseconds for the upstream to return response headers (covers request-body upload plus time-to-first-byte). Overrides the global --upstream-timeout-seconds default. Response body streaming afterwards is bounded by upstream_body_idle_ms."
+          },
+          "upstream_body_idle_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 86400000,
+            "default": null,
+            "description": "Optional longest wait in milliseconds for the next upstream response body frame after response headers. Null uses 60000 for ordinary responses and exempts text/event-stream and gRPC; an explicit value applies to every non-upgraded response; 0 disables. On expiry the response stream is ended and the backend records a passive timeout."
           },
           "retries": {
             "type": "integer",
