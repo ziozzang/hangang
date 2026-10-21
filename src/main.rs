@@ -324,7 +324,8 @@ struct Args {
     #[arg(long, default_value_t = 3000)]
     connect_timeout_ms: u64,
     /// Emit a per-request access log line (tracing target `hangang::access`)
-    /// with client, method, host, path, status and latency.
+    /// with client, method, path, route, status, latency, request ID, trace
+    /// ID, selected backend and declared response bytes.
     #[arg(long)]
     access_log: bool,
 }

@@ -413,6 +413,36 @@ struct TrafficContext {
     protocol: &'static str,
     tls: bool,
     started: std::time::Instant,
+    // Generated per request; replaced by a valid `x-request-id` from a
+    // trusted proxy once the edge is resolved.
+    request_id: String,
+    trace_id: Option<String>,
+    backend_index: Option<usize>,
+    backend_id: Option<String>,
+    response_bytes: Option<u64>,
+}
+
+/// Selected upstream member, carried on the response so the response-head
+/// record can name it without holding the backend lease.
+#[derive(Clone)]
+struct UpstreamTarget {
+    index: usize,
+    member_id: Option<String>,
+}
+
+/// Accept a proxy-supplied request ID only in a conservative log-safe shape.
+fn valid_request_id(value: &HeaderValue) -> Option<&str> {
+    let bytes = value.as_bytes();
+    ((1..=128).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:+/=".contains(b)))
+    .then(|| value.to_str().ok())
+    .flatten()
+}
+
+fn generate_request_id() -> String {
+    format!("{:032x}", crate::trace_context::random_u128())
 }
 
 impl TrafficContext {
@@ -458,7 +488,41 @@ impl TrafficContext {
                 .get::<crate::tls::TransportInfo>()
                 .is_some_and(|info| info.tls),
             started: std::time::Instant::now(),
+            request_id: generate_request_id(),
+            trace_id: None,
+            backend_index: None,
+            backend_id: None,
+            response_bytes: None,
         }
+    }
+
+    /// Head-time facts about the final response: the upstream member that
+    /// produced it and its declared body length.
+    fn observe_response(&mut self, response: &Response<Body>) {
+        if let Some(target) = response.extensions().get::<UpstreamTarget>() {
+            self.backend_index = Some(target.index);
+            self.backend_id = target.member_id.clone();
+        }
+        let status = response.status();
+        self.response_bytes = if self.method == Method::HEAD
+            || status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED
+        {
+            Some(0)
+        } else if response
+            .extensions()
+            .get::<crate::error_pages::GatewayGenerated>()
+            .is_some()
+        {
+            None
+        } else {
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+        };
     }
 
     fn record(&self, history: &crate::traffic::TrafficHistory, status: u16, policy_revision: u64) {
@@ -476,6 +540,11 @@ impl TrafficContext {
                 response_head_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 protocol: self.protocol,
                 tls: self.tls,
+                request_id: Some(&self.request_id),
+                trace_id: self.trace_id.as_deref(),
+                backend_index: self.backend_index,
+                backend_id: self.backend_id.as_deref(),
+                response_bytes: self.response_bytes,
             },
             policy_revision,
         );
@@ -1353,6 +1422,11 @@ impl Proxy {
                 .route_id
                 .as_deref()
                 .map(|id| crate::traffic::bounded_ascii(id, 128));
+            let request_id = crate::traffic::bounded_ascii(&context.request_id, 128);
+            let backend_id = context
+                .backend_id
+                .as_deref()
+                .map(|id| crate::traffic::bounded_ascii(id, 128));
             tracing::info!(
                 target: "hangang::access",
                 peer = %context.peer_ip,
@@ -1363,6 +1437,15 @@ impl Proxy {
                 status,
                 policy_revision = revision,
                 latency_ms = context.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                request_id = %request_id,
+                trace_id = %context.trace_id.as_deref().unwrap_or("-"),
+                backend_index = %context
+                    .backend_index
+                    .map_or_else(|| "-".to_owned(), |index| index.to_string()),
+                backend_id = %backend_id.as_deref().unwrap_or("-"),
+                response_bytes = %context
+                    .response_bytes
+                    .map_or_else(|| "-".to_owned(), |bytes| bytes.to_string()),
                 "request"
             );
         }
@@ -1733,7 +1816,8 @@ impl Proxy {
             );
         }
         response.extensions_mut().insert(ResponseSecurityFinalized);
-        if let Some(context) = &traffic {
+        if let Some(context) = traffic.as_mut() {
+            context.observe_response(&response);
             self.record_response_head(context, response.status().as_u16());
         }
         Ok(retain_request_permit(response, permit))
@@ -1877,15 +1961,12 @@ impl Proxy {
                     .map(Vec::as_slice)
                     .unwrap_or(&self.trusted_proxies)
             });
-        let edge = match self.resolve_edge(
-            &request,
-            peer,
-            if workload_evidence.is_some() {
-                &[]
-            } else {
-                trusted_proxies
-            },
-        ) {
+        let edge_trust: &[ipnet::IpNet] = if workload_evidence.is_some() {
+            &[]
+        } else {
+            trusted_proxies
+        };
+        let edge = match self.resolve_edge(&request, peer, edge_trust) {
             Ok(edge) => edge,
             Err(_) => {
                 return Ok(response(
@@ -1894,8 +1975,22 @@ impl Proxy {
                 ));
             }
         };
+        // Correlation identity follows the same trust decision as the client
+        // address: only a trusted proxy may supply trace and request IDs.
+        let trusted_peer =
+            !edge_trust.is_empty() && crate::trusted_proxy::is_trusted(peer.ip(), edge_trust);
+        let trace_id = crate::trace_context::normalize(request.headers_mut(), trusted_peer);
         if let Some(context) = traffic.as_mut() {
             context.client_ip = edge.client_ip;
+            context.trace_id = Some(trace_id);
+            if trusted_peer {
+                let mut ids = request.headers().get_all("x-request-id").iter();
+                if let (Some(value), None) = (ids.next(), ids.next())
+                    && let Some(id) = valid_request_id(value)
+                {
+                    context.request_id = id.to_owned();
+                }
+            }
         }
         let mut guard_evidence = None;
         if let Some(guard) = &self.guard {
@@ -4152,6 +4247,10 @@ impl Proxy {
         if let Some(lease) = backend_lease {
             response.extensions_mut().insert(lease);
         }
+        response.extensions_mut().insert(UpstreamTarget {
+            index,
+            member_id: runtime.route.backends[index].id().map(str::to_owned),
+        });
         if let Some(permit) = route_permit {
             response.extensions_mut().insert(permit);
         }
@@ -4779,6 +4878,17 @@ fn auth_request_headers(
             HeaderName::from_static(name),
             HeaderValue::from_str(&value).map_err(|_| 503u16)?,
         );
+    }
+    // The request's normalized W3C trace context, so the authorization
+    // service joins the same trace as the upstream.
+    for name in [
+        crate::trace_context::TRACEPARENT,
+        crate::trace_context::TRACESTATE,
+    ] {
+        headers.remove(&name);
+        if let Some(value) = original.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
     }
     // Configured static headers are applied last with `insert`, so a
     // client copy of the same name can never reach the service.

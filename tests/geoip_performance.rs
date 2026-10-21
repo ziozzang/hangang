@@ -185,6 +185,11 @@ async fn geoip_observation_contention_release_diagnostic() {
                                     response_head_ms: 1,
                                     protocol: "h2",
                                     tls: false,
+                                    request_id: None,
+                                    trace_id: None,
+                                    backend_index: None,
+                                    backend_id: None,
+                                    response_bytes: None,
                                 });
                             }
                             black_box(observed);

@@ -93,7 +93,7 @@ Hangang은 메모리 저장량을 제한하고 선택적으로 SQLite에 영속�
 
 외부 authorization, route Lua, JSON request matching, request transformation을 쓰는 라우트는 대상이 아닙니다. 요청은 빈 본문의 GET이어야 합니다. Cache-Control 또는 Pragma 지시는 일반 캐시를 우회하며 `only-if-cached`는 origin 요청 없이 `504`를 받습니다. Authorization, Proxy-Authorization, Cookie, Range, Content-Range, Upgrade, 모든 `If-*` 헤더도 우회합니다.
 
-키는 SHA-256 hash이며 DB key column에 요청 헤더나 URI를 노출하지 않습니다. 원래 method, URI scheme/authority/path/query, TLS 상태, client peer-IP partition, 전체 route fingerprint, generation, proxy forwarding header와 body transform 전의 원래 end-to-end header를 포함합니다. header 이름은 정렬하고 반복 값 순서를 유지하며 hop-by-hop field는 제외합니다. key header material이 64 KiB를 넘으면 우회합니다. 폭넓은 key는 표현을 분리하는 대신 적중률을 낮춥니다. 저장된 status·header·body는 암호화 없이 SQLite에 있으므로 디렉터리를 보호하고 at-rest 암호화가 필요하면 암호화 저장소를 사용하십시오.
+키는 SHA-256 hash이며 DB key column에 요청 헤더나 URI를 노출하지 않습니다. 원래 method, URI scheme/authority/path/query, TLS 상태, client peer-IP partition, 전체 route fingerprint, generation, proxy forwarding header와 body transform 전의 원래 end-to-end header를 포함합니다. header 이름은 정렬하고 반복 값 순서를 유지하며 hop-by-hop field와 요청마다 달라지는 W3C 추적 문맥(`traceparent`, `tracestate`)은 제외합니다. key header material이 64 KiB를 넘으면 우회합니다. 폭넓은 key는 표현을 분리하는 대신 적중률을 낮춥니다. 저장된 status·header·body는 암호화 없이 SQLite에 있으므로 디렉터리를 보호하고 at-rest 암호화가 필요하면 암호화 저장소를 사용하십시오.
 
 ## Fill, 실패와 purge 동작
 

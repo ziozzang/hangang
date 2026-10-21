@@ -83,7 +83,7 @@ HTTP 라우트 목록과 백엔드 편집 화면은 기존 관리자 전용 `GET
 
 - [영속 로컬 계정 감사 · 영문](ACCOUNT_AUDIT.md) — 계정 감사 기록
 - [선택적 계정 감사 기록 · 영문](ACCOUNT_AUDIT_FILTERS.md) — 감사 필터
-- [최근 트래픽 메타데이터 · 영문](TRAFFIC_HISTORY.md) — HTTP 트래픽 이력
+- [최근 트래픽 메타데이터](ko/TRAFFIC_HISTORY.md) — HTTP 트래픽 이력과 요청 상관 필드
 - [선택적 HTTP 응답 헤드 기록 · 영문](HTTP_RECORDING.md) — HTTP 기록
 - [HTTP 요청 리스너 식별 · 영문](HTTP_TRAFFIC_LISTENERS.md) — 리스너 식별
 - [실시간 TCP 연결 이력 · 영문](TCP_CONNECTION_HISTORY.md) — TCP 연결 이력

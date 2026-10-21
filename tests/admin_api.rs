@@ -1308,6 +1308,11 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         response_head_ms: 3,
         protocol: "h1",
         tls: false,
+        request_id: None,
+        trace_id: None,
+        backend_index: None,
+        backend_id: None,
+        response_bytes: None,
     });
     assert_eq!(
         request_with_token(
@@ -1394,6 +1399,11 @@ async fn events_and_recent_traffic_respect_roles_and_session_revocation() {
         response_head_ms: 5,
         protocol: "h2",
         tls: true,
+        request_id: None,
+        trace_id: None,
+        backend_index: None,
+        backend_id: None,
+        response_bytes: None,
     });
     let traffic_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
