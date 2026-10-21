@@ -16,19 +16,6 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa: no patched release; tracked in jikji/hangang#4" },
     # rustls-pemfile 2.2: unmaintained; replace with rustls-pki-types PEM parsing.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration tracked in jikji/hangang#4" },
-    # Fixed by a semver-compatible lockfile update (separate PR). quinn-proto and
-    # webpki-root-certs are reported only by cargo-audit, which scans every
-    # lockfile entry; cargo-deny skips them as unused on this graph.
-    { id = "RUSTSEC-2026-0338", reason = "quinn-proto < 0.11.18; lockfile update PR" },
-    { id = "RUSTSEC-2026-0340", reason = "quinn-proto < 0.11.18; lockfile update PR" },
-    { id = "RUSTSEC-2026-0343", reason = "quinn-proto < 0.11.18; lockfile update PR" },
-    { id = "RUSTSEC-2026-0346", reason = "rustls < 0.23.46; lockfile update PR" },
-    { id = "RUSTSEC-2026-0347", reason = "rustls < 0.23.46; lockfile update PR" },
-    { id = "RUSTSEC-2026-0348", reason = "rustls < 0.23.46; lockfile update PR" },
-    { id = "RUSTSEC-2026-0349", reason = "rustls < 0.23.46; lockfile update PR" },
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots < 1.0.10; lockfile update PR" },
-    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki < 0.103.16; lockfile update PR" },
-    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs < 1.0.10; lockfile update PR" },
 ]
 
 [licenses]

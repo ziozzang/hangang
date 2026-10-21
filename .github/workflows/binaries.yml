@@ -57,6 +57,10 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.96.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install protoc
+        # build.rs of hangang-route-grpc and the pinned hopae/sumunjang/pumgye
+        # gRPC crates call an external protoc; runner images do not ship one.
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends protobuf-compiler
       - name: Use physical temporary paths
         run: python3 -c 'import os,tempfile; print("TMPDIR=" + os.path.realpath(tempfile.gettempdir()))' >> "$GITHUB_ENV"
       - name: Formatting and clippy on all targets
@@ -127,9 +131,16 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
           rustup target add '${{ matrix.target }}'
-      - name: Install musl build tools
-        if: contains(matrix.target, '-musl')
-        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+      - name: Install protoc and musl build tools (Linux)
+        # gRPC build scripts call an external protoc; runner images do not ship one.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          if [ '${{ contains(matrix.target, '-musl') }}' = true ]; then sudo apt-get install -y musl-tools; fi
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: Use physical temporary paths
         shell: bash
         run: python3 -c 'import os,tempfile; print("TMPDIR=" + os.path.realpath(tempfile.gettempdir()))' >> "$GITHUB_ENV"
