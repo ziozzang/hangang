@@ -4865,6 +4865,33 @@ impl Proxy {
                 explicit_forwarded_port: None,
             });
         }
+        // RFC 7239 `Forwarded` is used only when the proxy sent no
+        // `X-Forwarded-*` field, so either family alone has one meaning and
+        // a mixed request keeps the established `X-Forwarded-*` behavior.
+        if !crate::trusted_proxy::has_x_forwarded(headers)
+            && let Some(identity) =
+                crate::trusted_proxy::forwarded_identity(headers, trusted_proxies)?
+        {
+            let proto = identity
+                .proto
+                .unwrap_or(if transport.tls { "https" } else { "http" });
+            let forwarded_host = match identity.host {
+                Some(host) => Some(
+                    HeaderValue::from_str(&host)
+                        .ok()
+                        .filter(valid_authority)
+                        .ok_or(crate::trusted_proxy::InvalidForwardedHeader)?,
+                ),
+                None => client_host,
+            };
+            return Ok(EdgeContext {
+                client_ip: identity.client_ip,
+                proto,
+                forwarded_host,
+                forwarded_port: default_forwarded_port(proto, transport.local_port),
+                explicit_forwarded_port: None,
+            });
+        }
         let client_ip =
             crate::trusted_proxy::client_ip_from_forwarded(peer.ip(), headers, trusted_proxies)?;
         let proto = crate::trusted_proxy::forwarded_proto(headers, transport.tls);

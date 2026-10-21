@@ -3793,6 +3793,126 @@ async fn trusted_proxy_derives_client_from_forwarded_headers_only_when_trusted()
 }
 
 #[tokio::test]
+async fn trusted_proxy_honors_rfc7239_forwarded_without_x_forwarded_fields() {
+    use ipnet::IpNet;
+
+    let (backend, seen, backend_task) = upstream("b").await;
+    let mut denied = route(vec![format!("http://{backend}")]);
+    denied.deny_cidrs = vec!["9.9.9.0/24".parse::<IpNet>().unwrap()];
+    let (gateway, policy) = proxy(vec![denied]);
+    let gateway = gateway.with_trusted_proxies(vec![
+        "127.0.0.0/8".parse::<IpNet>().unwrap(),
+        "10.0.0.0/8".parse::<IpNet>().unwrap(),
+    ]);
+    let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let (front, front_task) = frontend_with_peer(gateway, peer).await;
+    let client = client();
+    let send = |headers: Vec<(&'static str, &'static str)>| {
+        let mut request = Request::builder().uri(format!("http://{front}/"));
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        client.request(request.body(Full::new(Bytes::new())).unwrap())
+    };
+    let header = |index: usize, name: &str| {
+        seen.lock().unwrap()[index]
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    // The rightmost untrusted hop supplies the client, proto and host.
+    let response = send(vec![(
+        "forwarded",
+        "for=8.8.8.8;proto=https;host=real.example, for=\"10.0.0.1:4711\";proto=http",
+    )])
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(header(0, "x-forwarded-for").as_deref(), Some("8.8.8.8"));
+    assert_eq!(header(0, "x-forwarded-proto").as_deref(), Some("https"));
+    assert_eq!(
+        header(0, "x-forwarded-host").as_deref(),
+        Some("real.example")
+    );
+    assert_eq!(
+        header(0, "forwarded"),
+        None,
+        "Forwarded is regenerated as X-Forwarded-*"
+    );
+
+    // A bracketed, quoted IPv6 node is accepted.
+    let response = send(vec![("forwarded", "for=\"[2001:db8::7]:443\"")])
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(header(1, "x-forwarded-for").as_deref(), Some("2001:db8::7"));
+
+    // IP policy applies to the Forwarded client.
+    let response = send(vec![("forwarded", "for=9.9.9.9")]).await.unwrap();
+    assert_eq!(response.status(), 403);
+
+    // Strict parsing: unverifiable or ambiguous identity fails closed.
+    for value in [
+        "for=_hidden",
+        "for=unknown",
+        "for=8.8.8.8;for=1.1.1.1",
+        "for=2001:db8::7",
+        "for=\"8.8.8.8",
+        "proto=https",
+        "for=8.8.8.8;proto=ftp",
+        "for=8.8.8.8;host=\"a.example/x\"",
+    ] {
+        let response = send(vec![("forwarded", value)]).await.unwrap();
+        assert_eq!(response.status(), 400, "{value}");
+    }
+
+    // X-Forwarded-* keeps precedence when a proxy sends both families.
+    let response = send(vec![
+        ("forwarded", "for=_obfuscated"),
+        ("x-forwarded-for", "8.8.4.4"),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(header(2, "x-forwarded-for").as_deref(), Some("8.8.4.4"));
+
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
+
+    // An untrusted peer's Forwarded is ignored and stripped.
+    let (backend, seen, backend_task) = upstream("b").await;
+    let (proxy, policy) = proxy(vec![route(vec![format!("http://{backend}")])]);
+    let (front, front_task) = frontend_with_peer(proxy, peer).await;
+    let response = client
+        .request(
+            Request::builder()
+                .uri(format!("http://{front}/"))
+                .header("forwarded", "for=8.8.8.8;proto=https")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    {
+        let headers = &seen.lock().unwrap()[0].headers;
+        assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
+        assert_eq!(headers["x-forwarded-proto"], "http");
+        assert!(!headers.contains_key("forwarded"));
+    }
+    front_task.abort();
+    backend_task.abort();
+    policy.shutdown().await;
+}
+
+#[tokio::test]
 async fn ambiguous_forwarded_proto_cannot_bypass_required_tls() {
     use ipnet::IpNet;
 
