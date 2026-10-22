@@ -97,6 +97,15 @@ pub fn validate_exempt(cidrs: &[ipnet::IpNet]) -> Result<()> {
         cidrs.len() <= 1024,
         "failure ban exemptions allow at most 1024 IP ranges"
     );
+    for net in cidrs {
+        // Client IPs are compared in canonical form, so a mapped range would
+        // silently never match. Require the plain IPv4 range instead.
+        ensure!(
+            !matches!(net, ipnet::IpNet::V6(v6)
+                if v6.prefix_len() >= 96 && v6.addr().to_ipv4_mapped().is_some()),
+            "failure ban exemptions must use IPv4 ranges, not IPv4-mapped IPv6"
+        );
+    }
     Ok(())
 }
 
@@ -523,6 +532,8 @@ mod tests {
         assert!(!is_exempt(Some(&nets), "11.0.0.1".parse().unwrap()));
         assert!(!is_exempt(None, "10.1.2.3".parse().unwrap()));
         assert!(validate_exempt(&vec![nets[0]; 1025]).is_err());
+        assert!(validate_exempt(&["::ffff:192.0.2.0/120".parse().unwrap()]).is_err());
+        assert!(validate_exempt(&["2001:db8::/32".parse().unwrap()]).is_ok());
     }
 
     fn rule() -> Rule {
