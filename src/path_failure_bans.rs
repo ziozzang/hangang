@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_CLIENTS: usize = 1024;
+const MAX_CLIENTS: usize = 16384;
+/// A ban may last up to 365 days; the failure window stays at most one day.
+pub const MAX_BAN_SECONDS: u32 = 365 * 86400;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,8 +71,12 @@ pub fn validate(rules: &[Rule]) -> Result<()> {
             "path failure threshold must be 1..1000"
         );
         ensure!(
-            (1..=86400).contains(&rule.window_seconds) && (1..=86400).contains(&rule.ban_seconds),
-            "path failure window and ban must be 1..86400 seconds"
+            (1..=86400).contains(&rule.window_seconds),
+            "path failure window must be 1..86400 seconds"
+        );
+        ensure!(
+            (1..=MAX_BAN_SECONDS).contains(&rule.ban_seconds),
+            "path failure ban must be 1..31536000 seconds"
         );
         ensure!(
             !rule.statuses.is_empty() && rule.statuses.len() <= 16,
@@ -84,6 +90,20 @@ pub fn validate(rules: &[Rule]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn validate_exempt(cidrs: &[ipnet::IpNet]) -> Result<()> {
+    ensure!(
+        cidrs.len() <= 1024,
+        "failure ban exemptions allow at most 1024 IP ranges"
+    );
+    Ok(())
+}
+
+/// Exempt clients bypass every failure-ban check, observation and backend call.
+pub fn is_exempt(cidrs: Option<&[ipnet::IpNet]>, ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    cidrs.is_some_and(|cidrs| cidrs.iter().any(|net| net.contains(&ip)))
 }
 
 #[derive(Debug)]
@@ -484,6 +504,27 @@ fn check_scope_at<B>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn ban_may_last_a_year_and_exemptions_match_canonical_ips() {
+        let rule = |ban_seconds| Rule {
+            path: "/login".into(),
+            hosts: vec![],
+            include_subpaths: false,
+            failures: 1,
+            window_seconds: 60,
+            ban_seconds,
+            statuses: vec![403],
+        };
+        assert!(validate(&[rule(MAX_BAN_SECONDS)]).is_ok());
+        assert!(validate(&[rule(MAX_BAN_SECONDS + 1)]).is_err());
+        let nets: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(is_exempt(Some(&nets), "10.1.2.3".parse().unwrap()));
+        assert!(is_exempt(Some(&nets), "::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!is_exempt(Some(&nets), "11.0.0.1".parse().unwrap()));
+        assert!(!is_exempt(None, "10.1.2.3".parse().unwrap()));
+        assert!(validate_exempt(&vec![nets[0]; 1025]).is_err());
+    }
+
     fn rule() -> Rule {
         Rule {
             path: "/login".into(),
@@ -525,6 +566,8 @@ mod tests {
             let mut invalid = rule();
             invalid.window_seconds = bad;
             assert!(validate(&[invalid]).is_err());
+        }
+        for bad in [0, MAX_BAN_SECONDS + 1] {
             let mut invalid = rule();
             invalid.ban_seconds = bad;
             assert!(validate(&[invalid]).is_err());

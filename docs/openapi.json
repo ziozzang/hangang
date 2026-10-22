@@ -6534,6 +6534,17 @@
             ],
             "description": "Default url. Host/global expands an established client-IP ban across paths, including images and public health. Separate administrator recovery is exempt."
           },
+          "failure_ban_exempt_cidrs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 1024,
+            "items": {
+              "type": "string"
+            },
+            "description": "Verified client IP ranges never counted, observed or banned by path failure bans, including an existing ban. Exempt requests do not contact the security Redis."
+          },
           "path_failure_bans": {
             "type": [
               "array",
@@ -6578,7 +6589,7 @@
                 "ban_seconds": {
                   "type": "integer",
                   "minimum": 1,
-                  "maximum": 86400
+                  "maximum": 31536000
                 },
                 "statuses": {
                   "type": "array",

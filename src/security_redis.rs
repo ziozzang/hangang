@@ -549,7 +549,7 @@ end
 if mode=='reserve' then
  if state and state.banned>now then return 'banned' end
  if not state then
-  if redis.call('ZCARD',KEYS[1])>=1024 then return 'capacity' end
+  if redis.call('ZCARD',KEYS[1])>=16384 then return 'capacity' end
   state={epoch=ARGV[3],count=0,started=now,banned=0,flight=0}
  end
  state.flight=state.flight+1

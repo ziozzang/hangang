@@ -66,6 +66,9 @@ pub struct Settings {
     pub path_failure_bans: Option<Vec<crate::path_failure_bans::Rule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_ban_scope: Option<crate::path_failure_bans::Scope>,
+    /// Verified client IP ranges that path failure bans never count or ban.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_ban_exempt_cidrs: Option<Vec<ipnet::IpNet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_rate_limits: Option<Vec<crate::path_rate_limits::Rule>>,
     /// Explicit pre-routing path deny namespaces. No implicit blocked paths.
@@ -126,6 +129,9 @@ impl Settings {
         }
         if let Some(settings) = &self.security_redis {
             settings.validate()?;
+        }
+        if let Some(cidrs) = &self.failure_ban_exempt_cidrs {
+            crate::path_failure_bans::validate_exempt(cidrs)?;
         }
         if let Some(rules) = &self.path_failure_bans {
             crate::path_failure_bans::validate(rules)?;

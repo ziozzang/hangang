@@ -803,6 +803,26 @@ async fn automatic_http01_delegation_is_domain_scoped_sanitized_and_bounded() {
         before + 1,
         "global ban bypassed"
     );
+    // An exempt client range is never counted or banned, even while banned.
+    let mut config = active.load().config.clone();
+    config.revision += 1;
+    config.settings.failure_ban_exempt_cidrs = Some(vec!["127.0.0.0/8".parse().unwrap()]);
+    active.store(Arc::new(Snapshot::replace(config, &active.load()).unwrap()));
+    for _ in 0..3 {
+        assert_eq!(send("GET", "/app", "example.test", "").await.status(), 401);
+    }
+    assert_ne!(
+        send(
+            "GET",
+            "/.well-known/acme-challenge/owned_01",
+            "example.test",
+            ""
+        )
+        .await
+        .status(),
+        429,
+        "exempt client stayed banned"
+    );
     front_task.abort();
     issuer_task.abort();
     app_task.abort();
