@@ -1652,7 +1652,13 @@ impl Proxy {
                 .forwarded_host
                 .as_ref()
                 .and_then(|host| host.to_str().ok());
-            let result = if let Some(redis) = &snapshot.settings.security_redis {
+            let exempt = crate::path_failure_bans::is_exempt(
+                snapshot.config.settings.failure_ban_exempt_cidrs.as_deref(),
+                edge.client_ip,
+            );
+            let result = if exempt {
+                Ok(())
+            } else if let Some(redis) = &snapshot.settings.security_redis {
                 redis
                     .check_bans(
                         snapshot
@@ -2001,7 +2007,12 @@ impl Proxy {
             guard_evidence = evidence;
         }
         let peer = SocketAddr::new(edge.client_ip, peer.port());
-        if let Some(capture) = request.extensions().get::<FailureCapture>().cloned() {
+        if let Some(capture) = request.extensions().get::<FailureCapture>().cloned()
+            && !crate::path_failure_bans::is_exempt(
+                snapshot.config.settings.failure_ban_exempt_cidrs.as_deref(),
+                edge.client_ip,
+            )
+        {
             let scope = snapshot
                 .config
                 .settings

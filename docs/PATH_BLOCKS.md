@@ -55,7 +55,9 @@ Failures count only on configured URLs after failure-observation admission. The 
 
 The administrator menu lists active bans, filters a canonical IPv4/IPv6 address and releases that IP after confirmation. APIs are `GET /v1/security/bans?ip=...` and `POST /v1/security/bans/release` with `{"ip":"192.0.2.10"}`. Queries return at most200 records and a truncated flag; filtered search reaches matching IPs beyond the unfiltered limit. Viewers cannot read or release bans. Release removes active configured-rule failure/ban records; accepted releases can finish after caller cancellation/logout, while revoked actors cannot admit new ones. Old observations are fenced from newly admitted generations.
 
-Each rule tracks at most1024 client records, including pending observations. Active bans are not evicted to admit a new IP; unknown-IP capacity exhaustion fails closed503. Local cancellation releases reservations. Redis abandoned reservations expire after a bounded TTL; expired selected-failure callbacks fail closed503 instead of recreating records. Up to128 rules and16 hosts/rule are allowed, with32KiB aggregate selector/policy text per list; IP allowlists cap1024 CIDRs and country lists256 codes. Invalid settings leave the active document intact.
+`ban_seconds` accepts1–31536000 (365 days); `window_seconds` stays1–86400. `failure_ban_exempt_cidrs` (up to1024 ranges) lists verified client IPs that failure bans never count, observe or ban, even during an existing ban; exempt requests do not contact the security Redis.
+
+Each rule tracks at most16384 client records, including pending observations. Active bans are not evicted to admit a new IP; unknown-IP capacity exhaustion fails closed503. Local cancellation releases reservations. Redis abandoned reservations expire after a bounded TTL; expired selected-failure callbacks fail closed503 instead of recreating records. Up to128 rules and16 hosts/rule are allowed, with32KiB aggregate selector/policy text per list; IP allowlists cap1024 CIDRs and country lists256 codes. Invalid settings leave the active document intact.
 
 ## Shared Redis and Valkey
 

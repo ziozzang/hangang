@@ -539,7 +539,7 @@ local mode=ARGV[1]; local ip=ARGV[2]
 local raw=redis.call('HGET',KEYS[2],ip); local state=raw and cjson.decode(raw) or nil
 if mode=='check' then return (state and state.banned>now) and 1 or 0 end
 if mode=='list' then
- local result={}; local members=ip~='' and {ip} or redis.call('ZRANGE',KEYS[1],0,1023)
+ local result={}; local members=ip~='' and {ip} or redis.call('ZRANGE',KEYS[1],0,-1)
  for _,member in ipairs(members) do
   local value=redis.call('HGET',KEYS[2],member)
   if value then local s=cjson.decode(value); if s.banned>now then table.insert(result,member..'|'..math.ceil((s.banned-now)/1000)); if #result>=tonumber(ARGV[3]) then break end end end
@@ -549,7 +549,7 @@ end
 if mode=='reserve' then
  if state and state.banned>now then return 'banned' end
  if not state then
-  if redis.call('ZCARD',KEYS[1])>=1024 then return 'capacity' end
+  if redis.call('ZCARD',KEYS[1])>=16384 then return 'capacity' end
   state={epoch=ARGV[3],count=0,started=now,banned=0,flight=0}
  end
  state.flight=state.flight+1
@@ -1306,7 +1306,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(stale.record(401).await.unwrap_err().status, 503);
-        let _:i64=a.invoke("local t=redis.call('TIME'); for i=1,1024 do redis.call('ZADD',KEYS[1],tonumber(t[1])*1000+60000,'client-'..i) end;return 1",a.ban_keys(&rules[0]).to_vec(),vec![]).await.unwrap();
+        let _:i64=a.invoke("local t=redis.call('TIME'); for i=1,16384 do redis.call('ZADD',KEYS[1],tonumber(t[1])*1000+60000,'client-'..i) end;return 1",a.ban_keys(&rules[0]).to_vec(),vec![]).await.unwrap();
         assert_eq!(
             a.observe(&rules, &request("/login"), None, ip)
                 .await
