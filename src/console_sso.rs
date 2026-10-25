@@ -77,7 +77,7 @@ impl Sso {
         let mut bytes = Vec::new();
         Read::by_ref(&mut f).take(65537).read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 65536, "SSO configuration too large");
-        let config: Config = serde_json::from_slice(&bytes)?;
+        let config: Config = hangang::input_json::from_slice(&bytes)?;
         let url = reqwest::Url::parse(&config.public_url)?;
         let local = url
             .host_str()
@@ -256,7 +256,7 @@ impl Sso {
             token: String,
             user: User,
         }
-        let r: Reply = serde_json::from_slice(&bytes)?;
+        let r: Reply = hangang::input_json::from_slice(&bytes)?;
         ensure!(
             r.user.enabled
                 && r.user

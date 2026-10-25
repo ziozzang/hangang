@@ -393,7 +393,7 @@ mod tests {
     use tokio_util::task::AbortOnDropHandle;
 
     fn runtime() -> Arc<HttpRuntime> {
-        let config: Config = serde_json::from_str(
+        let config: Config = crate::input_json::from_str(
             r#"{"http":[{"id":"pool","backends":["http://127.0.0.1:8080"]}]}"#,
         )
         .unwrap();
@@ -672,7 +672,7 @@ mod tests {
     async fn same_address_docker_restart_replaces_client_and_fences_pending_socks_dial() {
         let docker = FakeDocker::start().await;
         let reference = "docker://app/edge/8080";
-        let config: Config = serde_json::from_str(&format!(
+        let config: Config = crate::input_json::from_str(&format!(
             r#"{{"http":[{{"id":"pool","backends":["{reference}"]}}]}}"#
         ))
         .unwrap();

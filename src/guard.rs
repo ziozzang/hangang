@@ -681,7 +681,7 @@ impl GuardClient {
                 .send()
                 .await?;
             let body = Self::bounded_body(response).await?;
-            let decision: Decision = serde_json::from_slice(&body)?;
+            let decision: Decision = crate::input_json::from_slice(&body)?;
             ensure!(
                 decision.version == 1 && decision.ttl_ms <= 5000,
                 "invalid decision"
@@ -809,7 +809,7 @@ impl GuardClient {
                 .send()
                 .await?;
             let body = Self::bounded_body(response).await?;
-            let decision: Decision = serde_json::from_slice(&body)?;
+            let decision: Decision = crate::input_json::from_slice(&body)?;
             ensure!(
                 decision.version == 1
                     && decision
@@ -990,7 +990,7 @@ impl GuardClient {
                     let result: Result<()> = async {
                         let response = client.get(format!("{base}/v1/snapshot")).header(reqwest::header::AUTHORIZATION, auth.clone()).send().await?;
                         let body = Self::bounded_body(response).await?;
-                        guard.install(serde_json::from_slice(&body)?)
+                        guard.install(crate::input_json::from_slice(&body)?)
                     }.await;
                     match result { Ok(()) => { let policy = guard.policy.load(); tracing::debug!(revision = policy.as_ref().map(|p| p.revision), dropped_events = guard.dropped.load(Ordering::Relaxed), "guard snapshot refreshed"); }, Err(_) => tracing::warn!(dropped_events = guard.dropped.load(Ordering::Relaxed), "guard snapshot refresh failed; retaining cache until expiry") }
                 }
@@ -1203,7 +1203,7 @@ mod tests {
                             records
                                 .lock()
                                 .unwrap()
-                                .push(serde_json::from_slice(&body).unwrap());
+                                .push(crate::input_json::from_slice(&body).unwrap());
                             let body = serde_json::to_vec(&*output.lock().unwrap()).unwrap();
                             Ok::<_, std::convert::Infallible>(Response::new(Full::new(
                                 bytes::Bytes::from(body),

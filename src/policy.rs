@@ -383,7 +383,7 @@ impl RunningWorker {
             .read_exact(&mut payload)
             .await
             .context("failed to read policy response")?;
-        serde_json::from_slice(&payload).context("failed to decode policy response")
+        crate::input_json::from_slice(&payload).context("failed to decode policy response")
     }
 
     async fn terminate(mut self) {
@@ -447,7 +447,7 @@ pub fn worker_main() -> Result<()> {
 
     while let Some(payload) = read_frame(&mut reader)? {
         let request: WorkerRequest =
-            serde_json::from_slice(&payload).context("failed to decode policy request")?;
+            crate::input_json::from_slice(&payload).context("failed to decode policy request")?;
         let shutdown = matches!(request, WorkerRequest::Shutdown);
         let response = match handle_worker_request(request) {
             Ok(response) => response,
@@ -787,8 +787,8 @@ fn install_transform_api(
                     "JSON input exceeds 16384 bytes".to_owned(),
                 ));
             }
-            let value: serde_json::Value =
-                serde_json::from_slice(&encoded.as_bytes()).map_err(mlua::Error::external)?;
+            let value: serde_json::Value = crate::input_json::from_slice(&encoded.as_bytes())
+                .map_err(mlua::Error::external)?;
             lua.to_value(&value)
         })?,
     )?;

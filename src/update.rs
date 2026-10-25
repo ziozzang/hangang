@@ -91,7 +91,7 @@ pub fn sign_release_manifest(payload_json: &[u8], signing_key: &SigningKey) -> R
         "release payload exceeds 64 KiB"
     );
     let manifest: ReleaseManifest =
-        serde_json::from_slice(payload_json).context("invalid release manifest payload")?;
+        crate::input_json::from_slice(payload_json).context("invalid release manifest payload")?;
     validate_manifest_fields(&manifest)?;
     let signature = signing_key.sign(payload_json);
     let envelope = SignedEnvelope {
@@ -333,8 +333,8 @@ impl UpdateManager {
             encoded.len() <= MAX_MANIFEST_BYTES as usize,
             "signed release manifest exceeds 64 KiB"
         );
-        let envelope: SignedEnvelope =
-            serde_json::from_slice(encoded).context("invalid signed release manifest envelope")?;
+        let envelope: SignedEnvelope = crate::input_json::from_slice(encoded)
+            .context("invalid signed release manifest envelope")?;
         let payload = STANDARD
             .decode(&envelope.payload)
             .context("manifest payload is not valid base64")?;
@@ -347,8 +347,8 @@ impl UpdateManager {
             .0
             .verify_strict(&payload, &signature)
             .context("update manifest signature verification failed")?;
-        let manifest: ReleaseManifest =
-            serde_json::from_slice(&payload).context("invalid signed release manifest payload")?;
+        let manifest: ReleaseManifest = crate::input_json::from_slice(&payload)
+            .context("invalid signed release manifest payload")?;
         validate_manifest_fields(&manifest)?;
         ensure!(
             manifest.target == self.target,

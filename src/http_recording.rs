@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn first_match_and_peer_client_are_distinct() {
-        let policy: Policy = serde_json::from_str(r#"{
+        let policy: Policy = crate::input_json::from_str(r#"{
             "default_action":"drop", "rules":[
               {"id":"peer", "action":"record", "match":{"methods":["POST"],"peer_cidrs":["192.0.2.0/24"],"client_cidrs":["198.51.100.0/24"],"path_prefixes":["/private/"]}},
               {"id":"all", "action":"drop", "match":{}}

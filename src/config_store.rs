@@ -1024,8 +1024,8 @@ impl FileConfigStore {
 
     async fn read_challenges(&self) -> StoreResult<BTreeMap<String, FileChallenge>> {
         let path = self.challenges_path();
-        blocking(Access::Read, move || match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        blocking(Access::Read, move || match read_challenge_file(&path) {
+            Ok(bytes) => crate::input_json::from_slice(&bytes)
                 .map_err(|error| StoreError::Invalid(anyhow!(error).context("decode challenges"))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(error) => Err(StoreError::Unavailable(
@@ -1044,11 +1044,38 @@ impl FileConfigStore {
             let bytes = serde_json::to_vec(&challenges).map_err(|error| {
                 StoreError::Invalid(anyhow!(error).context("encode challenges"))
             })?;
+            if bytes.len() > MAX_CONFIG_BYTES {
+                return Err(StoreError::Invalid(anyhow!("challenges exceed 1 MiB")));
+            }
             write_atomically(&path, &bytes)
                 .map_err(|error| StoreError::Unavailable(error.context("write challenges")))
         })
         .await
     }
+}
+
+fn read_challenge_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(std::io::Error::other(
+            "challenges must be a regular file within 1 MiB",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(std::io::Error::other("challenges exceed 1 MiB"));
+    }
+    Ok(bytes)
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -4018,7 +4045,7 @@ pub(crate) fn decode(revision: u64, json: &str) -> StoreResult<Config> {
             "stored configuration exceeds 1 MiB"
         )));
     }
-    let config: Config = serde_json::from_str(json).map_err(|error| {
+    let config: Config = crate::input_json::from_str(json).map_err(|error| {
         StoreError::Invalid(anyhow!(error).context("decode stored configuration"))
     })?;
     if config.revision != revision {
@@ -4860,5 +4887,38 @@ mod tests {
                 "the read failure stays in the chain: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod challenge_input_tests {
+    use super::*;
+    #[tokio::test]
+    async fn challenge_documents_refuse_oversize_and_deep_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileConfigStore::new(directory.path().join("config.json"));
+        let path = store.challenges_path();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES as u64 + 1)
+            .unwrap();
+        assert!(store.read_challenges().await.is_err());
+        let deep = format!("{{\"unknown\":{}0{}}}", "[".repeat(129), "]".repeat(129));
+        std::fs::write(&path, deep).unwrap();
+        assert!(store.read_challenges().await.is_err());
+        assert!(
+            store
+                .write_challenges(BTreeMap::from([(
+                    "x".into(),
+                    FileChallenge {
+                        key_authorization: "a".repeat(MAX_CONFIG_BYTES),
+                        expires_unix: 0,
+                    }
+                )]))
+                .await
+                .is_err()
+        );
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(store.read_challenges().await.unwrap().is_empty());
     }
 }

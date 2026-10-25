@@ -128,8 +128,8 @@ pub(crate) fn parse_token(mut token: Vec<u8>) -> Result<Vec<u8>> {
 
 fn load(path: &Path) -> Result<(String, Vec<u8>)> {
     let raw = secure_read(path, CONFIG_MAX)?;
-    let config: FileConfig =
-        serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("invalid observer config"))?;
+    let config: FileConfig = crate::input_json::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("invalid observer config"))?;
     ensure!(valid_node_id(&config.node_id), "invalid observer node id");
     let token = secure_read(&config.token_file, TOKEN_MAX)?;
     // Admin session bearers are exactly 43 base64url characters

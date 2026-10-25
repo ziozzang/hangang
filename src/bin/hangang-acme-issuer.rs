@@ -7,6 +7,7 @@ use hangang::acme::{
     self, AcmeConfig, AcmeEngine, AcmeFileConfig, ChallengeMode, CloudflareDnsProvider,
     DnsProvider, IssuedCertificate,
 };
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
@@ -217,10 +218,11 @@ fn current_certificate_meta(root: &Path, domains: &[String]) -> Result<Option<Ce
             let cert = read_bounded(&root.join(&target).join("cert.pem"), MAX_PEM)?;
             let key = read_bounded(&root.join(&target).join("key.pem"), MAX_PEM)?;
             let validated = acme::validate_certificate(domains, &cert, &key)?;
-            let leaf = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert))
-                .next()
-                .transpose()?
-                .context("validated certificate has no leaf")?;
+            let leaf =
+                rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(&cert))
+                    .next()
+                    .transpose()?
+                    .context("validated certificate has no leaf")?;
             use sha2::{Digest, Sha256};
             let fingerprint = Sha256::digest(leaf.as_ref())
                 .iter()
@@ -555,7 +557,7 @@ async fn main() -> Result<()> {
         .init();
     absolute_normal(&args.config, "issuer config")?;
     let bytes = read_bounded(&args.config, MAX_CONFIG)?;
-    let config = serde_json::from_slice::<IssuerFile>(&bytes)?.prepare()?;
+    let config = hangang::input_json::from_slice::<IssuerFile>(&bytes)?.prepare()?;
     ensure_private_dir(&config.output_directory)?;
     ensure_target(&config.output_directory.join("current"))?;
     ensure!(
@@ -672,7 +674,7 @@ async fn supervise(
                     }
                     match read_bounded(&path,MAX_CONFIG) {
                         Ok(bytes) if bytes != previous => {
-                            match serde_json::from_slice::<IssuerFile>(&bytes).context("parse issuer config").and_then(IssuerFile::prepare).and_then(|next|{
+                            match hangang::input_json::from_slice::<IssuerFile>(&bytes).context("parse issuer config").and_then(IssuerFile::prepare).and_then(|next|{
                                 ensure_private_dir(&next.output_directory)?;
                                 ensure_target(&next.output_directory.join("current"))?;
                                 Ok(next)
@@ -716,7 +718,7 @@ async fn supervise(
                     }
                     match read_bounded(&path,MAX_CONFIG) {
                         Ok(bytes) if bytes != previous => {
-                            match serde_json::from_slice::<IssuerFile>(&bytes).context("parse issuer config").and_then(IssuerFile::prepare).and_then(|next|{
+                            match hangang::input_json::from_slice::<IssuerFile>(&bytes).context("parse issuer config").and_then(IssuerFile::prepare).and_then(|next|{
                                 ensure_private_dir(&next.output_directory)?;
                                 ensure_target(&next.output_directory.join("current"))?;
                                 Ok(next)
@@ -782,11 +784,13 @@ mod tests {
         write_status(&prepared, "ready", None).unwrap();
         let path = root.join("issuer-status.json");
         let body = std::fs::read(&path).unwrap();
-        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let leaf = rustls_pemfile::certs(&mut std::io::Cursor::new(&certificate.certificate_pem))
-            .next()
-            .unwrap()
-            .unwrap();
+        let status: serde_json::Value = hangang::input_json::from_slice(&body).unwrap();
+        let leaf = rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(
+            &certificate.certificate_pem,
+        ))
+        .next()
+        .unwrap()
+        .unwrap();
         assert_eq!(status["version"], 1);
         assert_eq!(status["manager"], "hangang-acme-issuer");
         assert_eq!(status["challenge"], "dns-01");
@@ -811,7 +815,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("account.json"));
         write_status(&prepared, "retrying", Some(Duration::from_secs(10))).unwrap();
         let retrying: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            hangang::input_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(retrying["phase"], "retrying");
         assert!(
             retrying["retry_next_unix_ms"].as_u64().unwrap()
@@ -837,9 +841,10 @@ mod tests {
         let root = private_output(temp.path(), "zone");
         let prepared = prepared_status_fixture(root.clone(), vec!["example.test".into()]);
         write_status(&prepared, "renewing", None).unwrap();
-        let status: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("issuer-status.json")).unwrap())
-                .unwrap();
+        let status: serde_json::Value = hangang::input_json::from_slice(
+            &std::fs::read(root.join("issuer-status.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(status["phase"], "renewing");
         assert!(status["certificate_fingerprint_sha256"].is_null());
         assert!(status["expires_unix_ms"].is_null());
@@ -879,7 +884,7 @@ mod tests {
         .await
         .unwrap();
         let status: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(status_path).unwrap()).unwrap();
+            hangang::input_json::from_slice(&std::fs::read(status_path).unwrap()).unwrap();
         assert_eq!(status["phase"], "ready");
         assert_eq!(
             status["expires_unix_ms"],
@@ -1049,7 +1054,7 @@ mod tests {
         let first = payload("first.json", &zone_a);
         std::fs::write(&path, &first).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let config = serde_json::from_slice::<IssuerFile>(&first)
+        let config = hangang::input_json::from_slice::<IssuerFile>(&first)
             .unwrap()
             .prepare()
             .unwrap();

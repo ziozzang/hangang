@@ -107,7 +107,7 @@ def build_candidate(root: Path) -> Path:
     (package / "Cargo.toml").write_text(cargo)
     shutil.copy2(WORKSPACE / "Cargo.lock", package / "Cargo.lock")
     shutil.copy2(WORKSPACE / "build.rs", package / "build.rs")
-    for name in ("src", "docs", "web", "crates"):
+    for name in ("src", "docs", "web", "crates", "vendor"):
         os.symlink(WORKSPACE / name, package / name, target_is_directory=True)
     # Keep dependency artifacts between runs. This is a dedicated target tree
     # and never overwrites the workspace's active debug/release executable.

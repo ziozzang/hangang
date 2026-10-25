@@ -97,10 +97,11 @@ def unique_object(pairs):
 
 
 def main():
+    from input_limits import json_document
     try:
         data = sys.stdin.buffer.read(1024 * 1024 + 1)
         require(len(data) <= 1024 * 1024, 'manifest exceeds 1 MiB')
-        document = json.loads(data, object_pairs_hook=unique_object)
+        document = json_document(data, object_pairs_hook=unique_object)
         print(json.dumps(plan(document), indent=2))
         return 0
     except (ValueError, TypeError, RecursionError):

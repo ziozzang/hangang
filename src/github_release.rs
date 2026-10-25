@@ -144,7 +144,7 @@ pub(crate) async fn fetch(client: &Client, endpoint: &str) -> Result<Release> {
     );
     let bytes = crate::update::read_response_limited(response, MAX_METADATA, "4 MiB").await?;
     let release: Release =
-        serde_json::from_slice(&bytes).context("invalid GitHub release metadata")?;
+        crate::input_json::from_slice(&bytes).context("invalid GitHub release metadata")?;
     release.version()?;
     Ok(release)
 }

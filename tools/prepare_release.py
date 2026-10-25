@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
+from input_limits import toml_file
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -85,7 +85,7 @@ def prepare(seed: Path | None, output: Path, target: str, *, unsigned: bool = Fa
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("output directory must be empty")
 
-    package = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    package = toml_file(ROOT / "Cargo.toml")
     version = package["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError(f"release version must be stable MAJOR.MINOR.PATCH: {version}")

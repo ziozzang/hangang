@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plan certificate groups offline without contacting a CA or DNS provider."""
 import argparse
-import json
+from input_limits import json_document, read_text
 import ipaddress
 from pathlib import Path
 
@@ -43,7 +43,7 @@ def main():
     if args.input.resolve() == args.output.resolve():
         parser.error('input and output must be separate files')
     try:
-        source = json.loads(args.input.read_text())
+        source = json_document(read_text(args.input))
         plan = {'groups': group_domains(source.get('domains') if isinstance(source, dict) else source)}
         # A plan contains only requested public DNS names, never provider credentials.
         from consolidate_listener_routes import write_private

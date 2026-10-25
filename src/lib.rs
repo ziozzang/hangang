@@ -52,6 +52,7 @@ pub mod workload_material;
 pub mod workload_tls;
 
 pub mod ingress;
+pub mod input_json;
 pub mod kubernetes;
 
 pub mod active_probe;

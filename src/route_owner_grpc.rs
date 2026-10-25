@@ -41,7 +41,7 @@ impl Configuration {
             bytes.len() <= 16 * 1024,
             "route owner configuration exceeds bound"
         );
-        Ok(serde_json::from_slice(&bytes)?)
+        Ok(crate::input_json::from_slice(&bytes)?)
     }
 }
 /// Validated private resources; preparation opens no listening socket.

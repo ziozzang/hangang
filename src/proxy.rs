@@ -4385,7 +4385,7 @@ async fn inspect_json_body(
         }
     })?;
     let bytes = collected.to_bytes();
-    let json = serde_json::from_slice(&bytes).map_err(|_| InspectError::Invalid)?;
+    let json = crate::input_json::from_slice(&bytes).map_err(|_| InspectError::Invalid)?;
     Ok((Request::from_parts(parts, full_body(bytes)), json))
 }
 

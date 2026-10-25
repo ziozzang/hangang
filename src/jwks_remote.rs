@@ -363,7 +363,8 @@ impl RemoteJwksProvider {
             }
         };
         let body = fetch_bounded(&self.client, &uri).await?;
-        let keys: serde_json::Value = serde_json::from_slice(&body).context("invalid JWKS JSON")?;
+        let keys: serde_json::Value =
+            crate::input_json::from_slice(&body).context("invalid JWKS JSON")?;
         let count = keys
             .get("keys")
             .and_then(serde_json::Value::as_array)
@@ -417,7 +418,7 @@ fn same_origin(a: &Url, b: &Url) -> bool {
 
 fn jwks_from_discovery(body: &[u8], issuer_raw: &str, issuer: &Url) -> Result<Url> {
     let document: DiscoveryDocument =
-        serde_json::from_slice(body).context("invalid OIDC discovery JSON")?;
+        crate::input_json::from_slice(body).context("invalid OIDC discovery JSON")?;
     ensure!(
         document.issuer == issuer_raw,
         "OIDC discovery issuer differs from configured issuer"
@@ -540,11 +541,11 @@ mod tests {
     #[test]
     fn endpoint_wire_shape_is_explicit_and_closed() {
         let oidc: RemoteJwksConfig =
-            serde_json::from_str(r#"{"endpoint":{"kind":"oidc"}}"#).unwrap();
+            crate::input_json::from_str(r#"{"endpoint":{"kind":"oidc"}}"#).unwrap();
         assert_eq!(oidc.cache_ttl_seconds, 300);
         assert_eq!(oidc.refresh_cooldown_seconds, 10);
         assert_eq!(oidc.timeout_ms, 3000);
-        let pinned: RemoteJwksConfig = serde_json::from_str(
+        let pinned: RemoteJwksConfig = crate::input_json::from_str(
             r#"{"endpoint":{"kind":"jwks","url":"https://issuer.example/keys"}}"#,
         )
         .unwrap();
@@ -555,7 +556,7 @@ mod tests {
             r#"{"endpoint":{"kind":"jwks","url":"https://issuer.example/keys","insecure":true}}"#,
         ] {
             assert!(
-                serde_json::from_str::<RemoteJwksConfig>(invalid).is_err(),
+                crate::input_json::from_str::<RemoteJwksConfig>(invalid).is_err(),
                 "{invalid}"
             );
         }

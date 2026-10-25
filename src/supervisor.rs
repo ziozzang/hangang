@@ -109,7 +109,7 @@ pub fn load_status(path: &std::path::Path) -> Result<UpdateStatus> {
         .take(65537)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 65536, "update status too large");
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(crate::input_json::from_slice(&bytes)?)
 }
 fn persist_status(path: &std::path::Path, status: &UpdateStatus) -> Result<()> {
     use std::io::Write;
@@ -576,5 +576,41 @@ mod tests {
         assert_eq!(status.rollbacks_total, 0);
         assert_eq!(status.last_rollback_reason, None);
         assert_eq!(status.last_rollback_unix, 0);
+    }
+
+    #[test]
+    fn status_file_rejects_deep_unknown_fields_and_oversized_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("update-status.json");
+        let status = UpdateStatus::initial(true);
+        let mut document = serde_json::to_string(&status).unwrap();
+        document.pop();
+        document.push_str(&format!(
+            ",\"unknown\":{}0{}}}",
+            "[".repeat(129),
+            "]".repeat(129)
+        ));
+        // A typed decoder otherwise skips unknown fields without a depth check.
+        assert!(serde_json::from_str::<UpdateStatus>(&document).is_ok());
+        std::fs::write(&path, document).unwrap();
+        assert!(
+            load_status(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("nesting")
+        );
+
+        std::fs::write(&path, vec![b' '; 65537]).unwrap();
+        assert!(
+            load_status(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("too large")
+        );
+
+        persist_status(&path, &status).unwrap();
+        assert_eq!(load_status(&path).unwrap().phase, status.phase);
     }
 }

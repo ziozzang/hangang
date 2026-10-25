@@ -3547,7 +3547,7 @@ mod tests {
         assert!(prepared.http[0].country_policy.as_ref().unwrap().enforced());
         assert!(prepared.geoip.as_ref().unwrap().load().is_none());
 
-        let mut tcp: TcpRoute = serde_json::from_str(
+        let mut tcp: TcpRoute = crate::input_json::from_str(
             r#"{"id":"tcp","enabled":false,"listen":"127.0.0.1:9009","backends":["127.0.0.1:9010"]}"#,
         )
         .unwrap();
@@ -3567,8 +3567,10 @@ mod tests {
     }
 
     fn route() -> Config {
-        serde_json::from_str(r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080"]}]}"#)
-            .unwrap()
+        crate::input_json::from_str(
+            r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080"]}]}"#,
+        )
+        .unwrap()
     }
     #[test]
     fn canonical_domain_defaults_and_group_validation_are_strict() {
@@ -3647,7 +3649,7 @@ mod tests {
         assert!(wire.get("public_http").is_none());
         assert!(wire["http"][0].get("listener_ids").is_none());
         let listener: crate::public_listener_config::Listener =
-            serde_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap();
+            crate::input_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap();
         assert!(listener.enabled);
         config.public_http.push(listener.clone());
         config.http[0].listener_ids = vec!["edge".into()];
@@ -3670,7 +3672,7 @@ mod tests {
     fn protected_scope_cannot_move_between_public_listeners() {
         let mut old = route();
         old.http[0].resource_policy = Some(
-            serde_json::from_str(
+            crate::input_json::from_str(
                 r#"{"resource_id":"private","principal":{"source":"basic"},"allow":[]}"#,
             )
             .unwrap(),
@@ -3688,9 +3690,9 @@ mod tests {
     #[test]
     fn public_listener_generation_does_not_revive_after_disable() {
         let mut config = route();
-        config
-            .public_http
-            .push(serde_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap());
+        config.public_http.push(
+            crate::input_json::from_str(r#"{"id":"edge","listen":"127.0.0.1:8443"}"#).unwrap(),
+        );
         let first = Snapshot::new(config.clone()).unwrap();
         let same = Snapshot::replace(config.clone(), &first).unwrap();
         assert!(std::sync::Arc::ptr_eq(
@@ -3725,7 +3727,7 @@ mod tests {
             ..Default::default()
         });
         let serialized = serde_json::to_vec(&config).unwrap();
-        let restored: Config = serde_json::from_slice(&serialized).unwrap();
+        let restored: Config = crate::input_json::from_slice(&serialized).unwrap();
         assert!(!restored.http[0].enabled);
         assert_eq!(restored.http[0].backends, config.http[0].backends);
         let snapshot = Snapshot::new(restored).unwrap();
@@ -3800,7 +3802,7 @@ mod tests {
             );
             config.http[0].auth = None;
         }
-        assert!(serde_json::from_str::<AccessMode>("\"other\"").is_err());
+        assert!(crate::input_json::from_str::<AccessMode>("\"other\"").is_err());
     }
 
     #[test]
@@ -3849,7 +3851,7 @@ mod tests {
     }
     #[test]
     fn unrelated_updates_keep_backend_health_and_load_state() {
-        let mut config: Config = serde_json::from_str(
+        let mut config: Config = crate::input_json::from_str(
             r#"{"http":[{"id":"main","backends":["http://127.0.0.1:8080","http://127.0.0.1:8081"],
                 "balance":{"mode":"least_connections","health":{"failure_threshold":1,"cooldown_ms":60000}}}]}"#,
         )
@@ -3862,7 +3864,8 @@ mod tests {
         // An unrelated change (a second route) must not reset quarantine or
         // the in-flight lease on the surviving route.
         config.http.push(
-            serde_json::from_str(r#"{"id":"other","backends":["http://127.0.0.1:9090"]}"#).unwrap(),
+            crate::input_json::from_str(r#"{"id":"other","backends":["http://127.0.0.1:9090"]}"#)
+                .unwrap(),
         );
         let second = Snapshot::replace(config.clone(), &first).unwrap();
         let main = second.http.iter().find(|r| r.route.id == "main").unwrap();
@@ -3902,7 +3905,8 @@ mod tests {
         assert!(original.available(0));
 
         config.http.push(
-            serde_json::from_str(r#"{"id":"other","backends":["http://127.0.0.1:9090"]}"#).unwrap(),
+            crate::input_json::from_str(r#"{"id":"other","backends":["http://127.0.0.1:9090"]}"#)
+                .unwrap(),
         );
         let unrelated = Snapshot::replace(config.clone(), &first).unwrap();
         assert!(std::sync::Arc::ptr_eq(
@@ -4167,7 +4171,7 @@ mod tests {
     fn tcp_health_state_reuses_only_identical_routing_and_transport() {
         let mut config = Config::default();
         config.tcp.push(
-            serde_json::from_str(
+            crate::input_json::from_str(
                 r#"{"id":"stream","listen":"127.0.0.1:9001","backends":["127.0.0.1:8080"],"health":{"interval_ms":1000,"timeout_ms":500,"healthy_successes":2,"unhealthy_failures":2,"initial_state":"checking"}}"#,
             )
             .unwrap(),
@@ -4227,7 +4231,7 @@ mod tests {
     fn http_and_tcp_health_targets_share_one_bounded_probe_budget() {
         let mut config = Config::default();
         for index in 0..8 {
-            let mut route: TcpRoute = serde_json::from_str(
+            let mut route: TcpRoute = crate::input_json::from_str(
                 r#"{"id":"temporary","enabled":false,"listen":"127.0.0.1:9001","backends":["127.0.0.1:8080"],"health":{"interval_ms":1000,"timeout_ms":500,"healthy_successes":1,"unhealthy_failures":1}}"#,
             )
             .unwrap();
@@ -4281,7 +4285,7 @@ mod tests {
     }
     #[test]
     fn rejects_unknown_fields() {
-        assert!(serde_json::from_str::<Config>(r#"{"htpt":[]}"#).is_err());
+        assert!(crate::input_json::from_str::<Config>(r#"{"htpt":[]}"#).is_err());
     }
     #[test]
     fn validates_match_fields() {
@@ -4534,7 +4538,7 @@ mod tests {
         let text = serde_json::to_string(&config).unwrap();
         assert!(text.contains(r#""x-hopae-gateway-key":{"env":"HANGANG_HOPAE_KEY"}"#));
         assert_eq!(
-            serde_json::from_str::<Config>(&text).unwrap().http[0].auth,
+            crate::input_json::from_str::<Config>(&text).unwrap().http[0].auth,
             config.http[0].auth
         );
     }
@@ -4687,7 +4691,7 @@ mod strip_cookie_tests {
         let auth = auth_with(&["__Host-hopae", "__Host-hopae_bind", "Hopae", "hopae"]);
         validate_strip_request_cookies(&auth.strip_request_cookies).unwrap();
         let again: ExternalAuth =
-            serde_json::from_str(&serde_json::to_string(&auth).unwrap()).unwrap();
+            crate::input_json::from_str(&serde_json::to_string(&auth).unwrap()).unwrap();
         assert_eq!(again, auth);
         let empty = auth_with(&[]);
         assert!(

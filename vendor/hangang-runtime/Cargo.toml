@@ -1,0 +1,25 @@
+[package]
+name = "hangang-runtime"
+version = "0.1.2"
+edition = "2024"
+license = "MIT"
+description = "Shared bounded server transport for Hangang World"
+[dependencies]
+libc = "0.2"
+axum = "0.8"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
+anyhow = "1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "time", "macros"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["time"] }
+[dev-dependencies]
+rcgen = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+tempfile = "3"

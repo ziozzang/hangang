@@ -29,6 +29,7 @@ use instant_acme::{
 };
 use reqwest::Client;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -77,7 +78,7 @@ async fn json_bounded<T: for<'de> Deserialize<'de>>(response: reqwest::Response)
         );
         body.extend_from_slice(&chunk);
     }
-    Ok(serde_json::from_slice(&body)?)
+    Ok(crate::input_json::from_slice(&body)?)
 }
 
 type AcmeHyperClient =
@@ -130,8 +131,9 @@ fn acme_http_client(ca_path: Option<&Path>) -> Result<Box<dyn instant_acme::Http
             .take(MAX_PEM as u64 + 1)
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= MAX_PEM, "ACME CA bundle exceeds 1 MiB");
-        let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let certs =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(bytes))
+                .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
         ensure!(!certs.is_empty(), "ACME CA bundle is empty");
         for cert in certs {
             roots.add(cert)?;
@@ -476,7 +478,7 @@ impl AcmeFileConfig {
 /// Read one bounded JSON runtime configuration.
 pub async fn load_config_file(path: impl AsRef<Path>) -> Result<AcmeConfig> {
     let bytes = bounded_read(path.as_ref(), 256 * 1024).await?;
-    serde_json::from_slice::<AcmeFileConfig>(&bytes)?.into_config()
+    crate::input_json::from_slice::<AcmeFileConfig>(&bytes)?.into_config()
 }
 
 /// Poll a mounted config file and send validated replacements. The receiver
@@ -511,7 +513,7 @@ pub async fn watch_config_file(
             let result = if bytes.len() > 256 * 1024 {
                 Err("ACME config exceeds 256 KiB".to_owned())
             } else {
-                match serde_json::from_slice::<AcmeFileConfig>(&bytes) {
+                match crate::input_json::from_slice::<AcmeFileConfig>(&bytes) {
                     Ok(value) => value.into_config().map_err(|e| e.to_string()),
                     Err(error) => Err(error.to_string()),
                 }
@@ -2463,15 +2465,27 @@ impl AcmeEngine {
         let Some(key_path) = &self.config.private_key_path else {
             return Ok(true);
         };
-        let bytes = match fs::read(path).await {
+        let bytes = match bounded_read(path, MAX_PEM).await {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(error) => return Err(error.into()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
         };
-        let key = match fs::read(key_path).await {
+        let key = match bounded_read(key_path, MAX_PEM).await {
             Ok(key) => key,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(error) => return Err(error.into()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
         };
         let domains = self.config.checked_domains()?;
         let validated =
@@ -2550,13 +2564,13 @@ pub fn validate_certificate(
         cert.len() <= MAX_PEM && key.len() <= MAX_PEM,
         "certificate material exceeds 1 MiB"
     );
-    let chain = rustls_pemfile::certs(&mut std::io::Cursor::new(cert))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let chain = rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(cert))
+        .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
     ensure!(
         !chain.is_empty(),
         "ACME returned an empty certificate chain"
     );
-    let private = rustls_pemfile::private_key(&mut std::io::Cursor::new(key))?
+    let private = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut std::io::Cursor::new(key))
         .context("ACME returned no private key")?;
     let certified = rustls::sign::CertifiedKey::from_der(
         chain.clone(),
@@ -2634,7 +2648,7 @@ async fn load_or_create_account(path: &Path) -> Result<(StoredAccount, Vec<u8>)>
         Ok(_) => {
             let bytes = bounded_read(path, MAX_ACCOUNT_FILE as usize).await?;
             let stored: StoredAccount =
-                serde_json::from_slice(&bytes).context("parse ACME account file")?;
+                crate::input_json::from_slice(&bytes).context("parse ACME account file")?;
             let key = URL_SAFE_NO_PAD
                 .decode(&stored.key_pkcs8_der)
                 .context("decode ACME account key")?;
@@ -2657,7 +2671,16 @@ async fn load_or_create_account(path: &Path) -> Result<(StoredAccount, Vec<u8>)>
 }
 async fn bounded_read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let file = fs::File::open(path).await?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = options.open(path).await?;
+    let meta = file.metadata().await?;
+    ensure!(
+        meta.is_file() && meta.len() <= limit as u64,
+        "ACME input must be a regular file within its size limit"
+    );
     file.take(limit as u64 + 1).read_to_end(&mut bytes).await?;
     ensure!(
         bytes.len() <= limit,
@@ -2898,7 +2921,7 @@ mod cloudflare_receipt_recovery {
                                 let mut status = StatusCode::OK;
                                 let result = if method == Method::POST {
                                     let input: serde_json::Value =
-                                        serde_json::from_slice(&body).unwrap();
+                                        crate::input_json::from_slice(&body).unwrap();
                                     let name = input["name"].as_str().unwrap().to_owned();
                                     let value = input["content"].as_str().unwrap().to_owned();
                                     if state
@@ -2976,5 +2999,23 @@ mod cloudflare_receipt_recovery {
         assert!(state.lock().await.records.is_empty());
         stop.cancel();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod material_input_tests {
+    use super::*;
+    #[tokio::test]
+    async fn renewal_material_refuses_oversize_and_nonregular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cert.pem");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_PEM as u64 + 1)
+            .unwrap();
+        assert!(bounded_read(&path, MAX_PEM).await.is_err());
+        assert!(bounded_read(directory.path(), MAX_PEM).await.is_err());
+        std::fs::write(&path, b"bounded").unwrap();
+        assert_eq!(bounded_read(&path, MAX_PEM).await.unwrap(), b"bounded");
     }
 }

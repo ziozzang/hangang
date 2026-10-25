@@ -2225,7 +2225,7 @@ fn policy_state(transaction: &Transaction<'_>) -> Result<AuditPolicyObservation>
             && json.len() <= 65_536,
         "invalid stored account audit policy metadata"
     );
-    let policy: AuditPolicy = serde_json::from_str(&json)?;
+    let policy: AuditPolicy = crate::input_json::from_str(&json)?;
     policy.validate()?;
     Ok(AuditPolicyObservation {
         scope: "instance",
@@ -2341,8 +2341,8 @@ fn read_audit_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
                 if json.len() > 65_536 {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
-                let policy: AuditPolicy =
-                    serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let policy: AuditPolicy = crate::input_json::from_str(&json)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
                 policy
                     .validate()
                     .map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -5367,7 +5367,7 @@ mod tests {
         policy.rules[1].criteria.target_user_ids = vec![0];
         assert!(policy.validate().is_err());
         assert!(
-            serde_json::from_str::<AuditPolicy>(
+            crate::input_json::from_str::<AuditPolicy>(
                 r#"{"default_action":"record","rules":[],"unknown":1}"#
             )
             .is_err()

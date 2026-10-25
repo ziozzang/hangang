@@ -12,6 +12,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
 };
+use rustls_pki_types::pem::PemObject;
 use std::{
     io::Cursor,
     net::Ipv4Addr,
@@ -160,12 +161,10 @@ fn connector(material: &Material, identity: Option<(&str, &str)>) -> tokio_rustl
     .unwrap()
     .with_root_certificates(roots);
     let config = if let Some((cert, key)) = identity {
-        let certs = rustls_pemfile::certs(&mut Cursor::new(cert))
+        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(cert))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut Cursor::new(key))
-            .unwrap()
-            .unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut Cursor::new(key)).unwrap();
         builder.with_client_auth_cert(certs, key).unwrap()
     } else {
         builder.with_no_client_auth()

@@ -3,6 +3,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::{Request, StatusCode, client::conn::http1};
 use hyper_util::rt::TokioIo;
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, time::Duration};
 use tokio::{net::UnixStream, time::timeout};
@@ -56,9 +57,10 @@ impl DockerResolver {
                 && base.fragment().is_none(),
             "Docker remote URL must contain only an HTTPS origin"
         );
-        let roots = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("parse Docker CA certificates")?;
+        let roots =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(ca_pem))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("parse Docker CA certificates")?;
         ensure!(
             !roots.is_empty() && roots.len() <= 32,
             "Docker CA file must contain 1 to 32 certificates"
@@ -129,7 +131,7 @@ impl DockerResolver {
             Transport::Https { base, client } => https_request(base, client, &path).await?,
         };
         let inspect: InspectResponse =
-            serde_json::from_slice(&body).context("parse Docker inspection response")?;
+            crate::input_json::from_slice(&body).context("parse Docker inspection response")?;
         ensure!(inspect.state.running, "Docker container is not running");
         let endpoint = inspect
             .network_settings

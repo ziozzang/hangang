@@ -563,7 +563,7 @@ fn load_state(path: &Path) -> Result<Option<Stored>> {
         "Docker connection state is too large"
     );
     Ok(Some(
-        serde_json::from_slice(&bytes).context("parse Docker connection state")?,
+        crate::input_json::from_slice(&bytes).context("parse Docker connection state")?,
     ))
 }
 

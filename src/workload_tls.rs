@@ -3,6 +3,7 @@
 //! `authorize_peer` is an application authorization step **after** rustls has
 //! completed certificate-chain and (when configured) CRL verification. A
 //! caller must not use it to authenticate an unverified certificate chain.
+use rustls_pki_types::pem::PemObject;
 use std::{
     collections::HashSet,
     io::{Cursor, Read},
@@ -109,9 +110,10 @@ impl Prepared {
             .map(|path| read_bounded(path))
             .transpose()?;
 
-        let certs = rustls_pemfile::certs(&mut Cursor::new(&cert_bytes))
-            .collect::<std::io::Result<Vec<_>>>()
-            .context("invalid mTLS server certificate PEM")?;
+        let certs =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(&cert_bytes))
+                .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()
+                .context("invalid mTLS server certificate PEM")?;
         ensure!(
             !certs.is_empty() && certs.len() <= MAX_CHAIN_CERTIFICATES,
             "mTLS server certificate chain must contain 1..=16 certificates"
@@ -130,12 +132,12 @@ impl Prepared {
                 "mTLS server certificate is not currently valid"
             );
         }
-        let key = rustls_pemfile::private_key(&mut Cursor::new(&key_bytes))
-            .context("invalid mTLS server private-key PEM")?
-            .context("mTLS server private key is missing")?;
-        let ca_certs = rustls_pemfile::certs(&mut Cursor::new(&ca_bytes))
-            .collect::<std::io::Result<Vec<_>>>()
-            .context("invalid mTLS client CA PEM")?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut Cursor::new(&key_bytes))
+            .context("invalid or missing mTLS server private-key PEM")?;
+        let ca_certs =
+            rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(&ca_bytes))
+                .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()
+                .context("invalid mTLS client CA PEM")?;
         ensure!(
             !ca_certs.is_empty() && ca_certs.len() <= MAX_CHAIN_CERTIFICATES,
             "mTLS client CA must contain 1..=16 certificates"
@@ -152,9 +154,11 @@ impl Prepared {
         );
         let mut crl_expires_at = None;
         if let Some(bytes) = crl_bytes.as_deref() {
-            let crls = rustls_pemfile::crls(&mut Cursor::new(bytes))
-                .collect::<std::io::Result<Vec<CertificateRevocationListDer<'static>>>>()
-                .context("invalid mTLS client CRL PEM")?;
+            let crls = rustls_pki_types::CertificateRevocationListDer::pem_reader_iter(
+                &mut Cursor::new(bytes),
+            )
+            .collect::<Result<Vec<CertificateRevocationListDer<'static>>, rustls_pki_types::pem::Error>>()
+            .context("invalid mTLS client CRL PEM")?;
             ensure!(
                 !crls.is_empty() && crls.len() <= 16,
                 "mTLS client CRL file must contain 1..=16 lists"

@@ -64,7 +64,7 @@ async fn settings(bytes: &[u8], http_enabled: bool) -> Result<Settings> {
     let mut fingerprint = Sha256::new();
     fingerprint.update(bytes);
     let file: FileConfig =
-        serde_json::from_slice(bytes).context("invalid ACME runtime configuration")?;
+        crate::input_json::from_slice(bytes).context("invalid ACME runtime configuration")?;
     let mut config = file.acme.into_config()?;
     if let Some(path) = &config.ca_path {
         crate::tls::client_config(Some(path))?;
@@ -275,7 +275,7 @@ impl Runtime {
         // Parsing and key construction run off the async executor.
         let parsed =
             tokio::task::spawn_blocking(move || -> Result<(Vec<String>, u64, ServerConfig)> {
-                let bundle: Bundle = serde_json::from_slice(&bytes)?;
+                let bundle: Bundle = crate::input_json::from_slice(&bytes)?;
                 ensure!(
                     bundle.domains == domains,
                     "stored certificate domain set changed"

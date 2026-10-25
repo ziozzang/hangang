@@ -37,7 +37,7 @@ pub fn load(path: &Path) -> Result<Config> {
         bytes.len() <= MAX_CONFIG_BYTES,
         "configuration exceeds 1 MiB"
     );
-    let config: Config = serde_json::from_slice(&bytes).context("parse configuration")?;
+    let config: Config = crate::input_json::from_slice(&bytes).context("parse configuration")?;
     config.validate()?;
     Ok(config)
 }

@@ -67,7 +67,8 @@ fn read_config(path: &std::path::Path) -> Result<Config> {
         "config exceeds {} bytes",
         MAX_CONFIG_BYTES
     );
-    let config = serde_json::from_slice::<Config>(&bytes).context("parse strict DSR JSON")?;
+    let config =
+        hangang::input_json::from_slice::<Config>(&bytes).context("parse strict DSR JSON")?;
     config.validate()?;
     Ok(config)
 }

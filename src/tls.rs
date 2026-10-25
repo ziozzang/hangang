@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwap;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
@@ -29,14 +30,15 @@ pub(crate) fn mutual_client(
     let certificate = read_bounded(certificate)?;
     let key = read_bounded(key)?;
     let mut roots = RootCertStore::empty();
-    for certificate in rustls_pemfile::certs(&mut ca.as_slice()) {
+    for certificate in rustls_pki_types::CertificateDer::pem_reader_iter(&mut ca.as_slice()) {
         roots.add(certificate?)?;
     }
     ensure!(!roots.is_empty(), "native server CA is empty");
     let certificates =
-        rustls_pemfile::certs(&mut certificate.as_slice()).collect::<std::io::Result<Vec<_>>>()?;
-    let key =
-        rustls_pemfile::private_key(&mut key.as_slice())?.context("native client key missing")?;
+        rustls_pki_types::CertificateDer::pem_reader_iter(&mut certificate.as_slice())
+            .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut key.as_slice())
+        .context("native client key missing")?;
     let mut config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -167,11 +169,11 @@ pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     crate::certificates::read_bounded(path, "command-line", "material")
 }
 pub fn server_config(cert: &[u8], key: &[u8]) -> Result<ServerConfig> {
-    let certificates =
-        rustls_pemfile::certs(&mut Cursor::new(cert)).collect::<std::io::Result<Vec<_>>>()?;
+    let certificates = rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(cert))
+        .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
     ensure!(!certificates.is_empty(), "certificate chain is empty");
-    let key =
-        rustls_pemfile::private_key(&mut Cursor::new(key))?.context("private key is missing")?;
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut Cursor::new(key))
+        .context("private key is missing")?;
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()?
@@ -185,8 +187,8 @@ pub fn client_config(extra_ca: Option<&Path>) -> Result<ClientConfig> {
     let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = extra_ca {
         let bytes = read_bounded(path)?;
-        let certs =
-            rustls_pemfile::certs(&mut Cursor::new(bytes)).collect::<std::io::Result<Vec<_>>>()?;
+        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(bytes))
+            .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
         ensure!(!certs.is_empty(), "upstream CA file is empty");
         for cert in certs {
             roots.add(cert)?;
@@ -209,6 +211,20 @@ pub struct TransportInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn certificate_compression_stays_disabled() {
+        let client = client_config(None).unwrap();
+        assert!(client.cert_compressors.is_empty());
+        assert!(client.cert_decompressors.is_empty());
+        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = server_config(
+            pair.cert.pem().as_bytes(),
+            pair.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        assert!(server.cert_compressors.is_empty());
+        assert!(server.cert_decompressors.is_empty());
+    }
     #[test]
     fn rejects_invalid_material() {
         assert!(server_config(b"bad", b"bad").is_err());
@@ -294,10 +310,14 @@ pub fn sni_server_config(certificates: Vec<SniCertificate>) -> Result<ServerConf
                     && certificate.hosts.len() <= 128),
             "invalid TLS host count or default certificate hosts"
         );
-        let chain = rustls_pemfile::certs(&mut Cursor::new(&certificate.cert_pem))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let key = rustls_pemfile::private_key(&mut Cursor::new(&certificate.key_pem))?
-            .context("TLS private key is missing")?;
+        let chain = rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(
+            &certificate.cert_pem,
+        ))
+        .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut Cursor::new(
+            &certificate.key_pem,
+        ))
+        .context("TLS private key is missing")?;
         let certified = Arc::new(rustls::sign::CertifiedKey::from_der(chain, key, &provider)?);
         if certificate.default {
             ensure!(

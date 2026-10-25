@@ -40,7 +40,7 @@ pub fn verify(encoded: &str, signature: &str, key: &[u8], now: u64) -> Option<As
     let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
     mac.update(&bytes);
     mac.verify_slice(&signature).ok()?;
-    let a: Assertion = serde_json::from_slice(&bytes).ok()?;
+    let a: Assertion = crate::input_json::from_slice(&bytes).ok()?;
     if a.actor_id < 0
         || (a.actor_id == 0 && a.actor_name != "system")
         || a.actor_name.is_empty()

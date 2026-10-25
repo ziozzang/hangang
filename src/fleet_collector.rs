@@ -109,8 +109,8 @@ pub struct Runtime {
 
 fn load(path: &Path, forbidden: Option<[u8; 32]>) -> Result<Vec<Spec>> {
     let raw = crate::fleet_observer::secure_read(path, INVENTORY_MAX)?;
-    let file: InventoryFile =
-        serde_json::from_slice(&raw).map_err(|_| anyhow::anyhow!("invalid fleet inventory"))?;
+    let file: InventoryFile = crate::input_json::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("invalid fleet inventory"))?;
     ensure!(file.peers.len() <= 64, "too many fleet peers");
     let mut ids = HashSet::new();
     let mut origins = HashSet::new();
@@ -328,7 +328,7 @@ async fn poll(peer: Peer) -> std::result::Result<WireObservation, &'static str> 
         bytes.extend_from_slice(&chunk);
     }
     let value: WireObservation =
-        serde_json::from_slice(&bytes).map_err(|_| "invalid_observation")?;
+        crate::input_json::from_slice(&bytes).map_err(|_| "invalid_observation")?;
     match validate_wire(&value, &peer.spec.node_id) {
         "ok" => Ok(value),
         code => Err(code),

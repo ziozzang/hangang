@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hangang-route-grpc"]
+members = ["crates/hangang-route-grpc", "vendor/hangang-runtime", "vendor/pumgye-client"]
 resolver = "3"
 
 [package]
@@ -38,8 +38,8 @@ ipnet = { version = "2", features = ["serde"] }
 mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
-rsa = "0.9"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
+aws-lc-rs = "1.18.1"
 quick-xml = "0.41"
 memchr = "2"
 maxminddb = { version = "0.32.0", default-features = false }
@@ -55,11 +55,11 @@ subtle = "2"
 tempfile = "3"
 libc = "0.2"
 
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "webpki-tokio"] }
 webpki-roots = "1"
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.15", features = ["std"] }
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 semver = { version = "1", features = ["serde"] }
@@ -76,11 +76,20 @@ instant-acme = { version = "0.8.5", default-features = false, features = ["ring"
 x509-parser = "0.18.1"
 
 [dev-dependencies]
+h2 = "0.4"
+pkcs8 = "0.10"
 rcgen = "0.14"
 rand = "0.8"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Preserve the pinned upstream code while removing the unmaintained PEM shim.
+# See vendor/README.md for provenance and the narrow patch description.
+[patch."https://github.com/ziozzang/hangang-runtime"]
+hangang-runtime = { path = "vendor/hangang-runtime" }
+
+[patch."https://github.com/ziozzang/pumgye"]
+pumgye-client = { path = "vendor/pumgye-client" }

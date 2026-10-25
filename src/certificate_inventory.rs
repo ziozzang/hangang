@@ -2,6 +2,7 @@
 //! A configured path is not proof that its bytes are in the live TLS resolver.
 use crate::certificates::CertificateFiles;
 use anyhow::{Result, ensure};
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -138,9 +139,10 @@ fn entry(file: &CertificateFiles, configured_tls: bool, now: u64) -> Entry {
         Err(_) => return with_pending_status(item, status, &file.hosts, now),
     };
     item.read_state = "invalid";
-    let Ok(der) = rustls_pemfile::certs(&mut std::io::Cursor::new(&bytes))
-        .next()
-        .transpose()
+    let Ok(der) =
+        rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(&bytes))
+            .next()
+            .transpose()
     else {
         return with_pending_status(item, status, &file.hosts, now);
     };
@@ -262,7 +264,7 @@ fn read_status(path: &Path) -> Result<IssuerManifest> {
         bytes.len() <= MAX_STATUS_BYTES,
         "issuer status is too large"
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(crate::input_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]
@@ -277,10 +279,12 @@ mod tests {
         let cert = directory.path().join("cert.pem");
         let status = directory.path().join("issuer-status.json");
         std::fs::write(&cert, pair.cert.pem()).unwrap();
-        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(pair.cert.pem()))
-            .next()
-            .unwrap()
-            .unwrap();
+        let der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(
+            pair.cert.pem(),
+        ))
+        .next()
+        .unwrap()
+        .unwrap();
         let fingerprint = format!("{:x}", Sha256::digest(der.as_ref()));
         let file = CertificateFiles {
             id: "one".into(),

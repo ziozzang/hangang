@@ -2803,7 +2803,7 @@ impl Admin {
                 Ok(Ok(b)) => b.to_bytes(),
                 _ => return Ok(response(400, "invalid or oversized Docker request\n")),
             };
-            let query: Resolve = match serde_json::from_slice(&bytes) {
+            let query: Resolve = match crate::input_json::from_slice(&bytes) {
                 Ok(q) => q,
                 Err(_) => return Ok(response(400, "container, network and port are required\n")),
             };
@@ -2950,7 +2950,7 @@ impl Admin {
             Ok(Err(_)) => return Ok(response(413, "invalid or oversized body\n")),
             Err(_) => return Ok(response(408, "body timeout\n")),
         };
-        let config: Config = match serde_json::from_slice(&bytes) {
+        let config: Config = match crate::input_json::from_slice(&bytes) {
             Ok(c) => c,
             Err(_) => return Ok(response(400, "invalid configuration JSON\n")),
         };
@@ -3682,7 +3682,8 @@ impl Admin {
                         .map_err(|_| ());
                     if let Ok((200, bytes)) = &outcome
                         && path == "v1/policy"
-                        && let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes)
+                        && let Ok(document) =
+                            crate::input_json::from_slice::<serde_json::Value>(bytes)
                         && let Some(revision) = document
                             .get("revision")
                             .and_then(|v| v.as_u64())
@@ -3746,7 +3747,7 @@ impl Admin {
                 "owning authority rejected the operation; reload before retrying",
             );
         }
-        let document: serde_json::Value = match serde_json::from_slice(&bytes) {
+        let document: serde_json::Value = match crate::input_json::from_slice(&bytes) {
             Ok(doc) => doc,
             Err(_) => return problem(503, "Authority Unavailable", "invalid Pumgye response"),
         };
@@ -4663,7 +4664,8 @@ async fn read_json<T: serde::de::DeserializeOwned>(
         }
         Err(_) => return Err(problem(408, "Request Timeout", "body timeout")),
     };
-    serde_json::from_slice(&bytes).map_err(|error| problem(400, "Invalid JSON", &error.to_string()))
+    crate::input_json::from_slice(&bytes)
+        .map_err(|error| problem(400, "Invalid JSON", &error.to_string()))
 }
 
 /// Random per-process identifier (16 hex chars) so that instances answering

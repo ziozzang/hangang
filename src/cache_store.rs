@@ -1348,7 +1348,7 @@ fn decode_disk_entry(
         stored_at >= 0 && ttl >= 0 && initial_age >= 0,
         "invalid cached time value"
     );
-    let headers = serde_json::from_slice(&headers).context("decode cached headers")?;
+    let headers = crate::input_json::from_slice(&headers).context("decode cached headers")?;
     let entry = CacheEntry {
         body: Bytes::from(body),
         headers,
@@ -1513,10 +1513,10 @@ mod tests {
 
     #[test]
     fn serde_defaults_are_strict_and_validation_is_bounded() {
-        let config: CacheConfig = serde_json::from_str("{}").unwrap();
+        let config: CacheConfig = crate::input_json::from_str("{}").unwrap();
         assert_eq!(config, CacheConfig::default());
-        assert!(serde_json::from_str::<CacheConfig>(r#"{"unknown":true}"#).is_err());
-        assert!(serde_json::from_str::<CacheConfig>(r#"{"memory":{"extra":1}}"#).is_err());
+        assert!(crate::input_json::from_str::<CacheConfig>(r#"{"unknown":true}"#).is_err());
+        assert!(crate::input_json::from_str::<CacheConfig>(r#"{"memory":{"extra":1}}"#).is_err());
 
         let invalid = CacheConfig {
             max_object_bytes: 0,
@@ -1901,9 +1901,9 @@ mod tests {
 
     #[test]
     fn generation_is_optional_bounded_and_excluded_from_runtime_compatibility() {
-        let config: CacheConfig = serde_json::from_str("{}").unwrap();
+        let config: CacheConfig = crate::input_json::from_str("{}").unwrap();
         assert_eq!(config.generation, 0);
-        let parsed: CacheConfig = serde_json::from_str(r#"{"generation":7}"#).unwrap();
+        let parsed: CacheConfig = crate::input_json::from_str(r#"{"generation":7}"#).unwrap();
         assert_eq!(parsed.generation, 7);
         assert!(parsed.validate().is_ok());
         assert!(config.runtime_compatible(&parsed));
@@ -1929,7 +1929,7 @@ mod tests {
             ..CacheConfig::default()
         };
         assert!(too_large.validate().is_err());
-        assert!(serde_json::from_str::<CacheConfig>(r#"{"generation":-1}"#).is_err());
+        assert!(crate::input_json::from_str::<CacheConfig>(r#"{"generation":-1}"#).is_err());
     }
 
     #[tokio::test]

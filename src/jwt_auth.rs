@@ -552,10 +552,12 @@ fn prepare_jwk(object: &Map<String, Value>, algorithm: JwtAlgorithm) -> Result<P
                 "RSA modulus must be odd and 2048..4096 bits"
             );
             ensure!(exponent == [1, 0, 1], "RSA exponent must be 65537");
-            let _ = rsa::RsaPublicKey::new(
-                rsa::BigUint::from_bytes_be(&modulus),
-                rsa::BigUint::from_bytes_be(&exponent),
-            )?;
+            aws_lc_rs::signature::RsaPublicKeyComponents {
+                n: &modulus,
+                e: &exponent,
+            }
+            .to_parsed_public_key(&aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256)
+            .map_err(|_| anyhow::anyhow!("invalid RSA public key"))?;
             DecodingKey::from_rsa_components(n, e)?
         }
         ("EC", JwtAlgorithm::ES256) => {
@@ -572,6 +574,14 @@ fn prepare_jwk(object: &Map<String, Value>, algorithm: JwtAlgorithm) -> Result<P
                 decode_url(x, 32)?.len() == 32 && decode_url(y, 32)?.len() == 32,
                 "ES256 coordinates must be 32 bytes"
             );
+            let mut point = vec![4];
+            point.extend_from_slice(&decode_url(x, 32)?);
+            point.extend_from_slice(&decode_url(y, 32)?);
+            aws_lc_rs::signature::ParsedPublicKey::new(
+                &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED,
+                &point,
+            )
+            .map_err(|_| anyhow::anyhow!("invalid P-256 public key"))?;
             DecodingKey::from_ec_components(x, y)?
         }
         ("OKP", JwtAlgorithm::EdDSA) => {
@@ -587,14 +597,17 @@ fn prepare_jwk(object: &Map<String, Value>, algorithm: JwtAlgorithm) -> Result<P
                 decode_url(x, 32)?.len() == 32,
                 "Ed25519 public key must be 32 bytes"
             );
+            let public: [u8; 32] = decode_url(x, 32)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid Ed25519 public key length"))?;
+            ed25519_dalek::VerifyingKey::from_bytes(&public)?;
             DecodingKey::from_ed_components(x)?
         }
         _ => bail!("JWK type and algorithm disagree"),
     };
-    // The library's verifier factory parses EC/Ed25519 public keys now.
-    // RSA was constructed and checked above because this factory otherwise
-    // defers RSA component parsing until each signature verification.
-    let _ = (jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.verifier_factory)(
+    // Validate the provider selection during preparation. RSA components and
+    // P-256 points are checked above; AWS-LC otherwise defers parsing to verify.
+    let _ = (jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.verifier_factory)(
         &algorithm.library(),
         &key,
     )?;
@@ -967,7 +980,7 @@ fn parse_groups(value: Option<&Value>) -> std::result::Result<Vec<String>, Verif
 /// The caller must enforce a byte limit before invoking this helper.
 pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value> {
     ensure!(bytes.len() <= MAX_JWKS_BYTES, "strict JSON exceeds 128 KiB");
-    Ok(serde_json::from_slice::<StrictValue>(bytes)?.0)
+    Ok(crate::input_json::from_slice::<StrictValue>(bytes)?.0)
 }
 
 /// Duplicate-free JSON value for configuration fields that serde would
@@ -1058,8 +1071,33 @@ impl<'de> Deserialize<'de> for StrictValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::{encoding::AsDer, signature::KeyPair};
     use ed25519_dalek::{Signer, SigningKey};
-    use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+
+    fn rsa_key() -> aws_lc_rs::rsa::KeyPair {
+        aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap()
+    }
+    fn rsa_components(
+        key: &aws_lc_rs::rsa::KeyPair,
+    ) -> aws_lc_rs::signature::RsaPublicKeyComponents<Vec<u8>> {
+        key.public_key().into()
+    }
+    fn rsa_signing(key: &aws_lc_rs::rsa::KeyPair) -> jsonwebtoken::EncodingKey {
+        let der = key.as_der().unwrap();
+        // jsonwebtoken's RSA signer expects the inner PKCS#1 structure.
+        let info = pkcs8::PrivateKeyInfo::try_from(der.as_ref()).unwrap();
+        jsonwebtoken::EncodingKey::from_rsa_der(info.private_key)
+    }
+    fn ec_key() -> (Vec<u8>, Vec<u8>) {
+        let alg = &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let der = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            alg,
+            &aws_lc_rs::rand::SystemRandom::new(),
+        )
+        .unwrap();
+        let key = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(alg, der.as_ref()).unwrap();
+        (der.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+    }
 
     fn config() -> JwtConfig {
         JwtConfig {
@@ -1529,12 +1567,11 @@ mod tests {
 
     #[test]
     fn absent_jwk_algorithm_binds_only_one_compatible_configured_algorithm() {
-        let mut rng = rand::rngs::OsRng;
-        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let private = rsa_key();
         let jwks = serde_json::json!({"keys":[{
             "kty":"RSA", "kid":"rsa-no-alg",
-            "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
-            "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+            "n":URL_SAFE_NO_PAD.encode(rsa_components(&private).n),
+            "e":URL_SAFE_NO_PAD.encode(rsa_components(&private).e)
         }]});
         let bytes = jwks.to_string();
         let only_rs =
@@ -1613,26 +1650,24 @@ mod tests {
 
     #[test]
     fn rsa_and_pss_valid_signatures_and_wrong_keys() {
-        let mut rng = rand::rngs::OsRng;
-        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let wrong = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let der = private.to_pkcs1_der().unwrap();
-        let signing = jsonwebtoken::EncodingKey::from_rsa_der(der.as_bytes());
+        let private = rsa_key();
+        let wrong = rsa_key();
+        let signing = rsa_signing(&private);
         let jwks = serde_json::json!({"keys":[
             {"kty":"RSA", "kid":"rsa+main/1=", "alg":"RS256",
-             "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())},
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&private).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&private).e)},
             {"kty":"RSA", "kid":"pss", "alg":"PS256",
-             "n":URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())}
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&private).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&private).e)}
         ]});
         let wrong_jwks = serde_json::json!({"keys":[
             {"kty":"RSA", "kid":"rsa+main/1=", "alg":"RS256",
-             "n":URL_SAFE_NO_PAD.encode(wrong.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(wrong.e().to_bytes_be())},
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&wrong).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&wrong).e)},
             {"kty":"RSA", "kid":"pss", "alg":"PS256",
-             "n":URL_SAFE_NO_PAD.encode(wrong.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(wrong.e().to_bytes_be())}
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&wrong).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&wrong).e)}
         ]});
         let keys = PreparedKeys::from_jwks_json(
             jwks.to_string().as_bytes(),
@@ -1668,16 +1703,12 @@ mod tests {
 
     #[test]
     fn es256_valid_signature_and_invalid_public_point() {
-        use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint, pkcs8::EncodePrivateKey};
-        let mut rng = rand::rngs::OsRng;
-        let private = SecretKey::random(&mut rng);
-        let wrong = SecretKey::random(&mut rng);
-        let point = private.public_key().to_encoded_point(false);
-        let wrong_point = wrong.public_key().to_encoded_point(false);
-        let key_json = |kid: &str, point: &p256::EncodedPoint| {
+        let (der, point) = ec_key();
+        let (_, wrong_point) = ec_key();
+        let key_json = |kid: &str, point: &[u8]| {
             serde_json::json!({"kty":"EC", "crv":"P-256", "kid":kid, "alg":"ES256",
-                "x":URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-                "y":URL_SAFE_NO_PAD.encode(point.y().unwrap())})
+                "x":URL_SAFE_NO_PAD.encode(&point[1..33]),
+                "y":URL_SAFE_NO_PAD.encode(&point[33..])})
         };
         let jwks = serde_json::json!({"keys":[key_json("ec-main", &point)]});
         let wrong_jwks = serde_json::json!({"keys":[key_json("ec-main", &wrong_point)]});
@@ -1687,8 +1718,7 @@ mod tests {
         let wrong_keys =
             PreparedKeys::from_jwks_json(wrong_jwks.to_string().as_bytes(), &[JwtAlgorithm::ES256])
                 .unwrap();
-        let der = private.to_pkcs8_der().unwrap();
-        let signing = jsonwebtoken::EncodingKey::from_ec_der(der.as_bytes());
+        let signing = jsonwebtoken::EncodingKey::from_ec_der(der.as_ref());
         let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
         header.typ = Some("at+jwt".into());
         header.kid = Some("ec-main".into());
@@ -1744,7 +1774,6 @@ mod tests {
     #[test]
     #[ignore]
     fn jwt_signature_microbenchmark() {
-        use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint, pkcs8::EncodePrivateKey};
         use std::time::Instant;
 
         let mut cases: Vec<(&str, JwtVerifier, Arc<PreparedKey>, String)> = Vec::new();
@@ -1756,17 +1785,15 @@ mod tests {
             token(&ed_signing, &claims()),
         ));
 
-        let mut rng = rand::rngs::OsRng;
-        let rsa_private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let rsa_der = rsa_private.to_pkcs1_der().unwrap();
-        let rsa_signing = jsonwebtoken::EncodingKey::from_rsa_der(rsa_der.as_bytes());
+        let rsa_private = rsa_key();
+        let rsa_signing = rsa_signing(&rsa_private);
         let rsa_jwks = serde_json::json!({"keys":[
             {"kty":"RSA", "kid":"rs", "alg":"RS256",
-             "n":URL_SAFE_NO_PAD.encode(rsa_private.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(rsa_private.e().to_bytes_be())},
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&rsa_private).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&rsa_private).e)},
             {"kty":"RSA", "kid":"ps", "alg":"PS256",
-             "n":URL_SAFE_NO_PAD.encode(rsa_private.n().to_bytes_be()),
-             "e":URL_SAFE_NO_PAD.encode(rsa_private.e().to_bytes_be())}
+             "n":URL_SAFE_NO_PAD.encode(rsa_components(&rsa_private).n),
+             "e":URL_SAFE_NO_PAD.encode(rsa_components(&rsa_private).e)}
         ]});
         let rsa_keys = PreparedKeys::from_jwks_json(
             rsa_jwks.to_string().as_bytes(),
@@ -1790,18 +1817,16 @@ mod tests {
             ));
         }
 
-        let ec_private = SecretKey::random(&mut rng);
-        let point = ec_private.public_key().to_encoded_point(false);
+        let (ec_der, point) = ec_key();
         let ec_jwks = serde_json::json!({"keys":[{
             "kty":"EC", "crv":"P-256", "kid":"ec", "alg":"ES256",
-            "x":URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-            "y":URL_SAFE_NO_PAD.encode(point.y().unwrap())
+            "x":URL_SAFE_NO_PAD.encode(&point[1..33]),
+            "y":URL_SAFE_NO_PAD.encode(&point[33..])
         }]});
         let ec_keys =
             PreparedKeys::from_jwks_json(ec_jwks.to_string().as_bytes(), &[JwtAlgorithm::ES256])
                 .unwrap();
-        let ec_der = ec_private.to_pkcs8_der().unwrap();
-        let ec_signing = jsonwebtoken::EncodingKey::from_ec_der(ec_der.as_bytes());
+        let ec_signing = jsonwebtoken::EncodingKey::from_ec_der(ec_der.as_ref());
         let mut ec_header = jsonwebtoken::Header::new(Algorithm::ES256);
         ec_header.typ = Some("at+jwt".into());
         ec_header.kid = Some("ec".into());

@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn first_match_and_canonical_peer_and_outcome() {
-        let policy: Policy = serde_json::from_str(
+        let policy: Policy = crate::input_json::from_str(
             r#"{
           "default_action":"drop", "rules":[
             {"id":"specific", "action":"record", "match":{

@@ -92,7 +92,7 @@ impl Authority {
                 struct Identity {
                     user: User,
                 }
-                let identity: Identity = serde_json::from_slice(&bytes)?;
+                let identity: Identity = crate::input_json::from_slice(&bytes)?;
                 ensure!(
                     identity.user.enabled
                         && identity.user.role == crate::admin_users::Role::Admin
@@ -241,7 +241,7 @@ fn problem(status: StatusCode, detail: &str) -> Response<Body> {
 }
 impl Registry {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Configuration = serde_json::from_slice(&bounded_file(path, 64 * 1024)?)?;
+        let config: Configuration = crate::input_json::from_slice(&bounded_file(path, 64 * 1024)?)?;
         ensure!(config.plugins.len() <= 8, "too many console plugins");
         let mut plugins = BTreeMap::new();
         for binding in config.plugins {
@@ -257,7 +257,7 @@ impl Registry {
                 sha(&manifest_bytes) == binding.manifest_sha256,
                 "plugin manifest pin mismatch"
             );
-            let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+            let manifest: Manifest = crate::input_json::from_slice(&manifest_bytes)?;
             ensure!(
                 manifest.id == binding.id
                     && manifest.api_version == 1
@@ -584,7 +584,7 @@ impl Registry {
             Err(_) => return problem(StatusCode::REQUEST_TIMEOUT, "plugin request body timeout"),
         };
         if (method == Method::GET && !body.is_empty())
-            || (method != Method::GET && serde_json::from_slice::<Value>(&body).is_err())
+            || (method != Method::GET && crate::input_json::from_slice::<Value>(&body).is_err())
         {
             return problem(
                 StatusCode::BAD_REQUEST,
@@ -683,7 +683,7 @@ impl Registry {
                 );
                 bytes.extend_from_slice(&chunk);
             }
-            let _: Value = serde_json::from_slice(&bytes)?;
+            let _: Value = crate::input_json::from_slice(&bytes)?;
             let status = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 StatusCode::BAD_GATEWAY
             } else {
@@ -900,7 +900,7 @@ mod tests {
                     }
                     let method=request.method().to_string();let path=request.uri().path().to_owned();
                     let bytes=request.into_body().collect().await.unwrap().to_bytes();
-                    let body=if bytes.is_empty(){Value::Null}else{serde_json::from_slice(&bytes).unwrap()};
+                    let body=if bytes.is_empty(){Value::Null}else{crate::input_json::from_slice(&bytes).unwrap()};
                     calls.lock().unwrap().push((method.clone(),path.clone(),body.clone()));
                     assert_eq!(path,"/v1/policy/document","no legacy route or caller-selected backend");
                     if method=="GET" {return reply(StatusCode::OK,json!({"revision":4,"policy":{"mode":"observe"}}));}
@@ -917,11 +917,11 @@ mod tests {
         let (dir, path) = package();
         let manifest_path = dir.path().join("manifest.json");
         let mut manifest: Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            crate::input_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         manifest["routes"] = json!([{"path":"policy/document","method":"GET","mutation":false},{"path":"policy/document","method":"PUT","mutation":true}]);
         let manifest = serde_json::to_vec(&manifest).unwrap();
         fs::write(&manifest_path, &manifest).unwrap();
-        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut config: Value = crate::input_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         config["plugins"][0]["backend"] = json!(format!("http://{backend}"));
         config["plugins"][0]["manifest_sha256"] = json!(sha(&manifest));
         fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     fn mutual_tls_requires_https_matching_dns_and_absolute_paths() {
         let (_dir, path) = package();
-        let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut config: Value = crate::input_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         config["plugins"][0]["tls"] = json!({"server_name":"sumunjang.example.test","ca":"/missing/ca.pem","certificate":"/missing/client.pem","key":"/missing/client.key"});
         fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(Registry::load(&path).is_err());
@@ -1079,7 +1079,7 @@ mod tests {
             "https://example.org/v1/",
         ] {
             let (_dir, path) = package();
-            let mut cfg: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let mut cfg: Value = crate::input_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             cfg["plugins"][0]["backend"] = origin.into();
             fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
             assert!(Registry::load(&path).is_err(), "{origin}");

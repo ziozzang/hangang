@@ -532,7 +532,7 @@ fn transform_json(
     transform: impl FnOnce(&mut Value) -> Result<()>,
 ) -> Result<Vec<u8>> {
     let mut document: Value =
-        serde_json::from_slice(input).context("parse transform JSON input")?;
+        crate::input_json::from_slice(input).context("parse transform JSON input")?;
     transform(&mut document)?;
     let mut output = LimitedOutput::new(limit, input.len());
     let serialized = serde_json::to_writer(&mut output, &document);
@@ -927,17 +927,17 @@ mod tests {
 
     #[test]
     fn serde_defaults_and_unknown_fields_are_strict() {
-        let value: BodyTransform = serde_json::from_str("{}").unwrap();
+        let value: BodyTransform = crate::input_json::from_str("{}").unwrap();
         assert_eq!(value, BodyTransform::default());
-        assert!(serde_json::from_str::<BodyTransform>(r#"{"unknown":true}"#).is_err());
+        assert!(crate::input_json::from_str::<BodyTransform>(r#"{"unknown":true}"#).is_err());
         assert!(
-            serde_json::from_str::<BodyTransform>(
+            crate::input_json::from_str::<BodyTransform>(
                 r#"{"operations":[{"op":"replace","from":"a","to":"b","extra":1}]}"#
             )
             .is_err()
         );
         assert_eq!(
-            serde_json::from_str::<BodyTransform>(r#"{"mode":"ndjson"}"#)
+            crate::input_json::from_str::<BodyTransform>(r#"{"mode":"ndjson"}"#)
                 .unwrap()
                 .mode,
             TransformMode::Ndjson
@@ -1072,7 +1072,7 @@ mod tests {
             .apply_native(br#"{"a/b":{"~key":0},"items":[1,2]}"#)
             .unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&output).unwrap(),
+            crate::input_json::from_slice::<Value>(&output).unwrap(),
             json!({
                 "a/b": {"~key": 3}, "items": [1, 9], "new": 2
             })
@@ -1099,7 +1099,7 @@ mod tests {
             .apply_native(br#"{"object":{"a":1,"b":2},"array":[0,1,2]}"#)
             .unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&output).unwrap(),
+            crate::input_json::from_slice::<Value>(&output).unwrap(),
             json!({
                 "object": {"b": 2}, "array": [0, 2]
             })

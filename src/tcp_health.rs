@@ -372,11 +372,11 @@ mod tests {
         good = policy(InitialHealthState::Checking);
         good.unhealthy_failures = 101;
         assert!(good.validate().is_err());
-        assert!(serde_json::from_str::<TcpHealthPolicy>(
+        assert!(crate::input_json::from_str::<TcpHealthPolicy>(
             r#"{"interval_ms":1000,"timeout_ms":500,"healthy_successes":1,"unhealthy_failures":1,"initial_state":"pending"}"#
         )
         .is_err());
-        assert!(serde_json::from_str::<TcpHealthPolicy>(
+        assert!(crate::input_json::from_str::<TcpHealthPolicy>(
             r#"{"interval_ms":1000,"timeout_ms":500,"healthy_successes":1,"unhealthy_failures":1,"extra":true}"#
         )
         .is_err());

@@ -97,7 +97,7 @@ impl Fixture {
                         super::sign_release_manifest(&payload, &signing_key).unwrap();
                     if case == Case::Signature {
                         let mut envelope: serde_json::Value =
-                            serde_json::from_slice(&manifest).unwrap();
+                            crate::input_json::from_slice(&manifest).unwrap();
                         let mut signature = STANDARD
                             .decode(envelope["signature"].as_str().unwrap())
                             .unwrap();

@@ -1,0 +1,112 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,0 +8 @@
++libc = "0.2"
+@@ -13 +14 @@
+-rustls-pemfile = "2"
++rustls-pki-types = { version = "1.15", features = ["std"] }
+@@ -20,0 +22 @@
++rcgen = "0.14"
+--- a/src/https.rs
++++ b/src/https.rs
+@@ -2 +2 @@
+-use anyhow::{Result, ensure};
++use anyhow::{Context, Result, ensure};
+@@ -8 +8,2 @@
+-use std::{future::Future, io::Read, path::Path, sync::Arc, time::Duration};
++use rustls_pki_types::pem::PemObject;
++use std::{future::Future, path::Path, sync::Arc, time::Duration};
+@@ -11,15 +12,7 @@
+-    fn bytes(path: &Path) -> Result<Vec<u8>> {
+-        let mut bytes = Vec::new();
+-        std::fs::File::open(path)?
+-            .take(1024 * 1024 + 1)
+-            .read_to_end(&mut bytes)?;
+-        ensure!(bytes.len() <= 1024 * 1024, "TLS material exceeds bound");
+-        Ok(bytes)
+-    }
+-    let cert_bytes = bytes(cert)?;
+-    let key_bytes = bytes(key)?;
+-    let ca_bytes = bytes(ca)?;
+-    let certs =
+-        rustls_pemfile::certs(&mut cert_bytes.as_slice()).collect::<std::io::Result<Vec<_>>>()?;
+-    let key = rustls_pemfile::private_key(&mut key_bytes.as_slice())?
+-        .ok_or_else(|| anyhow::anyhow!("missing TLS private key"))?;
++    let cert_bytes = crate::read_tls_material(cert)?;
++    let key_bytes = crate::read_tls_material(key)?;
++    let ca_bytes = crate::read_tls_material(ca)?;
++    let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cert_bytes.as_slice())
++        .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
++    let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut key_bytes.as_slice())
++        .context("invalid or missing TLS private key")?;
+@@ -27 +20 @@
+-    for cert in rustls_pemfile::certs(&mut ca_bytes.as_slice()) {
++    for cert in rustls_pki_types::CertificateDer::pem_reader_iter(&mut ca_bytes.as_slice()) {
+@@ -96,0 +90,24 @@
++
++#[cfg(test)]
++mod pem_security_tests {
++    use super::*;
++    #[test]
++    fn migrated_pem_accepts_matching_material_and_refuses_bad_or_large_input() {
++        let directory = tempfile::tempdir().unwrap();
++        let cert = directory.path().join("cert.pem");
++        let key = directory.path().join("key.pem");
++        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++        std::fs::write(&cert, pair.cert.pem()).unwrap();
++        std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
++        let config = tls_config(&cert, &key, &cert, &[b"h2"]).unwrap();
++        assert!(config.cert_compressors.is_empty());
++        assert!(config.cert_decompressors.is_empty());
++        std::fs::write(&key, b"no private key").unwrap();
++        assert!(tls_config(&cert, &key, &cert, &[b"h2"]).is_err());
++        std::fs::File::create(&cert)
++            .unwrap()
++            .set_len(1024 * 1024 + 1)
++            .unwrap();
++        assert!(tls_config(&cert, &key, &cert, &[b"h2"]).is_err());
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,0 +24,19 @@
++pub(crate) fn read_tls_material(path: &Path) -> Result<Vec<u8>> {
++    use std::io::Read;
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
++    }
++    let file = options.open(path)?;
++    let meta = file.metadata()?;
++    ensure!(meta.is_file(), "TLS material is not a regular file");
++    ensure!(meta.len() <= 1024 * 1024, "TLS material exceeds bound");
++    let mut bytes = Vec::new();
++    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
++    ensure!(bytes.len() <= 1024 * 1024, "TLS material exceeds bound");
++    Ok(bytes)
++}
++
+@@ -25,12 +43,0 @@
+-    fn bounded(path: &Path) -> Result<Vec<u8>> {
+-        use std::io::Read;
+-        let mut bytes = Vec::new();
+-        std::fs::File::open(path)?
+-            .take(1024 * 1024 + 1)
+-            .read_to_end(&mut bytes)?;
+-        ensure!(
+-            bytes.len() <= 1024 * 1024,
+-            "gRPC TLS material exceeds bound"
+-        );
+-        Ok(bytes)
+-    }
+@@ -38,2 +45,5 @@
+-        .identity(Identity::from_pem(bounded(cert)?, bounded(key)?))
+-        .client_ca_root(Certificate::from_pem(bounded(ca)?))
++        .identity(Identity::from_pem(
++            read_tls_material(cert)?,
++            read_tls_material(key)?,
++        ))
++        .client_ca_root(Certificate::from_pem(read_tls_material(ca)?))

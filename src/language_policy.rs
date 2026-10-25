@@ -586,15 +586,21 @@ mod tests {
 
     #[test]
     fn route_wire_requires_mode_and_missing_choice_and_preserves_disabled_policy() {
-        assert!(serde_json::from_str::<Policy>(r#"{"allow":["ko"],"on_missing":"deny"}"#).is_err());
-        assert!(serde_json::from_str::<Policy>(r#"{"mode":"any","allow":["ko"]}"#).is_err());
         assert!(
-            serde_json::from_str::<Policy>(r#"{"mode":"any","on_missing":"deny","extra":true}"#)
+            crate::input_json::from_str::<Policy>(r#"{"allow":["ko"],"on_missing":"deny"}"#)
                 .is_err()
         );
-        let enabled: Policy =
-            serde_json::from_str(r#"{"mode":"preferred","allow":["KO"],"on_missing":"deny"}"#)
-                .unwrap();
+        assert!(crate::input_json::from_str::<Policy>(r#"{"mode":"any","allow":["ko"]}"#).is_err());
+        assert!(
+            crate::input_json::from_str::<Policy>(
+                r#"{"mode":"any","on_missing":"deny","extra":true}"#
+            )
+            .is_err()
+        );
+        let enabled: Policy = crate::input_json::from_str(
+            r#"{"mode":"preferred","allow":["KO"],"on_missing":"deny"}"#,
+        )
+        .unwrap();
         assert!(enabled.enforce);
         assert!(
             serde_json::to_value(&enabled)

@@ -363,11 +363,11 @@ async fn apply(
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
             let _budget = job_budget;
             if ndjson {
-                serde_json::from_slice::<serde::de::IgnoredAny>(&input)?;
+                crate::input_json::from_slice::<serde::de::IgnoredAny>(&input)?;
             }
             let output = cfg.apply_validated_native(&input)?;
             if ndjson && cfg.lua.is_none() {
-                serde_json::from_slice::<serde::de::IgnoredAny>(&output)?;
+                crate::input_json::from_slice::<serde::de::IgnoredAny>(&output)?;
             }
             Ok(output)
         })
@@ -403,7 +403,7 @@ async fn apply(
         if ndjson {
             output = tokio::task::spawn_blocking(move || {
                 let _budget = budget;
-                serde_json::from_slice::<serde::de::IgnoredAny>(&output)
+                crate::input_json::from_slice::<serde::de::IgnoredAny>(&output)
                     .map_err(|_| TransformError::Invalid)?;
                 Ok::<_, TransformError>(output)
             })

@@ -178,7 +178,7 @@ fn load(path: &PathBuf) -> Result<Prepared> {
         bytes.len() <= 1024 * 1024,
         "auth bridge config exceeds 1 MiB"
     );
-    prepare(serde_json::from_slice(&bytes).context("invalid auth bridge JSON")?)
+    prepare(hangang::input_json::from_slice(&bytes).context("invalid auth bridge JSON")?)
 }
 
 fn sole<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -534,7 +534,7 @@ mod tests {
                                 assert_eq!(request.method(), Method::POST);
                                 let bytes = request.into_body().collect().await.unwrap().to_bytes();
                                 let document: serde_json::Value =
-                                    serde_json::from_slice(&bytes).unwrap();
+                                    hangang::input_json::from_slice(&bytes).unwrap();
                                 let session = document["SSOSESSIONS"].as_str().unwrap();
                                 let status = match session {
                                     "error-admin" => StatusCode::INTERNAL_SERVER_ERROR,

@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
+use rustls_pki_types::pem::PemObject;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -747,7 +748,8 @@ impl Controller {
                 "Kubernetes list returned {status}: {}",
                 bounded_text(&bytes)
             );
-            let page: Value = serde_json::from_slice(&bytes).context("decode Kubernetes list")?;
+            let page: Value =
+                crate::input_json::from_slice(&bytes).context("decode Kubernetes list")?;
             let page_version = page
                 .pointer("/metadata/resourceVersion")
                 .and_then(Value::as_str)
@@ -871,16 +873,13 @@ impl Controller {
         // bookmarks, and normal closure that follow, never by the response
         // headers alone.
         let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut decoder = WatchDecoder::default();
         loop {
             let chunk = tokio::select! { _ = cancel.cancelled() => return Ok(WatchEnd::Closed), chunk = stream.next() => chunk };
             let Some(chunk) = chunk else { break };
-            buffer.extend_from_slice(&chunk?);
-            ensure!(
-                buffer.len() <= MAX_WATCH_EVENT_BYTES,
-                "Kubernetes watch event exceeds limit"
-            );
-            while let Some(event) = take_json(&mut buffer)? {
+            let chunk = chunk?;
+            let mut input = chunk.as_ref();
+            while let Some(event) = decoder.next(&mut input)? {
                 let action = event
                     .get("type")
                     .and_then(Value::as_str)
@@ -917,7 +916,7 @@ impl Controller {
             }
         }
         ensure!(
-            buffer.iter().all(u8::is_ascii_whitespace),
+            decoder.buffer.is_empty(),
             "truncated Kubernetes watch event"
         );
         Ok(WatchEnd::Closed)
@@ -1058,7 +1057,7 @@ impl Controller {
             let status = response.status();
             let bytes = bounded_body(response, MAX_WATCH_EVENT_BYTES).await?;
             if status.is_success() {
-                return Ok(serde_json::from_slice(&bytes).ok());
+                return Ok(crate::input_json::from_slice(&bytes).ok());
             }
             ensure!(
                 status == StatusCode::CONFLICT,
@@ -1089,7 +1088,7 @@ impl Controller {
             let status = response.status();
             let bytes = bounded_body(response, MAX_WATCH_EVENT_BYTES).await?;
             ensure!(status.is_success(), "Ingress read returned {status}");
-            current = serde_json::from_slice(&bytes).context("decode Ingress")?;
+            current = crate::input_json::from_slice(&bytes).context("decode Ingress")?;
             if !same_target(object, &current, &self.options.ingress_class) {
                 tracing::info!(namespace=%namespace, name=%name, "Ingress status update dropped: the object was recreated, changed, or left the class since it was queued");
                 return Ok(None);
@@ -1678,9 +1677,9 @@ impl ResourceCache {
                 let mut additions: BTreeMap<Vec<u8>, TlsCertificate> = BTreeMap::new();
                 for candidate in candidates {
                     let mut hash = Sha256::new();
-                    for cert in
-                        rustls_pemfile::certs(&mut std::io::Cursor::new(&candidate.cert_pem))
-                    {
+                    for cert in rustls_pki_types::CertificateDer::pem_reader_iter(
+                        &mut std::io::Cursor::new(&candidate.cert_pem),
+                    ) {
                         let cert = cert?;
                         hash.update((cert.len() as u64).to_be_bytes());
                         hash.update(cert.as_ref());
@@ -2106,9 +2105,10 @@ fn decode_secret(secret: &Value, key: &str) -> Result<Vec<u8>> {
 }
 /// Lower-cased DNS subject alternative names of the leaf certificate.
 fn certificate_dns_names(cert_pem: &[u8]) -> Result<Vec<String>> {
-    let leaf = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
-        .next()
-        .context("TLS certificate missing")??;
+    let leaf =
+        rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(cert_pem))
+            .next()
+            .context("TLS certificate missing")??;
     let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
         .map_err(|error| anyhow::anyhow!("invalid TLS certificate: {error}"))?;
     Ok(parsed
@@ -2129,27 +2129,63 @@ fn certificate_dns_names(cert_pem: &[u8]) -> Result<Vec<String>> {
         })
         .unwrap_or_default())
 }
-fn take_json(buffer: &mut Vec<u8>) -> Result<Option<Value>> {
-    let whitespace = buffer
-        .iter()
-        .take_while(|byte| byte.is_ascii_whitespace())
-        .count();
-    if whitespace > 0 {
-        buffer.drain(..whitespace);
-    }
-    if buffer.is_empty() {
-        return Ok(None);
-    }
-    let mut stream = serde_json::Deserializer::from_slice(buffer).into_iter::<Value>();
-    match stream.next() {
-        Some(Ok(value)) => {
-            let used = stream.byte_offset();
-            buffer.drain(..used);
-            Ok(Some(value))
+/// Frame each watch object once before parsing. Reparsing every incomplete
+/// prefix lets a peer sending one byte at a time cause quadratic CPU work.
+/// The byte and nesting limits apply before growing the retained buffer.
+#[derive(Default)]
+struct WatchDecoder {
+    buffer: Vec<u8>,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+impl WatchDecoder {
+    fn next(&mut self, input: &mut &[u8]) -> Result<Option<Value>> {
+        while let Some((&byte, rest)) = input.split_first() {
+            *input = rest;
+            if self.buffer.is_empty() {
+                if byte.is_ascii_whitespace() {
+                    continue;
+                }
+                ensure!(byte == b'{', "Kubernetes watch event must be an object");
+            }
+            ensure!(
+                self.buffer.len() < MAX_WATCH_EVENT_BYTES,
+                "Kubernetes watch event exceeds limit"
+            );
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'{' | b'[' => {
+                        ensure!(self.depth < 128, "Kubernetes watch nesting exceeds limit");
+                        self.depth += 1;
+                    }
+                    b'}' | b']' => {
+                        self.depth = self
+                            .depth
+                            .checked_sub(1)
+                            .context("invalid Kubernetes watch nesting")?;
+                    }
+                    _ => {}
+                }
+            }
+            self.buffer.push(byte);
+            if self.depth == 0 && !self.in_string {
+                let value = crate::input_json::from_slice(&self.buffer)
+                    .context("invalid Kubernetes watch JSON")?;
+                self.buffer.clear();
+                return Ok(Some(value));
+            }
         }
-        Some(Err(error)) if error.is_eof() => Ok(None),
-        Some(Err(error)) => Err(error.into()),
-        None => Ok(None),
+        Ok(None)
     }
 }
 async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -2347,11 +2383,42 @@ mod tests {
     }
     #[test]
     fn parses_fragmented_watch_values() {
-        let mut bytes = br#" {"type":"ADDED","object":{"metadata":{"name":"x"}}}"#.to_vec();
-        assert_eq!(take_json(&mut bytes).unwrap().unwrap()["type"], "ADDED");
-        assert!(take_json(&mut bytes).unwrap().is_none());
-        let mut partial = br#"{"type":"ADD"#.to_vec();
-        assert!(take_json(&mut partial).unwrap().is_none());
+        let bytes = br#" {"type":"ADDED","object":{"text":"}\\\"[","metadata":{"name":"x"}}} {"type":"DELETED"}"#;
+        let mut decoder = WatchDecoder::default();
+        let mut events = Vec::new();
+        for byte in bytes {
+            let mut input = std::slice::from_ref(byte);
+            if let Some(event) = decoder.next(&mut input).unwrap() {
+                events.push(event);
+            }
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(events[1]["type"], "DELETED");
+        assert!(decoder.buffer.is_empty());
+        let mut input = br#"{}{}"#.as_slice();
+        assert!(decoder.next(&mut input).unwrap().is_some());
+        assert!(decoder.next(&mut input).unwrap().is_some());
+        assert!(decoder.next(&mut input).unwrap().is_none());
+    }
+
+    #[test]
+    fn watch_rejects_oversize_and_deep_input_before_retaining_it() {
+        let mut decoder = WatchDecoder::default();
+        let mut prefix = br#"{"x":""#.as_slice();
+        assert!(decoder.next(&mut prefix).unwrap().is_none());
+        let padding = vec![b'a'; MAX_WATCH_EVENT_BYTES - decoder.buffer.len()];
+        assert!(decoder.next(&mut padding.as_slice()).unwrap().is_none());
+        assert!(decoder.next(&mut b"x".as_slice()).is_err());
+        assert_eq!(decoder.buffer.len(), MAX_WATCH_EVENT_BYTES);
+
+        let mut decoder = WatchDecoder::default();
+        let deep = format!("{{\"x\":{}", "[".repeat(128));
+        assert!(decoder.next(&mut deep.as_bytes()).is_err());
+        assert!(decoder.buffer.len() < deep.len());
+        for malformed in [b"[]".as_slice(), br#"{"x":]}"#, br#"{"x":tru}"#] {
+            assert!(WatchDecoder::default().next(&mut &*malformed).is_err());
+        }
     }
 }
 

@@ -8,15 +8,8 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
-# Known advisories present when this policy was introduced (issue #4). Each
-# entry must name the crate and the follow-up. Remove an entry as soon as the
-# lockfile no longer contains the affected version.
-ignore = [
-    # rsa 0.9: Marvin timing attack, no fixed release exists yet.
-    { id = "RUSTSEC-2023-0071", reason = "rsa: no patched release; tracked in jikji/hangang#4" },
-    # rustls-pemfile 2.2: unmaintained; replace with rustls-pki-types PEM parsing.
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; migration tracked in jikji/hangang#4" },
-]
+# The affected rsa and rustls-pemfile dependencies have been removed.
+ignore = []
 
 [licenses]
 version = 2

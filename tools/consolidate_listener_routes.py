@@ -3,6 +3,7 @@
 import argparse
 import copy
 import json
+from input_limits import json_document, read_text
 import os
 from pathlib import Path
 import tempfile
@@ -148,7 +149,7 @@ def main():
     if len(set(paths)) != len(paths):
         parser.error("input, output and report must be separate files")
     try:
-        candidate, report = consolidate(json.loads(args.input.read_text()), prefer_preserve_host=args.prefer_preserve_host)
+        candidate, report = consolidate(json_document(read_text(args.input)), prefer_preserve_host=args.prefer_preserve_host)
         write_private(args.output, candidate)
         if args.report:
             write_private(args.report, report)

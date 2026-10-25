@@ -594,12 +594,12 @@ mod tests {
             invalid.statuses = statuses;
             assert!(validate(&[invalid]).is_err());
         }
-        let wire: Rule = serde_json::from_str(
+        let wire: Rule = crate::input_json::from_str(
             r#"{"path":"/login","failures":3,"window_seconds":10,"ban_seconds":30}"#,
         )
         .unwrap();
         assert_eq!(wire, rule());
-        assert!(serde_json::from_str::<Rule>(r#"{"path":"/login","failures":3,"window_seconds":10,"ban_seconds":30,"unknown":true}"#).is_err());
+        assert!(crate::input_json::from_str::<Rule>(r#"{"path":"/login","failures":3,"window_seconds":10,"ban_seconds":30,"unknown":true}"#).is_err());
     }
 
     #[test]

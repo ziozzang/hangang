@@ -5384,10 +5384,9 @@ async fn require_tls_redirects_plaintext_requests_to_https() {
 
 #[tokio::test]
 async fn http2_conflicting_content_lengths_are_rejected_before_forwarding() {
-    // HTTP/2 validates only the first Content-Length; hyper represents a
-    // disagreement as an unknown body length while keeping every field. Left
-    // alone, the HTTP/1 upstream would receive both invalid fields plus
-    // chunked framing. The raw upstream must never be contacted for those.
+    // Conflicting lengths must be rejected either by the HTTP/2 parser with
+    // PROTOCOL_ERROR or by the gateway with HTTP 400. The raw HTTP/1 upstream
+    // must never receive ambiguous framing in either case.
     let (backend, seen, backend_task) = raw_upstream().await;
     let (proxy, policy) = proxy(vec![route(vec![format!("http://{backend}")])]);
     let (front, front_task) = frontend_h2(proxy).await;
@@ -5404,13 +5403,25 @@ async fn http2_conflicting_content_lengths_are_rejected_before_forwarding() {
             .header("content-length", second)
             .body(body())
             .unwrap();
-        let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), 400, "{first:?}/{second:?}");
-        let text = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            String::from_utf8_lossy(&text).contains("Content-Length"),
-            "rejection must come from the gateway, not the upstream: {text:?}"
-        );
+        match sender.send_request(request).await {
+            Ok(response) => {
+                assert_eq!(response.status(), 400, "{first:?}/{second:?}");
+                let text = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(
+                    String::from_utf8_lossy(&text).contains("Content-Length"),
+                    "rejection must come from the gateway, not the upstream: {text:?}"
+                );
+            }
+            Err(error) => {
+                use std::error::Error;
+                let reset = error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<h2::Error>())
+                    .expect("rejection must be an HTTP/2 protocol error");
+                assert!(reset.is_reset() && reset.is_remote(), "{reset:?}");
+                assert_eq!(reset.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+            }
+        }
     }
     assert!(
         seen.lock().unwrap().is_empty(),

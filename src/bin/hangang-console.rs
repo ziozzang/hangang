@@ -101,7 +101,7 @@ async fn actor(state: &State, authorization: &reqwest::header::HeaderValue) -> R
     struct Me {
         user: User,
     }
-    let me: Me = serde_json::from_slice(&bytes)?;
+    let me: Me = hangang::input_json::from_slice(&bytes)?;
     ensure!(
         me.user.enabled && me.user.username.len() <= 64,
         "invalid administrator identity"

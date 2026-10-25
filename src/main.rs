@@ -419,8 +419,10 @@ fn main() -> Result<()> {
             bytes.len() <= 16 * 1024 * 1024,
             "Ingress input exceeds 16 MiB"
         );
-        let config =
-            hangang::ingress::import(&serde_json::from_slice(&bytes)?, &args.ingress_class)?;
+        let config = hangang::ingress::import(
+            &hangang::input_json::from_slice(&bytes)?,
+            &args.ingress_class,
+        )?;
         println!("{}", serde_json::to_string_pretty(&config)?);
         return Ok(());
     }
@@ -645,14 +647,15 @@ async fn run(args: Args) -> Result<()> {
                             bytes.len() <= 1024 * 1024,
                             "inherited configuration too large"
                         );
-                        inherited_config =
-                            Some(match serde_json::from_slice::<InheritedSnapshot>(&bytes) {
+                        inherited_config = Some(
+                            match hangang::input_json::from_slice::<InheritedSnapshot>(&bytes) {
                                 Ok(snapshot) => snapshot,
                                 Err(_) => InheritedSnapshot {
-                                    config: serde_json::from_slice::<Config>(&bytes)?,
+                                    config: hangang::input_json::from_slice::<Config>(&bytes)?,
                                     epoch: None,
                                 },
-                            });
+                            },
+                        );
                     }
                 }
             }

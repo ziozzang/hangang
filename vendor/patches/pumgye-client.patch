@@ -1,0 +1,80 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,3 +3,3 @@
+-version.workspace = true
+-edition.workspace = true
+-license.workspace = true
++version = "0.1.9"
++edition = "2024"
++license = "MIT"
+@@ -7,0 +8 @@
++libc = "0.2"
+@@ -9 +10 @@
+-pumgye-protocol = { path = "../pumgye-protocol" }
++pumgye-protocol = { git = "https://github.com/ziozzang/pumgye", rev = "98ecfcd5f319c203b35d2e37aee9ce95a040d874" }
+@@ -14 +15 @@
+-rustls-pemfile = "2"
++rustls-pki-types = { version = "1.15", features = ["std"] }
+@@ -16,0 +18,2 @@
++tempfile = "3"
++rcgen = "0.14"
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5 +5 @@
+-use anyhow::{Result, ensure};
++use anyhow::{Context, Result, ensure};
+@@ -7,0 +8 @@
++use rustls_pki_types::pem::PemObject;
+@@ -40,3 +41,12 @@
+-            std::fs::File::open(path)?
+-                .take(1024 * 1024 + 1)
+-                .read_to_end(&mut bytes)?;
++            let mut options = std::fs::OpenOptions::new();
++            options.read(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
++            }
++            let file = options.open(path)?;
++            let meta = file.metadata()?;
++            ensure!(meta.is_file(), "TLS material is not a regular file");
++            ensure!(meta.len() <= 1024 * 1024, "TLS material exceeds bound");
++            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+@@ -50 +60 @@
+-        for cert in rustls_pemfile::certs(&mut ca.as_slice()) {
++        for cert in rustls_pki_types::CertificateDer::pem_reader_iter(&mut ca.as_slice()) {
+@@ -54,4 +64,4 @@
+-        let certs =
+-            rustls_pemfile::certs(&mut cert.as_slice()).collect::<std::io::Result<Vec<_>>>()?;
+-        let key = rustls_pemfile::private_key(&mut key.as_slice())?
+-            .ok_or_else(|| anyhow::anyhow!("missing client private key"))?;
++        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cert.as_slice())
++            .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()?;
++        let key = rustls_pki_types::PrivateKeyDer::from_pem_reader(&mut key.as_slice())
++            .context("invalid or missing client private key")?;
+@@ -360,0 +371,24 @@
++
++#[cfg(test)]
++mod pem_security_tests {
++    use super::*;
++    #[test]
++    fn migrated_pem_accepts_matching_material_and_refuses_bad_or_large_input() {
++        let directory = tempfile::tempdir().unwrap();
++        let cert = directory.path().join("cert.pem");
++        let key = directory.path().join("key.pem");
++        let pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++        std::fs::write(&cert, pair.cert.pem()).unwrap();
++        std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
++        let config = Tls::from_files("localhost", &cert, &cert, &key).unwrap();
++        assert!(config.config.cert_compressors.is_empty());
++        assert!(config.config.cert_decompressors.is_empty());
++        std::fs::write(&key, b"no private key").unwrap();
++        assert!(Tls::from_files("localhost", &cert, &cert, &key).is_err());
++        std::fs::File::create(&cert)
++            .unwrap()
++            .set_len(1024 * 1024 + 1)
++            .unwrap();
++        assert!(Tls::from_files("localhost", &cert, &cert, &key).is_err());
++    }
++}

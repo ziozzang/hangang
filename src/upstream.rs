@@ -5,6 +5,7 @@ use rustls::{
     crypto::{CryptoProvider, WebPkiSupportedAlgorithms},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -571,8 +572,8 @@ fn read_ca_file(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         bytes.len() as u64 <= MAX_CA_BYTES,
         "upstream CA file exceeds 1 MiB"
     );
-    let certs = rustls_pemfile::certs(&mut Cursor::new(bytes))
-        .collect::<std::io::Result<Vec<_>>>()
+    let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut Cursor::new(bytes))
+        .collect::<Result<Vec<_>, rustls_pki_types::pem::Error>>()
         .context("parse upstream CA file")?;
     ensure!(
         !certs.is_empty(),

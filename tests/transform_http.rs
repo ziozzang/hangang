@@ -131,10 +131,13 @@ async fn fixture_with_protocol(
                         reply
                             .headers_mut()
                             .append("set-cookie", "b=2".parse().unwrap());
-                        if path == "/compressed" {
+                        if let Some(encoding) = path
+                            .strip_prefix("/compressed/")
+                            .or_else(|| (path == "/compressed").then_some("gzip"))
+                        {
                             reply
                                 .headers_mut()
-                                .insert("content-encoding", "gzip".parse().unwrap());
+                                .insert("content-encoding", encoding.parse().unwrap());
                         }
                         if path == "/no-transform" {
                             reply
@@ -261,12 +264,19 @@ async fn encoded_range_conditional_upgrade_and_no_transform_are_explicit_failure
     let c = client();
     for (path, name, value, status) in [
         ("/echo", "content-encoding", "gzip", 415),
+        ("/echo", "content-encoding", "br", 415),
+        ("/echo", "content-encoding", "zstd", 415),
+        ("/echo", "content-encoding", "deflate", 415),
+        ("/echo", "content-encoding", "gzip, br", 415),
         ("/echo", "content-range", "bytes 0-3/10", 400),
         ("/echo", "range", "bytes=0-2", 416),
         ("/echo", "if-none-match", "old", 412),
         ("/echo", "upgrade", "websocket", 400),
         ("/echo", "cache-control", "no-transform", 400),
         ("/compressed", "x-test", "yes", 502),
+        ("/compressed/br", "x-test", "yes", 502),
+        ("/compressed/zstd", "x-test", "yes", 502),
+        ("/compressed/deflate", "x-test", "yes", 502),
         ("/no-transform", "x-test", "yes", 502),
         ("/206", "x-test", "yes", 502),
     ] {
@@ -550,6 +560,36 @@ async fn chunked_get_body_survives_a_streaming_request_transform() {
         let seen = f.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, "{\"n\":1}\n{\"n\":2}\n");
+    }
+    f.pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn compressed_bomb_is_rejected_before_backend_dispatch() {
+    // These streams represent 1 MiB and 1 GiB of zeroes. Rejection must
+    // happen before any decoding or backend dispatch, so the test never
+    // allocates the expanded input or invokes a decompressor.
+    let f = fixture(json!({}), Value::Null, 1).await;
+    for (encoding, bomb) in [
+        (
+            "gzip",
+            include_bytes!("fixtures/security/one-mib-zeroes.gz").as_slice(),
+        ),
+        (
+            "br",
+            include_bytes!("fixtures/security/one-gib-zeroes.br").as_slice(),
+        ),
+    ] {
+        assert!(bomb.len() < 2048);
+        let response = client()
+            .post(format!("{}/echo", f.url))
+            .header("content-encoding", encoding)
+            .body(bomb.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 415);
+        assert!(f.seen.lock().unwrap().is_empty());
     }
     f.pool.shutdown().await;
 }

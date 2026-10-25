@@ -196,7 +196,8 @@ fn parse_prepared(entry: &str) -> Result<PreparedCredential> {
         "credential identity map exceeds 4096 bytes"
     );
     let identity: std::collections::BTreeMap<String, Option<String>> =
-        serde_json::from_slice(&identity).context("credential identity map is invalid JSON")?;
+        crate::input_json::from_slice(&identity)
+            .context("credential identity map is invalid JSON")?;
     ensure!(
         identity.len() <= MAX_IDENTITY_HEADERS,
         "credential identity map exceeds 16 headers"
